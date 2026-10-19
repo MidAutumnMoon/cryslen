@@ -1,0 +1,11 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=cryslen
+GenericName=Image Viewer
+Comment=Minimal Wayland image and comic pager
+Exec=cy %f
+Icon=cryslen
+Terminal=false
+Categories=Graphics;Viewer;
+MimeType=image/png;image/jpeg;image/gif;image/webp;image/bmp;image/tiff;image/avif;image/jxl;application/zip;application/x-7z-compressed;
