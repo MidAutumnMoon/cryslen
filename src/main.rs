@@ -48,8 +48,6 @@ fn main() -> ExitCode {
     }
 }
 
-/// Open the source, run the event loop to completion, and report the GL init
-/// failure that `resumed` had to stash.
 fn run(open_path: &Path, land_on: Option<&str>) -> eros::Result<()> {
     let source = Arc::new(Source::open(open_path)?);
 

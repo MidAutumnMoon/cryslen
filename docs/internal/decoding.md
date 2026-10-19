@@ -55,9 +55,8 @@ pixel cap (the image crate's own 512 MiB allocation ceiling) before
 allocating.
 
 Each edge is also capped at the texture limit the renderer accepts
-(`MAX_TEXTURE_EDGE`, checked where a decoder first learns the
-dimensions, so oversized pages fail fast as sticky page errors
-instead of decoding first).
+(`MAX_TEXTURE_EDGE`). The check runs where a decoder first learns its
+dimensions, so an oversized page fails before the costly decode.
 
 ## libavif/dav1d integration essentials
 

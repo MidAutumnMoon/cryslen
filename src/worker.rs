@@ -198,8 +198,6 @@ fn run(
                     &decode_order,
                 );
             }
-            // The cache carries the outcome, decoder detail included, for the
-            // status line.
             notify();
         }
         current = match newer.or_else(|| rx.recv().ok()) {

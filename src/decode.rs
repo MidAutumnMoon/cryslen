@@ -95,7 +95,6 @@ fn checked_extent(width: u32, height: u32, bytes_per_pixel: usize) -> Result<usi
 pub const MAX_PIXELS: usize = 512 << 18;
 
 /// Largest page edge accepted as one GL texture (the common desktop limit).
-/// Bigger edges fail as sticky page errors.
 const MAX_TEXTURE_EDGE: u32 = 16384;
 
 fn check_dims(width: u32, height: u32) -> Result<(), DecodeError> {
@@ -210,11 +209,10 @@ pub enum DecodeError {
     NotAnImage,
     Corrupt(&'static str),
     Unsupported(&'static str),
-    /// `image`-crate failure, labelled with the format it was decoded as.
     Image(Format, image::ImageError),
     #[cfg(feature = "jxl")]
     Jxl(::jxl::error::Error),
-    /// libavif call failure: what step failed and the avifResult detail.
+    /// libavif call failure with its step and avifResult detail.
     #[cfg(feature = "avif")]
     Avif(&'static str, String),
 }
@@ -335,8 +333,8 @@ fn decode_image(bytes: &[u8], format: Format) -> Result<Decoded, DecodeError> {
     };
     let reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), image_format);
     let mut decoder = reader.into_decoder().map_err(|e| DecodeError::Image(format, e))?;
-    // Dimensions are known before the pixel pass. Orientation swaps at most
-    // w and h, and the edge cap checks both, so this pre-check is complete.
+    // Orientation only swaps w and h, and the cap checks both, so this
+    // pre-orientation check catches rotated pages too.
     let (width, height) = decoder.dimensions();
     check_dims(width, height)?;
     let orientation = decoder.orientation().map_err(|e| DecodeError::Image(format, e))?;

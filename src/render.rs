@@ -2,8 +2,8 @@
 //! All GL `unsafe` lives here behind safe functions (the only other unsafe in
 //! cryslen is decode.rs's libavif FFI block, behind the `avif` feature).
 //! Window and context creation returns errors for main to report. Runtime GL
-//! calls (resource creation, swap) panic instead: after context loss there is
-//! nothing left to show.
+//! calls (resource creation, swap) panic since context loss leaves nothing to
+//! show.
 //!
 //! Two page slots, YUV plane textures with shader-side conversion, spread
 //! layout draw. Chroma siting (avifChromaSamplePosition) is not applied: the
@@ -129,8 +129,8 @@ impl Window {
     ///
     /// # Safety
     ///
-    /// `event_loop` must be the loop this window runs on: the raw display
-    /// handle taken from it backs the GL display.
+    /// `event_loop` must be the loop this window runs on, because the raw
+    /// display handle taken from it backs the GL display.
     unsafe fn create(event_loop: &winit::event_loop::ActiveEventLoop) -> eros::Result<Window> {
         use glutin::context::NotCurrentGlContext as _;
         use glutin::display::GlDisplay as _;
@@ -142,9 +142,9 @@ impl Window {
             .with_inner_size(winit::dpi::LogicalSize { width: INITIAL_WINDOW_WIDTH, height: INITIAL_WINDOW_HEIGHT })
             .with_title("cryslen");
 
-        // The DisplayBuilder cannot express an empty config list (its picker
-        // returns a Config, not a Result), so the display, config, and window
-        // steps run directly here.
+        // glutin-winit's DisplayBuilder picks a config through a closure
+        // that cannot fail, so using it would force a panic on an empty
+        // config list.
         let raw_display = event_loop.display_handle()?.as_raw();
         let gl_display = glutin::display::Display::new(
             raw_display,
