@@ -54,6 +54,11 @@ Guard against hostile headers: `width.checked_mul(height)` against a
 pixel cap (the image crate's own 512 MiB allocation ceiling) before
 allocating.
 
+Each edge is also capped at the texture limit the renderer accepts
+(`MAX_TEXTURE_EDGE`, checked where a decoder first learns the
+dimensions, so oversized pages fail fast as sticky page errors
+instead of decoding first).
+
 ## libavif/dav1d integration essentials
 
 FFI sequence: `avifDecoderCreate` behind an RAII guard, a modest

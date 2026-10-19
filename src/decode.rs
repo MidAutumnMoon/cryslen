@@ -31,6 +31,7 @@ impl Decoded {
         format: Format,
         bytes: Box<[u8]>,
     ) -> Result<Decoded, DecodeError> {
+        check_dims(width, height)?;
         let want = checked_extent(width, height, 4)?;
         if bytes.len() != want {
             return Err(DecodeError::Corrupt("rgba extent"));
@@ -47,6 +48,7 @@ impl Decoded {
         format: Format,
         yuv: YuvImage,
     ) -> Result<Decoded, DecodeError> {
+        check_dims(width, height)?;
         let (_, (cw, ch)) = plane_dims((width, height), yuv.subsampling);
         let samples = |p: &Plane| match p {
             Plane::U8(bytes) => bytes.len(),
@@ -91,6 +93,17 @@ fn checked_extent(width: u32, height: u32, bytes_per_pixel: usize) -> Result<usi
 
 /// Hostile-header cap shared by all decoders, in pixels.
 pub const MAX_PIXELS: usize = 512 << 18;
+
+/// Largest page edge accepted as one GL texture (the common desktop limit).
+/// Bigger edges fail as sticky page errors.
+const MAX_TEXTURE_EDGE: u32 = 16384;
+
+fn check_dims(width: u32, height: u32) -> Result<(), DecodeError> {
+    if width > MAX_TEXTURE_EDGE || height > MAX_TEXTURE_EDGE {
+        return Err(DecodeError::Unsupported("page edge over the GPU texture limit"));
+    }
+    Ok(())
+}
 
 #[derive(Clone)]
 pub enum Pixels {
@@ -197,6 +210,13 @@ pub enum DecodeError {
     NotAnImage,
     Corrupt(&'static str),
     Unsupported(&'static str),
+    /// `image`-crate failure, labelled with the format it was decoded as.
+    Image(Format, image::ImageError),
+    #[cfg(feature = "jxl")]
+    Jxl(::jxl::error::Error),
+    /// libavif call failure: what step failed and the avifResult detail.
+    #[cfg(feature = "avif")]
+    Avif(&'static str, String),
 }
 
 impl std::fmt::Display for DecodeError {
@@ -205,9 +225,16 @@ impl std::fmt::Display for DecodeError {
             DecodeError::NotAnImage => write!(f, "not an image"),
             DecodeError::Corrupt(what) => write!(f, "corrupt: {what}"),
             DecodeError::Unsupported(what) => write!(f, "unsupported: {what}"),
+            DecodeError::Image(format, e) => write!(f, "{}: {e}", format.label()),
+            #[cfg(feature = "jxl")]
+            DecodeError::Jxl(e) => write!(f, "jxl: {e}"),
+            #[cfg(feature = "avif")]
+            DecodeError::Avif(what, detail) => write!(f, "{what}: {detail}"),
         }
     }
 }
+
+impl std::error::Error for DecodeError {}
 
 /// Decode one page. `name` is the page filename (extension fallback).
 /// Static: animated images show their first frame.
@@ -307,23 +334,18 @@ fn decode_image(bytes: &[u8], format: Format) -> Result<Decoded, DecodeError> {
         Format::Avif | Format::Jxl => return Err(DecodeError::Unsupported("internal dispatch")),
     };
     let reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), image_format);
-    let mut decoder = reader.into_decoder().map_err(|e| image_error(format, e))?;
-    let orientation = decoder.orientation().map_err(|e| image_error(format, e))?;
-    let mut oriented = image::DynamicImage::from_decoder(decoder).map_err(|e| image_error(format, e))?;
+    let mut decoder = reader.into_decoder().map_err(|e| DecodeError::Image(format, e))?;
+    // Dimensions are known before the pixel pass. Orientation swaps at most
+    // w and h, and the edge cap checks both, so this pre-check is complete.
+    let (width, height) = decoder.dimensions();
+    check_dims(width, height)?;
+    let orientation = decoder.orientation().map_err(|e| DecodeError::Image(format, e))?;
+    let mut oriented =
+        image::DynamicImage::from_decoder(decoder).map_err(|e| DecodeError::Image(format, e))?;
     oriented.apply_orientation(orientation);
     let rgba = oriented.to_rgba8();
     let (width, height) = (rgba.width(), rgba.height());
     Decoded::rgba(width, height, format, rgba.into_raw().into_boxed_slice())
-}
-
-/// The frozen error type is `'static`, so the decoder's detail goes to stderr
-/// and the page gets a short label.
-fn image_error(format: Format, e: image::ImageError) -> DecodeError {
-    eprintln!("cy: decode {}: {e}", format.label());
-    match e {
-        image::ImageError::Unsupported(_) => DecodeError::Unsupported("image variant"),
-        _ => DecodeError::Corrupt(format.label()),
-    }
 }
 
 /// libavif FFI: decoder over the in-memory file, YUV planes copied out
@@ -368,6 +390,7 @@ mod avif {
             if (width as u64) * (height as u64) > super::MAX_PIXELS as u64 {
                 return Err(DecodeError::Corrupt("avif: bad dimensions"));
             }
+            super::check_dims(width as u32, height as u32)?;
             let subsampling = match (*avif_image_ptr).yuvFormat {
                 AVIF_PIXEL_FORMAT_YUV444 => Subsampling::Yuv444,
                 AVIF_PIXEL_FORMAT_YUV422 => Subsampling::Yuv422,
@@ -447,8 +470,7 @@ mod avif {
             return Ok(());
         }
         let detail = std::ffi::CStr::from_ptr(avifResultToString(code)).to_string_lossy();
-        eprintln!("cy: {what}: {detail}");
-        Err(DecodeError::Corrupt(what))
+        Err(DecodeError::Avif(what, detail.into_owned()))
     }
 
     /// Copy one plane row by row (libavif rows are padded to `stride`).
@@ -529,7 +551,7 @@ mod jxl {
             Ok(ProcessingResult::NeedsMoreInput { .. }) => {
                 return Err(DecodeError::Corrupt("jxl: truncated header"))
             }
-            Err(e) => return Err(jxl_error(e)),
+            Err(e) => return Err(DecodeError::Jxl(e)),
         };
         let (width, height) = decoder.basic_info().size;
         let pixels =
@@ -537,20 +559,21 @@ mod jxl {
         let Some(pixel_count) = pixels else {
             return Err(DecodeError::Corrupt("jxl: bad dimensions"));
         };
+        super::check_dims(width as u32, height as u32)?;
 
         decoder.set_pixel_format(JxlPixelFormat {
             color_type: JxlColorType::Rgb,
             color_data_format: Some(JxlDataFormat::U8 { bit_depth: 8 }),
             extra_channel_format: Vec::new(),
         })
-        .map_err(jxl_error)?;
+        .map_err(DecodeError::Jxl)?;
 
         // pass 2: frame info
         let mut decoder = loop {
             match decoder.process(&mut input, Some(&mut runner)) {
                 Ok(ProcessingResult::Complete { result }) => break result,
                 Ok(ProcessingResult::NeedsMoreInput { fallback, .. }) => decoder = fallback,
-                Err(e) => return Err(jxl_error(e)),
+                Err(e) => return Err(DecodeError::Jxl(e)),
             }
         };
 
@@ -563,7 +586,7 @@ mod jxl {
             {
                 Ok(ProcessingResult::Complete { .. }) => break,
                 Ok(ProcessingResult::NeedsMoreInput { fallback, .. }) => decoder = fallback,
-                Err(e) => return Err(jxl_error(e)),
+                Err(e) => return Err(DecodeError::Jxl(e)),
             }
         }
 
@@ -572,11 +595,6 @@ mod jxl {
 
     fn threads() -> usize {
         std::thread::available_parallelism().map_or(1, |n| n.get()).min(MAX_THREADS)
-    }
-
-    fn jxl_error(e: jxl::error::Error) -> DecodeError {
-        eprintln!("cy: decode jxl: {e}");
-        DecodeError::Corrupt("jxl")
     }
 
     fn expand_rgba(rgb: &[u8]) -> Box<[u8]> {
@@ -706,13 +724,22 @@ mod tests {
     }
 
     #[test]
-    fn truncated_jpeg_is_corrupt_not_panic() {
+    fn truncated_jpeg_is_an_error_not_panic() {
         let img = image::RgbImage::from_pixel(32, 32, image::Rgb([1, 2, 3]));
         let mut jpg = Vec::new();
         image::DynamicImage::ImageRgb8(img)
             .write_to(&mut std::io::Cursor::new(&mut jpg), image::ImageFormat::Jpeg)
             .unwrap();
-        assert!(matches!(decode(&jpg[..20], "p.jpg"), Err(DecodeError::Corrupt(_))));
+        assert!(matches!(decode(&jpg[..20], "p.jpg"), Err(DecodeError::Image(Format::Jpeg, _))));
+    }
+
+    #[test]
+    fn edge_cap_at_gpu_texture_limit() {
+        let over = Decoded::rgba(16385, 1, Format::Png, vec![0u8; 4 * 16385].into_boxed_slice());
+        assert!(matches!(over, Err(DecodeError::Unsupported(_))));
+        let at_limit =
+            Decoded::rgba(16384, 1, Format::Png, vec![0u8; 4 * 16384].into_boxed_slice());
+        assert!(at_limit.is_ok());
     }
 
     #[test]
@@ -765,7 +792,7 @@ mod tests {
         #[cfg(not(feature = "jxl"))]
         assert!(matches!(decode(&[0xFF, 0x0A, 0x00], "a.jxl"), Err(DecodeError::Unsupported(_))));
         #[cfg(feature = "avif")]
-        assert!(matches!(decode(b"\x00\x00\x00\x0cftypavif", "a.avif"), Err(DecodeError::Corrupt(_))));
+        assert!(matches!(decode(b"\x00\x00\x00\x0cftypavif", "a.avif"), Err(DecodeError::Avif(..))));
         #[cfg(feature = "jxl")]
         assert!(matches!(decode(&[0xFF, 0x0A, 0x00], "a.jxl"), Err(DecodeError::Corrupt(_))));
     }

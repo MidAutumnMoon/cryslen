@@ -95,6 +95,9 @@ pub struct App {
     pub state: State,
     /// GL exists only after `resumed` (winit requirement).
     pub gl: Option<Gl>,
+    /// GL init failure from `resumed`, which cannot return a Result. Main
+    /// reports it after the event loop exits.
+    pub start_error: Option<eros::ErrorUnion>,
     /// Window size the GL surface was last resized to (physical px).
     pub last_win: (u32, u32),
     pub cursor: (f32, f32),
@@ -131,6 +134,7 @@ impl App {
             worker,
             state: State { index, ..START },
             gl: None,
+            start_error: None,
             last_win: (0, 0),
             cursor: (0.0, 0.0),
             dragging: false,
@@ -327,7 +331,14 @@ impl App {
 
 impl winit::application::ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
-        let window = Window::new(event_loop);
+        let window = match Window::new(event_loop) {
+            Ok(window) => window,
+            Err(e) => {
+                self.start_error = Some(e);
+                event_loop.exit();
+                return;
+            }
+        };
         let gl = window.glow();
         let egui = egui_glow::EguiGlow::new(event_loop, Arc::clone(&gl), None, None, true);
         // Bridge egui repaint requests into the winit loop (arm-only: the
@@ -391,7 +402,8 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
         // Give egui the event first. If it wants the pointer, we don't
         // pan or zoom.
         let egui_wants = {
-            let Gl { egui, window, .. } = self.gl.as_mut().unwrap();
+            let Gl { egui, window, .. } =
+                self.gl.as_mut().expect("gl is Some (returned early when absent)");
             let response = egui.on_window_event(&window.winit, &event);
             let wants = egui.egui_ctx.egui_wants_pointer_input();
             if response.repaint {

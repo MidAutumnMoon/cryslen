@@ -1,6 +1,9 @@
 //! GL rendering: window/context (glutin-on-winit) and the page quad renderer.
 //! All GL `unsafe` lives here behind safe functions (the only other unsafe in
 //! cryslen is decode.rs's libavif FFI block, behind the `avif` feature).
+//! Window and context creation returns errors for main to report. Runtime GL
+//! calls (resource creation, swap) panic instead: after context loss there is
+//! nothing left to show.
 //!
 //! Two page slots, YUV plane textures with shader-side conversion, spread
 //! layout draw. Chroma siting (avifChromaSamplePosition) is not applied: the
@@ -118,66 +121,79 @@ pub struct Window {
 }
 
 impl Window {
-    pub fn new(event_loop: &winit::event_loop::ActiveEventLoop) -> Window {
+    pub fn new(event_loop: &winit::event_loop::ActiveEventLoop) -> eros::Result<Window> {
         unsafe { Self::create(event_loop) }
     }
 
     /// Prefer desktop GL, fall back to GLES. The swap is non-blocking.
-    unsafe fn create(event_loop: &winit::event_loop::ActiveEventLoop) -> Window {
+    ///
+    /// # Safety
+    ///
+    /// `event_loop` must be the loop this window runs on: the raw display
+    /// handle taken from it backs the GL display.
+    unsafe fn create(event_loop: &winit::event_loop::ActiveEventLoop) -> eros::Result<Window> {
         use glutin::context::NotCurrentGlContext as _;
-        use glutin::display::{GetGlDisplay as _, GlDisplay as _};
+        use glutin::display::GlDisplay as _;
         use glutin::prelude::GlSurface as _;
+        use winit::raw_window_handle::HasDisplayHandle as _;
 
         let attrs = winit::window::WindowAttributes::default()
             .with_resizable(true)
             .with_inner_size(winit::dpi::LogicalSize { width: INITIAL_WINDOW_WIDTH, height: INITIAL_WINDOW_HEIGHT })
             .with_title("cryslen");
 
-        let (mut window, gl_config) =
-            glutin_winit::DisplayBuilder::new()
-                .with_preference(glutin_winit::ApiPreference::FallbackEgl)
-                .with_window_attributes(Some(attrs.clone()))
-                .build(event_loop, glutin::config::ConfigTemplateBuilder::new(), |mut it| {
-                    it.next().expect("no GL config")
-                })
-                .expect("create GL config");
-        let gl_display = gl_config.display();
+        // The DisplayBuilder cannot express an empty config list (its picker
+        // returns a Config, not a Result), so the display, config, and window
+        // steps run directly here.
+        let raw_display = event_loop.display_handle()?.as_raw();
+        let gl_display = glutin::display::Display::new(
+            raw_display,
+            glutin::display::DisplayApiPreference::Egl,
+        )?;
+        let template = glutin::config::ConfigTemplateBuilder::new().build();
+        let gl_config = gl_display
+            .find_configs(template)?
+            .next()
+            .ok_or_else(|| eros::error!("no GL config matched the template"))?;
 
-        let raw = window.as_ref().map(|w| w.window_handle().unwrap().as_raw());
-        let ctx_attrs = glutin::context::ContextAttributesBuilder::new().build(raw);
+        let window = glutin_winit::finalize_window(event_loop, attrs, &gl_config)?;
+        let raw_window = window.window_handle().expect("window handle").as_raw();
+        let ctx_attrs =
+            glutin::context::ContextAttributesBuilder::new().build(Some(raw_window));
         let fallback = glutin::context::ContextAttributesBuilder::new()
             .with_context_api(glutin::context::ContextApi::Gles(None))
-            .build(raw);
-        let not_current = gl_display.create_context(&gl_config, &ctx_attrs).unwrap_or_else(|_| {
-            gl_config.display().create_context(&gl_config, &fallback).unwrap()
-        });
+            .build(Some(raw_window));
+        let not_current = match gl_display.create_context(&gl_config, &ctx_attrs) {
+            Ok(context) => context,
+            Err(desktop) => gl_display
+                .create_context(&gl_config, &fallback)
+                .map_err(|gles| {
+                    eros::error!("GL context creation failed. desktop: {desktop}. GLES: {gles}")
+                })?,
+        };
 
-        let window = window.take().unwrap_or_else(|| {
-            glutin_winit::finalize_window(event_loop, attrs, &gl_config).unwrap()
-        });
         let (w, h): (u32, u32) = window.inner_size().into();
         let surface_attrs =
             glutin::surface::SurfaceAttributesBuilder::<glutin::surface::WindowSurface>::new()
                 .build(
-                    window.window_handle().unwrap().as_raw(),
-                    NonZeroU32::new(w).unwrap(),
-                    NonZeroU32::new(h).unwrap(),
+                    raw_window,
+                    NonZeroU32::new(w).expect("nonzero window width"),
+                    NonZeroU32::new(h).expect("nonzero window height"),
                 );
-        let surface = gl_display.create_window_surface(&gl_config, &surface_attrs).unwrap();
-        let context = not_current.make_current(&surface).unwrap();
+        let surface = gl_display.create_window_surface(&gl_config, &surface_attrs)?;
+        let context = not_current.make_current(&surface)?;
         // Non-blocking present plus pre_present_and_swap's
         // window.pre_present_notify() gives Wayland frame-callback pacing
         // without a blocking eglSwapBuffers owning the event loop. Same
         // choice eframe made.
         surface
-            .set_swap_interval(&context, glutin::surface::SwapInterval::DontWait)
-            .unwrap();
+            .set_swap_interval(&context, glutin::surface::SwapInterval::DontWait)?;
 
         let gl = Arc::new(glow::Context::from_loader_function(|s| {
-            let s = std::ffi::CString::new(s).unwrap();
+            let s = std::ffi::CString::new(s).expect("GL proc name without interior NUL");
             gl_display.get_proc_address(&s)
         }));
-        Window { winit: window, gl, surface, context }
+        Ok(Window { winit: window, gl, surface, context })
     }
 
     pub fn glow(&self) -> Arc<glow::Context> {
@@ -186,15 +202,18 @@ impl Window {
 
     pub fn resize(&self, size: winit::dpi::PhysicalSize<u32>) {
         use glutin::prelude::GlSurface as _;
-        self.surface
-            .resize(&self.context, size.width.try_into().unwrap(), size.height.try_into().unwrap());
+        self.surface.resize(
+            &self.context,
+            size.width.try_into().expect("nonzero surface width"),
+            size.height.try_into().expect("nonzero surface height"),
+        );
     }
 
     /// Frame-callback notify then non-blocking swap.
     pub fn pre_present_and_swap(&self) {
         use glutin::prelude::GlSurface as _;
         self.winit.pre_present_notify();
-        self.surface.swap_buffers(&self.context).unwrap();
+        self.surface.swap_buffers(&self.context).expect("swap buffers (GL context lost)");
     }
 }
 
@@ -263,7 +282,7 @@ impl PageSlots {
     pub fn new(gl: Arc<glow::Context>) -> PageSlots {
         let (vs, fs) = if gl.version().is_embedded { (VS_ES, FS_ES) } else { (VS_CORE, FS_CORE) };
         let compile = |kind, src| unsafe {
-            let shader = gl.create_shader(kind).unwrap();
+            let shader = gl.create_shader(kind).expect("GL shader object");
             gl.shader_source(shader, src);
             gl.compile_shader(shader);
             assert!(
@@ -275,9 +294,9 @@ impl PageSlots {
         };
         let (program, vbo, vao);
         unsafe {
-            program = gl.create_program().unwrap();
-            vbo = gl.create_buffer().unwrap();
-            vao = gl.create_vertex_array().unwrap();
+            program = gl.create_program().expect("GL program object");
+            vbo = gl.create_buffer().expect("GL buffer object");
+            vao = gl.create_vertex_array().expect("GL vertex array object");
 
             gl.attach_shader(program, compile(glow::VERTEX_SHADER, vs));
             gl.attach_shader(program, compile(glow::FRAGMENT_SHADER, fs));
@@ -292,7 +311,7 @@ impl PageSlots {
             );
 
             gl.bind_vertex_array(Some(vao));
-            let loc = gl.get_attrib_location(program, "pos").unwrap();
+            let loc = gl.get_attrib_location(program, "pos").expect("pos attribute in page shader");
             gl.enable_vertex_attrib_array(loc);
             gl.vertex_attrib_pointer_f32(loc, 2, glow::FLOAT, false, 8, 0);
 
@@ -311,7 +330,9 @@ impl PageSlots {
     ///
     /// # Panics
     ///
-    /// Panics if the page exceeds GL's MAX_TEXTURE_SIZE.
+    /// Panics if the page exceeds this context's MAX_TEXTURE_SIZE. Decode
+    /// rejects edges over its own cap first, so only a GPU advertising a
+    /// smaller limit can trip this.
     pub fn set(&mut self, slot: usize, page: usize, decoded: &Decoded) {
         if self.slots[slot].page == Some(page) {
             return;
@@ -508,7 +529,7 @@ fn delete_textures(gl: &glow::Context, textures: &Textures) {
 /// Texture with viewer defaults. CLAMP keeps edge texels from bleeding.
 /// `filterable` false (GLES R16) means NEAREST and no mips.
 fn new_texture(gl: &glow::Context, filterable: bool) -> <glow::Context as HasContext>::Texture {
-    let texture = unsafe { gl.create_texture().unwrap() };
+    let texture = unsafe { gl.create_texture().expect("GL texture object") };
     unsafe {
         gl.bind_texture(glow::TEXTURE_2D, Some(texture));
         gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as _);

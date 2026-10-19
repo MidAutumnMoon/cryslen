@@ -22,9 +22,9 @@ pub enum SourceError {
     NotFound(PathBuf),
     Empty,
     Unsupported(PathBuf),
-    Zip(String),
-    SevenZip(String),
-    Io(String),
+    Zip(zip::result::ZipError),
+    SevenZip(sevenz_rust2::Error),
+    Io(std::io::Error),
 }
 
 impl std::fmt::Display for SourceError {
@@ -39,6 +39,8 @@ impl std::fmt::Display for SourceError {
         }
     }
 }
+
+impl std::error::Error for SourceError {}
 
 /// A page source with persistent handles. Cheap to keep alive for the whole
 /// session. Shared with the decode worker behind an `Arc`.
@@ -69,7 +71,7 @@ impl Source {
 
     fn open_dir(dir: &Path) -> Result<Source, SourceError> {
         let mut names: Vec<String> = std::fs::read_dir(dir)
-            .map_err(|e| SourceError::Io(format!("{}: {e}", dir.display())))?
+            .map_err(SourceError::Io)?
             .filter_map(|entry| entry.ok())
             .filter(|entry| entry.file_type().is_ok_and(|t| t.is_file()))
             .filter_map(|entry| entry.file_name().into_string().ok())
@@ -82,9 +84,8 @@ impl Source {
     /// The archive handle opened here stays open for the session. `bytes`
     /// reads go through it, avoiding a central-directory parse per page.
     fn open_zip(path: &Path) -> Result<Source, SourceError> {
-        let file = std::fs::File::open(path).map_err(|e| SourceError::Zip(e.to_string()))?;
-        let zip = zip::ZipArchive::new(std::io::BufReader::new(file))
-            .map_err(|e| SourceError::Zip(e.to_string()))?;
+        let file = std::fs::File::open(path).map_err(SourceError::Io)?;
+        let zip = zip::ZipArchive::new(std::io::BufReader::new(file)).map_err(SourceError::Zip)?;
         // Non-UTF-8 entry names are skipped (zip 9 reports them as errors).
         let mut names: Vec<String> = zip
             .file_names()
@@ -104,7 +105,7 @@ impl Source {
     /// handle to keep here.
     fn open_sevenzip(path: &Path) -> Result<Source, SourceError> {
         let archive = sevenz_rust2::ArchiveReader::open(path, sevenz_rust2::Password::empty())
-            .map_err(|e| SourceError::SevenZip(e.to_string()))?;
+            .map_err(SourceError::SevenZip)?;
         let mut names: Vec<String> = archive
             .archive()
             .files
@@ -147,33 +148,31 @@ impl Source {
         let name = self
             .names
             .get(index)
-            .ok_or_else(|| SourceError::Io(format!("page {index} out of range")))?;
+            .ok_or_else(|| SourceError::Io(std::io::Error::other(format!("page {index} out of range"))))?;
         match &self.kind {
             SourceKind::Directory(dir) => std::fs::read(dir.join(name))
                 .map(Vec::into_boxed_slice)
-                .map_err(|e| SourceError::Io(e.to_string())),
+                .map_err(SourceError::Io),
             SourceKind::Zip(_) => {
-                let zip = self
-                    .zip
-                    .as_ref()
-                    .ok_or_else(|| SourceError::Zip("archive handle lost".to_string()))?;
                 // A poisoned lock only means a read panicked mid-flight. The
                 // archive itself is still readable, so recover the data.
-                let mut archive = match zip.lock() {
+                let mut archive = match self.zip.as_ref().expect("zip handle for zip sources").lock() {
                     Ok(guard) => guard,
                     Err(poisoned) => poisoned.into_inner(),
                 };
-                let mut entry = archive.by_name(name).map_err(|e| SourceError::Zip(e.to_string()))?;
+                let mut entry = archive.by_name(name).map_err(SourceError::Zip)?;
                 let mut buf = Vec::new();
-                entry.read_to_end(&mut buf).map_err(|e| SourceError::Zip(e.to_string()))?;
+                entry
+                    .read_to_end(&mut buf)
+                    .map_err(|e| SourceError::Zip(zip::result::ZipError::Io(e)))?;
                 Ok(buf.into_boxed_slice())
             }
             SourceKind::SevenZip(path) => {
                 let mut archive = sevenz_rust2::ArchiveReader::open(path, sevenz_rust2::Password::empty())
-                    .map_err(|e| SourceError::SevenZip(e.to_string()))?;
+                    .map_err(SourceError::SevenZip)?;
                 archive
                     .read_file(name)
-                    .map_err(|e| SourceError::SevenZip(e.to_string()))
+                    .map_err(SourceError::SevenZip)
                     .map(Into::into)
             }
         }

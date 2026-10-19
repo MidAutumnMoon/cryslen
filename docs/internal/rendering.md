@@ -73,7 +73,9 @@ arboard bundle.
   wrecks the math. ES3 mandates highp support.
 - Assert against `MAX_TEXTURE_SIZE` before uploading. GL silently
   rejects oversized `tex_image_2d` and the texture then samples black.
-  The bounds checks in shader-land cannot catch it.
+  The bounds checks in shader-land cannot catch it. Decode already
+  rejects edges over its own cap, so the assert only fires on GPUs
+  advertising a smaller limit.
 - GL objects must be deleted while their context is alive. Keep the
   window/context as the last field of the owning struct (Rust drop
   order) and call `egui_glow.destroy()` explicitly on exit or it logs

@@ -25,6 +25,7 @@ glutin = { version = "0.32", default-features = false, features = ["egl", "wayla
 glutin-winit = { version = "0.5", default-features = false, features = ["egl", "wayland"] }
 winit = { version = "0.30", default-features = false, features = ["rwh_06", "wayland", "wayland-dlopen"] }
 
+eros = { version = "0.8", default-features = false }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "tiff"] }
 natord = "1"
 zip = { version = "9", default-features = false, features = ["deflate"] }

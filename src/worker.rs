@@ -16,8 +16,7 @@ const BUDGET_BYTES: usize = 512 * 1024 * 1024;
 const SENTINEL: usize = usize::MAX;
 /// Cache entry: the decode outcome, not just the success case. A failed
 /// page is sticky, so waiting, error display, and hold-last-frame are all
-/// pure reads of this map and the failure follows the page across turns.
-/// of the same map, and the failure follows the page across turns.
+/// pure reads of this map, and the failure follows the page across turns.
 pub enum Page {
     Ready(Arc<Decoded>),
     Failed(String),
@@ -139,7 +138,7 @@ impl Worker {
     /// The decode outcome for one page, if it has been decided. Cloning a
     /// `Ready` page is an `Arc` bump.
     pub fn page(&self, index: usize) -> Option<Page> {
-        self.cache.lock().unwrap().map.get(&index).cloned()
+        self.cache.lock().expect("decode cache lock").map.get(&index).cloned()
     }
 }
 
@@ -182,13 +181,13 @@ fn run(
             if newer.is_some() {
                 break;
             }
-            let done = cache.lock().unwrap().map.contains_key(&index);
+            let done = cache.lock().expect("decode cache lock").map.contains_key(&index);
             if done {
                 continue;
             }
             let outcome = decode_page(source, index);
             {
-                let mut pages = cache.lock().unwrap();
+                let mut pages = cache.lock().expect("decode cache lock");
                 pages.insert(
                     index,
                     match outcome {
@@ -199,8 +198,8 @@ fn run(
                     &decode_order,
                 );
             }
-            // Detail went to stderr already. The cache now carries the
-            // outcome for the status line.
+            // The cache carries the outcome, decoder detail included, for the
+            // status line.
             notify();
         }
         current = match newer.or_else(|| rx.recv().ok()) {
@@ -211,13 +210,15 @@ fn run(
 }
 
 /// One page through the panic boundary: a panicking decoder must not kill
-/// the only worker thread.
+/// the only worker thread. The error string is the status-line message.
 fn decode_page(source: &Source, index: usize) -> Result<Arc<Decoded>, String> {
     let name = source.name(index).to_owned();
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let bytes = source.bytes(index).map_err(|e| e.to_string())?;
-        crate::decode::decode(&bytes, &name).map_err(|e| e.to_string())
-    }));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+        || -> eros::Result<Decoded> {
+            let bytes = source.bytes(index)?;
+            Ok(crate::decode::decode(&bytes, &name)?)
+        },
+    ));
     match result {
         Ok(Ok(page)) => Ok(Arc::new(page)),
         Ok(Err(e)) => Err(format!("page {}: {e}", index + 1)),

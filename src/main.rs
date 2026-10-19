@@ -11,17 +11,18 @@ mod view;
 mod worker;
 
 use std::path::Path;
+use std::process::ExitCode;
 use std::sync::Arc;
 
 use app::{App, UserEvent};
 use page::Source;
 use worker::Worker;
 
-fn main() {
-    let arg = std::env::args().nth(1).unwrap_or_else(|| {
+fn main() -> ExitCode {
+    let Some(arg) = std::env::args().nth(1) else {
         eprintln!("usage: cy <dir | archive | image-file>");
-        std::process::exit(2);
-    });
+        return ExitCode::from(2);
+    };
     let path = Path::new(&arg);
 
     let start = if path.is_file() && !is_archive(path) {
@@ -36,24 +37,29 @@ fn main() {
         None
     };
     let open_path = start.as_ref().map_or(path, |(dir, _)| dir.as_path());
+    let land_on = start.as_ref().and_then(|(_, name)| name.as_deref());
 
-    let source = match Source::open(open_path) {
-        Ok(s) => Arc::new(s),
+    match run(open_path, land_on) {
+        Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("cy: {e}");
-            std::process::exit(1);
+            ExitCode::FAILURE
         }
-    };
+    }
+}
+
+/// Open the source, run the event loop to completion, and report the GL init
+/// failure that `resumed` had to stash.
+fn run(open_path: &Path, land_on: Option<&str>) -> eros::Result<()> {
+    let source = Arc::new(Source::open(open_path)?);
 
     // Page to land on: the named file if given, else the first page.
-    let index = start
-        .as_ref()
-        .and_then(|(_, name)| name.as_ref())
+    let index = land_on
         .and_then(|name| (0..source.len()).find(|&i| source.name(i).eq_ignore_ascii_case(name)))
         .unwrap_or(0);
 
     let event_loop =
-        winit::event_loop::EventLoop::<UserEvent>::with_user_event().build().unwrap();
+        winit::event_loop::EventLoop::<UserEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
 
     let worker = Worker::spawn(Arc::clone(&source), move || {
@@ -62,7 +68,11 @@ fn main() {
     worker.focus(index);
 
     let mut app = App::new(source, worker, index, event_loop.create_proxy());
-    event_loop.run_app(&mut app).expect("event loop");
+    event_loop.run_app(&mut app)?;
+    if let Some(e) = app.start_error.take() {
+        return Err(e);
+    }
+    Ok(())
 }
 
 fn is_archive(path: &Path) -> bool {
