@@ -24,7 +24,7 @@
         let pkgs = nixpkgs.legacyPackages.${system}; in {
           default = pkgs.mkShell {
             packages = [
-              # toolchain to build the optional native deps (dav1d via libavif-sys)
+              # toolchain to build the native deps (dav1d via libavif-sys)
               pkgs.cmake
               (nasm-aom-shim pkgs)
               pkgs.meson
@@ -49,7 +49,6 @@
             version = "0.1.0";
             src = self;
             cargoLock.lockFile = ./Cargo.lock;
-            buildFeatures = [ "avif" "jxl" ];
             nativeBuildInputs = [
               pkgs.cmake
               (nasm-aom-shim pkgs)

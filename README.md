@@ -5,13 +5,11 @@
 - Pages from directories, `.zip`/`.cbz`, and `.7z`/`.cb7` archives
 - Manga mode: right-to-left reading (default on) and double-page spreads
 - Off-thread decoding with cancellation and prefetch; GPU-side pan/zoom
-- Optional AVIF (`--features avif`, dav1d, YUV converted in the display shader)
-  and JPEG XL (`--features jxl`, pure-Rust jxl-rs)
+- AVIF (dav1d, YUV converted in the display shader) and JPEG XL (jxl-rs)
 
 ## Build
 
-    cargo build --release            # common formats
-    nix develop -c cargo build --release --features avif,jxl
+    nix develop -c cargo build --release
 
 ## Keys
 

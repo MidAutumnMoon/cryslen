@@ -1,9 +1,8 @@
 //! Decoding: raw page bytes -> `Decoded` (RGBA or YUV planes).
 //!
 //! Dispatch is by magic bytes where possible, then extension. JPEG/PNG get
-//! EXIF orientation applied. AVIF (feature `avif`) decodes to YUV planes for
-//! shader-side color conversion. JXL (feature `jxl`) uses jxl-rs with a
-//! scoped-thread parallel runner.
+//! EXIF orientation applied. AVIF decodes to YUV planes for shader-side
+//! color conversion. JXL uses jxl-rs with a scoped-thread parallel runner.
 //!
 //! All functions here are panics-clean for corrupt input: they return
 //! `DecodeError`, never panic. Decoder panics are caught with catch_unwind
@@ -41,7 +40,6 @@ impl Decoded {
 
     /// Planar YUV sized per [`plane_dims`] for these dimensions. Called only
     /// by the `avif` decoder.
-    #[cfg_attr(not(feature = "avif"), allow(dead_code))]
     pub fn yuv(
         width: u32,
         height: u32,
@@ -110,7 +108,6 @@ pub enum Pixels {
     Rgba8(Box<[u8]>),
     /// Planar YUV, converted to RGB in the renderer's shader. Constructed
     /// only by the `avif` decoder.
-    #[cfg_attr(not(feature = "avif"), allow(dead_code))]
     Yuv(YuvImage),
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,7 +155,6 @@ pub struct YuvImage {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 // Yuv420/Yuv422 arrive only from the `avif` decoder.
-#[cfg_attr(not(feature = "avif"), allow(dead_code))]
 pub enum Subsampling {
     Mono,
     Yuv420,
@@ -168,7 +164,6 @@ pub enum Subsampling {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 // The BT matrices arrive only from the `avif` decoder.
-#[cfg_attr(not(feature = "avif"), allow(dead_code))]
 pub enum Matrix {
     Bt601,
     Bt709,
@@ -177,8 +172,7 @@ pub enum Matrix {
 }
 
 #[derive(Clone)]
-// Plane data in non-`avif` builds arrives only from the image crate as RGBA.
-#[cfg_attr(not(feature = "avif"), allow(dead_code))]
+// Plane data arrives only from the `avif` decoder.
 pub enum Plane {
     U8(Box<[u8]>),
     U16(Box<[u16]>),
@@ -210,10 +204,8 @@ pub enum DecodeError {
     Corrupt(&'static str),
     Unsupported(&'static str),
     Image(Format, image::ImageError),
-    #[cfg(feature = "jxl")]
     Jxl(::jxl::error::Error),
     /// libavif call failure with its step and avifResult detail.
-    #[cfg(feature = "avif")]
     Avif(&'static str, String),
 }
 
@@ -224,9 +216,7 @@ impl std::fmt::Display for DecodeError {
             DecodeError::Corrupt(what) => write!(f, "corrupt: {what}"),
             DecodeError::Unsupported(what) => write!(f, "unsupported: {what}"),
             DecodeError::Image(format, e) => write!(f, "{}: {e}", format.label()),
-            #[cfg(feature = "jxl")]
             DecodeError::Jxl(e) => write!(f, "jxl: {e}"),
-            #[cfg(feature = "avif")]
             DecodeError::Avif(what, detail) => write!(f, "{what}: {detail}"),
         }
     }
@@ -242,14 +232,8 @@ pub fn decode(bytes: &[u8], name: &str) -> Result<Decoded, DecodeError> {
         None => return Err(DecodeError::NotAnImage),
     };
     match format {
-        #[cfg(feature = "avif")]
         Format::Avif => avif::decode(bytes),
-        #[cfg(not(feature = "avif"))]
-        Format::Avif => Err(DecodeError::Unsupported("avif (rebuild with --features avif)")),
-        #[cfg(feature = "jxl")]
         Format::Jxl => jxl::decode(bytes),
-        #[cfg(not(feature = "jxl"))]
-        Format::Jxl => Err(DecodeError::Unsupported("jxl (rebuild with --features jxl)")),
         format => decode_image(bytes, format),
     }
 }
@@ -349,11 +333,8 @@ fn decode_image(bytes: &[u8], format: Format) -> Result<Decoded, DecodeError> {
 /// libavif FFI: decoder over the in-memory file, YUV planes copied out
 /// directly (avifImageYUVToRGB would cost a full RGB conversion we do on the
 /// GPU instead.
-#[cfg(feature = "avif")]
 mod avif {
     use libavif_sys::*;
-
-
 
     use super::{DecodeError, Decoded, Format, Matrix, Plane, Subsampling, YuvImage};
 
@@ -523,7 +504,6 @@ mod avif {
 
 /// jxl-rs low-level decode with a scoped-thread parallel runner. Output is
 /// requested as 8-bit RGB and expanded to RGBA here.
-#[cfg(feature = "jxl")]
 mod jxl {
     use jxl::api::{
         states, JxlColorType, JxlDataFormat, JxlDecoder, JxlDecoderOptions, JxlOutputBuffer,
@@ -778,20 +758,11 @@ mod tests {
     }
 
     #[test]
-    fn avif_and_jxl_without_features() {
+    fn avif_and_jxl_garbage_is_an_error_not_panic() {
         // No cheap encoder exists for either format in-tree, so only the
-        // dispatch decision is testable in default builds: sniffed pages
-        // reach the feature gate and come back Unsupported, never panic.
-        #[cfg(not(feature = "avif"))]
-        assert!(matches!(
-            decode(b"\x00\x00\x00\x0cftypavif", "a.avif"),
-            Err(DecodeError::Unsupported(_))
-        ));
-        #[cfg(not(feature = "jxl"))]
-        assert!(matches!(decode(&[0xFF, 0x0A, 0x00], "a.jxl"), Err(DecodeError::Unsupported(_))));
-        #[cfg(feature = "avif")]
+        // dispatch decision is testable: sniffed pages reach the decoder and
+        // come back as errors, never panic.
         assert!(matches!(decode(b"\x00\x00\x00\x0cftypavif", "a.avif"), Err(DecodeError::Avif(..))));
-        #[cfg(feature = "jxl")]
         assert!(matches!(decode(&[0xFF, 0x0A, 0x00], "a.jxl"), Err(DecodeError::Corrupt(_))));
     }
 }

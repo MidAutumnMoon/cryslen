@@ -3,11 +3,11 @@
 Reference for building cryslen and for measuring anything on this
 machine.
 
-## Nix devShell (needed for `--features avif`)
+## Nix devShell (needed for every build)
 
 The vendored build chain for libavif-sys's dav1d: `cmake`, `meson`,
 `ninja`, `perl`, `clang`, `pkg-config`, and a **nasm shim** (below).
-`--features jxl` is pure Rust and needs none of this. The flake's
+The flake's
 `packages.default` mirrors the devShell as `nativeBuildInputs` for
 `buildRustPackage` with `cargoLock.lockFile = ./Cargo.lock`, so keep
 the lockfile committed.
@@ -26,14 +26,6 @@ CMake caches `CMAKE_ASM_NASM_COMPILER` by absolute store path in
 libaom-sys` does not clear it. Delete the build dir manually before
 rebuilding, or the stale path keeps failing while the shim looks
 innocent.
-
-## Feature-gated dead code
-
-The YUV types are constructed only by the `avif` decoder, so default
-builds warn "never constructed". The pattern used:
-`#[cfg_attr(not(feature = "avif"), allow(dead_code))]` on the specific
-variants/enums. It is self-documenting, and the warning returns if the
-constructor ever disappears for real.
 
 ## Cargo feature hygiene for a Wayland-only build
 
@@ -84,7 +76,6 @@ invisible to `--all` until a bookmark covers them. `jj restore --from
 
 ## Gates
 
-`cargo clippy --all-targets` (default features) and, inside `nix
-develop`, `cargo clippy --all-targets --all-features -- -D warnings`
-plus `cargo test --all-features`. The avif feature compiles dav1d from
-source, so keep those runs for integration moments, not every edit.
+All inside `nix develop`: `cargo clippy --all-targets -- -D warnings`
+plus `cargo test`. dav1d compiles from source on the first run, then
+cargo caches it.
