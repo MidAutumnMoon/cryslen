@@ -1,7 +1,7 @@
 # cryslen
 
 <div align="center">
-  <img src="assets/icon-raw.avif" alt="cryslen" width="200">
+  <img src="assets/icon-raw.avif" alt="cryslen" width="350">
 
 ### `cy`: a minimal Wayland image and comic pager.
 </div>
