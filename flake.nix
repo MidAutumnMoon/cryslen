@@ -1,7 +1,7 @@
 {
   description = "cryslen (cy) — minimal wayland image/comic pager";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable-small";
 
   outputs = { self, nixpkgs }:
     let
@@ -33,7 +33,12 @@
               pkgs.clang
               pkgs.pkg-config
             ];
-            env.LD_LIBRARY_PATH = lib.makeLibraryPath [ pkgs.wayland ];
+            env.LD_LIBRARY_PATH = lib.makeLibraryPath (with pkgs; [
+              wayland
+              libxkbcommon
+              libGL
+              libinput
+            ]);
           };
         });
 
