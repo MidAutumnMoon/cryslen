@@ -451,7 +451,8 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                     }
                 };
                 let (total, win) = self.geometry();
-                let v = crate::view::zoom_at(self.state.view, self.cursor, (-(dy * 0.15)).exp());
+                // Scroll up (positive dy) zooms in.
+                let v = crate::view::zoom_at(self.state.view, self.cursor, (dy * 0.15).exp());
                 self.state.view = crate::view::clamp(v, total, win);
                 self.user_moved = true;
                 self.request_redraw();
