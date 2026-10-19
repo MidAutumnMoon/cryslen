@@ -82,8 +82,7 @@ impl Source {
     }
 
     /// The archive handle opened here stays open for the session; `bytes`
-    /// reads go through it (the prototype's per-page reopen cost a central
-    /// directory parse each time).
+    /// reads go through it, avoiding a central-directory parse per page.
     fn open_zip(path: &Path) -> Result<Source, SourceError> {
         let file = std::fs::File::open(path).map_err(|e| SourceError::Zip(e.to_string()))?;
         let zip = zip::ZipArchive::new(std::io::BufReader::new(file))

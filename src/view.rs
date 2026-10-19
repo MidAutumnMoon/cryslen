@@ -1,7 +1,5 @@
 //! View math: how a composed spread (1–2 pages) is placed in the window.
-//! Pure data, no GL. Ported functions from research/prototype-rawgl
-//! (fit, zoom_at) plus the spread composition.
-
+//! Pure data, no GL.
 /// Placement of the composed spread: scale is screen px per image px, offset
 /// is the screen position of the composed spread's top-left corner.
 #[derive(Debug, Clone, Copy, PartialEq)]

@@ -1,10 +1,5 @@
 //! Decode worker: one thread, latest-wins focus, ±2 prefetch window,
 //! in-memory cache with a byte budget. No disk persistence at all.
-//!
-//! The loop follows the pattern verified in research/08 (oculante-style
-//! cancellation): block on focus updates, drain pending ones keeping the
-//! last, decode the window nearest-first, aborting the rest whenever a newer
-//! focus arrives.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -214,8 +209,8 @@ fn run(
     }
 }
 
-/// One page through the panic boundary (research/08: a panicking decoder must
-/// not kill the only worker thread).
+/// One page through the panic boundary: a panicking decoder must not kill
+/// the only worker thread.
 fn decode_page(source: &Source, index: usize) -> Result<Arc<Decoded>, String> {
     let name = source.name(index).to_owned();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

@@ -2,8 +2,8 @@
 //!
 //! Dispatch is by magic bytes where possible, then extension. JPEG/PNG get
 //! EXIF orientation applied. AVIF (feature `avif`) decodes to YUV planes for
-//! shader-side color conversion. JXL (feature `jxl`) uses jxl-rs with the
-//! parallel runner from research/bench-decode.
+//! shader-side color conversion. JXL (feature `jxl`) uses jxl-rs with a
+//! scoped-thread parallel runner.
 //!
 //! `unsafe` in cryslen lives in exactly two places: render.rs (GL) and the
 //! libavif FFI block below (feature `avif`). Nothing else touches it.
@@ -214,7 +214,7 @@ impl std::fmt::Display for DecodeError {
 }
 
 /// Decode one page. `name` is the page filename (extension fallback).
-/// Static (first frame of animations; animated decode comes later, if ever).
+/// Static: animated images show their first frame.
 pub fn decode(bytes: &[u8], name: &str) -> Result<Decoded, DecodeError> {
     let format = match sniff(bytes).or_else(|| format_from_name(name)) {
         Some(format) => format,
@@ -297,7 +297,7 @@ fn sniff_ftyp_avif(bytes: &[u8]) -> bool {
 }
 
 /// image-crate path: decode with a concrete decoder so EXIF orientation is
-/// readable, then apply it (research/10: the 7-line verified fix).
+/// readable, then applies it.
 fn decode_image(bytes: &[u8], format: Format) -> Result<Decoded, DecodeError> {
     use image::ImageDecoder as _;
 
@@ -332,7 +332,7 @@ fn image_error(format: Format, e: image::ImageError) -> DecodeError {
 
 /// libavif FFI: decoder over the in-memory file, YUV planes copied out
 /// directly (avifImageYUVToRGB would cost a full RGB conversion we do on the
-/// GPU instead). Ported from research/bench-decode.
+/// GPU instead.
 #[cfg(feature = "avif")]
 mod avif {
     use libavif_sys::*;
@@ -505,9 +505,8 @@ mod avif {
     }
 }
 
-/// jxl-rs low-level decode with a scoped-thread parallel runner, ported from
-/// research/bench-decode (`jxl_rs_decode_mt`). Output is forced to 8-bit RGB
-/// (the verified path) and expanded to RGBA here.
+/// jxl-rs low-level decode with a scoped-thread parallel runner. Output is
+/// requested as 8-bit RGB and expanded to RGBA here.
 #[cfg(feature = "jxl")]
 mod jxl {
     use jxl::api::{
@@ -595,7 +594,7 @@ mod jxl {
         rgba
     }
 
-    /// Scoped-thread runner (from bench-decode). Per-task errors inside the
+    /// Scoped-thread runner. Per-task errors inside the
     /// threads are swallowed; a genuinely broken codestream fails the
     /// sequential `process` call right after.
     struct Pool(usize);
@@ -694,10 +693,9 @@ mod tests {
         }
     }
 
-    // The orientation code path (decoder.orientation + apply_orientation)
-    // runs for every image-crate decode above; the encoder cannot write
-    // EXIF orientation tags, so a transformed fixture is not synthesizable
-    // here. Real-world verification was research/10's exif-check scratch.
+    // decoder.orientation + apply_orientation runs in every image-crate
+    // decode above. The in-tree encoder cannot write EXIF orientation tags,
+    // so no transformed fixture can be synthesized here.
 
     #[test]
     fn jpeg_roundtrip() {

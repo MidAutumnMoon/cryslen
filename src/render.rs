@@ -80,7 +80,7 @@ const VS_ES: &str = r#"
     }"#;
 
 // highp: mediump may be fp16 — ulp at 16k image px is 8.0, wrecking the
-// coordinate math (challenge F5; ES3 mandates highp support).
+// coordinate math; ES3 mandates highp support.
 const FS_ES: &str = r#"
     #version 300 es
     precision highp float;
@@ -305,15 +305,17 @@ impl PageSlots {
     }
 
     /// Upload decoded pixels of `page` into visual slot `i` (0 = left,
-    /// 1 = right); re-uploading the same page is a no-op. Panics loudly on
-    /// MAX_TEXTURE_SIZE violations (challenge finding: never fail black).
+    /// 1 = right); re-uploading the same page is a no-op.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the page exceeds GL's MAX_TEXTURE_SIZE.
     pub fn set(&mut self, slot: usize, page: usize, decoded: &Decoded) {
         if self.slots[slot].page == Some(page) {
             return;
         }
         let (width, height) = (decoded.width, decoded.height);
-        // Fail loudly instead of uploading an oversized texture that GL
-        // silently rejects (it then samples as black).
+        // An oversized upload is silently rejected and then samples black.
         assert!(width > 0 && height > 0, "decoded page has zero dimension");
         assert!(
             width <= self.max_tex && height <= self.max_tex,
@@ -477,8 +479,8 @@ impl PageSlots {
 
 impl Drop for PageSlots {
     fn drop(&mut self) {
-        // Delete while the context still lives; the app must drop Pages
-        // before Window (challenge F7 teardown ordering).
+        // GL objects must be deleted while their context is alive. The
+        // window that owns the context is dropped after this struct.
         for slot in &mut self.slots {
             if let Some(textures) = slot.texture.take() {
                 delete_textures(&self.gl, &textures);
@@ -515,7 +517,7 @@ fn new_texture(gl: &glow::Context, filterable: bool) -> <glow::Context as HasCon
         gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as _);
         let (min, mag) = if filterable {
             // Mipmapped minification: fit view of a 50MP page minifies ~8x;
-            // LINEAR-only shimmers (challenge F3).
+            // LINEAR-only shimmer.
             (glow::LINEAR_MIPMAP_LINEAR, glow::LINEAR)
         } else {
             (glow::NEAREST, glow::NEAREST)

@@ -9,7 +9,7 @@
       systems = [ "x86_64-linux" ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
       # aom's cmake configure greps `nasm -hf` for "-Ox"; nasm 3.x dropped it
-      # from the help text though the flag works (see research/bench-decode).
+      # from the help text though the flag works.
       nasm-aom-shim = pkgs: pkgs.writeShellScriptBin "nasm" ''
         if [ "$1" = "-hf" ]; then
           ${pkgs.nasm}/bin/nasm "$@"
