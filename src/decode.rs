@@ -53,8 +53,8 @@ impl Decoded {
     ) -> Result<Decoded, DecodeError> {
         let (_, (cw, ch)) = plane_dims((width, height), yuv.subsampling);
         let samples = |p: &Plane| match p {
-            Plane::U8(b) => b.len(),
-            Plane::U16(b) => b.len(),
+            Plane::U8(bytes) => bytes.len(),
+            Plane::U16(bytes) => bytes.len(),
         };
         if samples(&yuv.y) != width as usize * height as usize
             || (yuv.subsampling != Subsampling::Mono
@@ -70,12 +70,12 @@ impl Decoded {
     pub fn resident_bytes(&self) -> usize {
         fn plane(p: &Plane) -> usize {
             match p {
-                Plane::U8(b) => b.len(),
-                Plane::U16(b) => b.len() * 2,
+                Plane::U8(bytes) => bytes.len(),
+                Plane::U16(bytes) => bytes.len() * 2,
             }
         }
         match &self.pixels {
-            Pixels::Rgba8(b) => b.len(),
+            Pixels::Rgba8(bytes) => bytes.len(),
             Pixels::Yuv(y) => plane(&y.y) + plane(&y.cb) + plane(&y.cr),
         }
     }
@@ -83,10 +83,12 @@ impl Decoded {
 
 /// Pixel count with a hostile-header cap (matches the image crate's 512 MiB
 /// allocation ceiling) times `bytes_per_pixel`.
-fn checked_extent(w: u32, h: u32, bpp: usize) -> Result<usize, DecodeError> {
-    let px = (w as u64).checked_mul(h as u64).filter(|&px| px <= MAX_PIXELS as u64);
-    match px {
-        Some(px) if px > 0 => Ok(px as usize * bpp),
+fn checked_extent(width: u32, height: u32, bytes_per_pixel: usize) -> Result<usize, DecodeError> {
+    let pixel_count = (width as u64)
+        .checked_mul(height as u64)
+        .filter(|&count| count <= MAX_PIXELS as u64);
+    match pixel_count {
+        Some(count) if count > 0 => Ok(count as usize * bytes_per_pixel),
         _ => Err(DecodeError::Corrupt("bad dimensions")),
     }
 }
@@ -253,45 +255,45 @@ pub(crate) fn format_from_name(name: &str) -> Option<Format> {
 
 /// Magic-byte sniffing. `None` only means "no known signature": the caller
 /// falls back to the extension.
-fn sniff(b: &[u8]) -> Option<Format> {
-    if b.starts_with(&[0xFF, 0xD8, 0xFF]) {
+fn sniff(bytes: &[u8]) -> Option<Format> {
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
         return Some(Format::Jpeg);
     }
-    if b.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
         return Some(Format::Png);
     }
-    if b.starts_with(b"GIF8") {
+    if bytes.starts_with(b"GIF8") {
         return Some(Format::Gif);
     }
-    if b.len() >= 12 && b.starts_with(b"RIFF") && &b[8..12] == b"WEBP" {
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
         return Some(Format::Webp);
     }
-    if b.starts_with(b"BM") {
+    if bytes.starts_with(b"BM") {
         return Some(Format::Bmp);
     }
-    if b.starts_with(&[0x49, 0x49, 0x2A, 0x00]) || b.starts_with(&[0x4D, 0x4D, 0x00, 0x2A]) {
+    if bytes.starts_with(&[0x49, 0x49, 0x2A, 0x00]) || bytes.starts_with(&[0x4D, 0x4D, 0x00, 0x2A]) {
         return Some(Format::Tiff);
     }
     // JXL: raw codestream or ISOBMFF container signature.
-    if b.starts_with(&[0xFF, 0x0A])
-        || b.starts_with(&[0x00, 0x00, 0x00, 0x0C, b'J', b'X', b'L', b' ', 0x0D, 0x0A, 0x87, 0x0A])
+    if bytes.starts_with(&[0xFF, 0x0A])
+        || bytes.starts_with(&[0x00, 0x00, 0x00, 0x0C, b'J', b'X', b'L', b' ', 0x0D, 0x0A, 0x87, 0x0A])
     {
         return Some(Format::Jxl);
     }
-    if sniff_ftyp_avif(b) {
+    if sniff_ftyp_avif(bytes) {
         return Some(Format::Avif);
     }
     None
 }
 
 /// AVIF lives in an ISOBMFF `ftyp` box; check the major + compatible brands.
-fn sniff_ftyp_avif(b: &[u8]) -> bool {
-    if b.len() < 12 || &b[4..8] != b"ftyp" {
+fn sniff_ftyp_avif(bytes: &[u8]) -> bool {
+    if bytes.len() < 12 || &bytes[4..8] != b"ftyp" {
         return false;
     }
-    let box_len = u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as usize;
-    let end = box_len.max(12).min(b.len());
-    b[8..end].as_chunks::<4>().0.iter().any(|brand| brand == b"avif" || brand == b"avis")
+    let box_len = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
+    let end = box_len.max(12).min(bytes.len());
+    bytes[8..end].as_chunks::<4>().0.iter().any(|brand| brand == b"avif" || brand == b"avis")
 }
 
 /// image-crate path: decode with a concrete decoder so EXIF orientation is
@@ -311,9 +313,9 @@ fn decode_image(bytes: &[u8], format: Format) -> Result<Decoded, DecodeError> {
     let reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), image_format);
     let mut decoder = reader.into_decoder().map_err(|e| image_error(format, e))?;
     let orientation = decoder.orientation().map_err(|e| image_error(format, e))?;
-    let mut img = image::DynamicImage::from_decoder(decoder).map_err(|e| image_error(format, e))?;
-    img.apply_orientation(orientation);
-    let rgba = img.to_rgba8();
+    let mut oriented = image::DynamicImage::from_decoder(decoder).map_err(|e| image_error(format, e))?;
+    oriented.apply_orientation(orientation);
+    let rgba = oriented.to_rgba8();
     let (width, height) = (rgba.width(), rgba.height());
     Decoded::rgba(width, height, format, rgba.into_raw().into_boxed_slice())
 }
@@ -347,36 +349,37 @@ mod avif {
         // receives either it or pointers read from it. The guard destroys it
         // on every exit path; `bytes` outlives the decoder (destroyed first).
         unsafe {
-            let dec = DecoderGuard(avifDecoderCreate());
-            if dec.0.is_null() {
+            let decoder_guard = DecoderGuard(avifDecoderCreate());
+            if decoder_guard.0.is_null() {
                 return Err(DecodeError::Unsupported("avif: decoder create"));
             }
-            (*dec.0).maxThreads = threads();
-            avifDecoderSetIOMemory(dec.0, bytes.as_ptr(), bytes.len());
-            check(avifDecoderParse(dec.0), "avif parse")?;
-            check(avifDecoderNextImage(dec.0), "avif image")?;
+            (*decoder_guard.0).maxThreads = threads();
+            avifDecoderSetIOMemory(decoder_guard.0, bytes.as_ptr(), bytes.len());
+            check(avifDecoderParse(decoder_guard.0), "avif parse")?;
+            check(avifDecoderNextImage(decoder_guard.0), "avif image")?;
 
-            let img = (*dec.0).image;
-            if img.is_null() {
+            let avif_image_ptr = (*decoder_guard.0).image;
+            if avif_image_ptr.is_null() {
                 return Err(DecodeError::Corrupt("avif: no image"));
             }
-            let (width, height) = ((*img).width as usize, (*img).height as usize);
-            let depth = (*img).depth;
+            let (width, height) =
+                ((*avif_image_ptr).width as usize, (*avif_image_ptr).height as usize);
+            let depth = (*avif_image_ptr).depth;
             if !matches!(depth, 8 | 10 | 12 | 16) {
                 return Err(DecodeError::Corrupt("avif: bad depth"));
             }
             if (width as u64) * (height as u64) > super::MAX_PIXELS as u64 {
                 return Err(DecodeError::Corrupt("avif: bad dimensions"));
             }
-            let subsampling = match (*img).yuvFormat {
+            let subsampling = match (*avif_image_ptr).yuvFormat {
                 AVIF_PIXEL_FORMAT_YUV444 => Subsampling::Yuv444,
                 AVIF_PIXEL_FORMAT_YUV422 => Subsampling::Yuv422,
                 AVIF_PIXEL_FORMAT_YUV420 => Subsampling::Yuv420,
                 AVIF_PIXEL_FORMAT_YUV400 => Subsampling::Mono,
                 _ => return Err(DecodeError::Unsupported("avif: pixel format")),
             };
-            let full_range = (*img).yuvRange == AVIF_RANGE_FULL;
-            let matrix = match (*img).matrixCoefficients as u32 {
+            let full_range = (*avif_image_ptr).yuvRange == AVIF_RANGE_FULL;
+            let matrix = match (*avif_image_ptr).matrixCoefficients as u32 {
                 AVIF_MATRIX_COEFFICIENTS_IDENTITY => Matrix::Identity,
                 AVIF_MATRIX_COEFFICIENTS_BT709 => Matrix::Bt709,
                 AVIF_MATRIX_COEFFICIENTS_BT2020_NCL => Matrix::Bt2020,
@@ -387,19 +390,37 @@ mod avif {
                 _ => return Err(DecodeError::Unsupported("avif: matrix coefficients")),
             };
 
-            let (cw, ch) = match subsampling {
+            let (chroma_width, chroma_height) = match subsampling {
                 Subsampling::Mono => (0, 0),
                 Subsampling::Yuv420 => (width.div_ceil(2), height.div_ceil(2)),
                 Subsampling::Yuv422 => (width.div_ceil(2), height),
                 Subsampling::Yuv444 => (width, height),
             };
-            let (y, cb, cr) = if subsampling == Subsampling::Mono {
+            let (luma_plane, blue_plane, red_plane) = if subsampling == Subsampling::Mono {
                 (Plane::U8(Box::new([])), Plane::U8(Box::new([])), Plane::U8(Box::new([])))
             } else {
                 (
-                    copy_plane((*img).yuvPlanes[0], (*img).yuvRowBytes[0], width, height, depth)?,
-                    copy_plane((*img).yuvPlanes[1], (*img).yuvRowBytes[1], cw, ch, depth)?,
-                    copy_plane((*img).yuvPlanes[2], (*img).yuvRowBytes[2], cw, ch, depth)?,
+                    copy_plane(
+                        (*avif_image_ptr).yuvPlanes[0],
+                        (*avif_image_ptr).yuvRowBytes[0],
+                        width,
+                        height,
+                        depth,
+                    )?,
+                    copy_plane(
+                        (*avif_image_ptr).yuvPlanes[1],
+                        (*avif_image_ptr).yuvRowBytes[1],
+                        chroma_width,
+                        chroma_height,
+                        depth,
+                    )?,
+                    copy_plane(
+                        (*avif_image_ptr).yuvPlanes[2],
+                        (*avif_image_ptr).yuvRowBytes[2],
+                        chroma_width,
+                        chroma_height,
+                        depth,
+                    )?,
                 )
             };
 
@@ -412,9 +433,9 @@ mod avif {
                     subsampling,
                     full_range,
                     matrix,
-                    y,
-                    cb,
-                    cr,
+                    y: luma_plane,
+                    cb: blue_plane,
+                    cr: red_plane,
                 },
             )
         }
@@ -436,34 +457,37 @@ mod avif {
     /// Copy one plane row by row (libavif rows are padded to `stride`).
     /// Depth > 8 planes are native-endian `u16` arrays on the C side.
     unsafe fn copy_plane(
-        ptr: *const u8,
-        stride: u32,
-        w: usize,
-        h: usize,
+        plane_ptr: *const u8,
+        row_stride: u32,
+        width: usize,
+        height: usize,
         depth: u32,
     ) -> Result<Plane, DecodeError> {
-        if ptr.is_null() {
+        if plane_ptr.is_null() {
             return Err(DecodeError::Corrupt("avif: missing plane"));
         }
-        let stride = stride as usize;
+        let row_stride = row_stride as usize;
         if depth == 8 {
-            if stride < w {
+            if row_stride < width {
                 return Err(DecodeError::Corrupt("avif: bad stride"));
             }
-            let mut out = Vec::with_capacity(w * h);
-            for row in 0..h {
-                let src = std::slice::from_raw_parts(ptr.add(row * stride), w);
+            let mut out = Vec::with_capacity(width * height);
+            for row in 0..height {
+                let src = std::slice::from_raw_parts(plane_ptr.add(row * row_stride), width);
                 out.extend_from_slice(src);
             }
             Ok(Plane::U8(out.into_boxed_slice()))
         } else {
-            let bytes = w * 2;
-            if stride < bytes {
+            let bytes = width * 2;
+            if row_stride < bytes {
                 return Err(DecodeError::Corrupt("avif: bad stride"));
             }
-            let mut out = Vec::with_capacity(w * h);
-            for row in 0..h {
-                let src = std::slice::from_raw_parts(ptr.add(row * stride) as *const u16, w);
+            let mut out = Vec::with_capacity(width * height);
+            for row in 0..height {
+                let src = std::slice::from_raw_parts(
+                    plane_ptr.add(row * row_stride) as *const u16,
+                    width,
+                );
                 out.extend_from_slice(src);
             }
             Ok(Plane::U16(out.into_boxed_slice()))
@@ -494,30 +518,32 @@ mod jxl {
     use super::{DecodeError, Decoded, Format};
 
     const MAX_THREADS: usize = 16;
-    /// Decode output cap, in pixels: matches the image crate's 512 MiB
-    /// allocation ceiling for hostile headers.
-    const MAX_PIXELS: usize = 512 << 18;
+
+    /// Buffered read chunk for the codestream input.
+    const READ_CHUNK_BYTES: usize = 1 << 20;
 
     pub fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
         let mut runner = Pool(threads());
-        let mut input = std::io::BufReader::with_capacity(1 << 20, std::io::Cursor::new(bytes));
+        let mut input =
+            std::io::BufReader::with_capacity(READ_CHUNK_BYTES, std::io::Cursor::new(bytes));
 
         // pass 1: headers -> image size
-        let dec = JxlDecoder::<states::Initialized>::new(JxlDecoderOptions::default());
-        let mut dec = match dec.process(&mut input, Some(&mut runner)) {
+        let decoder = JxlDecoder::<states::Initialized>::new(JxlDecoderOptions::default());
+        let mut decoder = match decoder.process(&mut input, Some(&mut runner)) {
             Ok(ProcessingResult::Complete { result }) => result,
             Ok(ProcessingResult::NeedsMoreInput { .. }) => {
                 return Err(DecodeError::Corrupt("jxl: truncated header"))
             }
             Err(e) => return Err(jxl_error(e)),
         };
-        let (w, h) = dec.basic_info().size;
-        let pixels = w.checked_mul(h).filter(|&px| px <= MAX_PIXELS);
-        let Some(pixels) = pixels else {
+        let (width, height) = decoder.basic_info().size;
+        let pixels =
+            width.checked_mul(height).filter(|&px| px <= super::MAX_PIXELS);
+        let Some(pixel_count) = pixels else {
             return Err(DecodeError::Corrupt("jxl: bad dimensions"));
         };
 
-        dec.set_pixel_format(JxlPixelFormat {
+        decoder.set_pixel_format(JxlPixelFormat {
             color_type: JxlColorType::Rgb,
             color_data_format: Some(JxlDataFormat::U8 { bit_depth: 8 }),
             extra_channel_format: Vec::new(),
@@ -525,26 +551,28 @@ mod jxl {
         .map_err(jxl_error)?;
 
         // pass 2: frame info
-        let mut dec = loop {
-            match dec.process(&mut input, Some(&mut runner)) {
+        let mut decoder = loop {
+            match decoder.process(&mut input, Some(&mut runner)) {
                 Ok(ProcessingResult::Complete { result }) => break result,
-                Ok(ProcessingResult::NeedsMoreInput { fallback, .. }) => dec = fallback,
+                Ok(ProcessingResult::NeedsMoreInput { fallback, .. }) => decoder = fallback,
                 Err(e) => return Err(jxl_error(e)),
             }
         };
 
         // pass 3: pixels
-        let mut buf = vec![0u8; pixels * 3];
-        let mut output = JxlOutputBuffer::new(&mut buf, h, w * 3);
+        let mut rgb_buffer = vec![0u8; pixel_count * 3];
+        let mut output = JxlOutputBuffer::new(&mut rgb_buffer, height, width * 3);
         loop {
-            match dec.process(&mut input, std::slice::from_mut(&mut output), Some(&mut runner)) {
+            match decoder
+                .process(&mut input, std::slice::from_mut(&mut output), Some(&mut runner))
+            {
                 Ok(ProcessingResult::Complete { .. }) => break,
-                Ok(ProcessingResult::NeedsMoreInput { fallback, .. }) => dec = fallback,
+                Ok(ProcessingResult::NeedsMoreInput { fallback, .. }) => decoder = fallback,
                 Err(e) => return Err(jxl_error(e)),
             }
         }
 
-        Decoded::rgba(w as u32, h as u32, Format::Jxl, expand_rgba(&buf))
+        Decoded::rgba(width as u32, height as u32, Format::Jxl, expand_rgba(&rgb_buffer))
     }
 
     fn threads() -> usize {
@@ -573,17 +601,19 @@ mod jxl {
     struct Pool(usize);
     impl JxlParallelRunner for Pool {
         fn run(&mut self, num: usize, fun: &JxlParallelRunnerFun<'_>) -> jxl::error::Result<()> {
-            let n = self.0.min(num);
-            if n < 2 {
+            let thread_count = self.0.min(num);
+            if thread_count < 2 {
                 return (0..num).try_for_each(fun);
             }
-            let chunk = num.div_ceil(n);
+            let chunk = num.div_ceil(thread_count);
             std::thread::scope(|s| {
-                for t in 0..n {
+                for thread_index in 0..thread_count {
                     let fun: &JxlParallelRunnerFun = fun;
                     s.spawn(move || {
-                        for i in t * chunk..((t + 1) * chunk).min(num) {
-                            let _ = fun(i);
+                        for task_index in thread_index * chunk
+                            ..((thread_index + 1) * chunk).min(num)
+                        {
+                            let _ = fun(task_index);
                         }
                     });
                 }

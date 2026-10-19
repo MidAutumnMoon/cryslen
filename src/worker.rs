@@ -92,7 +92,7 @@ impl PageCache {
         // Everything cached is now wanted; drop the neighbours, never the
         // focused page (so a budget-exceeding page cannot evict itself).
         let neighbours: Vec<usize> =
-            keep.iter().copied().filter(|&k| k != focused).collect();
+            keep.iter().copied().filter(|&page| page != focused).collect();
         for key in neighbours {
             self.remove(key);
             if self.live_bytes <= self.budget {
@@ -174,9 +174,9 @@ fn run(
         Err(_) => return,
     };
     while current != SENTINEL && !stop.load(Ordering::Relaxed) {
-        let want = window(current, source.len());
+        let decode_order = window(current, source.len());
         let mut newer: Option<usize> = None;
-        for &index in &want {
+        for &index in &decode_order {
             while let Ok(arrived) = rx.try_recv() {
                 if stop.load(Ordering::Relaxed) || arrived == SENTINEL {
                     return;
@@ -197,10 +197,10 @@ fn run(
                     index,
                     match outcome {
                         Ok(page) => Page::Ready(page),
-                        Err(e) => Page::Failed(e),
+                        Err(message) => Page::Failed(message),
                     },
                     current,
-                    &want,
+                    &decode_order,
                 );
             }
             // Detail went to stderr already; the cache now carries the
@@ -239,19 +239,25 @@ fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
+/// How many pages on each side of the focused page to prefetch. ±2 covers
+/// both modes' windows: single-page needs ±1, double-page spreads shift by
+/// two pages per turn.
+const PREFETCH_RADIUS: i64 = 2;
+
 /// Decode order around the focused page: the page itself, then neighbours
-/// out to ±2 (covers both modes' windows: single-page needs ±1,
-/// double-page spreads shift by two). Includes the current page — `keep[0]`
-/// is not a convention here, `run` passes `current` explicitly.
+/// out to [`PREFETCH_RADIUS`], nearest first. Includes the current page;
+/// `run` passes the focused page to the cache explicitly.
 pub fn window(current: usize, len: usize) -> Vec<usize> {
-    let mut want: Vec<usize> = (0..=2)
-        .flat_map(|d| [current as i64 - d as i64, current as i64 + d as i64])
-        .filter(|&i| (0..len as i64).contains(&i))
-        .map(|i| i as usize)
+    let mut pages: Vec<usize> = (0..=PREFETCH_RADIUS)
+        .flat_map(|distance| {
+            [current as i64 - distance, current as i64 + distance]
+        })
+        .filter(|&page| (0..len as i64).contains(&page))
+        .map(|page| page as usize)
         .collect();
-    want.sort_unstable_by_key(|&i| (i.abs_diff(current), i));
-    want.dedup();
-    want
+    pages.sort_unstable_by_key(|&page| (page.abs_diff(current), page));
+    pages.dedup();
+    pages
 }
 
 #[cfg(test)]

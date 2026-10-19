@@ -131,7 +131,7 @@ impl Window {
 
         let attrs = winit::window::WindowAttributes::default()
             .with_resizable(true)
-            .with_inner_size(winit::dpi::LogicalSize { width: 1000.0, height: 750.0 })
+            .with_inner_size(winit::dpi::LogicalSize { width: INITIAL_WINDOW_WIDTH, height: INITIAL_WINDOW_HEIGHT })
             .with_title("cryslen");
 
         let (mut window, gl_config) =
@@ -234,6 +234,14 @@ enum Textures {
     },
 }
 
+/// Initial window size, logical px.
+const INITIAL_WINDOW_WIDTH: f64 = 1000.0;
+const INITIAL_WINDOW_HEIGHT: f64 = 750.0;
+
+/// Neutral gray chroma for mono pages, in 8-bit storage (128 of 255;
+/// the wide-plane equivalent is `1 << (depth - 1)`).
+const MONO_CHROMA_MIDPOINT_8: u8 = 128;
+
 const IDENTITY3: [f32; 9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
 
 /// Uniform set describing an RGBA slot (mode 0); also the empty-slot default.
@@ -253,11 +261,15 @@ impl PageSlots {
     pub fn new(gl: Arc<glow::Context>) -> PageSlots {
         let (vs, fs) = if gl.version().is_embedded { (VS_ES, FS_ES) } else { (VS_CORE, FS_CORE) };
         let compile = |kind, src| unsafe {
-            let sh = gl.create_shader(kind).unwrap();
-            gl.shader_source(sh, src);
-            gl.compile_shader(sh);
-            assert!(gl.get_shader_compile_status(sh), "{}", gl.get_shader_info_log(sh));
-            sh
+            let shader = gl.create_shader(kind).unwrap();
+            gl.shader_source(shader, src);
+            gl.compile_shader(shader);
+            assert!(
+                gl.get_shader_compile_status(shader),
+                "{}",
+                gl.get_shader_info_log(shader)
+            );
+            shader
         };
         let (program, vbo, vao);
         unsafe {
@@ -299,67 +311,71 @@ impl PageSlots {
         if self.slots[slot].page == Some(page) {
             return;
         }
-        let (w, h) = (decoded.width, decoded.height);
+        let (width, height) = (decoded.width, decoded.height);
         // Fail loudly instead of uploading an oversized texture that GL
         // silently rejects (it then samples as black).
-        assert!(w > 0 && h > 0, "decoded page has zero dimension");
+        assert!(width > 0 && height > 0, "decoded page has zero dimension");
         assert!(
-            w <= self.max_tex && h <= self.max_tex,
-            "image {w}x{h} exceeds GL max texture size {} (tiling not implemented)",
+            width <= self.max_tex && height <= self.max_tex,
+            "image {width}x{height} exceeds GL max texture size {} (tiling not implemented)",
             self.max_tex
         );
         self.clear(slot);
         let gl = &self.gl;
         let textures = match &decoded.pixels {
-            Pixels::Rgba8(b) => {
-                assert_eq!(b.len(), w as usize * h as usize * 4, "rgba byte length");
-                Textures::Rgba(upload_rgba(gl, b, (w, h)))
+            Pixels::Rgba8(rgba_bytes) => {
+                assert_eq!(rgba_bytes.len(), width as usize * height as usize * 4, "rgba byte length");
+                Textures::Rgba(upload_rgba(gl, rgba_bytes, (width, height)))
             }
-            Pixels::Yuv(y) => {
-                let ((yw, yh), (cw, ch)) = plane_dims((w, h), y.subsampling);
-                let wide = matches!(y.y, Plane::U16(_));
+            Pixels::Yuv(yuv) => {
+                let ((luma_w, luma_h), (chroma_w, chroma_h)) =
+                    plane_dims((width, height), yuv.subsampling);
+                let wide = matches!(yuv.y, Plane::U16(_));
                 // GL_R16 is not filterable in GLES: LINEAR makes the texture
                 // incomplete (samples black); NEAREST without mips is the
                 // safe fallback on an ES context.
                 let filterable = !(gl.version().is_embedded && wide);
-                let expect = |p: &Plane, want_samples: usize, what: &str| {
+                let expect = |plane: &Plane, want_samples: usize, what: &str| {
                     // U16 planes are two bytes per sample.
                     let want_bytes = want_samples * if wide { 2 } else { 1 };
-                    assert_eq!(plane_bytes(p).len(), want_bytes, "{what} plane bytes");
+                    assert_eq!(plane_bytes(plane).len(), want_bytes, "{what} plane bytes");
                 };
-                expect(&y.y, yw as usize * yh as usize, "y");
-                let y_t = upload_plane(gl, plane_bytes(&y.y), (yw, yh), wide, filterable);
-                let (cb_t, cr_t) = if y.subsampling == Subsampling::Mono {
+                expect(&yuv.y, luma_w as usize * luma_h as usize, "y");
+                let luma_texture =
+                    upload_plane(gl, plane_bytes(&yuv.y), (luma_w, luma_h), wide, filterable);
+                let (cb_texture, cr_texture) = if yuv.subsampling == Subsampling::Mono {
                     // 1x1 chroma at the range midpoint; the matrix cancels it
                     // to neutral gray. LE pairs match plane_bytes' U16 layout.
-                    let mid: Vec<u8> = if wide {
-                        (1u32 << (y.depth.clamp(1, 16) - 1)).to_le_bytes().to_vec()
+                    let midpoint_bytes: Vec<u8> = if wide {
+                        (1u32 << (yuv.depth.clamp(MIN_PLANE_DEPTH, MAX_PLANE_DEPTH) - 1))
+                            .to_le_bytes()
+                            .to_vec()
                     } else {
-                        vec![128]
+                        MONO_CHROMA_MIDPOINT_8.to_le_bytes().to_vec()
                     };
-                    (upload_plane(gl, &mid, (1, 1), wide, filterable),
-                     upload_plane(gl, &mid, (1, 1), wide, filterable))
+                    (upload_plane(gl, &midpoint_bytes, (1, 1), wide, filterable),
+                     upload_plane(gl, &midpoint_bytes, (1, 1), wide, filterable))
                 } else {
-                    expect(&y.cb, cw as usize * ch as usize, "cb");
-                    expect(&y.cr, cw as usize * ch as usize, "cr");
-                    (upload_plane(gl, plane_bytes(&y.cb), (cw, ch), wide, filterable),
-                     upload_plane(gl, plane_bytes(&y.cr), (cw, ch), wide, filterable))
+                    expect(&yuv.cb, chroma_w as usize * chroma_h as usize, "cb");
+                    expect(&yuv.cr, chroma_w as usize * chroma_h as usize, "cr");
+                    (upload_plane(gl, plane_bytes(&yuv.cb), (chroma_w, chroma_h), wide, filterable),
+                     upload_plane(gl, plane_bytes(&yuv.cr), (chroma_w, chroma_h), wide, filterable))
                 };
-                self.slots[slot].norm = depth_norm(y.depth, wide);
-                Textures::Yuv { y: y_t, cb: cb_t, cr: cr_t }
+                self.slots[slot].norm = depth_norm(yuv.depth, wide);
+                Textures::Yuv { y: luma_texture, cb: cb_texture, cr: cr_texture }
             }
         };
         self.slots[slot].page = Some(page);
         self.slots[slot].texture = Some(textures);
-        self.slots[slot].size = (w, h);
+        self.slots[slot].size = (width, height);
         self.slots[slot].uniforms = PageUniforms::from(&decoded.pixels);
     }
 
     /// Clear a slot (page left the spread — undecoded-but-wanted pages keep
     /// their last frame instead, per the hold-last-frame rule).
     pub fn clear(&mut self, slot: usize) {
-        if let Some(t) = self.slots[slot].texture.take() {
-            delete_textures(&self.gl, &t);
+        if let Some(textures) = self.slots[slot].texture.take() {
+            delete_textures(&self.gl, &textures);
             self.slots[slot].page = None;
             self.slots[slot].size = (0, 0);
             self.slots[slot].norm = 1.0;
@@ -388,43 +404,63 @@ impl PageSlots {
             gl.disable(glow::BLEND);
             gl.use_program(Some(self.program));
             gl.bind_vertex_array(Some(self.vao));
-            let u = |name: &str| gl.get_uniform_location(self.program, name);
-            gl.uniform_2_f32(u("u_win").as_ref(), win.0, win.1);
+            let uniform_location =
+                |name: &str| gl.get_uniform_location(self.program, name);
+            gl.uniform_2_f32(uniform_location("u_win").as_ref(), win.0, win.1);
             // `rects` is [left_slot, right_slot] by array position.
             for (slot, rect) in layout.rects.iter().enumerate() {
                 let Some(rect) = rect else { continue };
-                let Some(s) = self.slots.get(slot) else { continue };
-                let Some(tex) = &s.texture else { continue };
+                let Some(slot_state) = self.slots.get(slot) else { continue };
+                let Some(textures) = &slot_state.texture else { continue };
                 // Whole-pixel rect origin; LINEAR samples shimmer at 1:1 zoom
                 // on fractional offsets otherwise.
-                let off = (
+                let screen_origin = (
                     (view.offset.0 + rect.pos.0 * view.scale).round(),
                     (view.offset.1 + rect.pos.1 * view.scale).round(),
                 );
-                let size = (rect.size.0 * view.scale, rect.size.1 * view.scale);
-                if size.0 <= 0.0 || size.1 <= 0.0 {
+                let screen_size = (rect.size.0 * view.scale, rect.size.1 * view.scale);
+                if screen_size.0 <= 0.0 || screen_size.1 <= 0.0 {
                     continue;
                 }
-                let pu = s.uniforms;
-                let (_, (cw, ch)) = plane_dims(s.size, pu.subsampling);
-                let (yo, co) = range_offsets(pu.full_range);
-                gl.uniform_2_f32(u("u_offset").as_ref(), off.0, off.1);
-                gl.uniform_2_f32(u("u_size").as_ref(), size.0, size.1);
-                gl.uniform_2_f32(u("u_scale").as_ref(), view.scale, view.scale);
-                gl.uniform_2_f32(u("u_img").as_ref(), s.size.0 as f32, s.size.1 as f32);
-                gl.uniform_2_f32(u("u_csize").as_ref(), cw as f32, ch as f32);
-                gl.uniform_1_i32(u("u_mode").as_ref(), pu.mode as i32);
-                gl.uniform_1_i32(u("u_chroma").as_ref(), chroma_id(pu.subsampling) as i32);
-                gl.uniform_1_f32(u("u_norm").as_ref(), s.norm);
-                gl.uniform_3_f32(u("u_yuv_off").as_ref(), yo, co, co);
+                let page_uniforms = slot_state.uniforms;
+                let (_, (chroma_width, chroma_height)) =
+                    plane_dims(slot_state.size, page_uniforms.subsampling);
+                let (luma_anchor, chroma_anchor) = range_offsets(page_uniforms.full_range);
+                gl.uniform_2_f32(uniform_location("u_offset").as_ref(), screen_origin.0, screen_origin.1);
+                gl.uniform_2_f32(uniform_location("u_size").as_ref(), screen_size.0, screen_size.1);
+                gl.uniform_2_f32(uniform_location("u_scale").as_ref(), view.scale, view.scale);
+                gl.uniform_2_f32(
+                    uniform_location("u_img").as_ref(),
+                    slot_state.size.0 as f32,
+                    slot_state.size.1 as f32,
+                );
+                gl.uniform_2_f32(
+                    uniform_location("u_csize").as_ref(),
+                    chroma_width as f32,
+                    chroma_height as f32,
+                );
+                gl.uniform_1_i32(uniform_location("u_mode").as_ref(), page_uniforms.mode as i32);
+                gl.uniform_1_i32(
+                    uniform_location("u_chroma").as_ref(),
+                    chroma_id(page_uniforms.subsampling) as i32,
+                );
+                gl.uniform_1_f32(uniform_location("u_norm").as_ref(), slot_state.norm);
+                gl.uniform_3_f32(
+                    uniform_location("u_yuv_off").as_ref(),
+                    luma_anchor,
+                    chroma_anchor,
+                    chroma_anchor,
+                );
                 gl.uniform_matrix_3_f32_slice(
-                    u("u_mat").as_ref(),
+                    uniform_location("u_mat").as_ref(),
                     false,
-                    &yuv_to_rgb_matrix(pu.matrix, pu.full_range),
+                    &yuv_to_rgb_matrix(page_uniforms.matrix, page_uniforms.full_range),
                 );
                 gl.active_texture(glow::TEXTURE0);
-                match tex {
-                    Textures::Rgba(t) => gl.bind_texture(glow::TEXTURE_2D, Some(*t)),
+                match textures {
+                    Textures::Rgba(rgba_texture) => {
+                        gl.bind_texture(glow::TEXTURE_2D, Some(*rgba_texture))
+                    }
                     Textures::Yuv { y, cb, cr } => {
                         gl.bind_texture(glow::TEXTURE_2D, Some(*y));
                         gl.active_texture(glow::TEXTURE1);
@@ -444,8 +480,8 @@ impl Drop for PageSlots {
         // Delete while the context still lives; the app must drop Pages
         // before Window (challenge F7 teardown ordering).
         for slot in &mut self.slots {
-            if let Some(t) = slot.texture.take() {
-                delete_textures(&self.gl, &t);
+            if let Some(textures) = slot.texture.take() {
+                delete_textures(&self.gl, &textures);
             }
         }
         unsafe {
@@ -456,10 +492,10 @@ impl Drop for PageSlots {
     }
 }
 
-fn delete_textures(gl: &glow::Context, t: &Textures) {
+fn delete_textures(gl: &glow::Context, textures: &Textures) {
     unsafe {
-        match t {
-            Textures::Rgba(t) => gl.delete_texture(*t),
+        match textures {
+            Textures::Rgba(rgba_texture) => gl.delete_texture(*rgba_texture),
             Textures::Yuv { y, cb, cr } => {
                 gl.delete_texture(*y);
                 gl.delete_texture(*cb);
@@ -472,9 +508,9 @@ fn delete_textures(gl: &glow::Context, t: &Textures) {
 /// Texture with viewer defaults; CLAMP keeps edge texels from bleeding.
 /// `filterable` false (GLES R16) means NEAREST and no mips.
 fn new_texture(gl: &glow::Context, filterable: bool) -> <glow::Context as HasContext>::Texture {
-    let t = unsafe { gl.create_texture().unwrap() };
+    let texture = unsafe { gl.create_texture().unwrap() };
     unsafe {
-        gl.bind_texture(glow::TEXTURE_2D, Some(t));
+        gl.bind_texture(glow::TEXTURE_2D, Some(texture));
         gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as _);
         gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as _);
         let (min, mag) = if filterable {
@@ -487,7 +523,7 @@ fn new_texture(gl: &glow::Context, filterable: bool) -> <glow::Context as HasCon
         gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, min as _);
         gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, mag as _);
     }
-    t
+    texture
 }
 
 fn upload_rgba(
@@ -495,7 +531,7 @@ fn upload_rgba(
     data: &[u8],
     dims: (u32, u32),
 ) -> <glow::Context as HasContext>::Texture {
-    let t = new_texture(gl, true);
+    let texture = new_texture(gl, true);
     unsafe {
         gl.tex_image_2d(
             glow::TEXTURE_2D, 0, glow::RGBA8 as _,
@@ -504,7 +540,7 @@ fn upload_rgba(
         );
         gl.generate_mipmap(glow::TEXTURE_2D);
     }
-    t
+    texture
 }
 
 /// Single-channel plane: R8 for 8-bit, R16 for wider. Mipmaps unless the
@@ -517,7 +553,7 @@ fn upload_plane(
     filterable: bool,
 ) -> <glow::Context as HasContext>::Texture {
     let (internal, ty) = if wide { (glow::R16, glow::UNSIGNED_SHORT) } else { (glow::R8, glow::UNSIGNED_BYTE) };
-    let t = new_texture(gl, filterable);
+    let texture = new_texture(gl, filterable);
     unsafe {
         // Odd row widths: GL's default 4-byte unpack alignment would desync
         // every row after the first.
@@ -531,7 +567,7 @@ fn upload_plane(
             gl.generate_mipmap(glow::TEXTURE_2D);
         }
     }
-    t
+    texture
 }
 
 /// How the shader should read a slot's texture set. Derived CPU-side; passed
@@ -550,12 +586,12 @@ impl From<&Pixels> for PageUniforms {
     fn from(p: &Pixels) -> Self {
         match p {
             Pixels::Rgba8(_) => RGBA_UNIFORMS,
-            Pixels::Yuv(y) => PageUniforms {
+            Pixels::Yuv(yuv) => PageUniforms {
                 mode: 1,
-                subsampling: y.subsampling,
-                depth: y.depth,
-                full_range: y.full_range,
-                matrix: y.matrix,
+                subsampling: yuv.subsampling,
+                depth: yuv.depth,
+                full_range: yuv.full_range,
+                matrix: yuv.matrix,
             },
         }
     }
@@ -571,47 +607,83 @@ fn chroma_id(s: Subsampling) -> u32 {
     }
 }
 
-/// Quantization anchors subtracted in-shader: (luma, chroma). Limited range
-/// is BT studio swing: Y 16..235, C 16..240 (of 255).
+/// Chroma neutral point of full-range YUV (0.5 in 0..1 storage).
+const FULL_RANGE_CHROMA_NEUTRAL: f32 = 0.5;
+/// Limited-range (BT studio swing) anchors: Y 16..235, C 16..240 of 255.
+const LIMITED_LUMA_BLACK: f32 = 16.0 / 255.0;
+const LIMITED_CHROMA_NEUTRAL: f32 = 128.0 / 255.0;
+/// Limited-range excursion scales: 255/219 for luma, 255/224 for chroma.
+const LIMITED_LUMA_SCALE: f32 = 255.0 / 219.0;
+const LIMITED_CHROMA_SCALE: f32 = 255.0 / 224.0;
+/// Largest value an R16 (u16) texture sampler can return.
+const R16_STORAGE_MAX: f32 = 65535.0;
+
+/// Quantization anchors subtracted in-shader: (luma, chroma).
 fn range_offsets(full_range: bool) -> (f32, f32) {
-    if full_range { (0.0, 0.5) } else { (16.0 / 255.0, 128.0 / 255.0) }
+    if full_range {
+        (0.0, FULL_RANGE_CHROMA_NEUTRAL)
+    } else {
+        (LIMITED_LUMA_BLACK, LIMITED_CHROMA_NEUTRAL)
+    }
 }
 
 /// Normalizes R16 sampler output for U16-stored planes: sampling divides by
-/// 65535 but only `depth` bits are significant. 1.0 for 8-bit storage.
+/// [`R16_STORAGE_MAX`] but only `depth` bits are significant. 1.0 for 8-bit
+/// storage.
 fn depth_norm(depth: u8, wide: bool) -> f32 {
     if !wide {
         return 1.0;
     }
-    65535.0 / ((1u32 << depth.clamp(1, 16)) - 1) as f32
+    R16_STORAGE_MAX / ((1u32 << depth.clamp(MIN_PLANE_DEPTH, MAX_PLANE_DEPTH)) - 1) as f32
 }
+
+/// Plane bit depths the R8/R16 texture paths accept.
+const MIN_PLANE_DEPTH: u8 = 1;
+const MAX_PLANE_DEPTH: u8 = 16;
+
+/// Luma coefficients (KR, KB) of each conversion standard; KG = 1 - KR - KB.
+const BT601_KR_KB: (f32, f32) = (0.299, 0.114);
+const BT709_KR_KB: (f32, f32) = (0.2126, 0.0722);
+const BT2020_KR_KB: (f32, f32) = (0.2627, 0.0593);
 
 /// YUV→RGB conversion for `rgb = M · (yuv * norm - offsets)`, stored
 /// column-major for upload with transpose = false. Derived from the exact
 /// KR/KB of each standard; limited range folds in the studio-swing scales
-/// (255/219 luma, 255/224 chroma) so the anchors stay the plain offsets
-/// from [`range_offsets`]. `Identity` passes planes through as RGB.
+/// ([`LIMITED_LUMA_SCALE`], [`LIMITED_CHROMA_SCALE`]) so the anchors stay
+/// the plain offsets from [`range_offsets`]. `Identity` passes planes
+/// through as RGB.
 fn yuv_to_rgb_matrix(matrix: Matrix, full_range: bool) -> [f32; 9] {
-    let (kr, kb) = match matrix {
-        Matrix::Bt601 => (0.299, 0.114),
-        Matrix::Bt709 => (0.2126, 0.0722),
-        Matrix::Bt2020 => (0.2627, 0.0593),
+    let (k_red, k_blue) = match matrix {
+        Matrix::Bt601 => BT601_KR_KB,
+        Matrix::Bt709 => BT709_KR_KB,
+        Matrix::Bt2020 => BT2020_KR_KB,
         Matrix::Identity => return IDENTITY3,
     };
-    let kg = 1.0 - kr - kb;
-    let (ys, cs) = if full_range { (1.0, 1.0) } else { (255.0 / 219.0, 255.0 / 224.0) };
-    let g_cb = cs * 2.0 * kb * (1.0 - kb) / kg;
-    let g_cr = cs * 2.0 * kr * (1.0 - kr) / kg;
-    [ys, ys, ys, 0.0, -g_cb, cs * 2.0 * (1.0 - kb), cs * 2.0 * (1.0 - kr), -g_cr, 0.0]
+    let k_green = 1.0 - k_red - k_blue;
+    let (luma_scale, chroma_scale) =
+        if full_range { (1.0, 1.0) } else { (LIMITED_LUMA_SCALE, LIMITED_CHROMA_SCALE) };
+    let green_from_cb = chroma_scale * 2.0 * k_blue * (1.0 - k_blue) / k_green;
+    let green_from_cr = chroma_scale * 2.0 * k_red * (1.0 - k_red) / k_green;
+    [
+        luma_scale,
+        luma_scale,
+        luma_scale,
+        0.0,
+        -green_from_cb,
+        chroma_scale * 2.0 * (1.0 - k_blue),
+        chroma_scale * 2.0 * (1.0 - k_red),
+        -green_from_cr,
+        0.0,
+    ]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Row `r`, column `c` of the math matrix (storage is column-major).
-    fn e(m: &[f32; 9], r: usize, c: usize) -> f32 {
-        m[c * 3 + r]
+    /// Row `row`, column `col` of the math matrix (storage is column-major).
+    fn element(matrix: &[f32; 9], row: usize, col: usize) -> f32 {
+        matrix[col * 3 + row]
     }
 
     #[test]
@@ -624,36 +696,40 @@ mod tests {
 
     #[test]
     fn bt601_limited_matches_documented_constants() {
-        let m = yuv_to_rgb_matrix(Matrix::Bt601, false);
-        for r in 0..3 {
-            assert!((e(&m, r, 0) - 255.0 / 219.0).abs() < 1e-4, "luma scale row {r}");
+        let matrix = yuv_to_rgb_matrix(Matrix::Bt601, false);
+        for row in 0..3 {
+            assert!(
+                (element(&matrix, row, 0) - LIMITED_LUMA_SCALE).abs() < 1e-4,
+                "luma scale row {row}"
+            );
         }
-        assert!((e(&m, 0, 2) - 1.596027).abs() < 1e-3);
-        assert!((e(&m, 1, 1) - -0.391762).abs() < 1e-3);
-        assert!((e(&m, 1, 2) - -0.812968).abs() < 1e-3);
-        assert!((e(&m, 2, 1) - 2.017232).abs() < 1e-3);
-        assert_eq!(e(&m, 0, 1), 0.0);
-        assert_eq!(e(&m, 2, 2), 0.0);
+        assert!((element(&matrix, 0, 2) - 1.596027).abs() < 1e-3);
+        assert!((element(&matrix, 1, 1) - -0.391762).abs() < 1e-3);
+        assert!((element(&matrix, 1, 2) - -0.812968).abs() < 1e-3);
+        assert!((element(&matrix, 2, 1) - 2.017232).abs() < 1e-3);
+        assert_eq!(element(&matrix, 0, 1), 0.0);
+        assert_eq!(element(&matrix, 2, 2), 0.0);
     }
 
     #[test]
     fn bt709_limited_matches_documented_constants() {
-        let m = yuv_to_rgb_matrix(Matrix::Bt709, false);
-        assert!((e(&m, 0, 2) - 1.792741).abs() < 1e-3);
-        assert!((e(&m, 1, 1) - -0.212899).abs() < 1e-3);
-        assert!((e(&m, 1, 2) - -0.532909).abs() < 1e-3);
-        assert!((e(&m, 2, 1) - 2.112402).abs() < 1e-3);
+        let matrix = yuv_to_rgb_matrix(Matrix::Bt709, false);
+        assert!((element(&matrix, 0, 2) - 1.792741).abs() < 1e-3);
+        assert!((element(&matrix, 1, 1) - -0.212899).abs() < 1e-3);
+        assert!((element(&matrix, 1, 2) - -0.532909).abs() < 1e-3);
+        assert!((element(&matrix, 2, 1) - 2.112402).abs() < 1e-3);
     }
 
     #[test]
     fn full_range_matrices() {
-        let m = yuv_to_rgb_matrix(Matrix::Bt601, true);
-        assert_eq!(e(&m, 0, 0), 1.0);
-        assert!((e(&m, 0, 2) - 1.402).abs() < 1e-6); // 2(1 - 0.299), exact
-        assert!((e(&m, 2, 1) - 1.772).abs() < 1e-6); // 2(1 - 0.114), exact
-        let m = yuv_to_rgb_matrix(Matrix::Bt709, true);
-        assert!((e(&m, 0, 2) - 1.5748).abs() < 1e-6);
-        assert!((e(&m, 2, 1) - 1.8556).abs() < 1e-6);
+        let matrix = yuv_to_rgb_matrix(Matrix::Bt601, true);
+        assert_eq!(element(&matrix, 0, 0), 1.0);
+        // 2(1 - KR), exact per the standard's coefficients.
+        assert!((element(&matrix, 0, 2) - 2.0 * (1.0 - BT601_KR_KB.0)).abs() < 1e-6);
+        assert!((element(&matrix, 2, 1) - 2.0 * (1.0 - BT601_KR_KB.1)).abs() < 1e-6);
+        let matrix = yuv_to_rgb_matrix(Matrix::Bt709, true);
+        assert!((element(&matrix, 0, 2) - 2.0 * (1.0 - BT709_KR_KB.0)).abs() < 1e-6);
+        assert!((element(&matrix, 2, 1) - 2.0 * (1.0 - BT709_KR_KB.1)).abs() < 1e-6);
         assert_eq!(
             yuv_to_rgb_matrix(Matrix::Identity, false),
             [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
@@ -662,38 +738,43 @@ mod tests {
 
     #[test]
     fn limited_range_anchors_hit_black_and_white() {
-        let m = yuv_to_rgb_matrix(Matrix::Bt601, false);
-        let (yo, co) = range_offsets(false);
-        assert_eq!((yo, co), (16.0 / 255.0, 128.0 / 255.0));
-        for (raw_y, want) in [(16.0 / 255.0, 0.0), (235.0 / 255.0, 1.0)] {
-            for r in 0..3 {
-                let got = e(&m, r, 0) * (raw_y - yo); // chroma terms cancel at midpoint
-                assert!((got - want).abs() < 1e-4, "row {r}: {got} vs {want}");
+        let matrix = yuv_to_rgb_matrix(Matrix::Bt601, false);
+        let (luma_anchor, chroma_anchor) = range_offsets(false);
+        assert_eq!((luma_anchor, chroma_anchor), (LIMITED_LUMA_BLACK, LIMITED_CHROMA_NEUTRAL));
+        // Studio-swing black and white map to 0.0 and 1.0.
+        let black = LIMITED_LUMA_BLACK;
+        let white = 235.0 / 255.0;
+        for (raw_luma, expected) in [(black, 0.0), (white, 1.0)] {
+            for row in 0..3 {
+                let got = element(&matrix, row, 0) * (raw_luma - luma_anchor);
+                assert!((got - expected).abs() < 1e-4, "row {row}: {got} vs {expected}");
             }
         }
     }
 
     #[test]
     fn quantization_helpers() {
-        assert_eq!(range_offsets(true), (0.0, 0.5));
+        assert_eq!(range_offsets(true), (0.0, FULL_RANGE_CHROMA_NEUTRAL));
         assert_eq!(depth_norm(8, false), 1.0);
-        assert_eq!(depth_norm(16, true), 1.0);
-        assert!((depth_norm(10, true) - 65535.0 / 1023.0).abs() < 1e-4);
-        assert!((depth_norm(12, true) - 65535.0 / 4095.0).abs() < 1e-4);
+        assert_eq!(depth_norm(MAX_PLANE_DEPTH, true), 1.0);
+        assert!((depth_norm(10, true) - R16_STORAGE_MAX / 1023.0).abs() < 1e-4);
+        assert!((depth_norm(12, true) - R16_STORAGE_MAX / 4095.0).abs() < 1e-4);
     }
 
     #[test]
     fn page_uniforms_from_pixels() {
         assert_eq!(PageUniforms::from(&Pixels::Rgba8(Box::default())), RGBA_UNIFORMS);
-        let yuv = Pixels::Yuv(crate::decode::YuvImage {
+        let yuv_pixels = Pixels::Yuv(crate::decode::YuvImage {
             depth: 10,
             subsampling: Subsampling::Yuv420,
             full_range: false,
             matrix: Matrix::Bt2020,
             y: Plane::U8(Box::default()), cb: Plane::U8(Box::default()), cr: Plane::U8(Box::default()),
         });
-        let u = PageUniforms::from(&yuv);
-        assert_eq!((u.mode, u.subsampling, u.depth, u.full_range, u.matrix),
-            (1, Subsampling::Yuv420, 10, false, Matrix::Bt2020));
+        let uniforms = PageUniforms::from(&yuv_pixels);
+        assert_eq!(
+            (uniforms.mode, uniforms.subsampling, uniforms.depth, uniforms.full_range, uniforms.matrix),
+            (1, Subsampling::Yuv420, 10, false, Matrix::Bt2020)
+        );
     }
 }

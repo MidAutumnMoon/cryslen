@@ -271,11 +271,11 @@ impl App {
     /// (spread total, window size), both in physical px — the pan/zoom math
     /// frame of reference.
     fn geometry(&self) -> ((f32, f32), (f32, f32)) {
-        let win = self.gl.as_ref().map(|gl| {
-            let s = gl.window.winit.inner_size();
-            (s.width as f32, s.height as f32)
+        let window = self.gl.as_ref().map(|gl| {
+            let window_size = gl.window.winit.inner_size();
+            (window_size.width as f32, window_size.height as f32)
         });
-        (self.last_layout.total(), win.unwrap_or((0.0, 0.0)))
+        (self.last_layout.total(), window.unwrap_or((0.0, 0.0)))
     }
 
     fn dispatch(&mut self, act: Action, event_loop: &winit::event_loop::ActiveEventLoop) {
@@ -297,10 +297,10 @@ impl App {
             }
             Action::ToggleFullscreen => {
                 self.state.fullscreen = !self.state.fullscreen;
-                let fs =
+                let fullscreen_request =
                     self.state.fullscreen.then_some(winit::window::Fullscreen::Borderless(None));
                 if let Some(gl) = self.gl.as_ref() {
-                    gl.window.winit.set_fullscreen(fs);
+                    gl.window.winit.set_fullscreen(fullscreen_request);
                 }
             }
             Action::ResetView => self.needs_refit(),
@@ -413,21 +413,22 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } if !egui_wants => {
-                let dy = {
+                let wheel_delta_y = {
                     let Some(gl) = self.gl.as_ref() else { return };
                     match delta {
-                        MouseScrollDelta::LineDelta(_, y) => *y,
-                        // PixelDelta is physical; normalize so zoom speed
-                        // doesn't change with the output scale factor.
-                        MouseScrollDelta::PixelDelta(p) => {
-                            p.y as f32 / (40.0 * gl.window.winit.scale_factor() as f32)
+                        MouseScrollDelta::LineDelta(_, lines) => *lines,
+                        MouseScrollDelta::PixelDelta(pixels) => {
+                            pixels.y as f32
+                                / (PIXELS_PER_WHEEL_LINE
+                                    * gl.window.winit.scale_factor() as f32)
                         }
                     }
                 };
-                let (total, win) = self.geometry();
+                let (total, window) = self.geometry();
                 // Scroll up (positive dy) zooms in.
-                let v = crate::view::zoom_at(self.state.view, self.cursor, (dy * 0.15).exp());
-                self.state.view = crate::view::clamp(v, total, win);
+                let zoom_factor = (wheel_delta_y * WHEEL_ZOOM_SENSITIVITY).exp();
+                let zoomed = crate::view::zoom_at(self.state.view, self.cursor, zoom_factor);
+                self.state.view = crate::view::clamp(zoomed, total, window);
                 self.user_moved = true;
                 self.request_redraw();
             }
@@ -435,16 +436,17 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                 self.dragging = *state == ElementState::Pressed && !egui_wants;
             }
             WindowEvent::CursorMoved { position, .. } => {
-                let new = (position.x as f32, position.y as f32);
+                let cursor_pos = (position.x as f32, position.y as f32);
                 if self.dragging && !egui_wants {
-                    let (total, win) = self.geometry();
-                    let delta = (new.0 - self.cursor.0, new.1 - self.cursor.1);
-                    let v = crate::view::pan(self.state.view, delta);
-                    self.state.view = crate::view::clamp(v, total, win);
+                    let (total, window) = self.geometry();
+                    let pan_delta =
+                        (cursor_pos.0 - self.cursor.0, cursor_pos.1 - self.cursor.1);
+                    let panned = crate::view::pan(self.state.view, pan_delta);
+                    self.state.view = crate::view::clamp(panned, total, window);
                     self.user_moved = true;
                     self.request_redraw();
                 }
-                self.cursor = new;
+                self.cursor = cursor_pos;
             }
             WindowEvent::RedrawRequested => {
                 self.frame();
@@ -458,6 +460,15 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
 
 /// How long a page may stay undecided before the status line says so.
 const WAIT_GRACE: Duration = Duration::from_millis(150);
+
+/// Wheel zoom sensitivity: e^(`WHEEL_ZOOM_SENSITIVITY` * lines) per event,
+/// so one notch is ~×1.16 and three notches ~×1.6.
+const WHEEL_ZOOM_SENSITIVITY: f32 = 0.15;
+
+/// Assumed wheel resolution for high-resolution (pixel-mode) wheels: how
+/// many physical px of scroll equal one "line", normalized by scale factor
+/// so zoom speed does not vary with output scaling.
+const PIXELS_PER_WHEEL_LINE: f32 = 40.0;
 
 #[cfg(test)]
 mod tests {

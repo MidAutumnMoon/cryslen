@@ -255,11 +255,11 @@ mod tests {
         let bytes = source.bytes(0).expect("first page reads");
         // It is the PNG we packed (magic; IHDR big-endian dims 40x30).
         assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
-        let w = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
-        let h = u32::from_be_bytes(bytes[20..24].try_into().unwrap());
-        assert_eq!((w, h), (40, 30));
-        let decoded = crate::decode::decode(&bytes, "p1.png").expect("decodes");
-        assert_eq!((decoded.width, decoded.height), (40, 30));
+        let width = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
+        let height = u32::from_be_bytes(bytes[20..24].try_into().unwrap());
+        assert_eq!((width, height), (40, 30));
+        let decoded_page = crate::decode::decode(&bytes, "p1.png").expect("decodes");
+        assert_eq!((decoded_page.width, decoded_page.height), (width, height));
     }
 
     #[test]

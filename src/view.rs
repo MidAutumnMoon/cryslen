@@ -28,13 +28,13 @@ pub struct SpreadLayout {
 impl SpreadLayout {
     /// Bounding size of the composed spread, in image pixels.
     pub fn total(&self) -> (f32, f32) {
-        let mut w: f32 = 0.0;
-        let mut h: f32 = 0.0;
+        let mut total_width: f32 = 0.0;
+        let mut total_height: f32 = 0.0;
         for r in self.rects.iter().flatten() {
-            w += r.size.0;
-            h = h.max(r.size.1);
+            total_width += r.size.0;
+            total_height = total_height.max(r.size.1);
         }
-        (w, h)
+        (total_width, total_height)
     }
 }
 
@@ -43,10 +43,12 @@ impl SpreadLayout {
 /// decoding — that page joins the layout when it arrives).
 pub fn layout(dims: [Option<(u32, u32)>; 2]) -> SpreadLayout {
     let mut rects: [Option<PageRect>; 2] = [None, None];
-    let mut x = 0.0;
+    let mut next_slot_x = 0.0;
     for (slot, dims) in dims.iter().enumerate() {
-        if let Some((w, h)) = *dims {            rects[slot] = Some(PageRect { pos: (x, 0.0), size: (w as f32, h as f32) });
-            x += w as f32;
+        if let Some((width, height)) = *dims {
+            rects[slot] =
+                Some(PageRect { pos: (next_slot_x, 0.0), size: (width as f32, height as f32) });
+            next_slot_x += width as f32;
         }
     }
     SpreadLayout { rects }
@@ -64,12 +66,18 @@ pub fn fit(total: (f32, f32), win: (f32, f32)) -> View {
     }
 }
 
+/// Zoom scale bounds: `scale` is screen px per image px, so these cap how
+/// far in (40 px per image px) and out (1 image px covers 20 screen px) a
+/// page can be zoomed.
+pub const MIN_SCALE: f32 = 0.05;
+pub const MAX_SCALE: f32 = 40.0;
+
 /// Zoom by `factor`, keeping the image point under `cursor` (screen px)
-/// anchored. Clamps scale to 0.05..=40; the anchor uses the *actual* factor
-/// applied so hitting the clamp does not shift the image.
+/// anchored. Clamps scale to [`MIN_SCALE`]..=[`MAX_SCALE`]; the anchor uses
+/// the *actual* factor applied so hitting the clamp does not shift the image.
 pub fn zoom_at(mut view: View, cursor: (f32, f32), factor: f32) -> View {
     let old = view.scale;
-    view.scale = (old * factor).clamp(0.05, 40.0);
+    view.scale = (old * factor).clamp(MIN_SCALE, MAX_SCALE);
     let applied = view.scale / old;
     // keep the image pixel under the cursor fixed: off' = cursor - (cursor-off)*applied
     view.offset = (cursor.0 - (cursor.0 - view.offset.0) * applied,
@@ -89,20 +97,20 @@ pub const KEEP: f32 = 64.0;
 /// Clamp pan so the spread cannot be lost: at least `KEEP` px of it stays
 /// inside the window. An axis where the scaled spread fits the window is
 /// pinned to the centered position. Simple and predictable, no rubber bands.
-pub fn clamp(view: View, total: (f32, f32), win: (f32, f32)) -> View {
-    let axis = |off: f32, content: f32, win: f32| -> f32 {
-        if content <= win {
-            (win - content) / 2.0
+pub fn clamp(view: View, total: (f32, f32), window: (f32, f32)) -> View {
+    let axis = |offset: f32, content: f32, window: f32| -> f32 {
+        if content <= window {
+            (window - content) / 2.0
         } else {
-            off.clamp(win - content - KEEP, KEEP)
+            offset.clamp(window - content - KEEP, KEEP)
         }
     };
     let scaled = (total.0 * view.scale, total.1 * view.scale);
     View {
         scale: view.scale,
         offset: (
-            axis(view.offset.0, scaled.0, win.0),
-            axis(view.offset.1, scaled.1, win.1),
+            axis(view.offset.0, scaled.0, window.0),
+            axis(view.offset.1, scaled.1, window.1),
         ),
     }
 }
@@ -165,9 +173,9 @@ mod tests {
     #[test]
     fn zoom_clamps_scale() {
         let v = zoom_at(View { scale: 30.0, offset: (0.0, 0.0) }, (0.0, 0.0), 100.0);
-        assert_eq!(v.scale, 40.0);
+        assert_eq!(v.scale, MAX_SCALE);
         let v = zoom_at(View { scale: 0.1, offset: (0.0, 0.0) }, (0.0, 0.0), 0.001);
-        assert_eq!(v.scale, 0.05);
+        assert_eq!(v.scale, MIN_SCALE);
     }
 
     #[test]
