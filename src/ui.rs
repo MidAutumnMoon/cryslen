@@ -1,10 +1,9 @@
 //! Status overlay: one egui bottom panel, data in / text out.
-//!
 
 use crate::page::Spread;
 
 /// Everything the status line shows. Built by the app each frame from plain
-/// state; no logic lives here.
+/// state. No logic lives here.
 pub struct StatusLine {
     pub total: usize,
     pub spread: Spread,
@@ -28,7 +27,7 @@ pub fn show(ui: &mut egui::Ui, status: &StatusLine) {
     });
 }
 
-/// The single status line; separate so it is directly testable.
+/// The single status line, separate so it is directly testable.
 pub fn line(status: &StatusLine) -> String {
     let mut head = format!("{}/{}", status.spread.first + 1, status.total);
     if let Some(second) = status.spread.second {

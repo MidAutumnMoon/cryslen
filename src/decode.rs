@@ -6,15 +6,14 @@
 //! scoped-thread parallel runner.
 //!
 //! All functions here are panics-clean for corrupt input: they return
-//! `DecodeError`, never panic (wrap decoder panics with catch_unwind where a
-//! crate documents panics; the worker also has a boundary as belt-and-braces).
-//! The FFI `unsafe` for AVIF is confined to the `avif` submodule.
-
-
+//! `DecodeError`, never panic. Decoder panics are caught with catch_unwind
+//! where a crate documents them. The worker adds its own boundary as
+//! belt-and-braces. The FFI `unsafe` for AVIF is confined to the `avif`
+//! submodule.
 
 /// Decoded page: dimensions plus pixels in one of two layouts. Construct via
 /// [`Decoded::rgba`] / [`Decoded::yuv`], which validate that pixel extents
-/// match the dimensions — extent bugs surface as worker decode errors here,
+/// match the dimensions. Extent bugs surface as worker decode errors here,
 /// not as display-time panics.
 #[derive(Clone)]
 pub struct Decoded {
@@ -97,12 +96,11 @@ pub const MAX_PIXELS: usize = 512 << 18;
 pub enum Pixels {
     /// Interleaved RGBA, `4 * width * height` bytes, row-major, top-first.
     Rgba8(Box<[u8]>),
-    /// Planar YUV; the renderer converts to RGB in its shader. Constructed
+    /// Planar YUV, converted to RGB in the renderer's shader. Constructed
     /// only by the `avif` decoder.
     #[cfg_attr(not(feature = "avif"), allow(dead_code))]
     Yuv(YuvImage),
 }
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
     Jpeg,
@@ -130,9 +128,10 @@ impl Format {
     }
 }
 
-/// Planar YUV image. 8-bit planes are one byte per sample; 10/12-bit are
-/// `u16` samples with `depth` significant bits (normalize by `(1<<depth)-1`).
-/// Dimensions ride on [`Decoded`]; plane sizes derive from them.
+/// Planar YUV image. 8-bit planes are one byte per sample. 10/12-bit planes
+/// are `u16` samples with `depth` significant bits (normalize by
+/// `(1<<depth)-1`). Dimensions ride on [`Decoded`]. Plane sizes derive from
+/// them.
 #[derive(Clone)]
 pub struct YuvImage {
     pub depth: u8,
@@ -174,22 +173,22 @@ pub enum Plane {
 }
 
 /// Plane dims (y, chroma) for an image size and subsampling. Mono has no
-/// chroma (renderers substitute a 1x1 midpoint). Pure; testable.
+/// chroma (renderers substitute a 1x1 midpoint).
 pub fn plane_dims(size: (u32, u32), s: Subsampling) -> ((u32, u32), (u32, u32)) {
-    let (w, h) = size;
+    let (width, height) = size;
     match s {
-        Subsampling::Mono => ((w, h), (1, 1)),
-        Subsampling::Yuv420 => ((w, h), (w.div_ceil(2), h.div_ceil(2))),
-        Subsampling::Yuv422 => ((w, h), (w.div_ceil(2), h)),
-        Subsampling::Yuv444 => ((w, h), (w, h)),
+        Subsampling::Mono => ((width, height), (1, 1)),
+        Subsampling::Yuv420 => ((width, height), (width.div_ceil(2), height.div_ceil(2))),
+        Subsampling::Yuv422 => ((width, height), (width.div_ceil(2), height)),
+        Subsampling::Yuv444 => ((width, height), (width, height)),
     }
 }
 
 /// Byte view of a plane (u16 planes are little-endian native pairs).
-pub fn plane_bytes(p: &Plane) -> &[u8] {
-    match p {
-        Plane::U8(b) => b,
-        Plane::U16(b) => bytemuck::cast_slice(b),
+pub fn plane_bytes(plane: &Plane) -> &[u8] {
+    match plane {
+        Plane::U8(bytes) => bytes,
+        Plane::U16(words) => bytemuck::cast_slice(words),
     }
 }
 
@@ -338,7 +337,8 @@ mod avif {
 
     use super::{DecodeError, Decoded, Format, Matrix, Plane, Subsampling, YuvImage};
 
-    /// dav1d parallelism saturates quickly on stills; capped, knob baked in.
+    /// dav1d parallelism saturates quickly on stills, so the thread count
+    /// is capped (knob baked in).
     const MAX_THREADS: usize = 8;
 
     pub fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
@@ -590,9 +590,9 @@ mod jxl {
         rgba
     }
 
-    /// Scoped-thread runner. Per-task errors inside the
-    /// threads are swallowed; a genuinely broken codestream fails the
-    /// sequential `process` call right after.
+    /// Scoped-thread runner. Per-task errors inside the threads are
+    /// swallowed. A genuinely broken codestream fails the sequential
+    /// `process` call right after.
     struct Pool(usize);
     impl JxlParallelRunner for Pool {
         fn run(&mut self, num: usize, fun: &JxlParallelRunnerFun<'_>) -> jxl::error::Result<()> {

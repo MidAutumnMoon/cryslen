@@ -1,9 +1,7 @@
-//! Page model: a directory or archive viewed as a natural-sorted list of pages,
-//! plus the pure spread-pairing math (cover alone, then pairs).
-//!
-//!
-//! The spread functions are pure and unit-tested; the `Source` owns persistent
-//! archive handles so zip files are not reopened per page.
+//! Page model: a directory or archive viewed as a natural-sorted list of
+//! pages, plus the pure spread-pairing math (cover alone, then pairs).
+//! The spread functions are pure and unit-tested. The `Source` owns
+//! persistent archive handles so zip files are not reopened per page.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -11,7 +9,7 @@ use std::sync::Mutex;
 
 use crate::decode::format_from_name;
 
-/// Where pages come from; decided by `Source::open` from one path argument.
+/// Where pages come from, decided by `Source::open` from one path argument.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceKind {
     Directory(PathBuf),
@@ -43,7 +41,7 @@ impl std::fmt::Display for SourceError {
 }
 
 /// A page source with persistent handles. Cheap to keep alive for the whole
-/// session; shared with the decode worker behind an `Arc`.
+/// session. Shared with the decode worker behind an `Arc`.
 pub struct Source {
     pub kind: SourceKind,
     names: Vec<String>,
@@ -81,7 +79,7 @@ impl Source {
         Source::from_names(SourceKind::Directory(dir.to_path_buf()), names)
     }
 
-    /// The archive handle opened here stays open for the session; `bytes`
+    /// The archive handle opened here stays open for the session. `bytes`
     /// reads go through it, avoiding a central-directory parse per page.
     fn open_zip(path: &Path) -> Result<Source, SourceError> {
         let file = std::fs::File::open(path).map_err(|e| SourceError::Zip(e.to_string()))?;
@@ -101,7 +99,7 @@ impl Source {
         Ok(source)
     }
 
-    /// Listing needs one archive walk; `bytes` reopens per read —
+    /// Listing needs one archive walk, and `bytes` reopens per read:
     /// sevenz-rust2's `ArchiveReader` owns its file and there is no cheap
     /// handle to keep here.
     fn open_sevenzip(path: &Path) -> Result<Source, SourceError> {
@@ -144,7 +142,7 @@ impl Source {
     }
 
     /// Raw encoded bytes of one page. Zip reads go through the persistent
-    /// archive handle; 7z reopens per read (sevenz-rust2 limitation).
+    /// archive handle. 7z reopens per read (sevenz-rust2 limitation).
     pub fn bytes(&self, index: usize) -> Result<Box<[u8]>, SourceError> {
         let name = self
             .names
@@ -159,7 +157,7 @@ impl Source {
                     .zip
                     .as_ref()
                     .ok_or_else(|| SourceError::Zip("archive handle lost".to_string()))?;
-                // A poisoned lock only means a read panicked mid-flight; the
+                // A poisoned lock only means a read panicked mid-flight. The
                 // archive itself is still readable, so recover the data.
                 let mut archive = match zip.lock() {
                     Ok(guard) => guard,
@@ -187,7 +185,7 @@ fn sort_pages(names: &mut [String]) {
     names.sort_by(|a, b| natord::compare(a, b));
 }
 
-/// Which pages one screen shows. Cover is alone; afterwards pairs:
+/// Which pages one screen shows. The cover is alone, afterwards pairs,
 /// 0-based: `0`, `1+2`, `3+4`, ...
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Spread {
@@ -220,8 +218,8 @@ pub fn advance(current: usize, forward: bool, double: bool, len: usize) -> usize
 }
 
 impl Spread {
-    /// Visual seating as [left, right]: western reads first-left; manga reads
-    /// first-right, so a lone page lands in the right slot.
+    /// Visual seating as [left, right]. Western reads first-left. Manga
+    /// reads first-right, so a lone page lands in the right slot.
     pub fn seats(&self, rtl: bool) -> [Option<usize>; 2] {
         if rtl {
             [self.second, Some(self.first)]
@@ -238,8 +236,8 @@ mod tests {
 
     use std::io::Write as _;
 
-    /// LZMA-compressed 7z with two small PNGs (built by 7zz; the crate's
-    /// encoder features are trimmed, so the fixture is checked in).
+    /// LZMA-compressed 7z with two small PNGs, built by 7zz. The crate's
+    /// encoder features are trimmed, so the fixture is checked in.
     const SEVENZ_FIXTURE: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/two_pages.7z"
@@ -340,7 +338,8 @@ mod tests {
     fn odd_tail_clamps_at_source() {
         // 7 pages: index 6 lives in pair (5, 6).
         assert_eq!(spread_for(6, true, 7), Spread { first: 5, second: Some(6) });
-        // 6 pages: the would-be pair (5, 6) shows page 5 alone — no phantom.
+        // 6 pages: the would-be pair (5, 6) shows page 5 alone, with no
+        // phantom page.
         assert_eq!(spread_for(5, true, 6), Spread { first: 5, second: None });
         // Out-of-range index clamps to the last page.
         assert_eq!(spread_for(99, true, 6).first, 5);

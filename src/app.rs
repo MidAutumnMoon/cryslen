@@ -1,6 +1,6 @@
 //! App: winit event handling, state transitions, frame composition.
 //!
-//! State is a single plain struct; every event maps to an `Action` first
+//! State is a single plain struct. Every event maps to an `Action` first
 //! (pure, testable), then mutates state.
 
 use std::sync::Arc;
@@ -16,9 +16,10 @@ use crate::worker::{Page, Worker};
 
 /// User events that wake the parked loop.
 pub enum UserEvent {
-    /// egui wants a repaint after this delay (arm-only; fired by new_events).
+    /// egui wants a repaint after this delay. Arming only: `new_events`
+    /// fires the redraw when the deadline is reached.
     Repaint(Duration),
-    /// Decode cache changed; redraw to pick up newly decoded pages.
+    /// Decode cache changed. Redraw to pick up newly decoded pages.
     PagesUpdated,
 }
 
@@ -53,8 +54,9 @@ pub enum Action {
     ResetView,
 }
 
-/// Key map, baked in. Arrows are *directional*: Right=Next, Left=Prev; the
-/// app swaps them when `rtl` is on (reading direction decides, not the key).
+/// Key map, baked in. Arrows are directional: Right means Next, Left means
+/// Prev. The app swaps them when `rtl` is on, because the reading direction
+/// decides, not the key label.
 pub fn action(code: KeyCode) -> Option<Action> {
     use Action::*;
     match code {
@@ -97,19 +99,20 @@ pub struct App {
     pub last_win: (u32, u32),
     pub cursor: (f32, f32),
     pub dragging: bool,
-    /// Set when the current spread's first page is undecided (hold-last-frame
-    /// rule: keep showing what's on screen; the status line flags waiting
-    /// after 150 ms — no spinner animation that would force repaints).
+    /// Set while the current spread's first page is undecided. The last
+    /// frame stays on screen (hold-last-frame rule) and the status line
+    /// flags waiting after 150 ms. No spinner animation: it would force
+    /// repaints.
     pub waiting_since: Option<Instant>,
-    /// Layout of the spread currently on screen; the memo pan/zoom needs
-    /// between frames.
+    /// Layout of the spread currently on screen. Pan and zoom read this
+    /// memo between frames.
     pub last_layout: SpreadLayout,
-    /// Spread total the current view was fitted to; NaN forces a refit on
-    /// the next frame (page turn, resize, decode arrival changes the shape).
+    /// Spread total the current view was fitted to. NaN forces a refit on
+    /// the next frame.
     pub fitted_total: (f32, f32),
-    /// The user zoomed or panned since the last fit; suppresses the
-    /// auto-refit that fires when a late-decoded page changes the spread
-    /// shape (their view wins over geometry).
+    /// The user zoomed or panned since the last fit. Their view wins over
+    /// geometry, suppressing the auto-refit that fires when a late-decoded
+    /// page changes the spread shape.
     pub user_moved: bool,
     /// Proxy for egui's repaint bridge. winit 0.30 cannot create one from
     /// `ActiveEventLoop` (only `EventLoop::create_proxy`, before `run_app`).
@@ -144,10 +147,9 @@ impl App {
         crate::page::spread_for(self.state.index, self.state.double, self.source.len())
     }
 
-    /// Upload what changed: for each visual seat (left, right) either the
-    /// freshly decoded page, or — when that page is undecided — nothing, so
-    /// the slot keeps its last frame (hold-last-frame rule). Seats without a
-    /// page in this spread are cleared.
+    /// Upload what changed. A seat with a freshly decoded page shows it. An
+    /// undecided page keeps the slot's last frame (hold-last-frame rule). A
+    /// seat with no page in this spread is cleared.
     fn sync_slots(&mut self, spread: &Spread) {
         let seats = spread.seats(self.state.rtl);
         if let Some(gl) = self.gl.as_mut() {
@@ -181,8 +183,8 @@ impl App {
         self.sync_slots(&spread);
 
         // Refit when the composed spread changed shape (page turn, resize,
-        // newly decoded dims) — unless the user has zoomed/panned since the
-        // last fit, in which case their view wins over geometry.
+        // newly decoded dims). Skip it when the user has zoomed or panned:
+        // their view wins over geometry.
         let total = self.last_layout.total();
         if total != self.fitted_total {
             if !self.user_moved {
@@ -386,7 +388,8 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
             return;
         }
 
-        // Give egui the event first; if it wants the pointer, we don't pan/zoom.
+        // Give egui the event first. If it wants the pointer, we don't
+        // pan or zoom.
         let egui_wants = {
             let Gl { egui, window, .. } = self.gl.as_mut().unwrap();
             let response = egui.on_window_event(&window.winit, &event);
@@ -496,7 +499,7 @@ mod tests {
         // Western: Right/Space advances.
         assert!(is_forward(Action::Next, false));
         assert!(!is_forward(Action::Prev, false));
-        // RTL manga: the same keys flip — Left-ward "next" reads forward.
+        // RTL manga: the same keys flip, so Left-ward "next" reads forward.
         assert!(!is_forward(Action::Next, true));
         assert!(is_forward(Action::Prev, true));
     }

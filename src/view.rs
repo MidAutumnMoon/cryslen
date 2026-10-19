@@ -15,7 +15,7 @@ pub struct PageRect {
     pub size: (f32, f32),
 }
 
-/// Layout of a spread's visual slots: `rects` is always [left, right]; slot
+/// Layout of a spread's visual slots. `rects` is always [left, right]. Slot
 /// seating (which page goes where) was decided before layout by
 /// [`crate::page::Spread::seats`]. A slot with no decoded page yet is `None`.
 #[derive(Debug, Clone, Copy, Default)]
@@ -37,8 +37,8 @@ impl SpreadLayout {
 }
 
 /// Compose one or two pages side by side, top-aligned. `dims[i]` is the
-/// decoded size of visual slot i (0 = left, 1 = right; None while still
-/// decoding — that page joins the layout when it arrives).
+/// decoded size of visual slot i (0 = left, 1 = right). A still-decoding
+/// slot is None and joins the layout when it arrives.
 pub fn layout(dims: [Option<(u32, u32)>; 2]) -> SpreadLayout {
     let mut rects: [Option<PageRect>; 2] = [None, None];
     let mut next_slot_x = 0.0;
@@ -71,7 +71,7 @@ pub const MIN_SCALE: f32 = 0.05;
 pub const MAX_SCALE: f32 = 40.0;
 
 /// Zoom by `factor`, keeping the image point under `cursor` (screen px)
-/// anchored. Clamps scale to [`MIN_SCALE`]..=[`MAX_SCALE`]; the anchor uses
+/// anchored. Clamps scale to [`MIN_SCALE`]..=[`MAX_SCALE`]. The anchor uses
 /// the *actual* factor applied so hitting the clamp does not shift the image.
 pub fn zoom_at(mut view: View, cursor: (f32, f32), factor: f32) -> View {
     let old = view.scale;

@@ -41,9 +41,9 @@ impl Page {
     }
 }
 
-/// Cache shared between worker (writer) and app (reader). Byte budget is the
-/// approximate sum of decoded buffer sizes; eviction is simplest-first (drop
-/// arbitrary non-current entries). There is no LRU machinery.
+/// Cache shared between worker (writer) and app (reader). The byte budget is
+/// the approximate sum of decoded buffer sizes. Eviction is simplest-first:
+/// drop arbitrary non-current entries. There is no LRU machinery.
 struct PageCache {
     map: HashMap<usize, Page>,
     budget: usize,
@@ -56,7 +56,7 @@ impl PageCache {
     }
 
     /// Store a page outcome, then evict until under budget. `focused` never
-    /// goes; entries outside `keep` go first, then the neighbours.
+    /// goes. Entries outside `keep` go first, then the neighbours.
     fn insert(&mut self, index: usize, page: Page, focused: usize, keep: &[usize]) {
         let bytes = page.resident_bytes();
         if let Some(old) = self.map.insert(index, page) {
@@ -84,8 +84,8 @@ impl PageCache {
                 return;
             }
         }
-        // Everything cached is now wanted; drop the neighbours, never the
-        // focused page (so a budget-exceeding page cannot evict itself).
+        // Everything cached is now wanted. Drop the neighbours, never the
+        // focused page, so a budget-exceeding page cannot evict itself.
         let neighbours: Vec<usize> =
             keep.iter().copied().filter(|&page| page != focused).collect();
         for key in neighbours {
@@ -113,8 +113,8 @@ pub struct Worker {
 
 impl Worker {
     /// Spawn the worker for `source`. `notify` fires after every cache change
-    /// (it should send the winit user event; the worker itself knows nothing
-    /// about winit).
+    /// and should send the winit user event. The worker itself knows nothing
+    /// about winit.
     pub fn spawn(source: Arc<Source>, notify: impl Fn() + Send + Sync + 'static) -> Worker {
         let (tx, rx) = mpsc::channel::<usize>();
         let cache = Arc::new(Mutex::new(PageCache::new()));
@@ -156,7 +156,8 @@ impl Drop for Worker {
 
 /// Worker loop: latest-wins focus, then decode the ±2 window around it,
 /// nearest first. A focus update arriving mid-batch aborts the rest of the
-/// batch (no FIFO backlog); one decode in flight always runs to completion.
+/// batch so no FIFO backlog forms. One decode in flight always runs to
+/// completion.
 fn run(
     source: &Source,
     rx: mpsc::Receiver<usize>,
@@ -198,7 +199,7 @@ fn run(
                     &decode_order,
                 );
             }
-            // Detail went to stderr already; the cache now carries the
+            // Detail went to stderr already. The cache now carries the
             // outcome for the status line.
             notify();
         }
@@ -283,7 +284,7 @@ mod tests {
                 .unwrap(),
             ))
         };
-        // Live bytes 8; inserting another page (total 16 > 8) evicts the
+        // Live bytes 8. Inserting another page (total 16 > 8) must evict the
         // page outside the keep set, never the focused page.
         cache.insert(1, page(1), 5, &[5, 4]);
         cache.insert(5, page(5), 5, &[5, 4]);
@@ -333,8 +334,8 @@ mod tests {
         };
         assert_eq!((page.width, page.height), (3, 2));
         assert!(*updates.lock().unwrap() > 0);
-        // Drop joins the thread; if the sentinel/stop path hung, the test
-        // suite would hang here (no GL or event loop involved).
+        // Drop joins the thread. A hung sentinel/stop path would hang the
+        // test suite here (no GL or event loop involved).
     }
 
     #[test]

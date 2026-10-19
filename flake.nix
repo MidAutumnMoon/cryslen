@@ -1,5 +1,5 @@
 {
-  description = "cryslen (cy) — minimal wayland image/comic pager";
+  description = "cryslen (cy): minimal wayland image/comic pager";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable-small";
 
@@ -8,8 +8,8 @@
       inherit (nixpkgs) lib;
       systems = [ "x86_64-linux" ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
-      # aom's cmake configure greps `nasm -hf` for "-Ox"; nasm 3.x dropped it
-      # from the help text though the flag works.
+      # aom's cmake configure greps `nasm -hf` for "-Ox", which nasm 3.x
+      # dropped from the help text though the flag works.
       nasm-aom-shim = pkgs: pkgs.writeShellScriptBin "nasm" ''
         if [ "$1" = "-hf" ]; then
           ${pkgs.nasm}/bin/nasm "$@"

@@ -3,7 +3,7 @@
 //! cryslen is decode.rs's libavif FFI block, behind the `avif` feature).
 //!
 //! Two page slots, YUV plane textures with shader-side conversion, spread
-//! layout draw. Chroma siting (avifChromaSamplePosition) is not applied — the
+//! layout draw. Chroma siting (avifChromaSamplePosition) is not applied: the
 //! default co-sited/midway assumption biases chroma by at most half a texel,
 //! invisible in practice.
 
@@ -17,9 +17,10 @@ use winit::raw_window_handle::HasWindowHandle as _;
 use crate::decode::{plane_bytes, plane_dims, Decoded, Matrix, Pixels, Plane, Subsampling};
 use crate::view::{SpreadLayout, View};
 
-/// Fixed -1..1 strip; the VS places it at the slot's screen rect from
+/// Fixed -1..1 strip. The VS places it at the slot's screen rect from
 /// uniforms, so pan/zoom never touch vertex data. Top-origin math lives in
-/// the VS (GL clip space is bottom-origin; winit coords are top-origin).
+/// the VS, because GL clip space is bottom-origin while winit coords are
+/// top-origin.
 const VS_CORE: &str = r#"
     #version 330 core
     in vec2 pos;
@@ -35,7 +36,7 @@ const VS_CORE: &str = r#"
 
 /// One shader, both pixel layouts: mode/subsampling/depth/range/matrix arrive
 /// as uniforms, so there are no per-variant programs. Chroma is sampled
-/// bilinearly at cosited scaled coordinates; for 444 that is exact.
+/// bilinearly at cosited scaled coordinates, exact for 444.
 const FS_CORE: &str = r#"
     #version 330 core
     in vec2 v_px;
@@ -54,8 +55,8 @@ const FS_CORE: &str = r#"
     uniform sampler2D u_tex2; // Cr
     void main() {
         // Fragment centers interpolate to image texel centers at 1:1 zoom
-        // (ip = k + 0.5), so ip / u_img already addresses texel centers —
-        // no extra half-texel offset.
+        // (ip = k + 0.5), so ip / u_img already addresses texel centers
+        // with no extra half-texel offset.
         vec2 ip = (v_px - u_offset) / u_scale;
         if (u_mode == 0) { color = vec4(texture(u_tex0, ip / u_img).rgb, 1.0); return; }
         float y = texture(u_tex0, ip / u_img).r;
@@ -78,8 +79,8 @@ const VS_ES: &str = r#"
         gl_Position = vec4(px.x / u_win.x * 2.0 - 1.0, 1.0 - px.y / u_win.y * 2.0, 0.0, 1.0);
     }"#;
 
-// highp: mediump may be fp16 — ulp at 16k image px is 8.0, wrecking the
-// coordinate math; ES3 mandates highp support.
+// highp is required: mediump may be fp16, where the ulp at 16k image px is
+// 8.0 and wrecks the coordinate math. ES3 mandates highp support.
 const FS_ES: &str = r#"
     #version 300 es
     precision highp float;
@@ -107,7 +108,7 @@ const FS_ES: &str = r#"
         color = vec4(u_mat * (yuv * u_norm - u_yuv_off), 1.0);
     }"#;
 
-/// Window + EGL context + surface. vsync is DontWait; the app must call
+/// Window + EGL context + surface. vsync is DontWait, so the app must call
 /// `pre_present_and_swap()` to present (Wayland frame pacing inside).
 pub struct Window {
     pub winit: winit::window::Window,
@@ -121,7 +122,7 @@ impl Window {
         unsafe { Self::create(event_loop) }
     }
 
-    /// Prefer desktop GL, fall back to GLES; the swap is non-blocking.
+    /// Prefer desktop GL, fall back to GLES. The swap is non-blocking.
     unsafe fn create(event_loop: &winit::event_loop::ActiveEventLoop) -> Window {
         use glutin::context::NotCurrentGlContext as _;
         use glutin::display::{GetGlDisplay as _, GlDisplay as _};
@@ -164,10 +165,10 @@ impl Window {
                 );
         let surface = gl_display.create_window_surface(&gl_config, &surface_attrs).unwrap();
         let context = not_current.make_current(&surface).unwrap();
-        // Non-blocking present + window.pre_present_notify() (in
-        // pre_present_and_swap) gives Wayland frame-callback pacing without a
-        // blocking eglSwapBuffers owning the event loop — same choice eframe
-        // made.
+        // Non-blocking present plus pre_present_and_swap's
+        // window.pre_present_notify() gives Wayland frame-callback pacing
+        // without a blocking eglSwapBuffers owning the event loop. Same
+        // choice eframe made.
         surface
             .set_swap_interval(&context, glutin::surface::SwapInterval::DontWait)
             .unwrap();
@@ -198,9 +199,11 @@ impl Window {
 }
 
 /// Up to two page slots, each an RGBA texture or a YUV plane triple.
-/// Upload happens on the main thread at frame time; pan/zoom are uniforms.
+/// Upload happens on the main thread at frame time. Pan/zoom stay uniforms
+/// and never re-upload.
+///
 /// Each slot remembers which page it holds, so `set` with an unchanged page
-/// is a no-op — callers never need to mirror GPU state on their side.
+/// is a no-op. Callers never need to mirror GPU state on their side.
 pub struct PageSlots {
     gl: Arc<glow::Context>,
     program: <glow::Context as glow::HasContext>::Program,
@@ -210,7 +213,8 @@ pub struct PageSlots {
     max_tex: u32,
 }
 
-/// One page slot's GPU state. Plain data; objects freed on replace/clear.
+/// One page slot's GPU state. Plain data. The GL objects are freed on
+/// replace and clear.
 struct Slot {
     /// Page whose pixels the textures hold (`None` when empty).
     page: Option<usize>,
@@ -242,7 +246,7 @@ const MONO_CHROMA_MIDPOINT_8: u8 = 128;
 
 const IDENTITY3: [f32; 9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
 
-/// Uniform set describing an RGBA slot (mode 0); also the empty-slot default.
+/// Uniform set describing an RGBA slot (mode 0). Also the empty-slot default.
 const RGBA_UNIFORMS: PageUniforms = PageUniforms {
     mode: 0,
     subsampling: Subsampling::Yuv444,
@@ -292,7 +296,7 @@ impl PageSlots {
             gl.enable_vertex_attrib_array(loc);
             gl.vertex_attrib_pointer_f32(loc, 2, glow::FLOAT, false, 8, 0);
 
-            // Sampler units are fixed; draw only rebinds textures.
+            // Sampler units are fixed. Draw rebinds textures only.
             gl.use_program(Some(program));
             for (unit, name) in ["u_tex0", "u_tex1", "u_tex2"].iter().enumerate() {
                 gl.uniform_1_i32(gl.get_uniform_location(program, name).as_ref(), unit as i32);
@@ -303,7 +307,7 @@ impl PageSlots {
     }
 
     /// Upload decoded pixels of `page` into visual slot `i` (0 = left,
-    /// 1 = right); re-uploading the same page is a no-op.
+    /// 1 = right). Re-uploading the same page is a no-op.
     ///
     /// # Panics
     ///
@@ -370,8 +374,8 @@ impl PageSlots {
         self.slots[slot].uniforms = PageUniforms::from(&decoded.pixels);
     }
 
-    /// Clear a slot (page left the spread — undecoded-but-wanted pages keep
-    /// their last frame instead, per the hold-last-frame rule).
+    /// Clear a slot. Used when the page left the spread. Undecoded-but-wanted
+    /// pages keep their last frame instead, per the hold-last-frame rule.
     pub fn clear(&mut self, slot: usize) {
         if let Some(textures) = self.slots[slot].texture.take() {
             delete_textures(&self.gl, &textures);
@@ -388,7 +392,7 @@ impl PageSlots {
 
     /// Draw the spread laid out by `layout` with `view`.
     ///
-    /// Does not clear; the app owns the framebuffer clear each frame.
+    /// Does not clear. The app owns the framebuffer clear each frame.
     pub fn draw(&self, win: (f32, f32), layout: &SpreadLayout, view: &View) {
         let gl = &self.gl;
         if win.0 <= 0.0 || win.1 <= 0.0 {
@@ -408,7 +412,7 @@ impl PageSlots {
                 let Some(rect) = rect else { continue };
                 let Some(slot_state) = self.slots.get(slot) else { continue };
                 let Some(textures) = &slot_state.texture else { continue };
-                // Whole-pixel rect origin; LINEAR samples shimmer at 1:1 zoom
+                // Whole-pixel rect origin: LINEAR samples shimmer at 1:1 zoom
                 // on fractional offsets otherwise.
                 let screen_origin = (
                     (view.offset.0 + rect.pos.0 * view.scale).round(),
@@ -501,7 +505,7 @@ fn delete_textures(gl: &glow::Context, textures: &Textures) {
     }
 }
 
-/// Texture with viewer defaults; CLAMP keeps edge texels from bleeding.
+/// Texture with viewer defaults. CLAMP keeps edge texels from bleeding.
 /// `filterable` false (GLES R16) means NEAREST and no mips.
 fn new_texture(gl: &glow::Context, filterable: bool) -> <glow::Context as HasContext>::Texture {
     let texture = unsafe { gl.create_texture().unwrap() };
@@ -636,14 +640,14 @@ fn depth_norm(depth: u8, wide: bool) -> f32 {
 const MIN_PLANE_DEPTH: u8 = 1;
 const MAX_PLANE_DEPTH: u8 = 16;
 
-/// Luma coefficients (KR, KB) of each conversion standard; KG = 1 - KR - KB.
+/// Luma coefficients (KR, KB) of each conversion standard. KG = 1 - KR - KB.
 const BT601_KR_KB: (f32, f32) = (0.299, 0.114);
 const BT709_KR_KB: (f32, f32) = (0.2126, 0.0722);
 const BT2020_KR_KB: (f32, f32) = (0.2627, 0.0593);
 
 /// YUV→RGB conversion for `rgb = M · (yuv * norm - offsets)`, stored
 /// column-major for upload with transpose = false. Derived from the exact
-/// KR/KB of each standard; limited range folds in the studio-swing scales
+/// KR/KB of each standard. Limited range folds in the studio-swing scales
 /// ([`LIMITED_LUMA_SCALE`], [`LIMITED_CHROMA_SCALE`]) so the anchors stay
 /// the plain offsets from [`range_offsets`]. `Identity` passes planes
 /// through as RGB.

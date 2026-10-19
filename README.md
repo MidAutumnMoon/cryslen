@@ -1,6 +1,6 @@
 # cryslen
 
-`cy` — a minimal Wayland image and comic pager.
+`cy`: a minimal Wayland image and comic pager.
 
 - Pages from directories, `.zip`/`.cbz`, and `.7z`/`.cb7` archives
 - Manga mode: right-to-left reading (default on) and double-page spreads
