@@ -13,9 +13,12 @@
 //! crate documents panics; the worker also has a boundary as belt-and-braces).
 //! The FFI `unsafe` for AVIF is confined to the `avif` submodule.
 
-use std::sync::Arc;
 
-/// Decoded page: dimensions plus pixels in one of two layouts.
+
+/// Decoded page: dimensions plus pixels in one of two layouts. Construct via
+/// [`Decoded::rgba`] / [`Decoded::yuv`], which validate that pixel extents
+/// match the dimensions — extent bugs surface as worker decode errors here,
+/// not as display-time panics.
 #[derive(Clone)]
 pub struct Decoded {
     pub width: u32,
@@ -24,6 +27,73 @@ pub struct Decoded {
     pub format: Format,
 }
 
+impl Decoded {
+    /// Interleaved RGBA, `4 * w * h` bytes, row-major, top-first.
+    pub fn rgba(
+        width: u32,
+        height: u32,
+        format: Format,
+        bytes: Box<[u8]>,
+    ) -> Result<Decoded, DecodeError> {
+        let want = checked_extent(width, height, 4)?;
+        if bytes.len() != want {
+            return Err(DecodeError::Corrupt("rgba extent"));
+        }
+        Ok(Decoded { width, height, pixels: Pixels::Rgba8(bytes), format })
+    }
+
+    /// Planar YUV sized per [`plane_dims`] for these dimensions. Called only
+    /// by the `avif` decoder.
+    #[cfg_attr(not(feature = "avif"), allow(dead_code))]
+    pub fn yuv(
+        width: u32,
+        height: u32,
+        format: Format,
+        yuv: YuvImage,
+    ) -> Result<Decoded, DecodeError> {
+        let (_, (cw, ch)) = plane_dims((width, height), yuv.subsampling);
+        let samples = |p: &Plane| match p {
+            Plane::U8(b) => b.len(),
+            Plane::U16(b) => b.len(),
+        };
+        if samples(&yuv.y) != width as usize * height as usize
+            || (yuv.subsampling != Subsampling::Mono
+                && (samples(&yuv.cb) != cw as usize * ch as usize
+                    || samples(&yuv.cr) != cw as usize * ch as usize))
+        {
+            return Err(DecodeError::Corrupt("yuv plane extent"));
+        }
+        Ok(Decoded { width, height, pixels: Pixels::Yuv(yuv), format })
+    }
+
+    /// Approximate resident size, for cache budget accounting.
+    pub fn resident_bytes(&self) -> usize {
+        fn plane(p: &Plane) -> usize {
+            match p {
+                Plane::U8(b) => b.len(),
+                Plane::U16(b) => b.len() * 2,
+            }
+        }
+        match &self.pixels {
+            Pixels::Rgba8(b) => b.len(),
+            Pixels::Yuv(y) => plane(&y.y) + plane(&y.cb) + plane(&y.cr),
+        }
+    }
+}
+
+/// Pixel count with a hostile-header cap (matches the image crate's 512 MiB
+/// allocation ceiling) times `bytes_per_pixel`.
+fn checked_extent(w: u32, h: u32, bpp: usize) -> Result<usize, DecodeError> {
+    let px = (w as u64).checked_mul(h as u64).filter(|&px| px <= MAX_PIXELS as u64);
+    match px {
+        Some(px) if px > 0 => Ok(px as usize * bpp),
+        _ => Err(DecodeError::Corrupt("bad dimensions")),
+    }
+}
+
+/// Hostile-header cap shared by all decoders, in pixels.
+pub const MAX_PIXELS: usize = 512 << 18;
+
 #[derive(Clone)]
 pub enum Pixels {
     /// Interleaved RGBA, `4 * width * height` bytes, row-major, top-first.
@@ -31,7 +101,7 @@ pub enum Pixels {
     /// Planar YUV; the renderer converts to RGB in its shader. Constructed
     /// only by the `avif` decoder.
     #[cfg_attr(not(feature = "avif"), allow(dead_code))]
-    Yuv(Arc<YuvImage>),
+    Yuv(YuvImage),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +134,7 @@ impl Format {
 /// Planar YUV image. 8-bit planes are one byte per sample; 10/12-bit are
 /// `u16` samples with `depth` significant bits (normalize by `(1<<depth)-1`).
 /// Dimensions ride on [`Decoded`]; plane sizes derive from them.
+#[derive(Clone)]
 pub struct YuvImage {
     pub depth: u8,
     pub subsampling: Subsampling,
@@ -96,11 +167,31 @@ pub enum Matrix {
 }
 
 #[derive(Clone)]
-// Plane data in the non-test build comes only from the `avif` decoder.
-#[cfg_attr(not(any(test, feature = "avif")), allow(dead_code))]
+// Plane data in non-`avif` builds arrives only from the image crate as RGBA.
+#[cfg_attr(not(feature = "avif"), allow(dead_code))]
 pub enum Plane {
     U8(Box<[u8]>),
     U16(Box<[u16]>),
+}
+
+/// Plane dims (y, chroma) for an image size and subsampling. Mono has no
+/// chroma (renderers substitute a 1x1 midpoint). Pure; testable.
+pub fn plane_dims(size: (u32, u32), s: Subsampling) -> ((u32, u32), (u32, u32)) {
+    let (w, h) = size;
+    match s {
+        Subsampling::Mono => ((w, h), (1, 1)),
+        Subsampling::Yuv420 => ((w, h), (w.div_ceil(2), h.div_ceil(2))),
+        Subsampling::Yuv422 => ((w, h), (w.div_ceil(2), h)),
+        Subsampling::Yuv444 => ((w, h), (w, h)),
+    }
+}
+
+/// Byte view of a plane (u16 planes are little-endian native pairs).
+pub fn plane_bytes(p: &Plane) -> &[u8] {
+    match p {
+        Plane::U8(b) => b,
+        Plane::U16(b) => bytemuck::cast_slice(b),
+    }
 }
 
 #[derive(Debug)]
@@ -224,12 +315,7 @@ fn decode_image(bytes: &[u8], format: Format) -> Result<Decoded, DecodeError> {
     img.apply_orientation(orientation);
     let rgba = img.to_rgba8();
     let (width, height) = (rgba.width(), rgba.height());
-    Ok(Decoded {
-        width,
-        height,
-        pixels: Pixels::Rgba8(rgba.into_raw().into_boxed_slice()),
-        format,
-    })
+    Decoded::rgba(width, height, format, rgba.into_raw().into_boxed_slice())
 }
 
 /// The frozen error type is `'static`, so the decoder's detail goes to stderr
@@ -249,9 +335,9 @@ fn image_error(format: Format, e: image::ImageError) -> DecodeError {
 mod avif {
     use libavif_sys::*;
 
-    use std::sync::Arc;
 
-    use super::{DecodeError, Decoded, Format, Matrix, Pixels, Plane, Subsampling, YuvImage};
+
+    use super::{DecodeError, Decoded, Format, Matrix, Plane, Subsampling, YuvImage};
 
     /// dav1d parallelism saturates quickly on stills; capped, knob baked in.
     const MAX_THREADS: usize = 8;
@@ -276,7 +362,10 @@ mod avif {
             }
             let (width, height) = ((*img).width as usize, (*img).height as usize);
             let depth = (*img).depth;
-            if width == 0 || height == 0 || !matches!(depth, 8 | 10 | 12 | 16) {
+            if !matches!(depth, 8 | 10 | 12 | 16) {
+                return Err(DecodeError::Corrupt("avif: bad depth"));
+            }
+            if (width as u64) * (height as u64) > super::MAX_PIXELS as u64 {
                 return Err(DecodeError::Corrupt("avif: bad dimensions"));
             }
             let subsampling = match (*img).yuvFormat {
@@ -304,20 +393,21 @@ mod avif {
                 Subsampling::Yuv422 => (width.div_ceil(2), height),
                 Subsampling::Yuv444 => (width, height),
             };
-            let y = copy_plane((*img).yuvPlanes[0], (*img).yuvRowBytes[0], width, height, depth)?;
-            let (cb, cr) = if subsampling == Subsampling::Mono {
-                (Plane::U8(Box::new([])), Plane::U8(Box::new([])))
+            let (y, cb, cr) = if subsampling == Subsampling::Mono {
+                (Plane::U8(Box::new([])), Plane::U8(Box::new([])), Plane::U8(Box::new([])))
             } else {
                 (
+                    copy_plane((*img).yuvPlanes[0], (*img).yuvRowBytes[0], width, height, depth)?,
                     copy_plane((*img).yuvPlanes[1], (*img).yuvRowBytes[1], cw, ch, depth)?,
                     copy_plane((*img).yuvPlanes[2], (*img).yuvRowBytes[2], cw, ch, depth)?,
                 )
             };
 
-            Ok(Decoded {
-                width: width as u32,
-                height: height as u32,
-                pixels: Pixels::Yuv(Arc::new(YuvImage {
+            super::Decoded::yuv(
+                width as u32,
+                height as u32,
+                Format::Avif,
+                YuvImage {
                     depth: depth as u8,
                     subsampling,
                     full_range,
@@ -325,9 +415,8 @@ mod avif {
                     y,
                     cb,
                     cr,
-                })),
-                format: Format::Avif,
-            })
+                },
+            )
         }
     }
 
@@ -402,7 +491,7 @@ mod jxl {
         JxlParallelRunner, JxlParallelRunnerFun, JxlPixelFormat, ProcessingResult,
     };
 
-    use super::{DecodeError, Decoded, Format, Pixels};
+    use super::{DecodeError, Decoded, Format};
 
     const MAX_THREADS: usize = 16;
     /// Decode output cap, in pixels: matches the image crate's 512 MiB
@@ -455,12 +544,7 @@ mod jxl {
             }
         }
 
-        Ok(Decoded {
-            width: w as u32,
-            height: h as u32,
-            pixels: Pixels::Rgba8(expand_rgba(&buf)),
-            format: Format::Jxl,
-        })
+        Decoded::rgba(w as u32, h as u32, Format::Jxl, expand_rgba(&buf))
     }
 
     fn threads() -> usize {

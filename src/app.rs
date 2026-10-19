@@ -1,8 +1,9 @@
 //! App: winit event handling, state transitions, frame composition.
 //!
-//! State is a single plain struct; every event maps
-//! to an `Action` first (pure, testable), then mutates state. The frame is:
-//! upload what the cache has -> draw pages -> paint egui status -> present.
+//! State is a single plain struct; every event maps to an `Action` first
+//! (pure, testable), then mutates state. The frame is: decide what should be
+//! on screen (pure reads of worker + state) -> upload what changed -> draw
+//! pages -> paint the egui status -> present.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -11,9 +12,9 @@ use egui_winit::winit;
 use winit::keyboard::KeyCode;
 
 use crate::page::{Source, Spread};
-use crate::render::{Pages, Window};
+use crate::render::{PageSlots, Window};
 use crate::view::{SpreadLayout, View};
-use crate::worker::Worker;
+use crate::worker::{Page, Worker};
 
 /// User events that wake the parked loop.
 pub enum UserEvent {
@@ -70,150 +71,116 @@ pub fn action(code: KeyCode) -> Option<Action> {
     }
 }
 
-/// Whether an action moves toward higher page indices: in RTL the "next"
-/// key (Right/Space) is visually leftward, so the arrows swap.
-pub fn forward_of(act: Action, rtl: bool) -> bool {
-    matches!(act, Action::Next) != rtl
+/// Whether an action advances reading order under the current direction.
+pub fn is_forward(act: Action, rtl: bool) -> bool {
+    match act {
+        Action::Next => !rtl,
+        Action::Prev => rtl,
+        _ => false,
+    }
 }
 
-/// Grace period before the status line admits the spread is still decoding.
-pub const WAIT_GRACE: Duration = Duration::from_millis(150);
+/// The GL bundle: everything that exists only between `resumed` and exit.
+/// Field order is drop order — slots and egui die while the window (and its
+/// context) still live.
+pub struct Gl {
+    pub slots: PageSlots,
+    pub egui: egui_glow::EguiGlow,
+    pub window: Window,
+}
 
 pub struct App {
     pub source: Arc<Source>,
     pub worker: Worker,
     pub state: State,
-    /// GL things exist only after `resumed` (winit requirement).
-    // Field order is drop order: Pages' textures and egui's GL objects must
-    // die while the context (owned by `window`) is still alive.
-    pub pages: Option<Pages>,
-    pub egui: Option<egui_glow::EguiGlow>,
-    pub window: Option<Window>,
+    /// GL exists only after `resumed` (winit requirement).
+    pub gl: Option<Gl>,
+    /// Window size the GL surface was last resized to (physical px).
+    pub last_win: (u32, u32),
     pub cursor: (f32, f32),
     pub dragging: bool,
-    /// Fatal-ish message (open/decode failure path); shown in the status line.
-    pub error: Option<String>,
-    /// Set when the current spread has undecoded pages (hold-last-frame rule:
-    /// keep showing what's on screen; the status line flags waiting after
-    /// 150 ms — no spinner animation that would force repaints).
+    /// Set when the current spread's first page is undecided (hold-last-frame
+    /// rule: keep showing what's on screen; the status line flags waiting
+    /// after 150 ms — no spinner animation that would force repaints).
     pub waiting_since: Option<Instant>,
+    /// Layout of the spread currently on screen; the memo pan/zoom needs
+    /// between frames.
     pub last_layout: SpreadLayout,
     /// Spread total the current view was fitted to; NaN forces a refit on
     /// the next frame (page turn, resize, decode arrival changes the shape).
     pub fitted_total: (f32, f32),
-    /// Window size the GL surface was last resized to.
-    pub last_win: (u32, u32),
-    /// Page index currently held by each texture slot. Texture uploads are
-    /// expensive (full re-upload + mipmaps); only upload on page change.
-    pub uploaded: [Option<usize>; 2],
     /// The user zoomed or panned since the last fit; suppresses the
     /// auto-refit that fires when a late-decoded page changes the spread
     /// shape (their view wins over geometry).
     pub user_moved: bool,
     /// Proxy for egui's repaint bridge. winit 0.30 cannot create one from
-    /// `ActiveEventLoop` (only `EventLoop::create_proxy`, before `run_app`),
-    /// so main() must pass one via [`App::set_proxy`]; until then the bridge
-    /// stays off (the status line never animates, so nothing is lost).
+    /// `ActiveEventLoop` (only `EventLoop::create_proxy`, before `run_app`).
     pub proxy: Option<winit::event_loop::EventLoopProxy<UserEvent>>,
 }
 
 impl App {
-    pub fn new(source: Arc<Source>, worker: Worker) -> App {
+    pub fn new(
+        source: Arc<Source>,
+        worker: Worker,
+        index: usize,
+        proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+    ) -> App {
         App {
             source,
             worker,
-            state: START,
-            pages: None,
-            egui: None,
-            window: None,
+            state: State { index, ..START },
+            gl: None,
+            last_win: (0, 0),
             cursor: (0.0, 0.0),
             dragging: false,
-            error: None,
             waiting_since: None,
             last_layout: SpreadLayout::default(),
             fitted_total: (f32::NAN, f32::NAN),
-            last_win: (0, 0),
-            uploaded: [None, None],
             user_moved: false,
-            proxy: None,
+            proxy: Some(proxy),
         }
     }
 
-    /// Hand over an event-loop proxy (cloneable, created in main before
-    /// `run_app`) so egui repaint requests can wake the parked loop.
-    pub fn set_proxy(&mut self, proxy: winit::event_loop::EventLoopProxy<UserEvent>) {
-        self.proxy = Some(proxy);
-    }
-
-    /// Spread for the current index/mode, with the tail pair clamped to the
-    /// book (a 6-page book ends on `5-` not `5-7`).
+    /// Spread for the current index/mode, clamped to the book.
     pub fn spread(&self) -> Spread {
-        let mut s = crate::page::spread_for(self.state.index, self.state.double);
-        if s.second.is_some_and(|p| p >= self.source.len()) {
-            s.second = None;
-        }
-        s
+        crate::page::spread_for(self.state.index, self.state.double, self.source.len())
     }
 
-    /// Feed the current spread to the renderer from the cache; returns the
-    /// layout used (also stored in `last_layout` for the status line).
-    pub fn sync_slots(&mut self) {
-        let spread = self.spread();
-        // Texture slots are visual (0 = left, 1 = right), matching
-        // SpreadLayout::rects; RTL seats the spread's first page on the right.
-        let left = if self.state.rtl { spread.second } else { Some(spread.first) };
-        let right = if self.state.rtl { Some(spread.first) } else { spread.second };
-        if let Some(pages) = self.pages.as_mut() {
-            for (slot, page) in [(0_usize, left), (1_usize, right)] {
-                match page.and_then(|p| self.worker.get(p)) {
-                    Some(d) if self.uploaded[slot] != page => {
-                        pages.set(slot, &d);
-                        self.uploaded[slot] = page;
-                    }
-                    // Slot without a page in this spread: nothing is coming,
-                    // drop the stale texture. Undecoded-but-wanted slots keep
-                    // their last frame (hold-last-frame rule).
-                    None if page.is_none() => {
-                        pages.clear(slot);
-                        self.uploaded[slot] = None;
-                    }
+    /// Upload what changed: for each visual seat (left, right) either the
+    /// freshly decoded page, or — when that page is undecided — nothing, so
+    /// the slot keeps its last frame (hold-last-frame rule). Seats without a
+    /// page in this spread are cleared.
+    fn sync_slots(&mut self, spread: &Spread) {
+        let seats = spread.seats(self.state.rtl);
+        if let Some(gl) = self.gl.as_mut() {
+            for (slot, &page) in seats.iter().enumerate() {
+                let shown = page.and_then(|p| self.worker.page(p));
+                match (page, shown) {
+                    (Some(p), Some(Page::Ready(d))) => gl.slots.set(slot, p, &d),
+                    (None, _) => gl.slots.clear(slot),
+                    // Undecided or failed: keep whatever the slot shows.
                     _ => {}
                 }
             }
         }
-        let dims = [
-            self.pages.as_ref().and_then(|p| p.size(0)),
-            self.pages.as_ref().and_then(|p| p.size(1)),
-        ];
-        self.last_layout = crate::view::layout(&spread, dims, self.state.rtl);
-        self.waiting_since = if self.worker.get(spread.first).is_some() {
-            None
-        } else {
-            Some(self.waiting_since.unwrap_or_else(Instant::now))
+        let dims = match self.gl.as_ref() {
+            Some(gl) => [gl.slots.size(0), gl.slots.size(1)],
+            None => [None, None],
         };
-        // Decode failures surface in the status line (worker stderr has detail).
-        if let Some(e) = self.worker.take_error() {
-            self.error = Some(e);
-        }
+        self.last_layout = crate::view::layout(dims);
     }
 
-    /// One frame: sync slots, draw pages, paint status, present.
+    /// One frame: decide, upload, draw, present.
     pub fn frame(&mut self) {
-        let size = {
-            let Some(window) = self.window.as_ref() else { return };
-            let size = window.winit.inner_size();
-            if size.width == 0 || size.height == 0 {
-                return; // minimized
-            }
-            if (size.width, size.height) != self.last_win {
-                window.resize(size);
-            }
-            size
+        let size = match self.surface_size() {
+            Some(size) => size,
+            None => return,
         };
-        self.last_win = (size.width, size.height);
         let win = (size.width as f32, size.height as f32);
 
-        self.sync_slots();
+        let spread = self.spread();
+        let first = self.worker.page(spread.first);
+        self.sync_slots(&spread);
 
         // Refit when the composed spread changed shape (page turn, resize,
         // newly decoded dims) — unless the user has zoomed/panned since the
@@ -226,6 +193,10 @@ impl App {
             self.fitted_total = total;
         }
 
+        self.waiting_since = match &first {
+            Some(Page::Ready(_)) | Some(Page::Failed(_)) => None,
+            None => Some(self.waiting_since.unwrap_or_else(Instant::now)),
+        };
         // While waiting on a decode, wake up once when the 150 ms status
         // grace expires so "decoding…" actually appears (loop parks otherwise).
         if let Some(since) = self.waiting_since {
@@ -237,34 +208,51 @@ impl App {
             }
         }
 
-        let spread = self.spread();
-        let first = self.worker.get(spread.first);
         let status = crate::ui::StatusLine {
-            page: self.state.index,
             total: self.source.len(),
             spread,
             double: self.state.double,
             rtl: self.state.rtl,
             source_label: self.source.label(),
-            format: first.as_ref().map(|d| d.format.label()),
-            dims: first.as_ref().map(|d| (d.width, d.height)),
+            format: match &first {
+                Some(Page::Ready(d)) => Some(d.format.label()),
+                _ => None,
+            },
+            dims: match &first {
+                Some(Page::Ready(d)) => Some((d.width, d.height)),
+                _ => None,
+            },
             zoom_percent: self.state.view.scale * 100.0,
             waiting: self.waiting_since.is_some_and(|t| t.elapsed() >= WAIT_GRACE),
-            error: self.error.clone(),
+            error: match &first {
+                Some(Page::Failed(e)) => Some(e.clone()),
+                _ => None,
+            },
         };
 
-        let (Some(window), Some(pages), Some(egui)) =
-            (&self.window, &self.pages, self.egui.as_mut())
-        else {
-            return;
-        };
-        egui.painter.clear([size.width, size.height], [0.08, 0.08, 0.09, 1.0]);
-        pages.draw(win, &self.last_layout, &self.state.view);
-        egui.run(&window.winit, |ui| crate::ui::show(ui, &status));
-        egui.paint(&window.winit);
-        window.pre_present_and_swap();
+        let Some(gl) = self.gl.as_mut() else { return };
+        gl.egui.painter.clear([size.width, size.height], [0.08, 0.08, 0.09, 1.0]);
+        gl.slots.draw(win, &self.last_layout, &self.state.view);
+        gl.egui.run(&gl.window.winit, |ui| crate::ui::show(ui, &status));
+        gl.egui.paint(&gl.window.winit);
+        gl.window.pre_present_and_swap();
         // First frame made it to the screen — no startup flash after this.
-        window.winit.set_visible(true);
+        gl.window.winit.set_visible(true);
+    }
+
+    /// Physical surface size, resizing the GL surface when it changed.
+    /// None when there is no window yet or it is minimized.
+    fn surface_size(&mut self) -> Option<winit::dpi::PhysicalSize<u32>> {
+        let gl = self.gl.as_ref()?;
+        let size = gl.window.winit.inner_size();
+        if size.width == 0 || size.height == 0 {
+            return None; // minimized
+        }
+        if (size.width, size.height) != self.last_win {
+            gl.window.resize(size);
+        }
+        self.last_win = (size.width, size.height);
+        Some(size)
     }
 
     /// Force a refit on the next frame and ask for one.
@@ -275,16 +263,16 @@ impl App {
     }
 
     fn request_redraw(&self) {
-        if let Some(window) = self.window.as_ref() {
-            window.winit.request_redraw();
+        if let Some(gl) = self.gl.as_ref() {
+            gl.window.winit.request_redraw();
         }
     }
 
     /// (spread total, window size), both in physical px — the pan/zoom math
     /// frame of reference.
     fn geometry(&self) -> ((f32, f32), (f32, f32)) {
-        let win = self.window.as_ref().map(|w| {
-            let s = w.winit.inner_size();
+        let win = self.gl.as_ref().map(|gl| {
+            let s = gl.window.winit.inner_size();
             (s.width as f32, s.height as f32)
         });
         (self.last_layout.total(), win.unwrap_or((0.0, 0.0)))
@@ -295,8 +283,12 @@ impl App {
             Action::Quit => event_loop.exit(),
             Action::ToggleDouble => {
                 self.state.double = !self.state.double;
-                self.state.index =
-                    crate::page::spread_for(self.state.index, self.state.double).first;
+                self.state.index = crate::page::spread_for(
+                    self.state.index,
+                    self.state.double,
+                    self.source.len(),
+                )
+                .first;
                 self.after_page_change();
             }
             Action::ToggleRtl => {
@@ -305,16 +297,15 @@ impl App {
             }
             Action::ToggleFullscreen => {
                 self.state.fullscreen = !self.state.fullscreen;
-                let fs = self.state.fullscreen.then_some(
-                    winit::window::Fullscreen::Borderless(None),
-                );
-                if let Some(window) = self.window.as_ref() {
-                    window.winit.set_fullscreen(fs);
+                let fs =
+                    self.state.fullscreen.then_some(winit::window::Fullscreen::Borderless(None));
+                if let Some(gl) = self.gl.as_ref() {
+                    gl.window.winit.set_fullscreen(fs);
                 }
             }
             Action::ResetView => self.needs_refit(),
             Action::Next | Action::Prev => {
-                let forward = forward_of(act, self.state.rtl);
+                let forward = is_forward(act, self.state.rtl);
                 self.state.index = crate::page::advance(
                     self.state.index,
                     forward,
@@ -328,7 +319,6 @@ impl App {
 
     fn after_page_change(&mut self) {
         self.needs_refit(); // fit to the new spread once its dims are known
-        self.error = None; // per-page errors do not outlive the page
         self.worker.focus(self.state.index); // cheap, never blocks
     }
 }
@@ -346,14 +336,9 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                 let _ = proxy.lock().send_event(UserEvent::Repaint(info.delay));
             });
         }
-        let pages = Pages::new(gl);
-        // Fresh GL objects: forget what the slots held, or a second `resumed`
-        // would skip uploads forever (slot tracking vs empty textures).
-        self.uploaded = [None, None];
+        let slots = PageSlots::new(gl);
         window.winit.request_redraw();
-        self.pages = Some(pages);
-        self.egui = Some(egui);
-        self.window = Some(window);
+        self.gl = Some(Gl { slots, egui, window });
     }
 
     fn user_event(&mut self, event_loop: &winit::event_loop::ActiveEventLoop, event: UserEvent) {
@@ -378,14 +363,11 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
     }
 
     fn exiting(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) {
-        // Teardown while the GL context still exists; egui_glow logs a leak
-        // warning if destroy() never runs. Field order makes this the default
-        // too, in case anything is dropped implicitly.
-        self.pages = None;
-        if let Some(egui) = self.egui.as_mut() {
-            egui.destroy();
+        // egui_glow logs a leak warning if destroy() never runs; field order
+        // handles the rest (slots and egui drop before the window/context).
+        if let Some(mut gl) = self.gl.take() {
+            gl.egui.destroy();
         }
-        self.window = None;
     }
 
     fn window_event(
@@ -400,32 +382,24 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
         if matches!(event, WindowEvent::CloseRequested | WindowEvent::Destroyed) {
             event_loop.exit();
         }
-        if self.window.is_none() {
+        if self.gl.is_none() {
             return;
         }
 
         // Give egui the event first; if it wants the pointer, we don't pan/zoom.
         let egui_wants = {
-            let window = self.window.as_ref().unwrap();
-            match self.egui.as_mut() {
-                Some(egui) => {
-                    let response = egui.on_window_event(&window.winit, &event);
-                    let wants = egui.egui_ctx.egui_wants_pointer_input();
-                    if response.repaint {
-                        window.winit.request_redraw();
-                    }
-                    wants
-                }
-                None => false,
+            let Gl { egui, window, .. } = self.gl.as_mut().unwrap();
+            let response = egui.on_window_event(&window.winit, &event);
+            let wants = egui.egui_ctx.egui_wants_pointer_input();
+            if response.repaint {
+                window.winit.request_redraw();
             }
+            wants
         };
 
         match &event {
-            WindowEvent::Resized(size) => {
-                if let Some(window) = self.window.as_ref() {
-                    window.resize(*size);
-                }
-                self.last_win = (size.width, size.height);
+            WindowEvent::Resized(_) => {
+                self.surface_size();
                 self.needs_refit();
             }
             WindowEvent::KeyboardInput { event: key, .. } => {
@@ -440,13 +414,13 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::MouseWheel { delta, .. } if !egui_wants => {
                 let dy = {
-                    let Some(window) = self.window.as_ref() else { return };
+                    let Some(gl) = self.gl.as_ref() else { return };
                     match delta {
                         MouseScrollDelta::LineDelta(_, y) => *y,
                         // PixelDelta is physical; normalize so zoom speed
                         // doesn't change with the output scale factor.
                         MouseScrollDelta::PixelDelta(p) => {
-                            p.y as f32 / (40.0 * window.winit.scale_factor() as f32)
+                            p.y as f32 / (40.0 * gl.window.winit.scale_factor() as f32)
                         }
                     }
                 };
@@ -482,6 +456,9 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
     }
 }
 
+/// How long a page may stay undecided before the status line says so.
+const WAIT_GRACE: Duration = Duration::from_millis(150);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -506,20 +483,20 @@ mod tests {
     #[test]
     fn forward_follows_reading_direction() {
         // Western: Right/Space advances.
-        assert!(forward_of(Action::Next, false));
-        assert!(!forward_of(Action::Prev, false));
+        assert!(is_forward(Action::Next, false));
+        assert!(!is_forward(Action::Prev, false));
         // RTL manga: the same keys flip — Left-ward "next" reads forward.
-        assert!(!forward_of(Action::Next, true));
-        assert!(forward_of(Action::Prev, true));
+        assert!(!is_forward(Action::Next, true));
+        assert!(is_forward(Action::Prev, true));
     }
 
     #[test]
     fn page_turn_respects_rtl() {
-        // advance() composes with forward_of: in RTL, "Next" from page 1
+        // advance() composes with is_forward: in RTL, "Next" from page 1
         // moves to page 0 (the cover), in western to page 2.
-        let fwd = forward_of(Action::Next, true);
+        let fwd = is_forward(Action::Next, true);
         assert_eq!(crate::page::advance(1, fwd, false, 10), 0);
-        let fwd = forward_of(Action::Next, false);
+        let fwd = is_forward(Action::Next, false);
         assert_eq!(crate::page::advance(1, fwd, false, 10), 2);
     }
 }

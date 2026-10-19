@@ -1,6 +1,6 @@
 //! View math: how a composed spread (1–2 pages) is placed in the window.
-//! Pure data, no GL. Ported functions from
-//! research/prototype-rawgl/src/main.rs (fit, zoom_at) and add spread layout.
+//! Pure data, no GL. Ported functions from research/prototype-rawgl
+//! (fit, zoom_at) plus the spread composition.
 
 /// Placement of the composed spread: scale is screen px per image px, offset
 /// is the screen position of the composed spread's top-left corner.
@@ -17,12 +17,12 @@ pub struct PageRect {
     pub size: (f32, f32),
 }
 
-/// Layout of a spread: which page index (if decoded and part of the spread)
-/// occupies which rect. In RTL mode the *first* page of the pair goes on the
-/// RIGHT (manga reading order); `rects` is always [left_slot, right_slot].
+/// Layout of a spread's visual slots: `rects` is always [left, right]; slot
+/// seating (which page goes where) was decided before layout by
+/// [`crate::page::Spread::seats`]. A slot with no decoded page yet is `None`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SpreadLayout {
-    pub rects: [Option<(usize, PageRect)>; 2],
+    pub rects: [Option<PageRect>; 2],
 }
 
 impl SpreadLayout {
@@ -30,7 +30,7 @@ impl SpreadLayout {
     pub fn total(&self) -> (f32, f32) {
         let mut w: f32 = 0.0;
         let mut h: f32 = 0.0;
-        for (_, r) in self.rects.iter().flatten() {
+        for r in self.rects.iter().flatten() {
             w += r.size.0;
             h = h.max(r.size.1);
         }
@@ -40,25 +40,12 @@ impl SpreadLayout {
 
 /// Compose one or two pages side by side, top-aligned. `dims[i]` is the
 /// decoded size of visual slot i (0 = left, 1 = right; None while still
-/// decoding). RTL swaps slot assignment. Pages whose dims are unknown are
-/// skipped (shown when ready).
-pub fn layout(
-    spread: &crate::page::Spread,
-    dims: [Option<(u32, u32)>; 2],
-    rtl: bool,
-) -> SpreadLayout {
-    // Which page sits left/right: western reads first-left; manga reads
-    // first-right, so a lone page lands in the right slot.
-    let left = if rtl { spread.second } else { Some(spread.first) };
-    let right = if rtl { Some(spread.first) } else { spread.second };
-    let live = |d: Option<(u32, u32)>| d.filter(|&(w, h)| w > 0 && h > 0);
-
-    let mut rects: [Option<(usize, PageRect)>; 2] = [None, None];
+/// decoding — that page joins the layout when it arrives).
+pub fn layout(dims: [Option<(u32, u32)>; 2]) -> SpreadLayout {
+    let mut rects: [Option<PageRect>; 2] = [None, None];
     let mut x = 0.0;
-    for (slot, page) in [(0, left), (1, right)] {
-        if let (Some(p), Some((w, h))) = (page, live(dims[slot])) {
-            rects[slot] =
-                Some((p, PageRect { pos: (x, 0.0), size: (w as f32, h as f32) }));
+    for (slot, dims) in dims.iter().enumerate() {
+        if let Some((w, h)) = *dims {            rects[slot] = Some(PageRect { pos: (x, 0.0), size: (w as f32, h as f32) });
             x += w as f32;
         }
     }
@@ -124,63 +111,31 @@ pub fn clamp(view: View, total: (f32, f32), win: (f32, f32)) -> View {
 mod tests {
     use super::*;
 
-    fn rect(pos: (f32, f32), size: (f32, f32)) -> (usize, PageRect) {
-        (0, PageRect { pos, size })
-    }
-
     #[test]
-    fn layout_symmetric_pair_western() {
-        let spread = crate::page::Spread { first: 1, second: Some(2) };
-        let l = layout(&spread, [Some((100, 200)), Some((100, 200))], false);
-        assert_eq!(l.rects[0].unwrap().0, 1);
-        assert_eq!(l.rects[0].unwrap().1, rect((0.0, 0.0), (100.0, 200.0)).1);
-        assert_eq!(l.rects[1].unwrap().0, 2);
-        assert_eq!(l.rects[1].unwrap().1, rect((100.0, 0.0), (100.0, 200.0)).1);
-        assert_eq!(l.total(), (200.0, 200.0));
-    }
-
-    #[test]
-    fn layout_symmetric_pair_rtl_swaps() {
-        let spread = crate::page::Spread { first: 1, second: Some(2) };
-        let l = layout(&spread, [Some((100, 200)), Some((100, 200))], true);
-        // first page (1) on the RIGHT, second (2) on the LEFT
-        assert_eq!(l.rects[0].unwrap().0, 2);
-        assert_eq!(l.rects[1].unwrap().0, 1);
+    fn layout_places_slots_left_to_right() {
+        let l = layout([Some((100, 200)), Some((100, 200))]);
+        assert_eq!(l.rects[0], Some(PageRect { pos: (0.0, 0.0), size: (100.0, 200.0) }));
+        assert_eq!(l.rects[1], Some(PageRect { pos: (100.0, 0.0), size: (100.0, 200.0) }));
         assert_eq!(l.total(), (200.0, 200.0));
     }
 
     #[test]
     fn layout_asymmetric_pair_top_aligned() {
-        let spread = crate::page::Spread { first: 1, second: Some(2) };
-        // western: first (100x300) left, second (200x150) right
-        let l = layout(&spread, [Some((100, 300)), Some((200, 150))], false);
-        assert_eq!(l.rects[0].unwrap().1, rect((0.0, 0.0), (100.0, 300.0)).1);
-        assert_eq!(l.rects[1].unwrap().1, rect((100.0, 0.0), (200.0, 150.0)).1);
+        let l = layout([Some((100, 300)), Some((200, 150))]);
+        assert_eq!(l.rects[0], Some(PageRect { pos: (0.0, 0.0), size: (100.0, 300.0) }));
+        assert_eq!(l.rects[1], Some(PageRect { pos: (100.0, 0.0), size: (200.0, 150.0) }));
         assert_eq!(l.total(), (300.0, 300.0)); // widths sum, heights max
     }
 
     #[test]
-    fn layout_single_page_western_left_rtl_right() {
-        let spread = crate::page::Spread { first: 5, second: None };
-        let west = layout(&spread, [Some((80, 120)), None], false);
-        assert_eq!(west.rects[0].unwrap().0, 5);
-        assert_eq!(west.rects[1], None);
-        let rtl = layout(&spread, [None, Some((80, 120))], true);
-        assert_eq!(rtl.rects[0], None);
-        assert_eq!(rtl.rects[1].unwrap().0, 5);
-        assert_eq!(rtl.rects[1].unwrap().1, rect((0.0, 0.0), (80.0, 120.0)).1);
-    }
-
-    #[test]
-    fn layout_skips_undecoded_second_slot() {
-        let spread = crate::page::Spread { first: 1, second: Some(2) };
-        let l = layout(&spread, [Some((100, 200)), None], false);
+    fn layout_skips_undecoded_slots() {
+        let l = layout([Some((100, 200)), None]);
         assert_eq!(l.rects[1], None);
         assert_eq!(l.total(), (100.0, 200.0));
-        // and an undecoded first slot leaves the second starting at x=0
-        let l = layout(&spread, [None, Some((100, 200))], false);
+        // an undecoded left slot leaves the right page starting at x=0
+        let l = layout([None, Some((100, 200))]);
         assert_eq!(l.rects[0], None);
-        assert_eq!(l.rects[1].unwrap().1, rect((0.0, 0.0), (100.0, 200.0)).1);
+        assert_eq!(l.rects[1], Some(PageRect { pos: (0.0, 0.0), size: (100.0, 200.0) }));
     }
 
     #[test]

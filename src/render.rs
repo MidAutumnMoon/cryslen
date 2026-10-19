@@ -15,7 +15,7 @@ use egui_winit::winit;
 use glow::HasContext;
 use winit::raw_window_handle::HasWindowHandle as _;
 
-use crate::decode::{Decoded, Matrix, Pixels, Plane, Subsampling};
+use crate::decode::{plane_bytes, plane_dims, Decoded, Matrix, Pixels, Plane, Subsampling};
 use crate::view::{SpreadLayout, View};
 
 /// Fixed -1..1 strip; the VS places it at the slot's screen rect from
@@ -201,7 +201,9 @@ impl Window {
 
 /// Up to two page slots, each an RGBA texture or a YUV plane triple.
 /// Upload happens on the main thread at frame time; pan/zoom are uniforms.
-pub struct Pages {
+/// Each slot remembers which page it holds, so `set` with an unchanged page
+/// is a no-op — callers never need to mirror GPU state on their side.
+pub struct PageSlots {
     gl: Arc<glow::Context>,
     program: <glow::Context as glow::HasContext>::Program,
     vao: <glow::Context as glow::HasContext>::VertexArray,
@@ -212,6 +214,8 @@ pub struct Pages {
 
 /// One page slot's GPU state. Plain data; objects freed on replace/clear.
 struct Slot {
+    /// Page whose pixels the textures hold (`None` when empty).
+    page: Option<usize>,
     texture: Option<Textures>,
     size: (u32, u32),
     uniforms: PageUniforms,
@@ -242,11 +246,11 @@ const RGBA_UNIFORMS: PageUniforms = PageUniforms {
 };
 
 fn empty_slot() -> Slot {
-    Slot { texture: None, size: (0, 0), uniforms: RGBA_UNIFORMS, norm: 1.0 }
+    Slot { page: None, texture: None, size: (0, 0), uniforms: RGBA_UNIFORMS, norm: 1.0 }
 }
 
-impl Pages {
-    pub fn new(gl: Arc<glow::Context>) -> Pages {
+impl PageSlots {
+    pub fn new(gl: Arc<glow::Context>) -> PageSlots {
         let (vs, fs) = if gl.version().is_embedded { (VS_ES, FS_ES) } else { (VS_CORE, FS_CORE) };
         let compile = |kind, src| unsafe {
             let sh = gl.create_shader(kind).unwrap();
@@ -285,13 +289,17 @@ impl Pages {
             }
         }
         let max_tex = unsafe { gl.get_parameter_i32(glow::MAX_TEXTURE_SIZE) } as u32;
-        Pages { gl, program, vao, slots: [empty_slot(), empty_slot()], vbo, max_tex }
+        PageSlots { gl, program, vao, slots: [empty_slot(), empty_slot()], vbo, max_tex }
     }
 
-    /// Upload decoded pixels into slot `i` (0/1). Panics loudly on
+    /// Upload decoded pixels of `page` into visual slot `i` (0 = left,
+    /// 1 = right); re-uploading the same page is a no-op. Panics loudly on
     /// MAX_TEXTURE_SIZE violations (challenge finding: never fail black).
-    pub fn set(&mut self, slot: usize, page: &Decoded) {
-        let (w, h) = (page.width, page.height);
+    pub fn set(&mut self, slot: usize, page: usize, decoded: &Decoded) {
+        if self.slots[slot].page == Some(page) {
+            return;
+        }
+        let (w, h) = (decoded.width, decoded.height);
         // Fail loudly instead of uploading an oversized texture that GL
         // silently rejects (it then samples as black).
         assert!(w > 0 && h > 0, "decoded page has zero dimension");
@@ -302,7 +310,7 @@ impl Pages {
         );
         self.clear(slot);
         let gl = &self.gl;
-        let textures = match &page.pixels {
+        let textures = match &decoded.pixels {
             Pixels::Rgba8(b) => {
                 assert_eq!(b.len(), w as usize * h as usize * 4, "rgba byte length");
                 Textures::Rgba(upload_rgba(gl, b, (w, h)))
@@ -341,22 +349,26 @@ impl Pages {
                 Textures::Yuv { y: y_t, cb: cb_t, cr: cr_t }
             }
         };
+        self.slots[slot].page = Some(page);
         self.slots[slot].texture = Some(textures);
         self.slots[slot].size = (w, h);
-        self.slots[slot].uniforms = PageUniforms::from(&page.pixels);
+        self.slots[slot].uniforms = PageUniforms::from(&decoded.pixels);
     }
 
-    /// Clear a slot (page left the spread or failed to decode).
+    /// Clear a slot (page left the spread — undecoded-but-wanted pages keep
+    /// their last frame instead, per the hold-last-frame rule).
     pub fn clear(&mut self, slot: usize) {
         if let Some(t) = self.slots[slot].texture.take() {
             delete_textures(&self.gl, &t);
+            self.slots[slot].page = None;
             self.slots[slot].size = (0, 0);
             self.slots[slot].norm = 1.0;
         }
     }
 
+    /// Decoded size of the page held by the slot, if any.
     pub fn size(&self, slot: usize) -> Option<(u32, u32)> {
-        Some(self.slots[slot].size)
+        self.slots[slot].texture.as_ref().map(|_| self.slots[slot].size)
     }
 
     /// Draw the spread laid out by `layout` with `view`. Sets viewport,
@@ -378,10 +390,9 @@ impl Pages {
             gl.bind_vertex_array(Some(self.vao));
             let u = |name: &str| gl.get_uniform_location(self.program, name);
             gl.uniform_2_f32(u("u_win").as_ref(), win.0, win.1);
-            // `rects` is [left_slot, right_slot] by array position; the usize
-            // inside is the page id (the app keeps slots in sync with it).
-            for (slot, entry) in layout.rects.iter().enumerate() {
-                let Some((_, rect)) = entry else { continue };
+            // `rects` is [left_slot, right_slot] by array position.
+            for (slot, rect) in layout.rects.iter().enumerate() {
+                let Some(rect) = rect else { continue };
                 let Some(s) = self.slots.get(slot) else { continue };
                 let Some(tex) = &s.texture else { continue };
                 // Whole-pixel rect origin; LINEAR samples shimmer at 1:1 zoom
@@ -428,7 +439,7 @@ impl Pages {
     }
 }
 
-impl Drop for Pages {
+impl Drop for PageSlots {
     fn drop(&mut self) {
         // Delete while the context still lives; the app must drop Pages
         // before Window (challenge F7 teardown ordering).
@@ -550,25 +561,6 @@ impl From<&Pixels> for PageUniforms {
     }
 }
 
-/// Plane dims (y, chroma) for an image size and subsampling. Pure; testable.
-pub fn plane_dims(size: (u32, u32), s: Subsampling) -> ((u32, u32), (u32, u32)) {
-    let (w, h) = size;
-    match s {
-        Subsampling::Mono => ((w, h), (1, 1)),
-        Subsampling::Yuv420 => ((w, h), (w.div_ceil(2), h.div_ceil(2))),
-        Subsampling::Yuv422 => ((w, h), (w.div_ceil(2), h)),
-        Subsampling::Yuv444 => ((w, h), (w, h)),
-    }
-}
-
-/// Byte view of a plane (u16 planes are little-endian native pairs).
-pub fn plane_bytes(p: &Plane) -> &[u8] {
-    match p {
-        Plane::U8(b) => b,
-        Plane::U16(b) => bytemuck::cast_slice(b),
-    }
-}
-
 /// Shader subsampling id: 0 mono, 1 = 420, 2 = 422, 3 = 444.
 fn chroma_id(s: Subsampling) -> u32 {
     match s {
@@ -620,18 +612,6 @@ mod tests {
     /// Row `r`, column `c` of the math matrix (storage is column-major).
     fn e(m: &[f32; 9], r: usize, c: usize) -> f32 {
         m[c * 3 + r]
-    }
-
-    #[test]
-    fn plane_dims_table() {
-        assert_eq!(plane_dims((7, 5), Subsampling::Mono), ((7, 5), (1, 1)));
-        assert_eq!(plane_dims((7, 5), Subsampling::Yuv420), ((7, 5), (4, 3)));
-        assert_eq!(plane_dims((7, 5), Subsampling::Yuv422), ((7, 5), (4, 5)));
-        assert_eq!(plane_dims((7, 5), Subsampling::Yuv444), ((7, 5), (7, 5)));
-        assert_eq!(plane_dims((8, 6), Subsampling::Yuv420), ((8, 6), (4, 3)));
-        assert_eq!(plane_dims((8, 6), Subsampling::Yuv422), ((8, 6), (4, 6)));
-        assert_eq!(plane_dims((1, 1), Subsampling::Yuv420), ((1, 1), (1, 1)));
-        assert_eq!(plane_dims((16385, 3), Subsampling::Yuv422), ((16385, 3), (8193, 3)));
     }
 
     #[test]
@@ -705,13 +685,13 @@ mod tests {
     #[test]
     fn page_uniforms_from_pixels() {
         assert_eq!(PageUniforms::from(&Pixels::Rgba8(Box::default())), RGBA_UNIFORMS);
-        let yuv = Pixels::Yuv(Arc::new(crate::decode::YuvImage {
+        let yuv = Pixels::Yuv(crate::decode::YuvImage {
             depth: 10,
             subsampling: Subsampling::Yuv420,
             full_range: false,
             matrix: Matrix::Bt2020,
             y: Plane::U8(Box::default()), cb: Plane::U8(Box::default()), cr: Plane::U8(Box::default()),
-        }));
+        });
         let u = PageUniforms::from(&yuv);
         assert_eq!((u.mode, u.subsampling, u.depth, u.full_range, u.matrix),
             (1, Subsampling::Yuv420, 10, false, Matrix::Bt2020));

@@ -62,9 +62,7 @@ fn main() {
     });
     worker.focus(index);
 
-    let mut app = App::new(source, worker);
-    app.state.index = index;
-    app.set_proxy(event_loop.create_proxy());
+    let mut app = App::new(source, worker, index, event_loop.create_proxy());
     event_loop.run_app(&mut app).expect("event loop");
 }
 

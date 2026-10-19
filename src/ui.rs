@@ -6,8 +6,6 @@ use crate::page::Spread;
 /// Everything the status line shows. Built by the app each frame from plain
 /// state; no logic lives here.
 pub struct StatusLine {
-    /// 0-based index of the spread's first page.
-    pub page: usize,
     pub total: usize,
     pub spread: Spread,
     pub double: bool,
@@ -32,7 +30,7 @@ pub fn show(ui: &mut egui::Ui, status: &StatusLine) {
 
 /// The single status line; separate so it is directly testable.
 pub fn line(status: &StatusLine) -> String {
-    let mut head = format!("{}/{}", status.page + 1, status.total);
+    let mut head = format!("{}/{}", status.spread.first + 1, status.total);
     if let Some(second) = status.spread.second {
         head.push_str(&format!("-{}", second + 1));
     }
@@ -69,7 +67,6 @@ mod tests {
 
     fn status() -> StatusLine {
         StatusLine {
-            page: 11,
             total: 214,
             spread: Spread { first: 11, second: Some(12) },
             double: true,
@@ -102,7 +99,6 @@ mod tests {
     #[test]
     fn single_page_and_unknown_format() {
         let mut s = status();
-        s.page = 4;
         s.spread = Spread { first: 4, second: None };
         s.double = false;
         s.rtl = false;

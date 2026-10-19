@@ -20,7 +20,7 @@ pub enum SourceKind {
 }
 
 #[derive(Debug)]
-pub enum OpenError {
+pub enum SourceError {
     NotFound(PathBuf),
     Empty,
     Unsupported(PathBuf),
@@ -29,15 +29,15 @@ pub enum OpenError {
     Io(String),
 }
 
-impl std::fmt::Display for OpenError {
+impl std::fmt::Display for SourceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            OpenError::NotFound(p) => write!(f, "not found: {}", p.display()),
-            OpenError::Empty => write!(f, "no image pages found"),
-            OpenError::Unsupported(p) => write!(f, "unsupported source: {}", p.display()),
-            OpenError::Zip(e) => write!(f, "zip: {e}"),
-            OpenError::SevenZip(e) => write!(f, "7z: {e}"),
-            OpenError::Io(e) => write!(f, "io: {e}"),
+            SourceError::NotFound(p) => write!(f, "not found: {}", p.display()),
+            SourceError::Empty => write!(f, "no image pages found"),
+            SourceError::Unsupported(p) => write!(f, "unsupported source: {}", p.display()),
+            SourceError::Zip(e) => write!(f, "zip: {e}"),
+            SourceError::SevenZip(e) => write!(f, "7z: {e}"),
+            SourceError::Io(e) => write!(f, "io: {e}"),
         }
     }
 }
@@ -53,8 +53,8 @@ pub struct Source {
 impl Source {
     /// `path` is a directory, or `.zip`/`.cbz`/`.7z`/`.cb7` archive. Listing is
     /// filtered to image extensions and natural-sorted (natord).
-    pub fn open(path: &Path) -> Result<Source, OpenError> {
-        if std::fs::metadata(path).map_err(|_| OpenError::NotFound(path.to_path_buf()))?.is_dir() {
+    pub fn open(path: &Path) -> Result<Source, SourceError> {
+        if std::fs::metadata(path).map_err(|_| SourceError::NotFound(path.to_path_buf()))?.is_dir() {
             return Source::open_dir(path);
         }
         let ext = path
@@ -65,13 +65,13 @@ impl Source {
         match ext.as_str() {
             "zip" | "cbz" => Source::open_zip(path),
             "7z" | "cb7" => Source::open_sevenzip(path),
-            _ => Err(OpenError::Unsupported(path.to_path_buf())),
+            _ => Err(SourceError::Unsupported(path.to_path_buf())),
         }
     }
 
-    fn open_dir(dir: &Path) -> Result<Source, OpenError> {
+    fn open_dir(dir: &Path) -> Result<Source, SourceError> {
         let mut names: Vec<String> = std::fs::read_dir(dir)
-            .map_err(|e| OpenError::Io(format!("{}: {e}", dir.display())))?
+            .map_err(|e| SourceError::Io(format!("{}: {e}", dir.display())))?
             .filter_map(|entry| entry.ok())
             .filter(|entry| entry.file_type().is_ok_and(|t| t.is_file()))
             .filter_map(|entry| entry.file_name().into_string().ok())
@@ -84,10 +84,10 @@ impl Source {
     /// The archive handle opened here stays open for the session; `bytes`
     /// reads go through it (the prototype's per-page reopen cost a central
     /// directory parse each time).
-    fn open_zip(path: &Path) -> Result<Source, OpenError> {
-        let file = std::fs::File::open(path).map_err(|e| OpenError::Zip(e.to_string()))?;
+    fn open_zip(path: &Path) -> Result<Source, SourceError> {
+        let file = std::fs::File::open(path).map_err(|e| SourceError::Zip(e.to_string()))?;
         let zip = zip::ZipArchive::new(std::io::BufReader::new(file))
-            .map_err(|e| OpenError::Zip(e.to_string()))?;
+            .map_err(|e| SourceError::Zip(e.to_string()))?;
         // Non-UTF-8 entry names are skipped (zip 9 reports them as errors).
         let mut names: Vec<String> = zip
             .file_names()
@@ -105,9 +105,9 @@ impl Source {
     /// Listing needs one archive walk; `bytes` reopens per read —
     /// sevenz-rust2's `ArchiveReader` owns its file and there is no cheap
     /// handle to keep here.
-    fn open_sevenzip(path: &Path) -> Result<Source, OpenError> {
+    fn open_sevenzip(path: &Path) -> Result<Source, SourceError> {
         let archive = sevenz_rust2::ArchiveReader::open(path, sevenz_rust2::Password::empty())
-            .map_err(|e| OpenError::SevenZip(e.to_string()))?;
+            .map_err(|e| SourceError::SevenZip(e.to_string()))?;
         let mut names: Vec<String> = archive
             .archive()
             .files
@@ -120,9 +120,9 @@ impl Source {
         Source::from_names(SourceKind::SevenZip(path.to_path_buf()), names)
     }
 
-    fn from_names(kind: SourceKind, names: Vec<String>) -> Result<Source, OpenError> {
+    fn from_names(kind: SourceKind, names: Vec<String>) -> Result<Source, SourceError> {
         if names.is_empty() {
-            return Err(OpenError::Empty);
+            return Err(SourceError::Empty);
         }
         Ok(Source { kind, names, zip: None })
     }
@@ -146,37 +146,37 @@ impl Source {
 
     /// Raw encoded bytes of one page. Zip reads go through the persistent
     /// archive handle; 7z reopens per read (sevenz-rust2 limitation).
-    pub fn bytes(&self, index: usize) -> Result<Box<[u8]>, OpenError> {
+    pub fn bytes(&self, index: usize) -> Result<Box<[u8]>, SourceError> {
         let name = self
             .names
             .get(index)
-            .ok_or_else(|| OpenError::Io(format!("page {index} out of range")))?;
+            .ok_or_else(|| SourceError::Io(format!("page {index} out of range")))?;
         match &self.kind {
             SourceKind::Directory(dir) => std::fs::read(dir.join(name))
                 .map(Vec::into_boxed_slice)
-                .map_err(|e| OpenError::Io(e.to_string())),
+                .map_err(|e| SourceError::Io(e.to_string())),
             SourceKind::Zip(_) => {
                 let zip = self
                     .zip
                     .as_ref()
-                    .ok_or_else(|| OpenError::Zip("archive handle lost".to_string()))?;
+                    .ok_or_else(|| SourceError::Zip("archive handle lost".to_string()))?;
                 // A poisoned lock only means a read panicked mid-flight; the
                 // archive itself is still readable, so recover the data.
                 let mut archive = match zip.lock() {
                     Ok(guard) => guard,
                     Err(poisoned) => poisoned.into_inner(),
                 };
-                let mut entry = archive.by_name(name).map_err(|e| OpenError::Zip(e.to_string()))?;
+                let mut entry = archive.by_name(name).map_err(|e| SourceError::Zip(e.to_string()))?;
                 let mut buf = Vec::new();
-                entry.read_to_end(&mut buf).map_err(|e| OpenError::Zip(e.to_string()))?;
+                entry.read_to_end(&mut buf).map_err(|e| SourceError::Zip(e.to_string()))?;
                 Ok(buf.into_boxed_slice())
             }
             SourceKind::SevenZip(path) => {
                 let mut archive = sevenz_rust2::ArchiveReader::open(path, sevenz_rust2::Password::empty())
-                    .map_err(|e| OpenError::SevenZip(e.to_string()))?;
+                    .map_err(|e| SourceError::SevenZip(e.to_string()))?;
                 archive
                     .read_file(name)
-                    .map_err(|e| OpenError::SevenZip(e.to_string()))
+                    .map_err(|e| SourceError::SevenZip(e.to_string()))
                     .map(Into::into)
             }
         }
@@ -196,8 +196,11 @@ pub struct Spread {
     pub second: Option<usize>,
 }
 
-/// Spread containing `index` when double-page mode is on/off.
-pub fn spread_for(index: usize, double: bool) -> Spread {
+/// Spread containing `index` when double-page mode is on/off, clamped to the
+/// book: an odd tail shows one page (`second: None`), never a phantom page.
+pub fn spread_for(index: usize, double: bool, len: usize) -> Spread {
+    let len = len.max(1);
+    let index = index.min(len - 1);
     if !double {
         return Spread { first: index, second: None };
     }
@@ -205,14 +208,28 @@ pub fn spread_for(index: usize, double: bool) -> Spread {
         return Spread { first: 0, second: None };
     }
     let first = 1 + ((index - 1) / 2) * 2;
-    Spread { first, second: Some(first + 1) }
+    Spread { first, second: (first + 1 < len).then_some(first + 1) }
 }
 
-/// Next/previous spread start from `current`. Clamps at the ends.
+/// Next/previous spread start from `current`. Clamps at the ends and always
+/// returns a spread *start* (stepping from the cover in double mode lands on
+/// the start of the second spread, not on its right page).
 pub fn advance(current: usize, forward: bool, double: bool, len: usize) -> usize {
     let step = if double { 2 } else { 1 };
     let next = if forward { current.saturating_add(step) } else { current.saturating_sub(step) };
-    next.min(len.saturating_sub(1))
+    spread_for(next, double, len).first
+}
+
+impl Spread {
+    /// Visual seating as [left, right]: western reads first-left; manga reads
+    /// first-right, so a lone page lands in the right slot.
+    pub fn seats(&self, rtl: bool) -> [Option<usize>; 2] {
+        if rtl {
+            [self.second, Some(self.first)]
+        } else {
+            [Some(self.first), self.second]
+        }
+    }
 }
 
 #[cfg(test)]
@@ -304,42 +321,56 @@ mod tests {
     fn open_errors() {
         assert!(matches!(
             Source::open(Path::new("/nonexistent-cryslen-dir")),
-            Err(OpenError::NotFound(_))
+            Err(SourceError::NotFound(_))
         ));
         let empty = TempDir::new("pageempty");
-        assert!(matches!(Source::open(empty.path()), Err(OpenError::Empty)));
+        assert!(matches!(Source::open(empty.path()), Err(SourceError::Empty)));
         let dir = TempDir::new("pageunsup");
         dir.write("book.rar", b"not really a rar");
         assert!(matches!(
             Source::open(&dir.path().join("book.rar")),
-            Err(OpenError::Unsupported(_))
+            Err(SourceError::Unsupported(_))
         ));
     }
 
     #[test]
     fn cover_alone_then_pairs() {
-        assert_eq!(spread_for(0, true), Spread { first: 0, second: None });
-        assert_eq!(spread_for(1, true), Spread { first: 1, second: Some(2) });
-        assert_eq!(spread_for(2, true), Spread { first: 1, second: Some(2) });
-        assert_eq!(spread_for(3, true), Spread { first: 3, second: Some(4) });
-        assert_eq!(spread_for(0, false), Spread { first: 0, second: None });
-        assert_eq!(spread_for(5, false), Spread { first: 5, second: None });
+        assert_eq!(spread_for(0, true, 10), Spread { first: 0, second: None });
+        assert_eq!(spread_for(1, true, 10), Spread { first: 1, second: Some(2) });
+        assert_eq!(spread_for(2, true, 10), Spread { first: 1, second: Some(2) });
+        assert_eq!(spread_for(3, true, 10), Spread { first: 3, second: Some(4) });
+        assert_eq!(spread_for(0, false, 10), Spread { first: 0, second: None });
+        assert_eq!(spread_for(5, false, 10), Spread { first: 5, second: None });
     }
 
     #[test]
-    fn odd_tail() {
+    fn odd_tail_clamps_at_source() {
         // 7 pages: index 6 lives in pair (5, 6).
-        assert_eq!(spread_for(6, true), Spread { first: 5, second: Some(6) });
-        // pair (5, 6) with 6 pages: layout skips the out-of-range slot.
-        assert_eq!(spread_for(5, true).first, 5);
+        assert_eq!(spread_for(6, true, 7), Spread { first: 5, second: Some(6) });
+        // 6 pages: the would-be pair (5, 6) shows page 5 alone — no phantom.
+        assert_eq!(spread_for(5, true, 6), Spread { first: 5, second: None });
+        // Out-of-range index clamps to the last page.
+        assert_eq!(spread_for(99, true, 6).first, 5);
     }
 
     #[test]
-    fn advance_steps_and_clamps() {
+    fn advance_steps_clamps_and_rebases() {
         assert_eq!(advance(1, true, true, 10), 3);
         assert_eq!(advance(3, false, true, 10), 1);
-        assert_eq!(advance(8, true, true, 9), 8);
+        assert_eq!(advance(8, true, true, 9), 7); // rebase: 8+2=10 -> clamp -> spread (7,8)
         assert_eq!(advance(1, false, true, 10), 0);
         assert_eq!(advance(4, true, false, 10), 5);
+        // The cover's next spread starts at 1, not 2 (status-line bug class).
+        assert_eq!(advance(0, true, true, 10), 1);
+    }
+
+    #[test]
+    fn seats_follow_reading_direction() {
+        let s = Spread { first: 1, second: Some(2) };
+        assert_eq!(s.seats(false), [Some(1), Some(2)]);
+        assert_eq!(s.seats(true), [Some(2), Some(1)]);
+        let lone = Spread { first: 5, second: None };
+        assert_eq!(lone.seats(false), [Some(5), None]);
+        assert_eq!(lone.seats(true), [None, Some(5)]);
     }
 }
