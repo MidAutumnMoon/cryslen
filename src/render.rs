@@ -137,7 +137,10 @@ impl Window {
         use glutin::prelude::GlSurface as _;
         use winit::raw_window_handle::HasDisplayHandle as _;
 
+        use winit::platform::wayland::WindowAttributesExtWayland as _;
+
         let attrs = winit::window::WindowAttributes::default()
+            .with_name("cryslen", "cryslen")
             .with_resizable(true)
             .with_inner_size(winit::dpi::LogicalSize { width: INITIAL_WINDOW_WIDTH, height: INITIAL_WINDOW_HEIGHT })
             .with_title("cryslen");
