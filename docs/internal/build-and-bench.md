@@ -6,26 +6,15 @@ machine.
 ## Nix devShell (needed for every build)
 
 The vendored build chain for libavif-sys's dav1d: `cmake`, `meson`,
-`ninja`, `perl`, `clang`, `pkg-config`, and a **nasm shim** (below).
-The flake's
+`ninja`, `perl`, `clang`, `pkg-config`, and `nasm` (dav1d's x86
+assembly requires it). The flake's
 `packages.default` mirrors the devShell as `nativeBuildInputs` for
 `buildRustPackage` with `cargoLock.lockFile = ./Cargo.lock`, so keep
 the lockfile committed.
 
-### The nasm shim (do not remove casually)
-
-aom's cmake configure greps `nasm -hf` output for the literal "-Ox".
-nasm 3.x still supports the flag but dropped it from the help text, so
-configure fails with "Unsupported nasm: multipass optimization not
-supported". The shim appends the line for `-hf` and execs the real
-nasm otherwise.
-
-**Cache trap:** when the toolchain changes (e.g. adding the shim),
-CMake caches `CMAKE_ASM_NASM_COMPILER` by absolute store path in
-`target*/build/libaom-sys-*/out/build/CMakeCache.txt`. `cargo clean -p
-libaom-sys` does not clear it. Delete the build dir manually before
-rebuilding, or the stale path keeps failing while the shim looks
-innocent.
+aom's cmake greps `nasm -hf` for `-Ox` and rejects nasm 3.x, but aom
+is not in this tree (`codec-dav1d` only). If `codec-aom` ever joins,
+prefer yasm or a patched libaom-sys over a wrapper script.
 
 ## Cargo feature hygiene for a Wayland-only build
 

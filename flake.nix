@@ -8,16 +8,6 @@
       inherit (nixpkgs) lib;
       systems = [ "x86_64-linux" ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
-      # aom's cmake configure greps `nasm -hf` for "-Ox", which nasm 3.x
-      # dropped from the help text though the flag works.
-      nasm-aom-shim = pkgs: pkgs.writeShellScriptBin "nasm" ''
-        if [ "$1" = "-hf" ]; then
-          ${pkgs.nasm}/bin/nasm "$@"
-          echo "  -Ox                     multipass optimization (shim)"
-        else
-          exec ${pkgs.nasm}/bin/nasm "$@"
-        fi
-      '';
     in
     {
       devShells = forAllSystems (system:
@@ -26,7 +16,7 @@
             packages = [
               # toolchain to build the native deps (dav1d via libavif-sys)
               pkgs.cmake
-              (nasm-aom-shim pkgs)
+              pkgs.nasm
               pkgs.meson
               pkgs.ninja
               pkgs.perl
@@ -51,7 +41,7 @@
             cargoLock.lockFile = ./Cargo.lock;
             nativeBuildInputs = [
               pkgs.cmake
-              (nasm-aom-shim pkgs)
+              pkgs.nasm
               pkgs.meson
               pkgs.ninja
               pkgs.perl
