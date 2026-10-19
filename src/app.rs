@@ -54,6 +54,13 @@ pub enum Action {
     ResetView,
 }
 
+impl Action {
+    /// Whether a held key keeps firing this action. Only paging repeats.
+    fn repeats(self) -> bool {
+        matches!(self, Action::Next | Action::Prev)
+    }
+}
+
 /// Key map, baked in. Arrows are directional: Right means Next, Left means
 /// Prev. The app swaps them when `rtl` is on, because the reading direction
 /// decides, not the key label.
@@ -418,11 +425,12 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                 self.needs_refit();
             }
             WindowEvent::KeyboardInput { event: key, .. } => {
-                // Auto-repeat must not re-toggle mode keys at ~30 Hz.
-                if key.state == ElementState::Pressed && !key.repeat {
+                if key.state == ElementState::Pressed {
                     if let PhysicalKey::Code(code) = key.physical_key {
                         if let Some(act) = action(code) {
-                            self.dispatch(act, event_loop);
+                            if !key.repeat || act.repeats() {
+                                self.dispatch(act, event_loop);
+                            }
                         }
                     }
                 }
@@ -504,6 +512,22 @@ mod tests {
         assert_eq!(action(KeyCode::PageUp), Some(Action::Prev));
         assert_eq!(action(KeyCode::KeyA), None);
         assert_eq!(action(KeyCode::ArrowUp), None);
+    }
+
+    #[test]
+    fn only_paging_repeats_on_hold() {
+        assert!(Action::Next.repeats());
+        assert!(Action::Prev.repeats());
+        let one_shot = [
+            Action::Quit,
+            Action::ToggleDouble,
+            Action::ToggleRtl,
+            Action::ToggleFullscreen,
+            Action::ResetView,
+        ];
+        for act in one_shot {
+            assert!(!act.repeats());
+        }
     }
 
     #[test]

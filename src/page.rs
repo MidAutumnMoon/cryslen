@@ -203,17 +203,35 @@ pub fn spread_for(index: usize, double: bool, len: usize) -> Spread {
     if index == 0 {
         return Spread { first: 0, second: None };
     }
-    let first = 1 + ((index - 1) / 2) * 2;
+    let first = spread_start(spread_number(index));
     Spread { first, second: (first + 1 < len).then_some(first + 1) }
 }
 
-/// Next/previous spread start from `current`. Clamps at the ends and always
-/// returns a spread *start* (stepping from the cover in double mode lands on
-/// the start of the second spread, not on its right page).
+/// Next/previous spread start from `current`, wrapping at the ends: forward
+/// from the last spread lands on the cover, backward from the cover on the
+/// last spread. Always returns a spread *start*.
 pub fn advance(current: usize, forward: bool, double: bool, len: usize) -> usize {
-    let step = if double { 2 } else { 1 };
-    let next = if forward { current.saturating_add(step) } else { current.saturating_sub(step) };
-    spread_for(next, double, len).first
+    let len = len.max(1);
+    let current = current.min(len - 1);
+    if !double {
+        let next = if forward { current + 1 } else { current + len - 1 };
+        return next % len;
+    }
+    // Double mode cycles spreads: the lone cover, then the pairs.
+    let spreads = 1 + (len - 1).div_ceil(2);
+    let number = spread_number(current);
+    let next = if forward { (number + 1) % spreads } else { (number + spreads - 1) % spreads };
+    spread_start(next)
+}
+
+/// 0-based spread number of a page: the cover is 0, pages 1 and 2 share 1.
+fn spread_number(page: usize) -> usize {
+    page.div_ceil(2)
+}
+
+/// First page of a double-mode spread number: pairs start on odd pages.
+fn spread_start(number: usize) -> usize {
+    if number > 0 { 2 * number - 1 } else { 0 }
 }
 
 impl Spread {
@@ -345,14 +363,61 @@ mod tests {
     }
 
     #[test]
-    fn advance_steps_clamps_and_rebases() {
+    fn advance_steps_and_wraps() {
         assert_eq!(advance(1, true, true, 10), 3);
         assert_eq!(advance(3, false, true, 10), 1);
-        assert_eq!(advance(8, true, true, 9), 7); // rebase: 8+2=10 -> clamp -> spread (7,8)
+        // 8 is the second page of the last spread (7, 8). Forward wraps to
+        // the cover.
+        assert_eq!(advance(8, true, true, 9), 0);
         assert_eq!(advance(1, false, true, 10), 0);
         assert_eq!(advance(4, true, false, 10), 5);
         // The cover's next spread starts at 1, not 2 (status-line bug class).
         assert_eq!(advance(0, true, true, 10), 1);
+    }
+
+    #[test]
+    fn advance_wraps_at_both_ends() {
+        // Single mode: last page to first and back.
+        assert_eq!(advance(9, true, false, 10), 0);
+        assert_eq!(advance(0, false, false, 10), 9);
+        // Double mode with a lone tail page.
+        assert_eq!(advance(9, true, true, 10), 0);
+        assert_eq!(advance(0, false, true, 10), 9);
+        // Double mode ending on a full pair.
+        assert_eq!(advance(7, true, true, 9), 0);
+        assert_eq!(advance(0, false, true, 9), 7);
+        // Odd tail: 6 pages are 0 | 1,2 | 3,4 | 5.
+        assert_eq!(advance(5, true, true, 6), 0);
+        assert_eq!(advance(0, false, true, 6), 5);
+    }
+
+    #[test]
+    fn advance_round_trips_through_spread_starts() {
+        // Stepping forward then backward returns to the spread the start
+        // came from, for every book size and mode.
+        for len in [1, 2, 3, 6, 9, 10] {
+            for &double in &[false, true] {
+                for page in 0..len {
+                    for &forward in &[false, true] {
+                        let stepped = advance(page, forward, double, len);
+                        let back = advance(stepped, !forward, double, len);
+                        assert_eq!(back, spread_for(page, double, len).first);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn advance_tiny_books() {
+        assert_eq!(advance(0, true, true, 1), 0);
+        assert_eq!(advance(0, false, false, 1), 0);
+        // 2 pages, double mode: cover and one lone page cycle into each
+        // other.
+        assert_eq!(advance(0, true, true, 2), 1);
+        assert_eq!(advance(1, true, true, 2), 0);
+        // A zero-length book never exists, but the math must tolerate it.
+        assert_eq!(advance(0, true, true, 0), 0);
     }
 
     #[test]
