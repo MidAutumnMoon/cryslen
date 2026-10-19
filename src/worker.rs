@@ -14,9 +14,9 @@ const BUDGET_BYTES: usize = 512 * 1024 * 1024;
 
 /// Wakes the loop so it can observe `stop` and exit (sent by `Drop`).
 const SENTINEL: usize = usize::MAX;
-
-/// Cache entry: the decode outcome, not just the success case. A failed page
-/// is sticky — waiting, error display, and hold-last-frame are all pure reads
+/// Cache entry: the decode outcome, not just the success case. A failed
+/// page is sticky, so waiting, error display, and hold-last-frame are all
+/// pure reads of this map and the failure follows the page across turns.
 /// of the same map, and the failure follows the page across turns.
 pub enum Page {
     Ready(Arc<Decoded>),
@@ -43,7 +43,7 @@ impl Page {
 
 /// Cache shared between worker (writer) and app (reader). Byte budget is the
 /// approximate sum of decoded buffer sizes; eviction is simplest-first (drop
-/// arbitrary non-current entries) — no LRU machinery.
+/// arbitrary non-current entries). There is no LRU machinery.
 struct PageCache {
     map: HashMap<usize, Page>,
     budget: usize,
@@ -240,8 +240,7 @@ fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
 const PREFETCH_RADIUS: i64 = 2;
 
 /// Decode order around the focused page: the page itself, then neighbours
-/// out to [`PREFETCH_RADIUS`], nearest first. Includes the current page;
-/// `run` passes the focused page to the cache explicitly.
+/// out to [`PREFETCH_RADIUS`], nearest first (the current page included).
 pub fn window(current: usize, len: usize) -> Vec<usize> {
     let mut pages: Vec<usize> = (0..=PREFETCH_RADIUS)
         .flat_map(|distance| {

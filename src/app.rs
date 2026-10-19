@@ -1,9 +1,7 @@
 //! App: winit event handling, state transitions, frame composition.
 //!
 //! State is a single plain struct; every event maps to an `Action` first
-//! (pure, testable), then mutates state. The frame is: decide what should be
-//! on screen (pure reads of worker + state) -> upload what changed -> draw
-//! pages -> paint the egui status -> present.
+//! (pure, testable), then mutates state.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -81,8 +79,8 @@ pub fn is_forward(act: Action, rtl: bool) -> bool {
 }
 
 /// The GL bundle: everything that exists only between `resumed` and exit.
-/// Field order is drop order — slots and egui die while the window (and its
-/// context) still live.
+/// Field order is drop order: slots and egui are dropped while the window
+/// (which owns the GL context) is still alive.
 pub struct Gl {
     pub slots: PageSlots,
     pub egui: egui_glow::EguiGlow,
@@ -198,7 +196,8 @@ impl App {
             None => Some(self.waiting_since.unwrap_or_else(Instant::now)),
         };
         // While waiting on a decode, wake up once when the 150 ms status
-        // grace expires so "decoding…" actually appears (loop parks otherwise).
+        // grace expires so "decoding…" appears. Without this the loop stays
+        // parked and the flag never shows.
         if let Some(since) = self.waiting_since {
             let shown = since.elapsed();
             if shown < WAIT_GRACE {
@@ -236,7 +235,8 @@ impl App {
         gl.egui.run(&gl.window.winit, |ui| crate::ui::show(ui, &status));
         gl.egui.paint(&gl.window.winit);
         gl.window.pre_present_and_swap();
-        // First frame made it to the screen — no startup flash after this.
+        // Reveal only after the first frame is presented, so the window
+        // never maps empty.
         gl.window.winit.set_visible(true);
     }
 
@@ -268,8 +268,8 @@ impl App {
         }
     }
 
-    /// (spread total, window size), both in physical px — the pan/zoom math
-    /// frame of reference.
+    /// (spread total, window size) in physical px, the coordinate frame that
+    /// pan and zoom work in.
     fn geometry(&self) -> ((f32, f32), (f32, f32)) {
         let window = self.gl.as_ref().map(|gl| {
             let window_size = gl.window.winit.inner_size();
@@ -363,8 +363,8 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
     }
 
     fn exiting(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) {
-        // egui_glow logs a leak warning if destroy() never runs; field order
-        // handles the rest (slots and egui drop before the window/context).
+        // egui_glow logs a leak warning if destroy() never runs. Drop order is
+        // Gl's documented invariant.
         if let Some(mut gl) = self.gl.take() {
             gl.egui.destroy();
         }
@@ -450,7 +450,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::RedrawRequested => {
                 self.frame();
-                // Idle: park the loop — zero CPU until the next input.
+                // Park until the next input, so idle costs nothing.
                 event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
             }
             _ => {}

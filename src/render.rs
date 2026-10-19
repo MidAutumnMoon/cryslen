@@ -5,8 +5,7 @@
 //! Two page slots, YUV plane textures with shader-side conversion, spread
 //! layout draw. Chroma siting (avifChromaSamplePosition) is not applied — the
 //! default co-sited/midway assumption biases chroma by at most half a texel,
-//! invisible in practice. The app clears the framebuffer each frame; `draw`
-//! renders only the page quads.
+//! invisible in practice.
 
 use core::num::NonZeroU32;
 use std::sync::Arc;
@@ -122,8 +121,7 @@ impl Window {
         unsafe { Self::create(event_loop) }
     }
 
-    /// glutin-on-winit creation (egui_glow's pure_glow pattern): prefer
-    /// desktop GL, fall back to GLES; swap is non-blocking.
+    /// Prefer desktop GL, fall back to GLES; the swap is non-blocking.
     unsafe fn create(event_loop: &winit::event_loop::ActiveEventLoop) -> Window {
         use glutin::context::NotCurrentGlContext as _;
         use glutin::display::{GetGlDisplay as _, GlDisplay as _};
@@ -338,7 +336,6 @@ impl PageSlots {
                 // safe fallback on an ES context.
                 let filterable = !(gl.version().is_embedded && wide);
                 let expect = |plane: &Plane, want_samples: usize, what: &str| {
-                    // U16 planes are two bytes per sample.
                     let want_bytes = want_samples * if wide { 2 } else { 1 };
                     assert_eq!(plane_bytes(plane).len(), want_bytes, "{what} plane bytes");
                 };
@@ -389,11 +386,9 @@ impl PageSlots {
         self.slots[slot].texture.as_ref().map(|_| self.slots[slot].size)
     }
 
-    /// Draw the spread laid out by `layout` with `view`. Sets viewport,
-    /// disables blend, pixel-snaps offsets; one quad per occupied slot.
-    /// YUV pages sample their planes and convert in-shader (subsampling,
-    /// depth, range, matrix passed as uniforms derived from `Pixels`).
-    /// Does NOT clear — the app owns the framebuffer clear each frame.
+    /// Draw the spread laid out by `layout` with `view`.
+    ///
+    /// Does not clear; the app owns the framebuffer clear each frame.
     pub fn draw(&self, win: (f32, f32), layout: &SpreadLayout, view: &View) {
         let gl = &self.gl;
         if win.0 <= 0.0 || win.1 <= 0.0 {
@@ -409,7 +404,6 @@ impl PageSlots {
             let uniform_location =
                 |name: &str| gl.get_uniform_location(self.program, name);
             gl.uniform_2_f32(uniform_location("u_win").as_ref(), win.0, win.1);
-            // `rects` is [left_slot, right_slot] by array position.
             for (slot, rect) in layout.rects.iter().enumerate() {
                 let Some(rect) = rect else { continue };
                 let Some(slot_state) = self.slots.get(slot) else { continue };
@@ -572,8 +566,7 @@ fn upload_plane(
     texture
 }
 
-/// How the shader should read a slot's texture set. Derived CPU-side; passed
-/// as uniforms. Purely data — no per-variant shader programs.
+/// How the shader should read a slot's texture set, derived CPU-side.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PageUniforms {
     /// 0 = RGBA, 1 = YUV

@@ -252,7 +252,6 @@ mod tests {
         assert_eq!(source.label(), "cb7");
         assert_eq!(source.names, ["p1.png", "p2.png"]);
         let bytes = source.bytes(0).expect("first page reads");
-        // It is the PNG we packed (magic; IHDR big-endian dims 40x30).
         assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
         let width = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
         let height = u32::from_be_bytes(bytes[20..24].try_into().unwrap());
@@ -272,12 +271,7 @@ mod tests {
         let source = Source::open(dir.path()).expect("dir opens");
         assert_eq!(source.len(), 4);
         assert_eq!(source.label(), "dir");
-        // c2 sorts before c10 (natord), extension filter drops notes.txt,
-        // uppercase .PNG still counts as an image.
-        assert_eq!(
-            source.names,
-            ["c1.png", "c2.png", "c10.png", "cover.PNG"]
-        );
+        assert_eq!(source.names, ["c1.png", "c2.png", "c10.png", "cover.PNG"]);
         assert_eq!(source.name(2), "c10.png");
     }
 

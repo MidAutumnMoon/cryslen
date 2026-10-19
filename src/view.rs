@@ -94,7 +94,7 @@ pub const KEEP: f32 = 64.0;
 
 /// Clamp pan so the spread cannot be lost: at least `KEEP` px of it stays
 /// inside the window. An axis where the scaled spread fits the window is
-/// pinned to the centered position. Simple and predictable, no rubber bands.
+/// pinned to the centered position.
 pub fn clamp(view: View, total: (f32, f32), window: (f32, f32)) -> View {
     let axis = |offset: f32, content: f32, window: f32| -> f32 {
         if content <= window {
@@ -130,7 +130,7 @@ mod tests {
         let l = layout([Some((100, 300)), Some((200, 150))]);
         assert_eq!(l.rects[0], Some(PageRect { pos: (0.0, 0.0), size: (100.0, 300.0) }));
         assert_eq!(l.rects[1], Some(PageRect { pos: (100.0, 0.0), size: (200.0, 150.0) }));
-        assert_eq!(l.total(), (300.0, 300.0)); // widths sum, heights max
+        assert_eq!(l.total(), (300.0, 300.0));
     }
 
     #[test]

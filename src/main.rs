@@ -24,7 +24,6 @@ fn main() {
     });
     let path = Path::new(&arg);
 
-    // A bare image file: view its directory, starting at that page.
     let start = if path.is_file() && !is_archive(path) {
         // Path::parent() yields Some("") for bare relative names ("pic.jpg").
         let dir = path

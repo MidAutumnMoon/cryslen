@@ -5,9 +5,6 @@
 //! shader-side color conversion. JXL (feature `jxl`) uses jxl-rs with a
 //! scoped-thread parallel runner.
 //!
-//! `unsafe` in cryslen lives in exactly two places: render.rs (GL) and the
-//! libavif FFI block below (feature `avif`). Nothing else touches it.
-//!
 //! All functions here are panics-clean for corrupt input: they return
 //! `DecodeError`, never panic (wrap decoder panics with catch_unwind where a
 //! crate documents panics; the worker also has a boundary as belt-and-braces).
@@ -286,7 +283,7 @@ fn sniff(bytes: &[u8]) -> Option<Format> {
     None
 }
 
-/// AVIF lives in an ISOBMFF `ftyp` box; check the major + compatible brands.
+/// AVIF files start with an ISOBMFF `ftyp` box.
 fn sniff_ftyp_avif(bytes: &[u8]) -> bool {
     if bytes.len() < 12 || &bytes[4..8] != b"ftyp" {
         return false;
@@ -494,7 +491,6 @@ mod avif {
         }
     }
 
-    /// Destroys the decoder on every exit path.
     struct DecoderGuard(*mut avifDecoder);
     impl Drop for DecoderGuard {
         fn drop(&mut self) {
