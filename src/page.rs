@@ -207,9 +207,9 @@ pub fn spread_for(index: usize, double: bool, len: usize) -> Spread {
     Spread { first, second: (first + 1 < len).then_some(first + 1) }
 }
 
-/// Next/previous spread start from `current`, wrapping at the ends: forward
-/// from the last spread lands on the cover, backward from the cover on the
-/// last spread. Always returns a spread *start*.
+/// Next/previous spread start from `current`, wrapping at the ends.
+/// Forward from the last spread lands on the cover, and backward from the
+/// cover on the last spread. Always returns a spread *start*.
 pub fn advance(current: usize, forward: bool, double: bool, len: usize) -> usize {
     let len = len.max(1);
     let current = current.min(len - 1);
@@ -217,19 +217,20 @@ pub fn advance(current: usize, forward: bool, double: bool, len: usize) -> usize
         let next = if forward { current + 1 } else { current + len - 1 };
         return next % len;
     }
-    // Double mode cycles spreads: the lone cover, then the pairs.
+    // The double-mode cycle is the lone cover, then the pairs.
     let spreads = 1 + (len - 1).div_ceil(2);
     let number = spread_number(current);
     let next = if forward { (number + 1) % spreads } else { (number + spreads - 1) % spreads };
     spread_start(next)
 }
 
-/// 0-based spread number of a page: the cover is 0, pages 1 and 2 share 1.
+/// 0-based spread number of a page. The cover is 0, and pages 1 and 2
+/// share 1.
 fn spread_number(page: usize) -> usize {
     page.div_ceil(2)
 }
 
-/// First page of a double-mode spread number: pairs start on odd pages.
+/// First page of a double-mode spread number. Pairs start on odd pages.
 fn spread_start(number: usize) -> usize {
     if number > 0 { 2 * number - 1 } else { 0 }
 }
@@ -366,8 +367,7 @@ mod tests {
     fn advance_steps_and_wraps() {
         assert_eq!(advance(1, true, true, 10), 3);
         assert_eq!(advance(3, false, true, 10), 1);
-        // 8 is the second page of the last spread (7, 8). Forward wraps to
-        // the cover.
+        // 8 is the second page of the last spread (7, 8).
         assert_eq!(advance(8, true, true, 9), 0);
         assert_eq!(advance(1, false, true, 10), 0);
         assert_eq!(advance(4, true, false, 10), 5);
@@ -393,8 +393,7 @@ mod tests {
 
     #[test]
     fn advance_round_trips_through_spread_starts() {
-        // Stepping forward then backward returns to the spread the start
-        // came from, for every book size and mode.
+        // A mid-spread page round-trips to its spread start, not to itself.
         for len in [1, 2, 3, 6, 9, 10] {
             for &double in &[false, true] {
                 for page in 0..len {
