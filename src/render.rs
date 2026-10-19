@@ -1,0 +1,719 @@
+//! GL rendering: window/context (glutin-on-winit) and the page quad renderer.
+//! All GL `unsafe` lives here behind safe functions (the only other unsafe in
+//! cryslen is decode.rs's libavif FFI block, behind the `avif` feature).
+//!
+//! Two page slots, YUV plane textures with shader-side conversion, spread
+//! layout draw. Chroma siting (avifChromaSamplePosition) is not applied — the
+//! default co-sited/midway assumption biases chroma by at most half a texel,
+//! invisible in practice. The app clears the framebuffer each frame; `draw`
+//! renders only the page quads.
+
+use core::num::NonZeroU32;
+use std::sync::Arc;
+
+use egui_winit::winit;
+use glow::HasContext;
+use winit::raw_window_handle::HasWindowHandle as _;
+
+use crate::decode::{Decoded, Matrix, Pixels, Plane, Subsampling};
+use crate::view::{SpreadLayout, View};
+
+/// Fixed -1..1 strip; the VS places it at the slot's screen rect from
+/// uniforms, so pan/zoom never touch vertex data. Top-origin math lives in
+/// the VS (GL clip space is bottom-origin; winit coords are top-origin).
+const VS_CORE: &str = r#"
+    #version 330 core
+    in vec2 pos;
+    uniform vec2 u_win;    // window size, px
+    uniform vec2 u_offset; // slot rect origin, screen px
+    uniform vec2 u_size;   // slot rect size, screen px
+    out vec2 v_px;
+    void main() {
+        vec2 px = u_offset + (pos * 0.5 + 0.5) * u_size;
+        v_px = px;
+        gl_Position = vec4(px.x / u_win.x * 2.0 - 1.0, 1.0 - px.y / u_win.y * 2.0, 0.0, 1.0);
+    }"#;
+
+/// One shader, both pixel layouts: mode/subsampling/depth/range/matrix arrive
+/// as uniforms, so there are no per-variant programs. Chroma is sampled
+/// bilinearly at cosited scaled coordinates; for 444 that is exact.
+const FS_CORE: &str = r#"
+    #version 330 core
+    in vec2 v_px;
+    out vec4 color;
+    uniform vec2 u_offset;
+    uniform vec2 u_scale;  // screen px per image px
+    uniform vec2 u_img;    // image size, texels
+    uniform vec2 u_csize;  // chroma plane size, texels
+    uniform int u_mode;    // 0 = RGBA, 1 = YUV
+    uniform int u_chroma;  // 0 mono, 1 = 420, 2 = 422, 3 = 444
+    uniform float u_norm;  // depth normalize (1.0 for 8-bit storage)
+    uniform vec3 u_yuv_off;
+    uniform mat3 u_mat;
+    uniform sampler2D u_tex0; // RGBA or Y
+    uniform sampler2D u_tex1; // Cb (1x1 midpoint for mono)
+    uniform sampler2D u_tex2; // Cr
+    void main() {
+        // Fragment centers interpolate to image texel centers at 1:1 zoom
+        // (ip = k + 0.5), so ip / u_img already addresses texel centers —
+        // no extra half-texel offset.
+        vec2 ip = (v_px - u_offset) / u_scale;
+        if (u_mode == 0) { color = vec4(texture(u_tex0, ip / u_img).rgb, 1.0); return; }
+        float y = texture(u_tex0, ip / u_img).r;
+        vec2 ratio = u_chroma == 1 ? vec2(0.5) : vec2(u_chroma == 2 ? 0.5 : 1.0, 1.0);
+        vec2 cuv = ip * ratio / u_csize;
+        vec3 yuv = vec3(y, texture(u_tex1, cuv).r, texture(u_tex2, cuv).r);
+        color = vec4(u_mat * (yuv * u_norm - u_yuv_off), 1.0);
+    }"#;
+
+const VS_ES: &str = r#"
+    #version 300 es
+    in vec2 pos;
+    uniform vec2 u_win;
+    uniform vec2 u_offset;
+    uniform vec2 u_size;
+    out vec2 v_px;
+    void main() {
+        vec2 px = u_offset + (pos * 0.5 + 0.5) * u_size;
+        v_px = px;
+        gl_Position = vec4(px.x / u_win.x * 2.0 - 1.0, 1.0 - px.y / u_win.y * 2.0, 0.0, 1.0);
+    }"#;
+
+// highp: mediump may be fp16 — ulp at 16k image px is 8.0, wrecking the
+// coordinate math (challenge F5; ES3 mandates highp support).
+const FS_ES: &str = r#"
+    #version 300 es
+    precision highp float;
+    in vec2 v_px;
+    out vec4 color;
+    uniform vec2 u_offset;
+    uniform vec2 u_scale;
+    uniform vec2 u_img;
+    uniform vec2 u_csize;
+    uniform int u_mode;
+    uniform int u_chroma;
+    uniform float u_norm;
+    uniform vec3 u_yuv_off;
+    uniform mat3 u_mat;
+    uniform sampler2D u_tex0;
+    uniform sampler2D u_tex1;
+    uniform sampler2D u_tex2;
+    void main() {
+        vec2 ip = (v_px - u_offset) / u_scale;
+        if (u_mode == 0) { color = vec4(texture(u_tex0, ip / u_img).rgb, 1.0); return; }
+        float y = texture(u_tex0, ip / u_img).r;
+        vec2 ratio = u_chroma == 1 ? vec2(0.5) : vec2(u_chroma == 2 ? 0.5 : 1.0, 1.0);
+        vec2 cuv = ip * ratio / u_csize;
+        vec3 yuv = vec3(y, texture(u_tex1, cuv).r, texture(u_tex2, cuv).r);
+        color = vec4(u_mat * (yuv * u_norm - u_yuv_off), 1.0);
+    }"#;
+
+/// Window + EGL context + surface. vsync is DontWait; the app must call
+/// `pre_present_and_swap()` to present (Wayland frame pacing inside).
+pub struct Window {
+    pub winit: winit::window::Window,
+    gl: Arc<glow::Context>,
+    surface: glutin::surface::Surface<glutin::surface::WindowSurface>,
+    context: glutin::context::PossiblyCurrentContext,
+}
+
+impl Window {
+    pub fn new(event_loop: &winit::event_loop::ActiveEventLoop) -> Window {
+        unsafe { Self::create(event_loop) }
+    }
+
+    /// glutin-on-winit creation (egui_glow's pure_glow pattern): prefer
+    /// desktop GL, fall back to GLES; swap is non-blocking.
+    unsafe fn create(event_loop: &winit::event_loop::ActiveEventLoop) -> Window {
+        use glutin::context::NotCurrentGlContext as _;
+        use glutin::display::{GetGlDisplay as _, GlDisplay as _};
+        use glutin::prelude::GlSurface as _;
+
+        let attrs = winit::window::WindowAttributes::default()
+            .with_resizable(true)
+            .with_inner_size(winit::dpi::LogicalSize { width: 1000.0, height: 750.0 })
+            .with_title("cryslen");
+
+        let (mut window, gl_config) =
+            glutin_winit::DisplayBuilder::new()
+                .with_preference(glutin_winit::ApiPreference::FallbackEgl)
+                .with_window_attributes(Some(attrs.clone()))
+                .build(event_loop, glutin::config::ConfigTemplateBuilder::new(), |mut it| {
+                    it.next().expect("no GL config")
+                })
+                .expect("create GL config");
+        let gl_display = gl_config.display();
+
+        let raw = window.as_ref().map(|w| w.window_handle().unwrap().as_raw());
+        let ctx_attrs = glutin::context::ContextAttributesBuilder::new().build(raw);
+        let fallback = glutin::context::ContextAttributesBuilder::new()
+            .with_context_api(glutin::context::ContextApi::Gles(None))
+            .build(raw);
+        let not_current = gl_display.create_context(&gl_config, &ctx_attrs).unwrap_or_else(|_| {
+            gl_config.display().create_context(&gl_config, &fallback).unwrap()
+        });
+
+        let window = window.take().unwrap_or_else(|| {
+            glutin_winit::finalize_window(event_loop, attrs, &gl_config).unwrap()
+        });
+        let (w, h): (u32, u32) = window.inner_size().into();
+        let surface_attrs =
+            glutin::surface::SurfaceAttributesBuilder::<glutin::surface::WindowSurface>::new()
+                .build(
+                    window.window_handle().unwrap().as_raw(),
+                    NonZeroU32::new(w).unwrap(),
+                    NonZeroU32::new(h).unwrap(),
+                );
+        let surface = gl_display.create_window_surface(&gl_config, &surface_attrs).unwrap();
+        let context = not_current.make_current(&surface).unwrap();
+        // Non-blocking present + window.pre_present_notify() (in
+        // pre_present_and_swap) gives Wayland frame-callback pacing without a
+        // blocking eglSwapBuffers owning the event loop — same choice eframe
+        // made.
+        surface
+            .set_swap_interval(&context, glutin::surface::SwapInterval::DontWait)
+            .unwrap();
+
+        let gl = Arc::new(glow::Context::from_loader_function(|s| {
+            let s = std::ffi::CString::new(s).unwrap();
+            gl_display.get_proc_address(&s)
+        }));
+        Window { winit: window, gl, surface, context }
+    }
+
+    pub fn glow(&self) -> Arc<glow::Context> {
+        Arc::clone(&self.gl)
+    }
+
+    pub fn resize(&self, size: winit::dpi::PhysicalSize<u32>) {
+        use glutin::prelude::GlSurface as _;
+        self.surface
+            .resize(&self.context, size.width.try_into().unwrap(), size.height.try_into().unwrap());
+    }
+
+    /// Frame-callback notify then non-blocking swap.
+    pub fn pre_present_and_swap(&self) {
+        use glutin::prelude::GlSurface as _;
+        self.winit.pre_present_notify();
+        self.surface.swap_buffers(&self.context).unwrap();
+    }
+}
+
+/// Up to two page slots, each an RGBA texture or a YUV plane triple.
+/// Upload happens on the main thread at frame time; pan/zoom are uniforms.
+pub struct Pages {
+    gl: Arc<glow::Context>,
+    program: <glow::Context as glow::HasContext>::Program,
+    vao: <glow::Context as glow::HasContext>::VertexArray,
+    slots: [Slot; 2],
+    vbo: <glow::Context as glow::HasContext>::Buffer,
+    max_tex: u32,
+}
+
+/// One page slot's GPU state. Plain data; objects freed on replace/clear.
+struct Slot {
+    texture: Option<Textures>,
+    size: (u32, u32),
+    uniforms: PageUniforms,
+    /// Depth-normalize factor for U16-stored planes (1.0 otherwise).
+    norm: f32,
+}
+
+enum Textures {
+    /// Single RGBA texture.
+    Rgba(<glow::Context as glow::HasContext>::Texture),
+    /// Y + Cb + Cr plane textures (Cb/Cr empty for mono, bound to a 1x1).
+    Yuv {
+        y: <glow::Context as glow::HasContext>::Texture,
+        cb: <glow::Context as glow::HasContext>::Texture,
+        cr: <glow::Context as glow::HasContext>::Texture,
+    },
+}
+
+const IDENTITY3: [f32; 9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+
+/// Uniform set describing an RGBA slot (mode 0); also the empty-slot default.
+const RGBA_UNIFORMS: PageUniforms = PageUniforms {
+    mode: 0,
+    subsampling: Subsampling::Yuv444,
+    depth: 8,
+    full_range: true,
+    matrix: Matrix::Identity,
+};
+
+fn empty_slot() -> Slot {
+    Slot { texture: None, size: (0, 0), uniforms: RGBA_UNIFORMS, norm: 1.0 }
+}
+
+impl Pages {
+    pub fn new(gl: Arc<glow::Context>) -> Pages {
+        let (vs, fs) = if gl.version().is_embedded { (VS_ES, FS_ES) } else { (VS_CORE, FS_CORE) };
+        let compile = |kind, src| unsafe {
+            let sh = gl.create_shader(kind).unwrap();
+            gl.shader_source(sh, src);
+            gl.compile_shader(sh);
+            assert!(gl.get_shader_compile_status(sh), "{}", gl.get_shader_info_log(sh));
+            sh
+        };
+        let (program, vbo, vao);
+        unsafe {
+            program = gl.create_program().unwrap();
+            vbo = gl.create_buffer().unwrap();
+            vao = gl.create_vertex_array().unwrap();
+
+            gl.attach_shader(program, compile(glow::VERTEX_SHADER, vs));
+            gl.attach_shader(program, compile(glow::FRAGMENT_SHADER, fs));
+            gl.link_program(program);
+            assert!(gl.get_program_link_status(program), "{}", gl.get_program_info_log(program));
+
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+            gl.buffer_data_u8_slice(
+                glow::ARRAY_BUFFER,
+                bytemuck::cast_slice(&[-1.0f32, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0]),
+                glow::STATIC_DRAW,
+            );
+
+            gl.bind_vertex_array(Some(vao));
+            let loc = gl.get_attrib_location(program, "pos").unwrap();
+            gl.enable_vertex_attrib_array(loc);
+            gl.vertex_attrib_pointer_f32(loc, 2, glow::FLOAT, false, 8, 0);
+
+            // Sampler units are fixed; draw only rebinds textures.
+            gl.use_program(Some(program));
+            for (unit, name) in ["u_tex0", "u_tex1", "u_tex2"].iter().enumerate() {
+                gl.uniform_1_i32(gl.get_uniform_location(program, name).as_ref(), unit as i32);
+            }
+        }
+        let max_tex = unsafe { gl.get_parameter_i32(glow::MAX_TEXTURE_SIZE) } as u32;
+        Pages { gl, program, vao, slots: [empty_slot(), empty_slot()], vbo, max_tex }
+    }
+
+    /// Upload decoded pixels into slot `i` (0/1). Panics loudly on
+    /// MAX_TEXTURE_SIZE violations (challenge finding: never fail black).
+    pub fn set(&mut self, slot: usize, page: &Decoded) {
+        let (w, h) = (page.width, page.height);
+        // Fail loudly instead of uploading an oversized texture that GL
+        // silently rejects (it then samples as black).
+        assert!(w > 0 && h > 0, "decoded page has zero dimension");
+        assert!(
+            w <= self.max_tex && h <= self.max_tex,
+            "image {w}x{h} exceeds GL max texture size {} (tiling not implemented)",
+            self.max_tex
+        );
+        self.clear(slot);
+        let gl = &self.gl;
+        let textures = match &page.pixels {
+            Pixels::Rgba8(b) => {
+                assert_eq!(b.len(), w as usize * h as usize * 4, "rgba byte length");
+                Textures::Rgba(upload_rgba(gl, b, (w, h)))
+            }
+            Pixels::Yuv(y) => {
+                let ((yw, yh), (cw, ch)) = plane_dims((w, h), y.subsampling);
+                let wide = matches!(y.y, Plane::U16(_));
+                // GL_R16 is not filterable in GLES: LINEAR makes the texture
+                // incomplete (samples black); NEAREST without mips is the
+                // safe fallback on an ES context.
+                let filterable = !(gl.version().is_embedded && wide);
+                let expect = |p: &Plane, want_samples: usize, what: &str| {
+                    // U16 planes are two bytes per sample.
+                    let want_bytes = want_samples * if wide { 2 } else { 1 };
+                    assert_eq!(plane_bytes(p).len(), want_bytes, "{what} plane bytes");
+                };
+                expect(&y.y, yw as usize * yh as usize, "y");
+                let y_t = upload_plane(gl, plane_bytes(&y.y), (yw, yh), wide, filterable);
+                let (cb_t, cr_t) = if y.subsampling == Subsampling::Mono {
+                    // 1x1 chroma at the range midpoint; the matrix cancels it
+                    // to neutral gray. LE pairs match plane_bytes' U16 layout.
+                    let mid: Vec<u8> = if wide {
+                        (1u32 << (y.depth.clamp(1, 16) - 1)).to_le_bytes().to_vec()
+                    } else {
+                        vec![128]
+                    };
+                    (upload_plane(gl, &mid, (1, 1), wide, filterable),
+                     upload_plane(gl, &mid, (1, 1), wide, filterable))
+                } else {
+                    expect(&y.cb, cw as usize * ch as usize, "cb");
+                    expect(&y.cr, cw as usize * ch as usize, "cr");
+                    (upload_plane(gl, plane_bytes(&y.cb), (cw, ch), wide, filterable),
+                     upload_plane(gl, plane_bytes(&y.cr), (cw, ch), wide, filterable))
+                };
+                self.slots[slot].norm = depth_norm(y.depth, wide);
+                Textures::Yuv { y: y_t, cb: cb_t, cr: cr_t }
+            }
+        };
+        self.slots[slot].texture = Some(textures);
+        self.slots[slot].size = (w, h);
+        self.slots[slot].uniforms = PageUniforms::from(&page.pixels);
+    }
+
+    /// Clear a slot (page left the spread or failed to decode).
+    pub fn clear(&mut self, slot: usize) {
+        if let Some(t) = self.slots[slot].texture.take() {
+            delete_textures(&self.gl, &t);
+            self.slots[slot].size = (0, 0);
+            self.slots[slot].norm = 1.0;
+        }
+    }
+
+    pub fn size(&self, slot: usize) -> Option<(u32, u32)> {
+        Some(self.slots[slot].size)
+    }
+
+    /// Draw the spread laid out by `layout` with `view`. Sets viewport,
+    /// disables blend, pixel-snaps offsets; one quad per occupied slot.
+    /// YUV pages sample their planes and convert in-shader (subsampling,
+    /// depth, range, matrix passed as uniforms derived from `Pixels`).
+    /// Does NOT clear — the app owns the framebuffer clear each frame.
+    pub fn draw(&self, win: (f32, f32), layout: &SpreadLayout, view: &View) {
+        let gl = &self.gl;
+        if win.0 <= 0.0 || win.1 <= 0.0 {
+            return;
+        }
+        unsafe {
+            // Own the state this draw depends on: egui's paint leaves BLEND
+            // enabled, and nothing resets the viewport after a resize.
+            gl.viewport(0, 0, win.0 as i32, win.1 as i32);
+            gl.disable(glow::BLEND);
+            gl.use_program(Some(self.program));
+            gl.bind_vertex_array(Some(self.vao));
+            let u = |name: &str| gl.get_uniform_location(self.program, name);
+            gl.uniform_2_f32(u("u_win").as_ref(), win.0, win.1);
+            // `rects` is [left_slot, right_slot] by array position; the usize
+            // inside is the page id (the app keeps slots in sync with it).
+            for (slot, entry) in layout.rects.iter().enumerate() {
+                let Some((_, rect)) = entry else { continue };
+                let Some(s) = self.slots.get(slot) else { continue };
+                let Some(tex) = &s.texture else { continue };
+                // Whole-pixel rect origin; LINEAR samples shimmer at 1:1 zoom
+                // on fractional offsets otherwise.
+                let off = (
+                    (view.offset.0 + rect.pos.0 * view.scale).round(),
+                    (view.offset.1 + rect.pos.1 * view.scale).round(),
+                );
+                let size = (rect.size.0 * view.scale, rect.size.1 * view.scale);
+                if size.0 <= 0.0 || size.1 <= 0.0 {
+                    continue;
+                }
+                let pu = s.uniforms;
+                let (_, (cw, ch)) = plane_dims(s.size, pu.subsampling);
+                let (yo, co) = range_offsets(pu.full_range);
+                gl.uniform_2_f32(u("u_offset").as_ref(), off.0, off.1);
+                gl.uniform_2_f32(u("u_size").as_ref(), size.0, size.1);
+                gl.uniform_2_f32(u("u_scale").as_ref(), view.scale, view.scale);
+                gl.uniform_2_f32(u("u_img").as_ref(), s.size.0 as f32, s.size.1 as f32);
+                gl.uniform_2_f32(u("u_csize").as_ref(), cw as f32, ch as f32);
+                gl.uniform_1_i32(u("u_mode").as_ref(), pu.mode as i32);
+                gl.uniform_1_i32(u("u_chroma").as_ref(), chroma_id(pu.subsampling) as i32);
+                gl.uniform_1_f32(u("u_norm").as_ref(), s.norm);
+                gl.uniform_3_f32(u("u_yuv_off").as_ref(), yo, co, co);
+                gl.uniform_matrix_3_f32_slice(
+                    u("u_mat").as_ref(),
+                    false,
+                    &yuv_to_rgb_matrix(pu.matrix, pu.full_range),
+                );
+                gl.active_texture(glow::TEXTURE0);
+                match tex {
+                    Textures::Rgba(t) => gl.bind_texture(glow::TEXTURE_2D, Some(*t)),
+                    Textures::Yuv { y, cb, cr } => {
+                        gl.bind_texture(glow::TEXTURE_2D, Some(*y));
+                        gl.active_texture(glow::TEXTURE1);
+                        gl.bind_texture(glow::TEXTURE_2D, Some(*cb));
+                        gl.active_texture(glow::TEXTURE2);
+                        gl.bind_texture(glow::TEXTURE_2D, Some(*cr));
+                    }
+                }
+                gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+            }
+        }
+    }
+}
+
+impl Drop for Pages {
+    fn drop(&mut self) {
+        // Delete while the context still lives; the app must drop Pages
+        // before Window (challenge F7 teardown ordering).
+        for slot in &mut self.slots {
+            if let Some(t) = slot.texture.take() {
+                delete_textures(&self.gl, &t);
+            }
+        }
+        unsafe {
+            self.gl.delete_program(self.program);
+            self.gl.delete_vertex_array(self.vao);
+            self.gl.delete_buffer(self.vbo);
+        }
+    }
+}
+
+fn delete_textures(gl: &glow::Context, t: &Textures) {
+    unsafe {
+        match t {
+            Textures::Rgba(t) => gl.delete_texture(*t),
+            Textures::Yuv { y, cb, cr } => {
+                gl.delete_texture(*y);
+                gl.delete_texture(*cb);
+                gl.delete_texture(*cr);
+            }
+        }
+    }
+}
+
+/// Texture with viewer defaults; CLAMP keeps edge texels from bleeding.
+/// `filterable` false (GLES R16) means NEAREST and no mips.
+fn new_texture(gl: &glow::Context, filterable: bool) -> <glow::Context as HasContext>::Texture {
+    let t = unsafe { gl.create_texture().unwrap() };
+    unsafe {
+        gl.bind_texture(glow::TEXTURE_2D, Some(t));
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as _);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as _);
+        let (min, mag) = if filterable {
+            // Mipmapped minification: fit view of a 50MP page minifies ~8x;
+            // LINEAR-only shimmers (challenge F3).
+            (glow::LINEAR_MIPMAP_LINEAR, glow::LINEAR)
+        } else {
+            (glow::NEAREST, glow::NEAREST)
+        };
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, min as _);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, mag as _);
+    }
+    t
+}
+
+fn upload_rgba(
+    gl: &glow::Context,
+    data: &[u8],
+    dims: (u32, u32),
+) -> <glow::Context as HasContext>::Texture {
+    let t = new_texture(gl, true);
+    unsafe {
+        gl.tex_image_2d(
+            glow::TEXTURE_2D, 0, glow::RGBA8 as _,
+            dims.0 as i32, dims.1 as i32, 0,
+            glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(Some(data)),
+        );
+        gl.generate_mipmap(glow::TEXTURE_2D);
+    }
+    t
+}
+
+/// Single-channel plane: R8 for 8-bit, R16 for wider. Mipmaps unless the
+/// format is unfilterable on this context.
+fn upload_plane(
+    gl: &glow::Context,
+    data: &[u8],
+    dims: (u32, u32),
+    wide: bool,
+    filterable: bool,
+) -> <glow::Context as HasContext>::Texture {
+    let (internal, ty) = if wide { (glow::R16, glow::UNSIGNED_SHORT) } else { (glow::R8, glow::UNSIGNED_BYTE) };
+    let t = new_texture(gl, filterable);
+    unsafe {
+        // Odd row widths: GL's default 4-byte unpack alignment would desync
+        // every row after the first.
+        gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+        gl.tex_image_2d(
+            glow::TEXTURE_2D, 0, internal as _,
+            dims.0 as i32, dims.1 as i32, 0,
+            glow::RED, ty, glow::PixelUnpackData::Slice(Some(data)),
+        );
+        if filterable {
+            gl.generate_mipmap(glow::TEXTURE_2D);
+        }
+    }
+    t
+}
+
+/// How the shader should read a slot's texture set. Derived CPU-side; passed
+/// as uniforms. Purely data — no per-variant shader programs.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PageUniforms {
+    /// 0 = RGBA, 1 = YUV
+    pub mode: u32,
+    pub subsampling: Subsampling,
+    pub depth: u8,
+    pub full_range: bool,
+    pub matrix: crate::decode::Matrix,
+}
+
+impl From<&Pixels> for PageUniforms {
+    fn from(p: &Pixels) -> Self {
+        match p {
+            Pixels::Rgba8(_) => RGBA_UNIFORMS,
+            Pixels::Yuv(y) => PageUniforms {
+                mode: 1,
+                subsampling: y.subsampling,
+                depth: y.depth,
+                full_range: y.full_range,
+                matrix: y.matrix,
+            },
+        }
+    }
+}
+
+/// Plane dims (y, chroma) for an image size and subsampling. Pure; testable.
+pub fn plane_dims(size: (u32, u32), s: Subsampling) -> ((u32, u32), (u32, u32)) {
+    let (w, h) = size;
+    match s {
+        Subsampling::Mono => ((w, h), (1, 1)),
+        Subsampling::Yuv420 => ((w, h), (w.div_ceil(2), h.div_ceil(2))),
+        Subsampling::Yuv422 => ((w, h), (w.div_ceil(2), h)),
+        Subsampling::Yuv444 => ((w, h), (w, h)),
+    }
+}
+
+/// Byte view of a plane (u16 planes are little-endian native pairs).
+pub fn plane_bytes(p: &Plane) -> &[u8] {
+    match p {
+        Plane::U8(b) => b,
+        Plane::U16(b) => bytemuck::cast_slice(b),
+    }
+}
+
+/// Shader subsampling id: 0 mono, 1 = 420, 2 = 422, 3 = 444.
+fn chroma_id(s: Subsampling) -> u32 {
+    match s {
+        Subsampling::Mono => 0,
+        Subsampling::Yuv420 => 1,
+        Subsampling::Yuv422 => 2,
+        Subsampling::Yuv444 => 3,
+    }
+}
+
+/// Quantization anchors subtracted in-shader: (luma, chroma). Limited range
+/// is BT studio swing: Y 16..235, C 16..240 (of 255).
+fn range_offsets(full_range: bool) -> (f32, f32) {
+    if full_range { (0.0, 0.5) } else { (16.0 / 255.0, 128.0 / 255.0) }
+}
+
+/// Normalizes R16 sampler output for U16-stored planes: sampling divides by
+/// 65535 but only `depth` bits are significant. 1.0 for 8-bit storage.
+fn depth_norm(depth: u8, wide: bool) -> f32 {
+    if !wide {
+        return 1.0;
+    }
+    65535.0 / ((1u32 << depth.clamp(1, 16)) - 1) as f32
+}
+
+/// YUV→RGB conversion for `rgb = M · (yuv * norm - offsets)`, stored
+/// column-major for upload with transpose = false. Derived from the exact
+/// KR/KB of each standard; limited range folds in the studio-swing scales
+/// (255/219 luma, 255/224 chroma) so the anchors stay the plain offsets
+/// from [`range_offsets`]. `Identity` passes planes through as RGB.
+fn yuv_to_rgb_matrix(matrix: Matrix, full_range: bool) -> [f32; 9] {
+    let (kr, kb) = match matrix {
+        Matrix::Bt601 => (0.299, 0.114),
+        Matrix::Bt709 => (0.2126, 0.0722),
+        Matrix::Bt2020 => (0.2627, 0.0593),
+        Matrix::Identity => return IDENTITY3,
+    };
+    let kg = 1.0 - kr - kb;
+    let (ys, cs) = if full_range { (1.0, 1.0) } else { (255.0 / 219.0, 255.0 / 224.0) };
+    let g_cb = cs * 2.0 * kb * (1.0 - kb) / kg;
+    let g_cr = cs * 2.0 * kr * (1.0 - kr) / kg;
+    [ys, ys, ys, 0.0, -g_cb, cs * 2.0 * (1.0 - kb), cs * 2.0 * (1.0 - kr), -g_cr, 0.0]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Row `r`, column `c` of the math matrix (storage is column-major).
+    fn e(m: &[f32; 9], r: usize, c: usize) -> f32 {
+        m[c * 3 + r]
+    }
+
+    #[test]
+    fn plane_dims_table() {
+        assert_eq!(plane_dims((7, 5), Subsampling::Mono), ((7, 5), (1, 1)));
+        assert_eq!(plane_dims((7, 5), Subsampling::Yuv420), ((7, 5), (4, 3)));
+        assert_eq!(plane_dims((7, 5), Subsampling::Yuv422), ((7, 5), (4, 5)));
+        assert_eq!(plane_dims((7, 5), Subsampling::Yuv444), ((7, 5), (7, 5)));
+        assert_eq!(plane_dims((8, 6), Subsampling::Yuv420), ((8, 6), (4, 3)));
+        assert_eq!(plane_dims((8, 6), Subsampling::Yuv422), ((8, 6), (4, 6)));
+        assert_eq!(plane_dims((1, 1), Subsampling::Yuv420), ((1, 1), (1, 1)));
+        assert_eq!(plane_dims((16385, 3), Subsampling::Yuv422), ((16385, 3), (8193, 3)));
+    }
+
+    #[test]
+    fn chroma_ids() {
+        assert_eq!(chroma_id(Subsampling::Mono), 0);
+        assert_eq!(chroma_id(Subsampling::Yuv420), 1);
+        assert_eq!(chroma_id(Subsampling::Yuv422), 2);
+        assert_eq!(chroma_id(Subsampling::Yuv444), 3);
+    }
+
+    #[test]
+    fn bt601_limited_matches_documented_constants() {
+        let m = yuv_to_rgb_matrix(Matrix::Bt601, false);
+        for r in 0..3 {
+            assert!((e(&m, r, 0) - 255.0 / 219.0).abs() < 1e-4, "luma scale row {r}");
+        }
+        assert!((e(&m, 0, 2) - 1.596027).abs() < 1e-3);
+        assert!((e(&m, 1, 1) - -0.391762).abs() < 1e-3);
+        assert!((e(&m, 1, 2) - -0.812968).abs() < 1e-3);
+        assert!((e(&m, 2, 1) - 2.017232).abs() < 1e-3);
+        assert_eq!(e(&m, 0, 1), 0.0);
+        assert_eq!(e(&m, 2, 2), 0.0);
+    }
+
+    #[test]
+    fn bt709_limited_matches_documented_constants() {
+        let m = yuv_to_rgb_matrix(Matrix::Bt709, false);
+        assert!((e(&m, 0, 2) - 1.792741).abs() < 1e-3);
+        assert!((e(&m, 1, 1) - -0.212899).abs() < 1e-3);
+        assert!((e(&m, 1, 2) - -0.532909).abs() < 1e-3);
+        assert!((e(&m, 2, 1) - 2.112402).abs() < 1e-3);
+    }
+
+    #[test]
+    fn full_range_matrices() {
+        let m = yuv_to_rgb_matrix(Matrix::Bt601, true);
+        assert_eq!(e(&m, 0, 0), 1.0);
+        assert!((e(&m, 0, 2) - 1.402).abs() < 1e-6); // 2(1 - 0.299), exact
+        assert!((e(&m, 2, 1) - 1.772).abs() < 1e-6); // 2(1 - 0.114), exact
+        let m = yuv_to_rgb_matrix(Matrix::Bt709, true);
+        assert!((e(&m, 0, 2) - 1.5748).abs() < 1e-6);
+        assert!((e(&m, 2, 1) - 1.8556).abs() < 1e-6);
+        assert_eq!(
+            yuv_to_rgb_matrix(Matrix::Identity, false),
+            [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+        );
+    }
+
+    #[test]
+    fn limited_range_anchors_hit_black_and_white() {
+        let m = yuv_to_rgb_matrix(Matrix::Bt601, false);
+        let (yo, co) = range_offsets(false);
+        assert_eq!((yo, co), (16.0 / 255.0, 128.0 / 255.0));
+        for (raw_y, want) in [(16.0 / 255.0, 0.0), (235.0 / 255.0, 1.0)] {
+            for r in 0..3 {
+                let got = e(&m, r, 0) * (raw_y - yo); // chroma terms cancel at midpoint
+                assert!((got - want).abs() < 1e-4, "row {r}: {got} vs {want}");
+            }
+        }
+    }
+
+    #[test]
+    fn quantization_helpers() {
+        assert_eq!(range_offsets(true), (0.0, 0.5));
+        assert_eq!(depth_norm(8, false), 1.0);
+        assert_eq!(depth_norm(16, true), 1.0);
+        assert!((depth_norm(10, true) - 65535.0 / 1023.0).abs() < 1e-4);
+        assert!((depth_norm(12, true) - 65535.0 / 4095.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn page_uniforms_from_pixels() {
+        assert_eq!(PageUniforms::from(&Pixels::Rgba8(Box::default())), RGBA_UNIFORMS);
+        let yuv = Pixels::Yuv(Arc::new(crate::decode::YuvImage {
+            depth: 10,
+            subsampling: Subsampling::Yuv420,
+            full_range: false,
+            matrix: Matrix::Bt2020,
+            y: Plane::U8(Box::default()), cb: Plane::U8(Box::default()), cr: Plane::U8(Box::default()),
+        }));
+        let u = PageUniforms::from(&yuv);
+        assert_eq!((u.mode, u.subsampling, u.depth, u.full_range, u.matrix),
+            (1, Subsampling::Yuv420, 10, false, Matrix::Bt2020));
+    }
+}
