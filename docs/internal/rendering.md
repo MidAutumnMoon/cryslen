@@ -79,8 +79,8 @@ arboard bundle.
   a smaller limit.
 - GL objects must be deleted while their context is alive. Keep the
   window/context as the last field of the owning struct (Rust drop
-  order) and call `egui_glow.destroy()` explicitly on exit or it logs
-  a leak warning.
+  order) and call `egui_glow.destroy()` in `Drop` before the painter
+  dies, or it logs a leak warning.
 
 ## Quad strategy
 
@@ -119,12 +119,13 @@ a whole class of "slightly wrong colors" regressions without a GPU.
 ## Upload policy
 
 Texture uploads are expensive, a full upload plus mipmap generation per
-plane, so uploaded pages stay in a page-keyed cache. `set(seat, page,
+plane, so uploaded pages stay in a page-keyed cache. `bind(seat, page,
 decoded)` no-ops on the same page id, uploads only on a cache miss, and
 otherwise rebinds the seat to the cached textures. Page revisits and the
-RTL re-seat are pure binds. The app never mirrors GPU state on its side.
+RTL re-seat are pure binds. The app owns what each seat shows (`shown`
+per seat) and drives the cache with per-seat show/hold/clear decisions.
 Each entry counts its plane bytes plus the mip chain against a 3 GiB
 cap. An insert past the cap evicts unbound pages, farthest from the
-nearest bound page first. Bound pages are never evicted, so a page that
-alone exceeds the cap still renders and is dropped by a later insert
-once unbound.
+nearest bound page first. Bound pages are never evicted, so a held last
+frame keeps drawing. A page that alone exceeds the cap renders until a
+later insert finds it unbound.

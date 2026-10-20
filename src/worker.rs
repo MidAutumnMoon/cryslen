@@ -4,7 +4,6 @@
 
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -124,7 +123,6 @@ impl PageCache {
 pub struct Worker {
     tx: mpsc::Sender<ToWorker>,
     cache: Arc<Mutex<PageCache>>,
-    stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -135,16 +133,14 @@ impl Worker {
     pub fn spawn(source: Arc<Source>, notify: impl Fn() + Send + Sync + 'static) -> Worker {
         let (tx, rx) = mpsc::channel::<ToWorker>();
         let cache = Arc::new(Mutex::new(PageCache::new()));
-        let stop = Arc::new(AtomicBool::new(false));
         let handle = std::thread::Builder::new()
             .name("cy-decode".into())
             .spawn({
                 let cache = Arc::clone(&cache);
-                let stop = Arc::clone(&stop);
-                move || run(&source, rx, &stop, &cache, &notify)
+                move || run(&source, rx, &cache, &notify)
             })
             .expect("spawn decode worker");
-        Worker { tx, cache, stop, handle: Some(handle) }
+        Worker { tx, cache, handle: Some(handle) }
     }
 
     /// Tell the worker which page the user is on. Every focus counts as a
@@ -162,8 +158,7 @@ impl Worker {
 
 impl Drop for Worker {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        // The Stop message wakes the loop so it observes `stop`.
+        // Stop wakes a parked loop so the join returns.
         let _ = self.tx.send(ToWorker::Stop);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
@@ -180,7 +175,6 @@ impl Drop for Worker {
 fn run(
     source: &Source,
     rx: mpsc::Receiver<ToWorker>,
-    stop: &AtomicBool,
     cache: &Mutex<PageCache>,
     notify: &dyn Fn(),
 ) {
@@ -194,9 +188,6 @@ fn run(
     loop {
         while let Ok(message) = rx.try_recv() {
             let ToWorker::Focus(index) = message else { return };
-            if stop.load(Ordering::Relaxed) {
-                return;
-            }
             arrivals.push(index);
         }
         if let Some(&newest) = arrivals.last() {
@@ -222,9 +213,6 @@ fn run(
                 Ok(ToWorker::Focus(index)) => index,
                 Ok(ToWorker::Stop) | Err(_) => return,
             };
-            if stop.load(Ordering::Relaxed) {
-                return;
-            }
             arrivals.push(arrived);
             continue;
         };
@@ -475,7 +463,7 @@ mod tests {
         };
         assert_eq!((page.width, page.height), (3, 2));
         assert!(*updates.lock().unwrap() > 0);
-        // Drop joins the thread. A hung sentinel/stop path would hang the
+        // Drop joins the thread. A hung stop path would hang the
         // test suite here (no GL or event loop involved).
     }
 

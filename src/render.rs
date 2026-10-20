@@ -4,9 +4,10 @@
 //! calls (resource creation, swap) panic since context loss leaves nothing to
 //! show.
 //!
-//! Two page seats over a page-keyed texture cache, YUV plane textures with
-//! shader-side conversion, spread layout draw. Chroma siting
-//! (avifChromaSamplePosition) is not applied: the
+//! A page-keyed texture cache plus the two-seat spread draw, YUV plane
+//! textures with shader-side conversion. The app owns what each seat
+//! displays and drives the cache with per-seat bind/clear calls.
+//! Chroma siting (avifChromaSamplePosition) is not applied: the
 //! default co-sited/midway assumption biases chroma by at most half a texel,
 //! invisible in practice.
 
@@ -110,18 +111,15 @@ const FS_ES: &str = r#"
         color = vec4(u_mat * (yuv * u_norm - u_yuv_off), 1.0);
     }"#;
 
-/// Up to two page seats over a page-keyed texture cache. Each entry is an
-/// RGBA texture or a YUV plane triple. Upload happens on the main thread at
+/// Page-keyed texture cache plus the spread draw. Each entry is an RGBA
+/// texture or a YUV plane triple. Upload happens on the main thread at
 /// frame time, only for pages missing from the cache. Pan/zoom stay
 /// uniforms and never re-upload.
-///
-/// Each seat remembers which page it shows, so `set` with an unchanged page
-/// is a no-op. Callers never need to mirror GPU state on their side.
-pub struct PageSlots {
+pub struct PageTextures {
     gl: Arc<glow::Context>,
     program: <glow::Context as glow::HasContext>::Program,
     vao: <glow::Context as glow::HasContext>::VertexArray,
-    /// Page each seat shows (`None` when empty).
+    /// Page each seat draws (`None` when empty).
     seats: [Option<usize>; 2],
     /// Uploaded textures by page, retained across visits until evicted.
     textures: HashMap<usize, Entry>,
@@ -167,8 +165,8 @@ const RGBA_UNIFORMS: PageUniforms = PageUniforms {
     matrix: Matrix::Identity,
 };
 
-impl PageSlots {
-    pub fn new(gl: Arc<glow::Context>) -> PageSlots {
+impl PageTextures {
+    pub fn new(gl: Arc<glow::Context>) -> PageTextures {
         let (vs, fs) = if gl.version().is_embedded { (VS_ES, FS_ES) } else { (VS_CORE, FS_CORE) };
         let compile = |kind, src| unsafe {
             let shader = gl.create_shader(kind).expect("GL shader object");
@@ -211,18 +209,19 @@ impl PageSlots {
             }
         }
         let max_tex = unsafe { gl.get_parameter_i32(glow::MAX_TEXTURE_SIZE) } as u32;
-        PageSlots { gl, program, vao, seats: [None, None], textures: HashMap::new(), vbo, max_tex }
+        PageTextures { gl, program, vao, seats: [None, None], textures: HashMap::new(), vbo, max_tex }
     }
 
-    /// Bind visual seat `i` (0 = left, 1 = right) to `page`, uploading its
-    /// textures only on a cache miss. Binding an unchanged page is a no-op.
+    /// Record that `seat` draws `page`, uploading its textures only on a
+    /// cache miss. Binding an unchanged page is a no-op. A bound page is
+    /// never evicted, so a held seat keeps drawing.
     ///
     /// # Panics
     ///
     /// Panics if the page exceeds this context's MAX_TEXTURE_SIZE. Decode
     /// rejects edges over its own cap first, so only a GPU advertising a
     /// smaller limit can trip this.
-    pub fn set(&mut self, seat: usize, page: usize, decoded: &Decoded) {
+    pub fn bind(&mut self, seat: usize, page: usize, decoded: &Decoded) {
         if self.seats[seat] == Some(page) {
             return;
         }
@@ -243,16 +242,9 @@ impl PageSlots {
         self.evict_over_budget();
     }
 
-    /// Unbind a seat. Used when the page left the spread. The page's
-    /// textures stay cached. Undecoded-but-wanted pages keep their last
-    /// frame instead, per the hold-last-frame rule.
+    /// Stop drawing `seat`. The page's textures stay cached.
     pub fn clear(&mut self, seat: usize) {
         self.seats[seat] = None;
-    }
-
-    /// Decoded size of the page held by the seat, if any.
-    pub fn size(&self, seat: usize) -> Option<(u32, u32)> {
-        self.seats[seat].and_then(|page| self.textures.get(&page).map(|entry| entry.size))
     }
 
     /// Drop cached pages until the map fits [`TEXTURE_BUDGET_BYTES`]. Never
@@ -355,7 +347,7 @@ impl PageSlots {
     }
 }
 
-impl Drop for PageSlots {
+impl Drop for PageTextures {
     fn drop(&mut self) {
         // GL objects must be deleted while their context is alive. The
         // window that owns the context is dropped after this struct.

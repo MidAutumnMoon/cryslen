@@ -8,8 +8,9 @@ use std::time::{Duration, Instant};
 
 use egui_winit::winit;
 
+use crate::decode::Decoded;
 use crate::keys::Action;
-use crate::render::PageSlots;
+use crate::render::PageTextures;
 use crate::source::Source;
 use crate::view::{Spread, SpreadLayout, View};
 use crate::window::Window;
@@ -43,13 +44,139 @@ const DEFAULT_STATE: State = State {
     fullscreen: false,
 };
 
+/// What one seat displays: the page and its decoded size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ShownPage {
+    page: usize,
+    dims: (u32, u32),
+}
+
+/// One seat's frame decision.
+enum SeatPlan {
+    /// Show this page, making it the seat's `shown` entry.
+    Show { page: usize, decoded: Arc<Decoded> },
+    /// Keep the seat's `shown` entry and its last frame.
+    Hold,
+    /// Show nothing.
+    Clear,
+}
+
+/// Decide one seat's frame. A wanted page that is Ready shows. An
+/// undecided or failed page holds the last frame, surfacing through the
+/// status fold instead. No wanted page clears the seat.
+fn seat_plan(
+    wanted: Option<usize>,
+    state: Option<&PageState>,
+    shown: Option<&ShownPage>,
+) -> SeatPlan {
+    match (wanted, state, shown) {
+        (None, _, _) => SeatPlan::Clear,
+        (Some(_), None, _) | (Some(_), Some(PageState::Failed(_)), _) => SeatPlan::Hold,
+        (Some(page), Some(PageState::Ready(decoded)), _) => SeatPlan::Show {
+            page,
+            decoded: Arc::clone(decoded),
+        },
+    }
+}
+
+/// Status facts folded over both seats of a spread.
+struct FoldedStatus {
+    /// A wanted seat is still undecided.
+    waiting: bool,
+    /// First failure among the seats, in seat order.
+    error: Option<String>,
+    /// Format of the first Ready seat, left preferred.
+    format: Option<&'static str>,
+    /// Dims of the first Ready seat, left preferred.
+    dims: Option<(u32, u32)>,
+}
+
+/// Fold the seats' decode outcomes into status facts. `states[i]` is the
+/// outcome fetched for `wanted[i]`.
+fn fold_status(wanted: [Option<usize>; 2], states: &[Option<PageState>; 2]) -> FoldedStatus {
+    let mut folded = FoldedStatus { waiting: false, error: None, format: None, dims: None };
+    for (seat, state) in states.iter().enumerate() {
+        if wanted[seat].is_some() && state.is_none() {
+            folded.waiting = true;
+        }
+        match state {
+            Some(PageState::Failed(message)) if folded.error.is_none() => {
+                folded.error = Some(message.clone());
+            }
+            Some(PageState::Ready(decoded)) if folded.format.is_none() => {
+                folded.format = Some(decoded.format.label());
+                folded.dims = Some((decoded.width, decoded.height));
+            }
+            _ => {}
+        }
+    }
+    folded
+}
+
+/// The auto-fit protocol: which spread total the view was fitted to, and
+/// whether the user has placed the view since.
+#[derive(Default)]
+struct Fit {
+    /// Spread total the view was fitted to. None demands a refit.
+    fitted_total: Option<(f32, f32)>,
+    /// The user zoomed or panned since the last fit.
+    user_moved: bool,
+}
+
+impl Fit {
+    /// Whether the view must be fitted to `total` this frame.
+    fn should_refit(&self, total: (f32, f32)) -> bool {
+        self.fitted_total != Some(total)
+    }
+
+    /// Record the fit of `total`.
+    fn fitted_to(&mut self, total: (f32, f32)) {
+        self.fitted_total = Some(total);
+    }
+
+    /// User zoom or pan. Their placement wins over later fit triggers.
+    fn user_moved(&mut self) {
+        self.user_moved = true;
+    }
+
+    /// Page turn: the new spread fits afresh once its dims settle. User
+    /// placement does not carry across pages.
+    fn page_turned(&mut self) {
+        self.refit();
+    }
+
+    /// Resize: fit afresh, discarding user placement.
+    fn resized(&mut self) {
+        self.refit();
+    }
+
+    /// Reset view: fit afresh, discarding user placement.
+    fn reset_view(&mut self) {
+        self.refit();
+    }
+
+    fn refit(&mut self) {
+        self.fitted_total = None;
+        self.user_moved = false;
+    }
+}
+
 /// The GL bundle: everything that exists only between `resumed` and exit.
-/// Field order is drop order: slots and egui are dropped while the window
+/// Field order is drop order: pages and egui are dropped while the window
 /// (which owns the GL context) is still alive.
 struct Gl {
-    slots: PageSlots,
+    pages: PageTextures,
     egui: egui_glow::EguiGlow,
     window: Window,
+}
+
+impl Drop for Gl {
+    fn drop(&mut self) {
+        // The drop body runs before the field drops, so egui's GL objects
+        // die here while the context is alive. egui_glow logs a leak
+        // warning if destroy never runs.
+        self.egui.destroy();
+    }
 }
 
 pub struct App {
@@ -61,25 +188,20 @@ pub struct App {
     /// GL init failure from `resumed`, which cannot return a Result. Main
     /// reports it after the event loop exits.
     pub start_error: Option<eros::ErrorUnion>,
+    /// The single source of what each seat displays, held frames included.
+    shown: [Option<ShownPage>; 2],
     /// Window size the GL surface was last resized to (physical px).
     last_surface_size: (u32, u32),
     cursor: (f32, f32),
     dragging: bool,
-    /// Set while the current spread's first page is undecided. The last
-    /// frame stays on screen (hold-last-frame rule) and the status line
-    /// flags waiting after 150 ms. No spinner animation: it would force
-    /// repaints.
+    /// Set while any wanted seat is undecided. The last frame stays on
+    /// screen (hold-last-frame rule) and the status line flags waiting
+    /// after 150 ms. No spinner animation: it would force repaints.
     waiting_since: Option<Instant>,
     /// Layout of the spread currently on screen. Pan and zoom read this
     /// memo between frames.
     last_layout: SpreadLayout,
-    /// Spread total the current view was fitted to. NaN forces a refit on
-    /// the next frame.
-    fitted_total: (f32, f32),
-    /// The user zoomed or panned since the last fit. Their view wins over
-    /// geometry, suppressing the auto-refit that fires when a late-decoded
-    /// page changes the spread shape.
-    user_moved: bool,
+    fit: Fit,
     /// Proxy for egui's repaint bridge. winit 0.30 cannot create one from
     /// `ActiveEventLoop` (only `EventLoop::create_proxy`, before `run_app`).
     proxy: Option<winit::event_loop::EventLoopProxy<UserEvent>>,
@@ -98,13 +220,13 @@ impl App {
             state: State { index, ..DEFAULT_STATE },
             gl: None,
             start_error: None,
+            shown: [None, None],
             last_surface_size: (0, 0),
             cursor: (0.0, 0.0),
             dragging: false,
             waiting_since: None,
             last_layout: SpreadLayout::default(),
-            fitted_total: (f32::NAN, f32::NAN),
-            user_moved: false,
+            fit: Fit::default(),
             proxy: Some(proxy),
         }
     }
@@ -114,27 +236,40 @@ impl App {
         crate::view::spread_for(self.state.index, self.state.double, self.source.len())
     }
 
-    /// Upload what changed. A seat with a freshly decoded page shows it. An
-    /// undecided page keeps the seat's last frame (hold-last-frame rule). A
-    /// seat with no page in this spread is cleared.
-    fn sync_slots(&mut self, spread: &Spread) {
-        let seats = spread.seats(self.state.rtl);
-        if let Some(gl) = self.gl.as_mut() {
-            for (seat, &page) in seats.iter().enumerate() {
-                let shown = page.and_then(|p| self.worker.page(p));
-                match (page, shown) {
-                    (Some(p), Some(PageState::Ready(d))) => gl.slots.set(seat, p, &d),
-                    (None, _) => gl.slots.clear(seat),
-                    // Undecided or failed: keep whatever the seat shows.
-                    _ => {}
+    /// Apply one frame's seat decisions: fetch each wanted seat's page
+    /// once, update `shown` and the texture bindings, and refresh the
+    /// layout memo from `shown`. Returns the fetched states for the
+    /// status fold.
+    fn display(&mut self, wanted: [Option<usize>; 2]) -> [Option<PageState>; 2] {
+        let mut states: [Option<PageState>; 2] = [None, None];
+        for seat in 0..2 {
+            states[seat] = wanted[seat].and_then(|page| self.worker.page(page));
+        }
+        let plans = [
+            seat_plan(wanted[0], states[0].as_ref(), self.shown[0].as_ref()),
+            seat_plan(wanted[1], states[1].as_ref(), self.shown[1].as_ref()),
+        ];
+        for (seat, plan) in plans.into_iter().enumerate() {
+            match plan {
+                SeatPlan::Show { page, decoded } => {
+                    self.shown[seat] =
+                        Some(ShownPage { page, dims: (decoded.width, decoded.height) });
+                    if let Some(gl) = self.gl.as_mut() {
+                        gl.pages.bind(seat, page, &decoded);
+                    }
+                }
+                SeatPlan::Hold => {}
+                SeatPlan::Clear => {
+                    self.shown[seat] = None;
+                    if let Some(gl) = self.gl.as_mut() {
+                        gl.pages.clear(seat);
+                    }
                 }
             }
         }
-        let dims = match self.gl.as_ref() {
-            Some(gl) => [gl.slots.size(0), gl.slots.size(1)],
-            None => [None, None],
-        };
-        self.last_layout = crate::view::layout(dims);
+        self.last_layout =
+            crate::view::layout([self.shown[0].map(|s| s.dims), self.shown[1].map(|s| s.dims)]);
+        states
     }
 
     /// One frame: decide, upload, draw, present.
@@ -146,32 +281,33 @@ impl App {
         let win = (size.width as f32, size.height as f32);
 
         let spread = self.spread();
-        let first = self.worker.page(spread.first);
-        self.sync_slots(&spread);
+        let states = self.display(spread.seats(self.state.rtl));
 
         // Refit when the composed spread changed shape (page turn, resize,
         // newly decoded dims). Skip it when the user has zoomed or panned:
         // their view wins over geometry.
         let total = self.last_layout.total();
-        if total != self.fitted_total {
-            if !self.user_moved {
+        if self.fit.should_refit(total) {
+            if !self.fit.user_moved {
                 self.state.view = crate::view::fit(total, win);
             }
-            self.fitted_total = total;
+            self.fit.fitted_to(total);
         }
 
-        self.waiting_since = match &first {
-            Some(PageState::Ready(_)) | Some(PageState::Failed(_)) => None,
-            None => Some(self.waiting_since.unwrap_or_else(Instant::now)),
+        let folded = fold_status(spread.seats(self.state.rtl), &states);
+        self.waiting_since = if folded.waiting {
+            Some(self.waiting_since.unwrap_or_else(Instant::now))
+        } else {
+            None
         };
         // While waiting on a decode, wake up once when the 150 ms status
         // grace expires so "decoding…" appears. Without this the loop stays
         // parked and the flag never shows.
         if let Some(since) = self.waiting_since {
-            let shown = since.elapsed();
-            if shown < WAIT_GRACE {
+            let elapsed = since.elapsed();
+            if elapsed < WAIT_GRACE {
                 if let Some(proxy) = &self.proxy {
-                    let _ = proxy.send_event(UserEvent::Repaint(WAIT_GRACE - shown));
+                    let _ = proxy.send_event(UserEvent::Repaint(WAIT_GRACE - elapsed));
                 }
             }
         }
@@ -182,25 +318,16 @@ impl App {
             double: self.state.double,
             rtl: self.state.rtl,
             source_label: self.source.label(),
-            format: match &first {
-                Some(PageState::Ready(d)) => Some(d.format.label()),
-                _ => None,
-            },
-            dims: match &first {
-                Some(PageState::Ready(d)) => Some((d.width, d.height)),
-                _ => None,
-            },
+            format: folded.format,
+            dims: folded.dims,
             zoom_percent: self.state.view.scale * 100.0,
             waiting: self.waiting_since.is_some_and(|t| t.elapsed() >= WAIT_GRACE),
-            error: match &first {
-                Some(PageState::Failed(e)) => Some(e.clone()),
-                _ => None,
-            },
+            error: folded.error,
         };
 
         let Some(gl) = self.gl.as_mut() else { return };
         gl.egui.painter.clear([size.width, size.height], [0.08, 0.08, 0.09, 1.0]);
-        gl.slots.draw(win, &self.last_layout, &self.state.view);
+        gl.pages.draw(win, &self.last_layout, &self.state.view);
         gl.egui.run(&gl.window.winit, |ui| crate::ui::show(ui, &status));
         gl.egui.paint(&gl.window.winit);
         gl.window.pre_present_and_swap();
@@ -222,13 +349,6 @@ impl App {
         }
         self.last_surface_size = (size.width, size.height);
         Some(size)
-    }
-
-    /// Force a refit on the next frame and ask for one.
-    fn needs_refit(&mut self) {
-        self.fitted_total = (f32::NAN, f32::NAN);
-        self.user_moved = false;
-        self.request_redraw();
     }
 
     fn request_redraw(&self) {
@@ -272,7 +392,10 @@ impl App {
                     gl.window.winit.set_fullscreen(fullscreen_request);
                 }
             }
-            Action::ResetView => self.needs_refit(),
+            Action::ResetView => {
+                self.fit.reset_view();
+                self.request_redraw();
+            }
             Action::Next | Action::Prev => {
                 let forward = act.is_forward(self.state.rtl);
                 self.state.index = crate::view::advance(
@@ -287,7 +410,8 @@ impl App {
     }
 
     fn after_page_change(&mut self) {
-        self.needs_refit(); // fit to the new spread once its dims are known
+        self.fit.page_turned();
+        self.request_redraw();
         self.worker.focus(self.state.index); // cheap, never blocks
     }
 }
@@ -312,9 +436,9 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                 let _ = proxy.lock().send_event(UserEvent::Repaint(info.delay));
             });
         }
-        let slots = PageSlots::new(gl);
+        let pages = PageTextures::new(gl);
         window.winit.request_redraw();
-        self.gl = Some(Gl { slots, egui, window });
+        self.gl = Some(Gl { pages, egui, window });
     }
 
     fn user_event(&mut self, event_loop: &winit::event_loop::ActiveEventLoop, event: UserEvent) {
@@ -339,11 +463,8 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
     }
 
     fn exiting(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) {
-        // egui_glow logs a leak warning if destroy() never runs. Drop order is
-        // Gl's documented invariant.
-        if let Some(mut gl) = self.gl.take() {
-            gl.egui.destroy();
-        }
+        // Gl's Drop destroys egui's GL objects while the context is alive.
+        self.gl = None;
     }
 
     fn window_event(
@@ -378,7 +499,8 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
         match &event {
             WindowEvent::Resized(_) => {
                 self.surface_size();
-                self.needs_refit();
+                self.fit.resized();
+                self.request_redraw();
             }
             WindowEvent::KeyboardInput { event: key, .. } => {
                 if key.state == ElementState::Pressed {
@@ -408,7 +530,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                 let zoom_factor = (wheel_delta_y * WHEEL_ZOOM_SENSITIVITY).exp();
                 let zoomed = crate::view::zoom_at(self.state.view, self.cursor, zoom_factor);
                 self.state.view = crate::view::clamp(zoomed, total, window);
-                self.user_moved = true;
+                self.fit.user_moved();
                 self.request_redraw();
             }
             WindowEvent::MouseInput { state, button: winit::event::MouseButton::Left, .. } => {
@@ -422,7 +544,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                         (cursor_pos.0 - self.cursor.0, cursor_pos.1 - self.cursor.1);
                     let panned = crate::view::pan(self.state.view, pan_delta);
                     self.state.view = crate::view::clamp(panned, total, window);
-                    self.user_moved = true;
+                    self.fit.user_moved();
                     self.request_redraw();
                 }
                 self.cursor = cursor_pos;
@@ -448,3 +570,141 @@ const WHEEL_ZOOM_SENSITIVITY: f32 = 0.15;
 /// many physical px of scroll equal one "line", normalized by scale factor
 /// so zoom speed does not vary with output scaling.
 const PIXELS_PER_WHEEL_LINE: f32 = 40.0;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ready(w: u32, h: u32) -> PageState {
+        PageState::Ready(Arc::new(
+            crate::decode::Decoded::rgba(
+                w,
+                h,
+                crate::decode::Format::Png,
+                vec![0u8; w as usize * h as usize * 4].into_boxed_slice(),
+            )
+            .expect("valid rgba page"),
+        ))
+    }
+
+    #[test]
+    fn seat_plan_clears_a_seat_with_no_wanted_page() {
+        assert!(matches!(seat_plan(None, None, None), SeatPlan::Clear));
+        let state = ready(2, 2);
+        assert!(matches!(seat_plan(None, Some(&state), None), SeatPlan::Clear));
+    }
+
+    #[test]
+    fn seat_plan_shows_a_ready_page_with_its_dims() {
+        let state = ready(640, 480);
+        let held = ShownPage { page: 9, dims: (10, 10) };
+        match seat_plan(Some(3), Some(&state), Some(&held)) {
+            SeatPlan::Show { page, decoded } => {
+                assert_eq!(page, 3);
+                assert_eq!((decoded.width, decoded.height), (640, 480));
+            }
+            SeatPlan::Hold | SeatPlan::Clear => panic!("a Ready page must show"),
+        }
+    }
+
+    #[test]
+    fn seat_plan_holds_an_undecided_page() {
+        let held = ShownPage { page: 2, dims: (8, 8) };
+        assert!(matches!(seat_plan(Some(4), None, Some(&held)), SeatPlan::Hold));
+        // Nothing held: the seat stays empty.
+        assert!(matches!(seat_plan(Some(4), None, None), SeatPlan::Hold));
+    }
+
+    #[test]
+    fn seat_plan_holds_a_failed_page() {
+        let failed = PageState::Failed("page 4: bad bitstream".into());
+        let held = ShownPage { page: 2, dims: (8, 8) };
+        assert!(matches!(
+            seat_plan(Some(4), Some(&failed), Some(&held)),
+            SeatPlan::Hold
+        ));
+    }
+
+    #[test]
+    fn fit_demands_refit_until_a_total_is_recorded() {
+        let mut fit = Fit::default();
+        assert!(fit.should_refit((100.0, 200.0)));
+        fit.fitted_to((100.0, 200.0));
+        assert!(!fit.should_refit((100.0, 200.0)));
+        assert!(fit.should_refit((100.0, 201.0)));
+    }
+
+    #[test]
+    fn user_move_survives_spread_shape_changes() {
+        let mut fit = Fit::default();
+        fit.fitted_to((100.0, 200.0));
+        fit.user_moved();
+        assert!(fit.user_moved);
+        // A late-decoded page changes the shape after the user moved.
+        fit.fitted_to((120.0, 200.0));
+        assert!(fit.user_moved);
+    }
+
+    #[test]
+    fn page_turn_discards_user_placement() {
+        let mut fit = Fit::default();
+        fit.fitted_to((100.0, 200.0));
+        fit.user_moved();
+        fit.page_turned();
+        assert!(fit.should_refit((100.0, 200.0)));
+        assert!(!fit.user_moved);
+    }
+
+    #[test]
+    fn resize_discards_user_placement() {
+        let mut fit = Fit::default();
+        fit.fitted_to((100.0, 200.0));
+        fit.user_moved();
+        fit.resized();
+        assert!(fit.should_refit((100.0, 200.0)));
+        assert!(!fit.user_moved);
+    }
+
+    #[test]
+    fn reset_view_discards_user_placement() {
+        let mut fit = Fit::default();
+        fit.fitted_to((100.0, 200.0));
+        fit.user_moved();
+        fit.reset_view();
+        assert!(fit.should_refit((100.0, 200.0)));
+        assert!(!fit.user_moved);
+    }
+
+    #[test]
+    fn fold_waits_on_any_undecided_wanted_seat() {
+        let both_decided = [Some(ready(2, 2)), Some(PageState::Failed("x".into()))];
+        assert!(!fold_status([Some(0), Some(1)], &both_decided).waiting);
+        let right_undecided = [Some(ready(2, 2)), None];
+        assert!(fold_status([Some(0), Some(1)], &right_undecided).waiting);
+        let left_undecided = [None, Some(ready(2, 2))];
+        assert!(fold_status([Some(0), Some(1)], &left_undecided).waiting);
+        // An unwanted seat is never waited on.
+        let single = [Some(ready(2, 2)), None];
+        assert!(!fold_status([Some(0), None], &single).waiting);
+    }
+
+    #[test]
+    fn fold_reports_the_first_error_in_seat_order() {
+        let both_failed =
+            [Some(PageState::Failed("left".into())), Some(PageState::Failed("right".into()))];
+        assert_eq!(fold_status([Some(0), Some(1)], &both_failed).error.as_deref(), Some("left"));
+        let right_failed = [Some(ready(2, 2)), Some(PageState::Failed("right".into()))];
+        assert_eq!(fold_status([Some(0), Some(1)], &right_failed).error.as_deref(), Some("right"));
+    }
+
+    #[test]
+    fn fold_takes_format_and_dims_from_the_leftmost_ready_seat() {
+        let only_right = [None, Some(ready(800, 600))];
+        let folded = fold_status([Some(0), Some(1)], &only_right);
+        assert_eq!(folded.format, Some("png"));
+        assert_eq!(folded.dims, Some((800, 600)));
+        let both = [Some(ready(640, 480)), Some(ready(800, 600))];
+        let folded = fold_status([Some(0), Some(1)], &both);
+        assert_eq!(folded.dims, Some((640, 480)));
+    }
+}
