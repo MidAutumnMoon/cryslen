@@ -45,10 +45,14 @@ pixels). Two non-obvious points:
    (`std::thread::scope`, static chunking, capped thread count)
    recovers full speed. The `jxl-image-rs-integration` crate hard-codes
    no runner, so it is the slow path too.
-2. Force the output format: `JxlPixelFormat { color_type: Rgb,
-   color_data_format: U8 { bit_depth: 8 }, .. }`, read into an RGB
-   buffer via `JxlOutputBuffer`, expand to RGBA. Higher-bit-depth JXL
-   output needs `image_all_channels` float buffers.
+2. Force the output format: `JxlPixelFormat { color_type: Rgba,
+   color_data_format: U8 { bit_depth: 8 }, extra_channel_format:
+   vec![None; basic_info.extra_channels.len()] }`, read into an RGBA
+   buffer via `JxlOutputBuffer`. The decoder interleaves RGBA and fills
+   opaque alpha itself. A file with its own alpha channel decodes with
+   that alpha intact. Supply one `extra_channel_format` slot per extra
+   channel. `None` means no separate buffer for it. Request higher bit
+   depths through `JxlDataFormat` (`U16`, `F16`, `F32`).
 
 Guard against hostile headers: `width.checked_mul(height)` against a
 pixel cap (the image crate's own 512 MiB allocation ceiling) before

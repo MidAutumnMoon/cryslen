@@ -502,8 +502,8 @@ mod avif {
     }
 }
 
-/// jxl-rs low-level decode with a scoped-thread parallel runner. Output is
-/// requested as 8-bit RGB and expanded to RGBA here.
+/// jxl-rs low-level decode with a scoped-thread parallel runner. The decoder
+/// fills opaque alpha when the file has none.
 mod jxl {
     use jxl::api::{
         states, JxlColorType, JxlDataFormat, JxlDecoder, JxlDecoderOptions, JxlOutputBuffer,
@@ -539,10 +539,13 @@ mod jxl {
         };
         super::check_dims(width as u32, height as u32)?;
 
+        let extra_channels = decoder.basic_info().extra_channels.len();
         decoder.set_pixel_format(JxlPixelFormat {
-            color_type: JxlColorType::Rgb,
+            color_type: JxlColorType::Rgba,
             color_data_format: Some(JxlDataFormat::U8 { bit_depth: 8 }),
-            extra_channel_format: Vec::new(),
+            // The decoder requires one slot per extra channel. None means
+            // that channel gets no separate buffer.
+            extra_channel_format: vec![None; extra_channels],
         })
         .map_err(DecodeError::Jxl)?;
 
@@ -556,8 +559,8 @@ mod jxl {
         };
 
         // pass 3: pixels
-        let mut rgb_buffer = vec![0u8; pixel_count * 3];
-        let mut output = JxlOutputBuffer::new(&mut rgb_buffer, height, width * 3);
+        let mut rgba_buffer = vec![0u8; pixel_count * 4];
+        let mut output = JxlOutputBuffer::new(&mut rgba_buffer, height, width * 4);
         loop {
             match decoder
                 .process(&mut input, std::slice::from_mut(&mut output), Some(&mut runner))
@@ -568,22 +571,16 @@ mod jxl {
             }
         }
 
-        Decoded::rgba(width as u32, height as u32, Format::Jxl, expand_rgba(&rgb_buffer))
+        Decoded::rgba(
+            width as u32,
+            height as u32,
+            Format::Jxl,
+            rgba_buffer.into_boxed_slice(),
+        )
     }
 
     fn threads() -> usize {
         std::thread::available_parallelism().map_or(1, |n| n.get()).min(MAX_THREADS)
-    }
-
-    fn expand_rgba(rgb: &[u8]) -> Box<[u8]> {
-        let mut rgba = vec![0u8; rgb.len() / 3 * 4].into_boxed_slice();
-        let (pixels, _) = rgba.as_chunks_mut::<4>();
-        let (src_pixels, _) = rgb.as_chunks::<3>();
-        for (dst, src) in pixels.iter_mut().zip(src_pixels) {
-            dst[..3].copy_from_slice(src);
-            dst[3] = 0xFF;
-        }
-        rgba
     }
 
     /// Scoped-thread runner. Per-task errors inside the threads are
@@ -759,10 +756,37 @@ mod tests {
 
     #[test]
     fn avif_and_jxl_garbage_is_an_error_not_panic() {
-        // No cheap encoder exists for either format in-tree, so only the
-        // dispatch decision is testable: sniffed pages reach the decoder and
-        // come back as errors, never panic.
+        // No avif encoder exists in-tree, so only the dispatch decision is
+        // testable for it.
         assert!(matches!(decode(b"\x00\x00\x00\x0cftypavif", "a.avif"), Err(DecodeError::Avif(..))));
         assert!(matches!(decode(&[0xFF, 0x0A, 0x00], "a.jxl"), Err(DecodeError::Corrupt(_))));
+    }
+
+    // 8x8 lossless cjxl fixtures with solid top and bottom halves. gray.jxl is
+    // grayscale. alpha.jxl carries an alpha extra channel.
+    #[test]
+    fn jxl_fixtures_decode_to_rgba() {
+        let page = decode(include_bytes!("testdata/gray.jxl"), "a.jxl").expect("gray jxl decodes");
+        assert_eq!((page.width, page.height), (8, 8));
+        assert_eq!(page.format, Format::Jxl);
+        match page.pixels {
+            // gray replicates to r=g=b
+            Pixels::Rgba8(b) => {
+                assert_eq!(&b[..4], &[0x20, 0x20, 0x20, 0xFF]);
+                assert_eq!(&b[128..132], &[0xE0, 0xE0, 0xE0, 0xFF]);
+            }
+            Pixels::Yuv(_) => panic!("jxl must decode to rgba"),
+        }
+
+        let page =
+            decode(include_bytes!("testdata/alpha.jxl"), "a.jxl").expect("alpha jxl decodes");
+        match page.pixels {
+            // the file's own alpha rides in the fourth byte
+            Pixels::Rgba8(b) => {
+                assert_eq!(&b[..4], &[0x40, 0x80, 0xC0, 0xFF]);
+                assert_eq!(&b[128..132], &[0x40, 0x80, 0xC0, 0x80]);
+            }
+            Pixels::Yuv(_) => panic!("jxl must decode to rgba"),
+        }
     }
 }
