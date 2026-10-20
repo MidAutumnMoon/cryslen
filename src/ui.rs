@@ -1,6 +1,6 @@
 //! Status overlay: one egui bottom panel, data in / text out.
 
-use crate::page::Spread;
+use crate::view::Spread;
 
 /// Everything the status line shows. Built by the app each frame from plain
 /// state. No logic lives here.

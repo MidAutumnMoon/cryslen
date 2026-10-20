@@ -1,7 +1,8 @@
 # Rendering: the Wayland/GL stack and its sharp edges
 
-Reference for anyone touching render.rs or the event loop. The working
-stack is winit + glutin + glow + egui_glow with no eframe and no X11.
+Reference for anyone touching render.rs, window.rs, or the event loop. The
+working stack is winit + glutin + glow + egui_glow with no eframe and no
+X11.
 Knowing why each piece exists prevents rewrites that regress latency.
 
 ## Stack layers (what each crate answers)
@@ -16,8 +17,8 @@ Knowing why each piece exists prevents rewrites that regress latency.
 
 eframe is those five pre-wired. notan is a parallel game-flavored
 packaging of the same layers. Going direct costs the boilerplate in
-render.rs and buys page textures outside egui's paint list, zero
-framework opinions about repaint, and no hidden X11.
+render.rs and window.rs and buys page textures outside egui's paint
+list, zero framework opinions about repaint, and no hidden X11.
 
 ## Feature flags that actually matter
 

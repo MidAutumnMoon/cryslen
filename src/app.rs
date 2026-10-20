@@ -7,11 +7,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use egui_winit::winit;
-use winit::keyboard::KeyCode;
 
-use crate::page::{Source, Spread};
-use crate::render::{PageSlots, Window};
-use crate::view::{SpreadLayout, View};
+use crate::keys::{action, is_forward, Action};
+use crate::render::PageSlots;
+use crate::source::Source;
+use crate::view::{Spread, SpreadLayout, View};
+use crate::window::Window;
 use crate::worker::{Page, Worker};
 
 /// User events that wake the parked loop.
@@ -41,51 +42,6 @@ pub const START: State = State {
     view: View { scale: 1.0, offset: (0.0, 0.0) },
     fullscreen: false,
 };
-
-/// Input actions, derived from physical keys (layout-independent).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Action {
-    Next,
-    Prev,
-    Quit,
-    ToggleDouble,
-    ToggleRtl,
-    ToggleFullscreen,
-    ResetView,
-}
-
-impl Action {
-    /// Whether a held key keeps firing this action. Only paging repeats.
-    fn repeats(self) -> bool {
-        matches!(self, Action::Next | Action::Prev)
-    }
-}
-
-/// Key map, baked in. Arrows are directional: Right means Next, Left means
-/// Prev. The app swaps them when `rtl` is on, because the reading direction
-/// decides, not the key label.
-pub fn action(code: KeyCode) -> Option<Action> {
-    use Action::*;
-    match code {
-        KeyCode::Escape | KeyCode::KeyQ => Some(Quit),
-        KeyCode::KeyD => Some(ToggleDouble),
-        KeyCode::KeyM => Some(ToggleRtl),
-        KeyCode::KeyF => Some(ToggleFullscreen),
-        KeyCode::KeyR => Some(ResetView),
-        KeyCode::ArrowRight | KeyCode::Space | KeyCode::PageDown => Some(Next),
-        KeyCode::ArrowLeft | KeyCode::PageUp => Some(Prev),
-        _ => None,
-    }
-}
-
-/// Whether an action advances reading order under the current direction.
-pub fn is_forward(act: Action, rtl: bool) -> bool {
-    match act {
-        Action::Next => !rtl,
-        Action::Prev => rtl,
-        _ => false,
-    }
-}
 
 /// The GL bundle: everything that exists only between `resumed` and exit.
 /// Field order is drop order: slots and egui are dropped while the window
@@ -155,7 +111,7 @@ impl App {
 
     /// Spread for the current index/mode, clamped to the book.
     pub fn spread(&self) -> Spread {
-        crate::page::spread_for(self.state.index, self.state.double, self.source.len())
+        crate::view::spread_for(self.state.index, self.state.double, self.source.len())
     }
 
     /// Upload what changed. A seat with a freshly decoded page shows it. An
@@ -296,7 +252,7 @@ impl App {
             Action::Quit => event_loop.exit(),
             Action::ToggleDouble => {
                 self.state.double = !self.state.double;
-                self.state.index = crate::page::spread_for(
+                self.state.index = crate::view::spread_for(
                     self.state.index,
                     self.state.double,
                     self.source.len(),
@@ -319,7 +275,7 @@ impl App {
             Action::ResetView => self.needs_refit(),
             Action::Next | Action::Prev => {
                 let forward = is_forward(act, self.state.rtl);
-                self.state.index = crate::page::advance(
+                self.state.index = crate::view::advance(
                     self.state.index,
                     forward,
                     self.state.double,
@@ -492,61 +448,3 @@ const WHEEL_ZOOM_SENSITIVITY: f32 = 0.15;
 /// many physical px of scroll equal one "line", normalized by scale factor
 /// so zoom speed does not vary with output scaling.
 const PIXELS_PER_WHEEL_LINE: f32 = 40.0;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn key_map() {
-        assert_eq!(action(KeyCode::Escape), Some(Action::Quit));
-        assert_eq!(action(KeyCode::KeyQ), Some(Action::Quit));
-        assert_eq!(action(KeyCode::KeyD), Some(Action::ToggleDouble));
-        assert_eq!(action(KeyCode::KeyM), Some(Action::ToggleRtl));
-        assert_eq!(action(KeyCode::KeyF), Some(Action::ToggleFullscreen));
-        assert_eq!(action(KeyCode::KeyR), Some(Action::ResetView));
-        assert_eq!(action(KeyCode::ArrowRight), Some(Action::Next));
-        assert_eq!(action(KeyCode::Space), Some(Action::Next));
-        assert_eq!(action(KeyCode::PageDown), Some(Action::Next));
-        assert_eq!(action(KeyCode::ArrowLeft), Some(Action::Prev));
-        assert_eq!(action(KeyCode::PageUp), Some(Action::Prev));
-        assert_eq!(action(KeyCode::KeyA), None);
-        assert_eq!(action(KeyCode::ArrowUp), None);
-    }
-
-    #[test]
-    fn only_paging_repeats_on_hold() {
-        assert!(Action::Next.repeats());
-        assert!(Action::Prev.repeats());
-        let one_shot = [
-            Action::Quit,
-            Action::ToggleDouble,
-            Action::ToggleRtl,
-            Action::ToggleFullscreen,
-            Action::ResetView,
-        ];
-        for act in one_shot {
-            assert!(!act.repeats());
-        }
-    }
-
-    #[test]
-    fn forward_follows_reading_direction() {
-        // Western: Right/Space advances.
-        assert!(is_forward(Action::Next, false));
-        assert!(!is_forward(Action::Prev, false));
-        // RTL manga: the same keys flip, so Left-ward "next" reads forward.
-        assert!(!is_forward(Action::Next, true));
-        assert!(is_forward(Action::Prev, true));
-    }
-
-    #[test]
-    fn page_turn_respects_rtl() {
-        // advance() composes with is_forward: in RTL, "Next" from page 1
-        // moves to page 0 (the cover), in western to page 2.
-        let fwd = is_forward(Action::Next, true);
-        assert_eq!(crate::page::advance(1, fwd, false, 10), 0);
-        let fwd = is_forward(Action::Next, false);
-        assert_eq!(crate::page::advance(1, fwd, false, 10), 2);
-    }
-}

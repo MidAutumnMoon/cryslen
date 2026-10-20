@@ -4,10 +4,14 @@
 
 mod app;
 mod decode;
-mod page;
+mod keys;
 mod render;
+mod source;
+#[cfg(test)]
+pub(crate) mod testkit;
 mod ui;
 mod view;
+mod window;
 mod worker;
 
 use std::path::Path;
@@ -15,7 +19,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use app::{App, UserEvent};
-use page::Source;
+use source::Source;
 use worker::Worker;
 
 fn main() -> ExitCode {

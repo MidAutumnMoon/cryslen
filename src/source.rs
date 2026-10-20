@@ -1,9 +1,7 @@
-//! Page model: a directory or archive viewed as a natural-sorted list of
-//! pages, plus the pure spread-pairing math (cover alone, then pairs).
-//! The spread functions are pure and unit-tested. The `Source` owns
-//! persistent archive handles so zip and 7z files are not reopened per
-//! page. 7z sources additionally hold a decompressed-page tier filled by
-//! a background pass.
+//! Page source: a directory or archive viewed as a natural-sorted list
+//! of pages. The `Source` owns persistent archive handles so zip and 7z
+//! files are not reopened per page. 7z sources additionally hold a
+//! decompressed-page tier filled by a background pass.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::Read;
@@ -308,73 +306,10 @@ fn sort_pages(names: &mut [String]) {
     names.sort_by(|a, b| natord::compare(a, b));
 }
 
-/// Which pages one screen shows. The cover is alone, afterwards pairs,
-/// 0-based: `0`, `1+2`, `3+4`, ...
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Spread {
-    pub first: usize,
-    pub second: Option<usize>,
-}
-
-/// Spread containing `index` when double-page mode is on/off, clamped to the
-/// book: an odd tail shows one page (`second: None`), never a phantom page.
-pub fn spread_for(index: usize, double: bool, len: usize) -> Spread {
-    let len = len.max(1);
-    let index = index.min(len - 1);
-    if !double {
-        return Spread { first: index, second: None };
-    }
-    if index == 0 {
-        return Spread { first: 0, second: None };
-    }
-    let first = spread_start(spread_number(index));
-    Spread { first, second: (first + 1 < len).then_some(first + 1) }
-}
-
-/// Next/previous spread start from `current`, wrapping at the ends.
-/// Forward from the last spread lands on the cover, and backward from the
-/// cover on the last spread. Always returns a spread *start*.
-pub fn advance(current: usize, forward: bool, double: bool, len: usize) -> usize {
-    let len = len.max(1);
-    let current = current.min(len - 1);
-    if !double {
-        let next = if forward { current + 1 } else { current + len - 1 };
-        return next % len;
-    }
-    // The double-mode cycle is the lone cover, then the pairs.
-    let spreads = 1 + (len - 1).div_ceil(2);
-    let number = spread_number(current);
-    let next = if forward { (number + 1) % spreads } else { (number + spreads - 1) % spreads };
-    spread_start(next)
-}
-
-/// 0-based spread number of a page. The cover is 0, and pages 1 and 2
-/// share 1.
-fn spread_number(page: usize) -> usize {
-    page.div_ceil(2)
-}
-
-/// First page of a double-mode spread number. Pairs start on odd pages.
-fn spread_start(number: usize) -> usize {
-    if number > 0 { 2 * number - 1 } else { 0 }
-}
-
-impl Spread {
-    /// Visual seating as [left, right]. Western reads first-left. Manga
-    /// reads first-right, so a lone page lands in the right slot.
-    pub fn seats(&self, rtl: bool) -> [Option<usize>; 2] {
-        if rtl {
-            [self.second, Some(self.first)]
-        } else {
-            [Some(self.first), self.second]
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decode::testkit::{tiny_png, TempDir};
+    use crate::testkit::{tiny_png, TempDir};
 
     use std::io::Write as _;
     use std::time::{Duration, Instant};
@@ -524,92 +459,5 @@ mod tests {
             Source::open(&dir.path().join("book.rar")),
             Err(SourceError::Unsupported(_))
         ));
-    }
-
-    #[test]
-    fn cover_alone_then_pairs() {
-        assert_eq!(spread_for(0, true, 10), Spread { first: 0, second: None });
-        assert_eq!(spread_for(1, true, 10), Spread { first: 1, second: Some(2) });
-        assert_eq!(spread_for(2, true, 10), Spread { first: 1, second: Some(2) });
-        assert_eq!(spread_for(3, true, 10), Spread { first: 3, second: Some(4) });
-        assert_eq!(spread_for(0, false, 10), Spread { first: 0, second: None });
-        assert_eq!(spread_for(5, false, 10), Spread { first: 5, second: None });
-    }
-
-    #[test]
-    fn odd_tail_clamps_at_source() {
-        // 7 pages: index 6 lives in pair (5, 6).
-        assert_eq!(spread_for(6, true, 7), Spread { first: 5, second: Some(6) });
-        // 6 pages: the would-be pair (5, 6) shows page 5 alone, with no
-        // phantom page.
-        assert_eq!(spread_for(5, true, 6), Spread { first: 5, second: None });
-        // Out-of-range index clamps to the last page.
-        assert_eq!(spread_for(99, true, 6).first, 5);
-    }
-
-    #[test]
-    fn advance_steps_and_wraps() {
-        assert_eq!(advance(1, true, true, 10), 3);
-        assert_eq!(advance(3, false, true, 10), 1);
-        // 8 is the second page of the last spread (7, 8).
-        assert_eq!(advance(8, true, true, 9), 0);
-        assert_eq!(advance(1, false, true, 10), 0);
-        assert_eq!(advance(4, true, false, 10), 5);
-        // The cover's next spread starts at 1, not 2 (status-line bug class).
-        assert_eq!(advance(0, true, true, 10), 1);
-    }
-
-    #[test]
-    fn advance_wraps_at_both_ends() {
-        // Single mode: last page to first and back.
-        assert_eq!(advance(9, true, false, 10), 0);
-        assert_eq!(advance(0, false, false, 10), 9);
-        // Double mode with a lone tail page.
-        assert_eq!(advance(9, true, true, 10), 0);
-        assert_eq!(advance(0, false, true, 10), 9);
-        // Double mode ending on a full pair.
-        assert_eq!(advance(7, true, true, 9), 0);
-        assert_eq!(advance(0, false, true, 9), 7);
-        // Odd tail: 6 pages are 0 | 1,2 | 3,4 | 5.
-        assert_eq!(advance(5, true, true, 6), 0);
-        assert_eq!(advance(0, false, true, 6), 5);
-    }
-
-    #[test]
-    fn advance_round_trips_through_spread_starts() {
-        // A mid-spread page round-trips to its spread start, not to itself.
-        for len in [1, 2, 3, 6, 9, 10] {
-            for &double in &[false, true] {
-                for page in 0..len {
-                    for &forward in &[false, true] {
-                        let stepped = advance(page, forward, double, len);
-                        let back = advance(stepped, !forward, double, len);
-                        assert_eq!(back, spread_for(page, double, len).first);
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn advance_tiny_books() {
-        assert_eq!(advance(0, true, true, 1), 0);
-        assert_eq!(advance(0, false, false, 1), 0);
-        // 2 pages, double mode: cover and one lone page cycle into each
-        // other.
-        assert_eq!(advance(0, true, true, 2), 1);
-        assert_eq!(advance(1, true, true, 2), 0);
-        // A zero-length book never exists, but the math must tolerate it.
-        assert_eq!(advance(0, true, true, 0), 0);
-    }
-
-    #[test]
-    fn seats_follow_reading_direction() {
-        let s = Spread { first: 1, second: Some(2) };
-        assert_eq!(s.seats(false), [Some(1), Some(2)]);
-        assert_eq!(s.seats(true), [Some(2), Some(1)]);
-        let lone = Spread { first: 5, second: None };
-        assert_eq!(lone.seats(false), [Some(5), None]);
-        assert_eq!(lone.seats(true), [None, Some(5)]);
     }
 }

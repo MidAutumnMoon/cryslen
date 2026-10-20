@@ -9,7 +9,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 
 use crate::decode::Decoded;
-use crate::page::Source;
+use crate::source::Source;
 
 /// Cache budget: approximate decoded bytes the cache may hold.
 const BUDGET_BYTES: usize = 768 * 1024 * 1024;
@@ -322,7 +322,7 @@ fn retain_trail(pending: &mut BTreeSet<usize>, focus: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decode::testkit::{tiny_png, TempDir};
+    use crate::testkit::{tiny_png, TempDir};
 
     use std::sync::Condvar;
     use std::time::{Duration, Instant};
