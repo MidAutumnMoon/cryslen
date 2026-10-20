@@ -105,23 +105,29 @@ write orientation tags, so fixtures for it must come from real files.
 
 ## Decode worker pattern (what makes skimming feel right)
 
-- One worker thread, mpsc focus channel. Every focus joins a pending
-  trail with its ±3 neighborhood, which covers the full next spread in
-  double-page mode. The trail is bounded to ±64 pages of the current focus.
-  Past that the reader has moved on, so pages are dropped instead of queued.
-  The next decode is the undecided pending page nearest the focus, with
-  pages ahead of the reader beating pages behind at equal distance. The
-  channel is observed between decodes, so a newer focus overtakes the
+- One worker thread, mpsc retune channel carrying the wanted `Spread`.
+  Every retune stamps both pages, joins them to a pending trail with
+  their ±3 neighborhood, which covers the full next spread in double
+  page mode, and the trail is bounded to ±64 pages of the spread's
+  first page. Past that the reader has moved on, so pages are dropped
+  instead of queued. The wanted spread itself never drops. The next
+  decode is the undecided pending page nearest the spread, with pages
+  ahead of the reader beating pages behind at equal distance. The
+  channel is observed between decodes, so a newer spread overtakes the
   backlog. One in-flight decode always completes, and no cancellation
   tokens are needed.
-- Cache values are outcomes (`Ready(Arc<Decoded>) | Failed(String)`).
+- Decided pages and the pending trail live in one book under one lock.
+  Cache values are outcomes (`Ready(Arc<Decoded>) | Failed(String)`).
   Failures are sticky per page: waiting, error display, and
-  hold-last-frame all read the same map, and an error follows its page
+  hold-last-frame all read the same book, and an error follows its page
   across turns instead of a global slot.
-- Byte budget in the hundreds of MiB. Each focus stamps its page as
-  viewed with a recency counter. Never-viewed pages are evicted first,
-  farthest from the focus first, then viewed pages
-  least-recently-viewed first. The focused page is never evicted.
+- Byte budget in the hundreds of MiB. Eviction victims are never-wanted
+  pages first, then least recently wanted, then farthest from the
+  spread. The wanted spread is never evicted, so each wanted page is
+  decided or pending at every instant and an oversized spread stays
+  over budget rather than losing a shown page.
+- The app reads one snapshot per frame, giving each seat Ready, Failed,
+  or Pending. There is no unknown state.
 - Wrap decode in `catch_unwind`: a panicking decoder must degrade to a
   `Failed` page, not kill the only worker.
 - Per-page latency is decode-bound, so hold-last-frame plus a status

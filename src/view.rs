@@ -62,6 +62,11 @@ impl Spread {
             [Some(self.first), self.second]
         }
     }
+
+    /// Whether `page` is one of this spread's pages.
+    pub fn contains(&self, page: usize) -> bool {
+        self.first == page || self.second == Some(page)
+    }
 }
 
 /// Placement of the composed spread: scale is screen px per image px, offset

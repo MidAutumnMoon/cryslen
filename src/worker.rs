@@ -1,6 +1,7 @@
-//! Decode worker: one thread, a pending trail around the focus decoded
-//! nearest first, byte-budget cache where viewed pages outlive
-//! speculative ones. No disk persistence at all.
+//! Decode worker: one thread serving the spread the app is showing. One
+//! book holds every decided page and the pending trail, the wanted
+//! spread never leaves it, and every other page leaves by recency then
+//! distance. No disk persistence at all.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap};
@@ -9,146 +10,225 @@ use std::thread::JoinHandle;
 
 use crate::decode::Decoded;
 use crate::source::Source;
+use crate::view::Spread;
 
-/// Cache budget: approximate decoded bytes the cache may hold.
+/// Cache budget: approximate decoded bytes the book may hold. The wanted
+/// spread stays resident even over this budget, and frames the display
+/// holds outlive the book entirely.
 const PAGE_CACHE_BUDGET_BYTES: usize = 768 * 1024 * 1024;
 
 enum ToWorker {
-    /// The spread now on screen. The first page anchors decode priority.
-    Focus(usize, Option<usize>),
+    Retune(Spread),
     Stop,
 }
 
-/// Cache entry: the decode outcome, success or failure. A failed
-/// page is sticky, so waiting, error display, and hold-last-frame are all
-/// pure reads of this map, and the failure follows the page across turns.
-#[derive(Clone)]
-pub enum PageState {
+/// One page's settled outcome. A failed page is sticky, so waiting,
+/// error display, and hold-last-frame are all pure reads of the book,
+/// and the failure follows the page across turns.
+enum Outcome {
     Ready(Arc<Decoded>),
     Failed(String),
 }
 
-impl PageState {
+impl Outcome {
     fn resident_bytes(&self) -> usize {
         match self {
-            PageState::Ready(d) => d.resident_bytes(),
-            PageState::Failed(e) => e.len(),
+            Outcome::Ready(d) => d.resident_bytes(),
+            Outcome::Failed(e) => e.len(),
         }
     }
 }
 
-/// Cache shared between worker (writer) and app (reader). The byte budget is
-/// the approximate sum of decoded buffer sizes. Eviction is two-tier:
-/// never-viewed pages go first, farthest from the focus first, then viewed
-/// pages least-recently-viewed first. The focused page never goes.
-struct PageCache {
-    map: HashMap<usize, PageState>,
+/// The worker's answer for one wanted spread, in spread order. There is
+/// no unknown state: a page without an outcome reads as [`SeatView::Pending`].
+#[derive(Clone)]
+pub struct SpreadView {
+    pub first: SeatView,
+    pub second: Option<SeatView>,
+}
+
+#[derive(Clone)]
+pub enum SeatView {
+    Ready(Arc<Decoded>),
+    Failed(String),
+    Pending,
+}
+
+impl SpreadView {
+    /// Visual seating as [left, right], mirroring [`crate::view::Spread::seats`].
+    /// Manga reads first-right, so a lone page lands in the right seat.
+    pub fn seats(&self, rtl: bool) -> [Option<&SeatView>; 2] {
+        if rtl {
+            [self.second.as_ref(), Some(&self.first)]
+        } else {
+            [Some(&self.first), self.second.as_ref()]
+        }
+    }
+}
+
+/// Decided pages and the pending trail under one lock, so every
+/// transition preserves the whole-book invariant: each page of the
+/// wanted spread is decided or pending, never neither. A wanted page
+/// joins the trail in `retune` and leaves it only by being decided in
+/// `store`, whose eviction cannot take a wanted page. The invariant has
+/// no exit.
+struct Book {
+    outcomes: HashMap<usize, Outcome>,
+    pending: BTreeSet<usize>,
+    /// Recency stamps, written only by `retune`. An unstamped page was
+    /// never wanted and leaves the book first.
+    stamps: HashMap<usize, u64>,
+    stamp: u64,
     budget: usize,
     live_bytes: usize,
-    viewed: HashMap<usize, u64>,
-    stamp: u64,
 }
 
-impl PageCache {
-    fn new() -> PageCache {
-        PageCache {
-            map: HashMap::new(),
+impl Book {
+    fn new() -> Book {
+        Book {
+            outcomes: HashMap::new(),
+            pending: BTreeSet::new(),
+            stamps: HashMap::new(),
+            stamp: 0,
             budget: PAGE_CACHE_BUDGET_BYTES,
             live_bytes: 0,
-            viewed: HashMap::new(),
-            stamp: 0,
         }
     }
 
-    fn mark_viewed(&mut self, index: usize) {
+    /// Point the worker at a spread. Both pages are stamped, joined to
+    /// the trail with their neighbours, and protected from trail
+    /// pruning.
+    fn retune(&mut self, want: Spread, len: usize) {
         self.stamp += 1;
-        self.viewed.insert(index, self.stamp);
+        self.stamps.insert(want.first, self.stamp);
+        if let Some(second) = want.second {
+            self.stamps.insert(second, self.stamp);
+        }
+        self.pending.insert(want.first);
+        if let Some(second) = want.second {
+            self.pending.insert(second);
+        }
+        self.pending.extend(neighbors(want.first, len));
+        retain_trail(&mut self.pending, want.first, &want);
+        self.assert_want_covered(&want);
     }
 
-    /// Store a page outcome, then evict until under budget. `focused`
-    /// never goes, even when it alone exceeds the budget.
-    fn insert(&mut self, index: usize, page: PageState, focused: usize) {
-        let bytes = page.resident_bytes();
-        if let Some(old) = self.map.insert(index, page) {
+    /// The pending page to decode next: the undecided page nearest the
+    /// spread's first, ahead of the reader before behind it. Pages that
+    /// already hold an outcome leave the pending set, so a page is never
+    /// decoded twice.
+    fn take_next(&mut self, want: &Spread) -> Option<usize> {
+        self.pending.retain(|page| !self.outcomes.contains_key(page));
+        self.pending
+            .iter()
+            .copied()
+            .min_by_key(|&page| next_pick_key(page, want.first))
+    }
+
+    /// Decide a pending page, then evict until under budget. Wanted
+    /// pages never go, so an oversized spread stays over budget rather
+    /// than dropping a page the display is showing.
+    fn store(&mut self, page: usize, outcome: Outcome, want: &Spread) {
+        let bytes = outcome.resident_bytes();
+        if let Some(old) = self.outcomes.insert(page, outcome) {
             self.live_bytes -= old.resident_bytes();
         }
         self.live_bytes += bytes;
+        self.pending.remove(&page);
         if self.live_bytes > self.budget {
-            self.evict(focused);
+            self.evict(want);
+        }
+        self.assert_want_covered(want);
+    }
+
+    /// Both seats of the wanted spread in one lock acquisition. Cloning
+    /// a `Ready` page is an `Arc` bump.
+    fn snapshot(&self, want: &Spread) -> SpreadView {
+        SpreadView {
+            first: self.seat(want.first),
+            second: want.second.map(|page| self.seat(page)),
         }
     }
 
-    fn evict(&mut self, focused: usize) {
+    fn seat(&self, page: usize) -> SeatView {
+        match self.outcomes.get(&page) {
+            Some(Outcome::Ready(d)) => SeatView::Ready(Arc::clone(d)),
+            Some(Outcome::Failed(e)) => SeatView::Failed(e.clone()),
+            None => SeatView::Pending,
+        }
+    }
+
+    /// Eviction victims are never-wanted pages first, then least
+    /// recently wanted, then farthest from the spread. A wanted page has
+    /// no path into the victim list.
+    fn evict(&mut self, want: &Spread) {
         if self.live_bytes <= self.budget {
             return;
         }
-        let mut speculative: Vec<usize> = self
-            .map
+        let mut victims: Vec<usize> = self
+            .outcomes
             .keys()
             .copied()
-            .filter(|&key| key != focused && !self.viewed.contains_key(&key))
+            .filter(|&page| !want.contains(page))
             .collect();
-        speculative.sort_unstable_by_key(|&key| Reverse(key.abs_diff(focused)));
-        for key in speculative {
-            self.remove(key);
+        victims.sort_unstable_by_key(|&page| {
+            (self.stamps.get(&page).copied().unwrap_or(0), Reverse(page.abs_diff(want.first)), page)
+        });
+        for page in victims {
+            if let Some(old) = self.outcomes.remove(&page) {
+                self.live_bytes -= old.resident_bytes();
+            }
             if self.live_bytes <= self.budget {
                 return;
             }
         }
-        let mut viewed: Vec<usize> =
-            self.map.keys().copied().filter(|&key| key != focused).collect();
-        viewed.sort_unstable_by_key(|&key| self.viewed[&key]);
-        for key in viewed {
-            self.remove(key);
-            if self.live_bytes <= self.budget {
-                return;
-            }
-        }
-        // The focused page stays even over budget, so an oversized page
-        // cannot evict itself.
+        // Only wanted pages remain, and they stay even over budget.
     }
 
-    fn remove(&mut self, key: usize) {
-        if let Some(old) = self.map.remove(&key) {
-            self.live_bytes -= old.resident_bytes();
+    fn assert_want_covered(&self, want: &Spread) {
+        let covered =
+            |page: usize| self.outcomes.contains_key(&page) || self.pending.contains(&page);
+        debug_assert!(covered(want.first));
+        if let Some(second) = want.second {
+            debug_assert!(covered(second));
         }
     }
 }
 
-/// Handle to the worker. `focus` is cheap and never blocks.
+/// Handle to the worker. `retune` is cheap and never blocks.
 pub struct Worker {
     tx: mpsc::Sender<ToWorker>,
-    cache: Arc<Mutex<PageCache>>,
+    book: Arc<Mutex<Book>>,
     handle: Option<JoinHandle<()>>,
 }
 
 impl Worker {
-    /// Spawn the worker for `source`. `notify` fires after every cache change
-    /// and should send the winit user event. The worker itself knows nothing
-    /// about winit.
+    /// Spawn the worker for `source`. `notify` fires after every decided
+    /// page and should send the winit user event. The worker itself
+    /// knows nothing about winit.
     pub fn spawn(source: Arc<Source>, notify: impl Fn() + Send + Sync + 'static) -> Worker {
         let (tx, rx) = mpsc::channel::<ToWorker>();
-        let cache = Arc::new(Mutex::new(PageCache::new()));
+        let book = Arc::new(Mutex::new(Book::new()));
         let handle = std::thread::Builder::new()
             .name("cy-decode".into())
             .spawn({
-                let cache = Arc::clone(&cache);
-                move || run(&source, rx, &cache, &notify)
+                let book = Arc::clone(&book);
+                move || run(&source, rx, &book, &notify)
             })
             .expect("spawn decode worker");
-        Worker { tx, cache, handle: Some(handle) }
+        Worker { tx, book, handle: Some(handle) }
     }
 
-    /// Tell the worker which spread the user is on. Both pages count as
-    /// viewed and join the decode trail. The first page anchors priority.
-    pub fn focus(&self, first: usize, second: Option<usize>) {
-        let _ = self.tx.send(ToWorker::Focus(first, second));
+    /// Tell the worker which spread the app is now showing. Every
+    /// retune joins the spread to the decode trail.
+    pub fn retune(&self, want: Spread) {
+        let _ = self.tx.send(ToWorker::Retune(want));
     }
 
-    /// The decode outcome for one page, if it has been decided. Cloning a
-    /// `Ready` page is an `Arc` bump.
-    pub fn page(&self, index: usize) -> Option<PageState> {
-        self.cache.lock().expect("decode cache lock").map.get(&index).cloned()
+    /// The current outcome for both seats of `want`, read under one
+    /// lock.
+    pub fn snapshot(&self, want: &Spread) -> SpreadView {
+        self.book.lock().expect("decode book lock").snapshot(want)
     }
 }
 
@@ -162,53 +242,42 @@ impl Drop for Worker {
     }
 }
 
-/// Worker loop: every focus joins the pending trail with its neighbors, and
-/// pages past `TRAIL_RADIUS` of the focus are dropped. One decode at a
-/// time, the undecided pending page nearest the focus first, ahead of the
-/// reader before behind. The channel is observed between decodes, so a
-/// newer focus overtakes the backlog. One decode in flight always runs
-/// to completion.
+/// Worker loop: every retune stamps and joins the pending trail, and
+/// pages past `TRAIL_RADIUS` of the wanted spread are dropped. One
+/// decode at a time, the undecided pending page nearest the spread
+/// first, ahead of the reader before behind. The channel is observed
+/// between decodes, so a newer spread overtakes the backlog. One decode
+/// in flight always runs to completion.
 fn run(
     source: &Source,
     rx: mpsc::Receiver<ToWorker>,
-    cache: &Mutex<PageCache>,
+    book: &Mutex<Book>,
     notify: &dyn Fn(),
 ) {
     let len = source.len();
-    let (mut focus, mut arrivals): (usize, Vec<(usize, Option<usize>)>) = match rx.recv() {
-        Ok(ToWorker::Focus(first, second)) => (first, vec![(first, second)]),
+    let (mut want, mut arrivals): (Spread, Vec<Spread>) = match rx.recv() {
+        Ok(ToWorker::Retune(want)) => (want, vec![want]),
         Ok(ToWorker::Stop) | Err(_) => return,
     };
-    let mut pending: BTreeSet<usize> = BTreeSet::new();
     loop {
         while let Ok(message) = rx.try_recv() {
-            let ToWorker::Focus(first, second) = message else { return };
-            arrivals.push((first, second));
+            let ToWorker::Retune(spread) = message else { return };
+            arrivals.push(spread);
         }
-        if let Some(&(newest, _)) = arrivals.last() {
-            focus = newest;
+        if let Some(&newest) = arrivals.last() {
+            want = newest;
             {
-                let mut pages = cache.lock().expect("decode cache lock");
-                for &(arrived, second) in &arrivals {
-                    pages.mark_viewed(arrived);
-                    if let Some(second) = second {
-                        pages.mark_viewed(second);
-                    }
+                let mut pages = book.lock().expect("decode book lock");
+                for &spread in &arrivals {
+                    pages.retune(spread, len);
                 }
             }
-            pending.extend(arrivals.iter().map(|&(first, _)| first));
-            pending.extend(arrivals.iter().filter_map(|&(_, second)| second));
-            pending.extend(neighbors(focus, len));
-            retain_trail(&mut pending, focus);
             arrivals.clear();
         }
-        let pick = {
-            let pages = cache.lock().expect("decode cache lock");
-            take_next(&mut pending, &pages, focus)
-        };
+        let pick = book.lock().expect("decode book lock").take_next(&want);
         let Some(index) = pick else {
             let arrived = match rx.recv() {
-                Ok(ToWorker::Focus(first, second)) => (first, second),
+                Ok(ToWorker::Retune(spread)) => spread,
                 Ok(ToWorker::Stop) | Err(_) => return,
             };
             arrivals.push(arrived);
@@ -216,33 +285,21 @@ fn run(
         };
         let outcome = decode_page(source, index);
         {
-            let mut pages = cache.lock().expect("decode cache lock");
-            pages.insert(
-                index,
-                match outcome {
-                    Ok(page) => PageState::Ready(page),
-                    Err(message) => PageState::Failed(message),
-                },
-                focus,
-            );
+            let mut pages = book.lock().expect("decode book lock");
+            let outcome = match outcome {
+                Ok(page) => Outcome::Ready(page),
+                Err(message) => Outcome::Failed(message),
+            };
+            pages.store(index, outcome, &want);
         }
-        pending.remove(&index);
         notify();
     }
 }
 
-/// Decode priority key: distance to the focus first, and at equal distance
-/// a page ahead of the reader before one behind it.
-fn next_pick_key(page: usize, focus: usize) -> (usize, bool) {
-    (page.abs_diff(focus), page < focus)
-}
-
-/// The pending page to decode next, or `None` when the trail is fully
-/// decided. Pages that already hold an outcome leave the pending set,
-/// so a Ready or Failed page is never decoded twice.
-fn take_next(pending: &mut BTreeSet<usize>, cache: &PageCache, focus: usize) -> Option<usize> {
-    pending.retain(|page| !cache.map.contains_key(page));
-    pending.iter().copied().min_by_key(|&page| next_pick_key(page, focus))
+/// Decode priority key: distance to the spread's first page, and at
+/// equal distance a page ahead of the reader before one behind it.
+fn next_pick_key(page: usize, anchor: usize) -> (usize, bool) {
+    (page.abs_diff(anchor), page < anchor)
 }
 
 /// One page through the panic boundary: a panicking decoder must not kill
@@ -272,15 +329,15 @@ fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
-/// How many pages on each side of the focused page to prefetch. The app
-/// anchors each spread on its first page, and a double-mode turn steps two
-/// pages, so the far page of the next spread sits at distance 3. Single-page
-/// mode over-prefetches by the same margin, which the two-tier cache reclaims
-/// first as speculation.
+/// How many pages on each side of the wanted spread to prefetch. The
+/// app anchors each spread on its first page, and a double-mode turn
+/// steps two pages, so the far page of the next spread sits at distance
+/// 3. Single-page mode over-prefetches by the same margin, which the
+/// book reclaims first as never-wanted.
 const PREFETCH_RADIUS: i64 = 3;
 
-/// Decode order around the focused page: the page itself, then neighbours
-/// out to [`PREFETCH_RADIUS`], nearest first.
+/// Decode order around the wanted spread: its first page, then
+/// neighbours out to [`PREFETCH_RADIUS`], nearest first.
 fn neighbors(current: usize, len: usize) -> Vec<usize> {
     let mut pages: Vec<usize> = (0..=PREFETCH_RADIUS)
         .flat_map(|distance| {
@@ -294,19 +351,23 @@ fn neighbors(current: usize, len: usize) -> Vec<usize> {
     pages
 }
 
-/// How many pages on each side of the focus may stay pending. A held key
-/// sends focuses faster than pages decode, so pages past this radius are
-/// dropped rather than queued for a reader that has already moved on.
+/// How many pages on each side of the wanted spread may stay pending. A
+/// held key sends retunes faster than pages decode, so pages past this
+/// radius are dropped rather than queued for a reader that has already
+/// moved on. The wanted spread itself never drops.
 const TRAIL_RADIUS: i64 = 64;
 
-fn retain_trail(pending: &mut BTreeSet<usize>, focus: usize) {
-    pending.retain(|&page| (page as i64 - focus as i64).abs() <= TRAIL_RADIUS);
+fn retain_trail(pending: &mut BTreeSet<usize>, anchor: usize, want: &Spread) {
+    pending.retain(|&page| {
+        (page as i64 - anchor as i64).abs() <= TRAIL_RADIUS || want.contains(page)
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testkit::{tiny_png, TempDir};
+    use crate::view::Spread;
 
     use std::sync::Condvar;
     use std::time::{Duration, Instant};
@@ -354,30 +415,44 @@ mod tests {
     }
 
     #[test]
+    fn view_seating_follows_reading_direction() {
+        let lone = SpreadView { first: SeatView::Pending, second: None };
+        assert!(matches!(lone.seats(true), [None, Some(SeatView::Pending)]));
+        assert!(matches!(lone.seats(false), [Some(SeatView::Pending), None]));
+        let pair =
+            SpreadView { first: SeatView::Pending, second: Some(SeatView::Failed("x".into())) };
+        assert!(matches!(pair.seats(true), [Some(SeatView::Failed(_)), Some(SeatView::Pending)]));
+        assert!(matches!(pair.seats(false), [Some(SeatView::Pending), Some(SeatView::Failed(_))]));
+    }
+
+    #[test]
     fn trail_retention_drops_pages_past_the_radius() {
         let mut pending: BTreeSet<usize> = (0..=200).collect();
-        retain_trail(&mut pending, 100);
+        let want = Spread { first: 100, second: Some(101) };
+        retain_trail(&mut pending, 100, &want);
         let kept = (100 - TRAIL_RADIUS as usize)..=(100 + TRAIL_RADIUS as usize);
         assert_eq!(pending, kept.collect());
     }
 
     #[test]
     fn next_pick_is_nearest_then_ahead() {
-        let mut cache = PageCache::new();
-        cache.insert(10, ready_page(10), 10);
-        let mut pending: BTreeSet<usize> = (8..=12).collect();
-        assert_eq!(take_next(&mut pending, &cache, 10), Some(11));
-        assert!(!pending.contains(&10));
+        let mut book = Book::new();
+        let want = Spread { first: 10, second: Some(11) };
+        book.pending.extend([10, 11]);
+        book.store(10, ready_page(10), &want);
+        book.pending.extend(8..=12);
+        assert_eq!(book.take_next(&want), Some(11));
+        assert!(!book.pending.contains(&10));
         let mut order = Vec::new();
-        while let Some(page) = take_next(&mut pending, &cache, 10) {
+        while let Some(page) = book.take_next(&want) {
             order.push(page);
-            pending.remove(&page);
+            book.pending.remove(&page);
         }
         assert_eq!(order, vec![11, 9, 12, 8]);
     }
 
-    fn ready_page(label: u8) -> PageState {
-        PageState::Ready(Arc::new(
+    fn ready_page(label: u8) -> Outcome {
+        Outcome::Ready(Arc::new(
             crate::decode::Decoded::rgba(
                 2,
                 1,
@@ -389,62 +464,73 @@ mod tests {
     }
 
     #[test]
-    fn cache_evicts_speculative_pages_far_first() {
-        let mut cache = PageCache::new();
-        cache.budget = 8;
-        cache.insert(1, ready_page(1), 5);
-        cache.insert(3, ready_page(3), 5);
-        assert!(cache.map.contains_key(&3));
-        assert!(!cache.map.contains_key(&1));
-        assert!(cache.live_bytes <= cache.budget);
+    fn evicts_unwanted_pages_far_first() {
+        let mut book = Book::new();
+        book.budget = 8;
+        let want = Spread { first: 5, second: Some(6) };
+        book.retune(want, 10);
+        book.store(1, ready_page(1), &want);
+        book.store(3, ready_page(3), &want);
+        assert!(book.outcomes.contains_key(&3));
+        assert!(!book.outcomes.contains_key(&1));
+        assert!(book.live_bytes <= book.budget);
     }
 
     #[test]
-    fn viewed_page_outlives_speculative_page() {
-        let mut cache = PageCache::new();
-        cache.budget = 8;
-        cache.mark_viewed(1);
-        cache.insert(1, ready_page(1), 5);
-        // Page 3 is nearer the focus but never viewed, so it goes first.
-        cache.insert(3, ready_page(3), 5);
-        assert!(cache.map.contains_key(&1));
-        assert!(!cache.map.contains_key(&3));
+    fn stamped_page_outlives_unstamped_page() {
+        let mut book = Book::new();
+        book.budget = 8;
+        let want = Spread { first: 5, second: Some(6) };
+        book.retune(Spread { first: 1, second: None }, 10);
+        book.retune(want, 10);
+        book.store(1, ready_page(1), &want);
+        // Page 3 is nearer the spread but was never wanted, so it goes.
+        book.store(3, ready_page(3), &want);
+        assert!(book.outcomes.contains_key(&1));
+        assert!(!book.outcomes.contains_key(&3));
     }
 
     #[test]
-    fn viewed_pages_evict_least_recent_first() {
-        let mut cache = PageCache::new();
-        cache.budget = 8;
-        cache.mark_viewed(1);
-        cache.mark_viewed(2);
-        cache.insert(1, ready_page(1), 5);
-        cache.insert(2, ready_page(2), 5);
-        assert!(cache.map.contains_key(&2));
-        assert!(!cache.map.contains_key(&1));
+    fn stamped_pages_evict_oldest_stamp_first() {
+        let mut book = Book::new();
+        book.budget = 8;
+        let want = Spread { first: 5, second: Some(6) };
+        book.retune(Spread { first: 1, second: None }, 10);
+        book.retune(Spread { first: 2, second: None }, 10);
+        book.retune(want, 10);
+        book.store(1, ready_page(1), &want);
+        book.store(2, ready_page(2), &want);
+        assert!(book.outcomes.contains_key(&2));
+        assert!(!book.outcomes.contains_key(&1));
     }
 
-    // A full cache must evict the oldest viewed page, never the spread the
-    // user just turned to.
+    // The endgame pin: a full book must evict the oldest unwanted page,
+    // never a page of the spread the user just turned to.
     #[test]
-    fn saturating_insert_spares_the_newest_viewed_page() {
-        let mut cache = PageCache::new();
-        cache.budget = 16;
-        cache.mark_viewed(1);
-        cache.insert(1, ready_page(1), 7);
-        cache.mark_viewed(7);
-        cache.insert(7, ready_page(7), 7);
-        cache.mark_viewed(8);
-        cache.insert(8, ready_page(8), 7);
-        assert!(cache.map.contains_key(&7), "focused page stays");
-        assert!(cache.map.contains_key(&8), "newest viewed page stays");
-        assert!(!cache.map.contains_key(&1), "oldest viewed page goes");
+    fn saturating_store_never_drops_the_want() {
+        let mut book = Book::new();
+        book.budget = 16;
+        let want = Spread { first: 7, second: Some(8) };
+        book.retune(Spread { first: 1, second: None }, 20);
+        book.retune(want, 20);
+        book.store(1, ready_page(1), &want);
+        book.store(7, ready_page(7), &want);
+        book.store(8, ready_page(8), &want);
+        assert!(book.outcomes.contains_key(&7));
+        assert!(book.outcomes.contains_key(&8));
+        assert!(!book.outcomes.contains_key(&1));
+        let view = book.snapshot(&want);
+        assert!(matches!(view.first, SeatView::Ready(_)));
+        assert!(matches!(view.second, Some(SeatView::Ready(_))));
     }
 
     #[test]
-    fn focused_page_survives_its_own_oversize() {
-        let mut cache = PageCache::new();
-        cache.budget = 10;
-        let big = PageState::Ready(Arc::new(
+    fn wanted_spread_survives_its_own_oversize() {
+        let mut book = Book::new();
+        book.budget = 10;
+        let want = Spread { first: 3, second: Some(4) };
+        book.retune(want, 10);
+        let big = Outcome::Ready(Arc::new(
             crate::decode::Decoded::rgba(
                 10,
                 10,
@@ -453,12 +539,12 @@ mod tests {
             )
             .unwrap(),
         ));
-        cache.insert(3, big, 3);
-        assert!(cache.map.contains_key(&3));
+        book.store(3, big, &want);
+        assert!(book.outcomes.contains_key(&3));
     }
 
     #[test]
-    fn focus_decodes_and_caches() {
+    fn retune_decodes_and_caches() {
         let dir = TempDir::new("worker");
         for i in 0..3 {
             dir.write(&format!("p{i}.png"), &tiny_png(3, 2, [i as u8, 0, 0, 255]));
@@ -469,13 +555,19 @@ mod tests {
         let worker = Worker::spawn(source, move || {
             *counted.lock().unwrap() += 1;
         });
-        worker.focus(1, None);
+        worker.retune(Spread { first: 1, second: None });
 
         let deadline = Instant::now() + Duration::from_secs(20);
-        while !matches!(worker.page(1), Some(PageState::Ready(_))) && Instant::now() < deadline {
+        while !matches!(
+            worker.snapshot(&Spread { first: 1, second: None }).first,
+            SeatView::Ready(_)
+        ) && Instant::now() < deadline
+        {
             std::thread::sleep(Duration::from_millis(10));
         }
-        let PageState::Ready(page) = worker.page(1).expect("focused page decoded in time") else {
+        let SeatView::Ready(page) =
+            worker.snapshot(&Spread { first: 1, second: None }).first
+        else {
             panic!("not Ready");
         };
         assert_eq!((page.width, page.height), (3, 2));
@@ -485,21 +577,24 @@ mod tests {
     }
 
     #[test]
-    fn decode_failure_is_a_sticky_cache_entry() {
+    fn decode_failure_is_a_sticky_book_entry() {
         let dir = TempDir::new("worker-err");
         dir.write("bad.png", b"not a png at all");
         dir.write("ok.png", &tiny_png(2, 2, [0, 255, 0, 255]));
         let source = Arc::new(Source::open(dir.path()).expect("temp source opens"));
         let worker = Worker::spawn(source, || {});
-        worker.focus(0, None);
+        let want = Spread { first: 0, second: None };
+        worker.retune(want);
         let deadline = Instant::now() + Duration::from_secs(20);
-        while !matches!(worker.page(0), Some(PageState::Failed(_))) && Instant::now() < deadline {
+        while !matches!(worker.snapshot(&want).first, SeatView::Failed(_))
+            && Instant::now() < deadline
+        {
             std::thread::sleep(Duration::from_millis(10));
         }
-        match worker.page(0) {
-            Some(PageState::Failed(msg)) => assert!(msg.contains("page 1"), "{msg}"),
-            Some(PageState::Ready(_)) => panic!("bad.png decoded as Ready?"),
-            None => panic!("page 0 not decided in time"),
+        match worker.snapshot(&want).first {
+            SeatView::Failed(msg) => assert!(msg.contains("page 1"), "{msg}"),
+            SeatView::Ready(_) => panic!("bad.png decoded as Ready?"),
+            SeatView::Pending => panic!("page 0 not decided in time"),
         }
     }
 
@@ -512,8 +607,8 @@ mod tests {
         (dir, source)
     }
 
-    /// Parks the worker after each insert until the test releases that
-    /// insert's number. Focuses sent while parked are guaranteed queued
+    /// Parks the worker after each store until the test releases that
+    /// store's number. Retunes sent while parked are guaranteed queued
     /// behind it, which pins the decode order for assertions.
     #[derive(Clone)]
     struct Gate(Arc<(Mutex<(u64, u64)>, Condvar)>);
@@ -546,34 +641,40 @@ mod tests {
     fn wait_ready(worker: &Worker, pages: &[usize]) {
         let deadline = Instant::now() + Duration::from_secs(20);
         for &page in pages {
-            while !matches!(worker.page(page), Some(PageState::Ready(_))) {
-                assert!(Instant::now() < deadline, "page {page} not decoded in time");
-                std::thread::sleep(Duration::from_millis(1));
+            loop {
+                match worker.snapshot(&Spread { first: page, second: None }).first {
+                    SeatView::Ready(_) => break,
+                    SeatView::Failed(msg) => panic!("page {page} failed: {msg}"),
+                    SeatView::Pending if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    SeatView::Pending => panic!("page {page} not decoded in time"),
+                }
             }
         }
     }
 
     #[test]
-    fn rapid_focuses_decode_every_trail_page() {
+    fn rapid_retunes_decode_every_trail_page() {
         let (_dir, source) = tiny_source("worker-skim", 50);
         let worker = Worker::spawn(source, || {});
         for page in 0..50 {
-            worker.focus(page, None);
+            worker.retune(Spread { first: page, second: None });
         }
         wait_ready(&worker, &(0..50).collect::<Vec<_>>());
     }
 
     #[test]
-    fn focused_spread_decodes_both_pages() {
+    fn retuned_spread_decodes_both_pages() {
         let (_dir, source) = tiny_source("worker-double", 6);
         let worker = Worker::spawn(source, || {});
-        worker.focus(3, Some(4));
+        worker.retune(Spread { first: 3, second: Some(4) });
         wait_ready(&worker, &[3, 4]);
-        // The pair decodes arrive through neighbors anyway, so the spread
-        // wiring is pinned by the viewed marks.
-        let pages = worker.cache.lock().expect("decode cache lock");
-        assert!(pages.viewed.contains_key(&3));
-        assert!(pages.viewed.contains_key(&4));
+        // Both pages being stamped is what keeps a wanted spread in the
+        // book, so the wiring is pinned on the stamps.
+        let book = worker.book.lock().expect("decode book lock");
+        assert!(book.stamps.contains_key(&3));
+        assert!(book.stamps.contains_key(&4));
     }
 
     #[test]
@@ -582,39 +683,45 @@ mod tests {
         let gate = Gate::new();
         let parked = gate.clone();
         let worker = Worker::spawn(source, move || parked.hold());
-        worker.focus(0, None);
+        worker.retune(Spread { first: 0, second: None });
         wait_ready(&worker, &[0]);
-        // All 140 focuses queue while the worker is parked on page 0.
+        // All 139 retunes queue while the worker is parked on page 0.
         for page in 1..140 {
-            worker.focus(page, None);
+            worker.retune(Spread { first: page, second: None });
         }
         gate.release(u64::MAX);
         wait_ready(&worker, &(75..140).collect::<Vec<_>>());
         for page in 1..75 {
             assert!(
-                worker.page(page).is_none(),
+                matches!(
+                    worker.snapshot(&Spread { first: page, second: None }).first,
+                    SeatView::Pending
+                ),
                 "page {page} decoded past the trail radius"
             );
         }
     }
 
     #[test]
-    fn newer_focus_overtakes_far_pending_pages() {
+    fn newer_retune_overtakes_far_pending_pages() {
         let (_dir, source) = tiny_source("worker-prio", 70);
         let gate = Gate::new();
         let parked = gate.clone();
         let worker = Worker::spawn(source, move || parked.hold());
-        worker.focus(0, None);
+        worker.retune(Spread { first: 0, second: None });
         wait_ready(&worker, &[0]);
-        worker.focus(60, None);
+        worker.retune(Spread { first: 60, second: None });
         gate.release(1);
         wait_ready(&worker, &[60]);
-        // The worker is parked on page 60's insert, so the old window
+        // The worker is parked on page 60's store, so the old window
         // pages 1 and 2 cannot have been decoded before it.
         for page in [1, 2] {
             assert!(
-                worker.page(page).is_none(),
-                "page {page} decoded before the focused page"
+                matches!(
+                    worker.snapshot(&Spread { first: page, second: None }).first,
+                    SeatView::Pending
+                ),
+                "page {page} decoded before the wanted page"
             );
         }
         gate.release(u64::MAX);

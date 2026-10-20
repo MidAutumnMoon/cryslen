@@ -14,14 +14,14 @@ use crate::render::PageTextures;
 use crate::source::Source;
 use crate::view::{Spread, SpreadLayout, View};
 use crate::window::Window;
-use crate::worker::{PageState, Worker};
+use crate::worker::{SeatView, SpreadView, Worker};
 
 /// User events that wake the parked loop.
 pub enum UserEvent {
     /// egui wants a repaint after this delay. Arming only: `new_events`
     /// fires the redraw when the deadline is reached.
     Repaint(Duration),
-    /// Decode cache changed. Redraw to pick up newly decoded pages.
+    /// The decode book changed. Redraw to pick up newly decided pages.
     PagesUpdated,
 }
 
@@ -44,37 +44,6 @@ const DEFAULT_STATE: State = State {
     fullscreen: false,
 };
 
-/// What one seat displays: the page and its decoded size.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ShownPage {
-    page: usize,
-    dims: (u32, u32),
-}
-
-/// One seat's frame decision.
-enum SeatPlan {
-    /// Show this page, making it the seat's `shown` entry.
-    Show { page: usize, decoded: Arc<Decoded> },
-    /// Keep the seat's `shown` entry and its last frame.
-    Hold,
-    /// Show nothing.
-    Clear,
-}
-
-/// Decide one seat's frame. A wanted page that is Ready shows. An
-/// undecided or failed page holds the last frame, surfacing through the
-/// status fold instead. No wanted page clears the seat.
-fn seat_plan(wanted: Option<usize>, state: Option<&PageState>) -> SeatPlan {
-    match (wanted, state) {
-        (None, _) => SeatPlan::Clear,
-        (Some(_), None) | (Some(_), Some(PageState::Failed(_))) => SeatPlan::Hold,
-        (Some(page), Some(PageState::Ready(decoded))) => SeatPlan::Show {
-            page,
-            decoded: Arc::clone(decoded),
-        },
-    }
-}
-
 /// Status facts folded over both seats of a spread.
 struct FoldedStatus {
     /// A wanted seat is still undecided.
@@ -87,19 +56,19 @@ struct FoldedStatus {
     dims: Option<(u32, u32)>,
 }
 
-/// Fold the seats' decode outcomes into status facts. `states[i]` is the
-/// outcome fetched for `wanted[i]`.
-fn fold_status(wanted: [Option<usize>; 2], states: &[Option<PageState>; 2]) -> FoldedStatus {
+/// Fold the seats' views into status facts. `views[i]` is the worker's
+/// view for `wanted[i]`.
+fn fold_status(wanted: [Option<usize>; 2], views: &[Option<SeatView>; 2]) -> FoldedStatus {
     let mut folded = FoldedStatus { waiting: false, error: None, format: None, dims: None };
-    for (seat, state) in states.iter().enumerate() {
-        if wanted[seat].is_some() && state.is_none() {
+    for (seat, view) in views.iter().enumerate() {
+        if wanted[seat].is_some() && matches!(view, Some(SeatView::Pending)) {
             folded.waiting = true;
         }
-        match state {
-            Some(PageState::Failed(message)) if folded.error.is_none() => {
+        match view {
+            Some(SeatView::Failed(message)) if folded.error.is_none() => {
                 folded.error = Some(message.clone());
             }
-            Some(PageState::Ready(decoded)) if folded.format.is_none() => {
+            Some(SeatView::Ready(decoded)) if folded.format.is_none() => {
                 folded.format = Some(decoded.format.label());
                 folded.dims = Some((decoded.width, decoded.height));
             }
@@ -184,8 +153,13 @@ pub struct App {
     /// GL init failure from `resumed`, which cannot return a Result. Main
     /// reports it after the event loop exits.
     pub start_error: Option<eros::ErrorUnion>,
-    /// The single source of what each seat displays, held frames included.
-    shown: [Option<ShownPage>; 2],
+    /// What each seat holds, the last frame included. Holding the
+    /// decoded page is the design: worker eviction can drop the book's
+    /// entry, never the pixels on screen.
+    held: [Option<Arc<Decoded>>; 2],
+    /// The spread last sent to the worker. Frame composition pins
+    /// against it: every spread change must retune.
+    retuned: Spread,
     /// Window size the GL surface was last resized to (physical px).
     last_surface_size: (u32, u32),
     cursor: (f32, f32),
@@ -210,13 +184,17 @@ impl App {
         index: usize,
         proxy: winit::event_loop::EventLoopProxy<UserEvent>,
     ) -> App {
+        let state = State { index, ..DEFAULT_STATE };
+        let spread = crate::view::spread_for(state.index, state.double, source.len());
+        worker.retune(spread);
         App {
             source,
             worker,
-            state: State { index, ..DEFAULT_STATE },
+            state,
             gl: None,
             start_error: None,
-            shown: [None, None],
+            held: [None, None],
+            retuned: spread,
             last_surface_size: (0, 0),
             cursor: (0.0, 0.0),
             dragging: false,
@@ -232,40 +210,40 @@ impl App {
         crate::view::spread_for(self.state.index, self.state.double, self.source.len())
     }
 
-    /// Apply one frame's seat decisions: fetch each wanted seat's page
-    /// once, update `shown` and the texture bindings, and refresh the
-    /// layout memo from `shown`. Returns the fetched states for the
-    /// status fold.
-    fn display(&mut self, wanted: [Option<usize>; 2]) -> [Option<PageState>; 2] {
-        let mut states: [Option<PageState>; 2] = [None, None];
+    /// Apply one frame's seat decisions: adopt each wanted seat's Ready
+    /// page, hold undecided and failed seats on their last frame, and
+    /// refresh the layout memo from the held frames. Returns the
+    /// seat-ordered views for the status fold.
+    fn display(&mut self, spread: Spread, view: &SpreadView) -> [Option<SeatView>; 2] {
+        let views: [Option<SeatView>; 2] =
+            view.seats(self.state.rtl).map(|seat| seat.cloned());
+        let wanted = spread.seats(self.state.rtl);
         for seat in 0..2 {
-            states[seat] = wanted[seat].and_then(|page| self.worker.page(page));
-        }
-        let plans = [
-            seat_plan(wanted[0], states[0].as_ref()),
-            seat_plan(wanted[1], states[1].as_ref()),
-        ];
-        for (seat, plan) in plans.into_iter().enumerate() {
-            match plan {
-                SeatPlan::Show { page, decoded } => {
-                    self.shown[seat] =
-                        Some(ShownPage { page, dims: (decoded.width, decoded.height) });
-                    if let Some(gl) = self.gl.as_mut() {
-                        gl.pages.bind(seat, page, &decoded);
-                    }
-                }
-                SeatPlan::Hold => {}
-                SeatPlan::Clear => {
-                    self.shown[seat] = None;
+            match (wanted[seat], views[seat].as_ref()) {
+                (None, _) => {
+                    self.held[seat] = None;
                     if let Some(gl) = self.gl.as_mut() {
                         gl.pages.clear(seat);
                     }
                 }
+                (Some(page), Some(SeatView::Ready(decoded))) => {
+                    self.held[seat] = Some(Arc::clone(decoded));
+                    if let Some(gl) = self.gl.as_mut() {
+                        gl.pages.bind(seat, page, decoded);
+                    }
+                }
+                // Undecided or failed: hold the seat's frame.
+                (Some(_), Some(SeatView::Pending | SeatView::Failed(_))) => {}
+                // A wanted seat always has a view.
+                (Some(_), None) => {}
             }
         }
-        self.last_layout =
-            crate::view::layout([self.shown[0].map(|s| s.dims), self.shown[1].map(|s| s.dims)]);
-        states
+        let dims = self
+            .held
+            .each_ref()
+            .map(|held| held.as_ref().map(|d| (d.width, d.height)));
+        self.last_layout = crate::view::layout(dims);
+        views
     }
 
     /// One frame: decide, upload, draw, present.
@@ -277,7 +255,9 @@ impl App {
         let win = (size.width as f32, size.height as f32);
 
         let spread = self.spread();
-        let states = self.display(spread.seats(self.state.rtl));
+        debug_assert_eq!(spread, self.retuned, "every spread change must retune the worker");
+        let view = self.worker.snapshot(&spread);
+        let views = self.display(spread, &view);
 
         // Refit when the composed spread changes shape, unless the user
         // has zoomed or panned: their view wins over geometry.
@@ -289,7 +269,7 @@ impl App {
             self.fit.fitted_to(total);
         }
 
-        let folded = fold_status(spread.seats(self.state.rtl), &states);
+        let folded = fold_status(spread.seats(self.state.rtl), &views);
         self.waiting_since = if folded.waiting {
             Some(self.waiting_since.unwrap_or_else(Instant::now))
         } else {
@@ -408,7 +388,8 @@ impl App {
         self.fit.page_turned();
         self.request_redraw();
         let spread = self.spread();
-        self.worker.focus(spread.first, spread.second);
+        self.retuned = spread;
+        self.worker.retune(spread);
     }
 }
 
@@ -569,8 +550,8 @@ const PIXELS_PER_WHEEL_LINE: f32 = 40.0;
 mod tests {
     use super::*;
 
-    fn ready(w: u32, h: u32) -> PageState {
-        PageState::Ready(Arc::new(
+    fn ready(w: u32, h: u32) -> SeatView {
+        SeatView::Ready(Arc::new(
             crate::decode::Decoded::rgba(
                 w,
                 h,
@@ -582,33 +563,16 @@ mod tests {
     }
 
     #[test]
-    fn seat_plan_clears_a_seat_with_no_wanted_page() {
-        assert!(matches!(seat_plan(None, None), SeatPlan::Clear));
-        let state = ready(2, 2);
-        assert!(matches!(seat_plan(None, Some(&state)), SeatPlan::Clear));
-    }
-
-    #[test]
-    fn seat_plan_shows_a_ready_page_with_its_dims() {
-        let state = ready(640, 480);
-        match seat_plan(Some(3), Some(&state)) {
-            SeatPlan::Show { page, decoded } => {
-                assert_eq!(page, 3);
-                assert_eq!((decoded.width, decoded.height), (640, 480));
-            }
-            SeatPlan::Hold | SeatPlan::Clear => panic!("a Ready page must show"),
-        }
-    }
-
-    #[test]
-    fn seat_plan_holds_an_undecided_page() {
-        assert!(matches!(seat_plan(Some(4), None), SeatPlan::Hold));
-    }
-
-    #[test]
-    fn seat_plan_holds_a_failed_page() {
-        let failed = PageState::Failed("page 4: bad bitstream".into());
-        assert!(matches!(seat_plan(Some(4), Some(&failed)), SeatPlan::Hold));
+    fn fold_waits_on_any_pending_wanted_seat() {
+        let both_decided = [Some(ready(2, 2)), Some(SeatView::Failed("x".into()))];
+        assert!(!fold_status([Some(0), Some(1)], &both_decided).waiting);
+        let right_pending = [Some(ready(2, 2)), Some(SeatView::Pending)];
+        assert!(fold_status([Some(0), Some(1)], &right_pending).waiting);
+        let left_pending = [Some(SeatView::Pending), Some(ready(2, 2))];
+        assert!(fold_status([Some(0), Some(1)], &left_pending).waiting);
+        // An unwanted seat is never waited on.
+        let single = [Some(ready(2, 2)), None];
+        assert!(!fold_status([Some(0), None], &single).waiting);
     }
 
     #[test]
@@ -662,24 +626,11 @@ mod tests {
     }
 
     #[test]
-    fn fold_waits_on_any_undecided_wanted_seat() {
-        let both_decided = [Some(ready(2, 2)), Some(PageState::Failed("x".into()))];
-        assert!(!fold_status([Some(0), Some(1)], &both_decided).waiting);
-        let right_undecided = [Some(ready(2, 2)), None];
-        assert!(fold_status([Some(0), Some(1)], &right_undecided).waiting);
-        let left_undecided = [None, Some(ready(2, 2))];
-        assert!(fold_status([Some(0), Some(1)], &left_undecided).waiting);
-        // An unwanted seat is never waited on.
-        let single = [Some(ready(2, 2)), None];
-        assert!(!fold_status([Some(0), None], &single).waiting);
-    }
-
-    #[test]
     fn fold_reports_the_first_error_in_seat_order() {
         let both_failed =
-            [Some(PageState::Failed("left".into())), Some(PageState::Failed("right".into()))];
+            [Some(SeatView::Failed("left".into())), Some(SeatView::Failed("right".into()))];
         assert_eq!(fold_status([Some(0), Some(1)], &both_failed).error.as_deref(), Some("left"));
-        let right_failed = [Some(ready(2, 2)), Some(PageState::Failed("right".into()))];
+        let right_failed = [Some(ready(2, 2)), Some(SeatView::Failed("right".into()))];
         assert_eq!(fold_status([Some(0), Some(1)], &right_failed).error.as_deref(), Some("right"));
     }
 
