@@ -27,9 +27,10 @@ silently re-import x11rb.
 
 `default-features = false, features = ["bzip2"]` keeps LZMA decode and
 drops the AES stack (aes/cbc/sha2/getrandom) and the LZMA encoder,
-which the read-only path never calls. Listing needs one archive walk.
-`ArchiveReader` owns its file handle so per-read reopens are inherent
-to the API (fine for non-solid archives, measurable for solid ones).
+which the read-only path never calls. The `ArchiveReader` handle is
+retained for the session. A background pass decompresses every page
+once into a byte-budgeted tier, so solid archives pay their block
+decode once.
 Non-UTF-8 entry names surface as errors from `file_names()` and are
 skipped.
 
