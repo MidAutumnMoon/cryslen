@@ -105,18 +105,23 @@ write orientation tags, so fixtures for it must come from real files.
 
 ## Decode worker pattern (what makes skimming feel right)
 
-- One worker thread, mpsc focus channel. Loop: block on `recv`, drain
-  pending with `try_recv` keeping only the last, decode a small window
-  around it (a couple of pages each side covers both single- and
-  double-page turns), check for newer focus between every decode. One
-  in-flight decode always completes. The rest of a stale batch is
-  dropped, so no FIFO backlog and no cancellation tokens are needed.
+- One worker thread, mpsc focus channel. Every focus joins a pending
+  trail with its ±2 window, which covers both single- and double-page
+  turns. The trail is bounded to ±64 pages of the current focus. Past
+  that the reader has moved on, so pages are dropped instead of queued.
+  The next decode is the undecided pending page nearest the focus, with
+  pages ahead of the reader beating pages behind at equal distance. The
+  channel is observed between decodes, so a newer focus overtakes the
+  backlog. One in-flight decode always completes, and no cancellation
+  tokens are needed.
 - Cache values are outcomes (`Ready(Arc<Decoded>) | Failed(String)`).
   Failures are sticky per page: waiting, error display, and
   hold-last-frame all read the same map, and an error follows its page
   across turns instead of a global slot.
-- Byte-budget eviction (hundreds of MiB), protecting the focused page
-  by parameter. Evict non-window entries first.
+- Byte budget in the hundreds of MiB. Each focus stamps its page as
+  viewed with a recency counter. Never-viewed pages are evicted first,
+  farthest from the focus first, then viewed pages
+  least-recently-viewed first. The focused page is never evicted.
 - Wrap decode in `catch_unwind`: a panicking decoder must degrade to a
   `Failed` page, not kill the only worker.
 - Per-page latency is decode-bound, so hold-last-frame plus a status

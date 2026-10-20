@@ -1,7 +1,9 @@
-//! Decode worker: one thread, latest-wins focus, ±2 prefetch window,
-//! in-memory cache with a byte budget. No disk persistence at all.
+//! Decode worker: one thread, a pending trail around the focus decoded
+//! nearest first, byte-budget cache where viewed pages outlive
+//! speculative ones. No disk persistence at all.
 
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
@@ -10,7 +12,7 @@ use crate::decode::Decoded;
 use crate::page::Source;
 
 /// Cache budget: approximate decoded bytes the cache may hold.
-const BUDGET_BYTES: usize = 512 * 1024 * 1024;
+const BUDGET_BYTES: usize = 768 * 1024 * 1024;
 
 /// Wakes the loop so it can observe `stop` and exit (sent by `Drop`).
 const SENTINEL: usize = usize::MAX;
@@ -41,58 +43,78 @@ impl Page {
 }
 
 /// Cache shared between worker (writer) and app (reader). The byte budget is
-/// the approximate sum of decoded buffer sizes. Eviction is simplest-first:
-/// drop arbitrary non-current entries. There is no LRU machinery.
+/// the approximate sum of decoded buffer sizes. Eviction is two-tier:
+/// never-viewed pages go first, farthest from the focus first, then viewed
+/// pages least-recently-viewed first. The focused page never goes.
 struct PageCache {
     map: HashMap<usize, Page>,
     budget: usize,
     live_bytes: usize,
+    /// Recency stamp per page the user visited, for the eviction order.
+    viewed: HashMap<usize, u64>,
+    stamp: u64,
 }
 
 impl PageCache {
     fn new() -> PageCache {
-        PageCache { map: HashMap::new(), budget: BUDGET_BYTES, live_bytes: 0 }
+        PageCache {
+            map: HashMap::new(),
+            budget: BUDGET_BYTES,
+            live_bytes: 0,
+            viewed: HashMap::new(),
+            stamp: 0,
+        }
     }
 
-    /// Store a page outcome, then evict until under budget. `focused` never
-    /// goes. Entries outside `keep` go first, then the neighbours.
-    fn insert(&mut self, index: usize, page: Page, focused: usize, keep: &[usize]) {
+    /// Marks a page the user visited. Revisiting refreshes its recency.
+    fn mark_viewed(&mut self, index: usize) {
+        self.stamp += 1;
+        self.viewed.insert(index, self.stamp);
+    }
+
+    /// Store a page outcome, then evict until under budget. `focused`
+    /// never goes, even when it alone exceeds the budget.
+    fn insert(&mut self, index: usize, page: Page, focused: usize) {
         let bytes = page.resident_bytes();
         if let Some(old) = self.map.insert(index, page) {
             self.live_bytes -= old.resident_bytes();
         }
         self.live_bytes += bytes;
         if self.live_bytes > self.budget {
-            self.evict(focused, keep);
+            self.evict(focused);
         }
     }
 
-    fn evict(&mut self, focused: usize, keep: &[usize]) {
+    fn evict(&mut self, focused: usize) {
         if self.live_bytes <= self.budget {
             return;
         }
-        let outside: Vec<usize> = self
+        // Speculative pages go first, farthest from the focus first.
+        let mut speculative: Vec<usize> = self
             .map
             .keys()
             .copied()
-            .filter(|k| *k != focused && !keep.contains(k))
+            .filter(|&key| key != focused && !self.viewed.contains_key(&key))
             .collect();
-        for key in outside {
+        speculative.sort_unstable_by_key(|&key| Reverse(key.abs_diff(focused)));
+        for key in speculative {
             self.remove(key);
             if self.live_bytes <= self.budget {
                 return;
             }
         }
-        // Everything cached is now wanted. Drop the neighbours, never the
-        // focused page, so a budget-exceeding page cannot evict itself.
-        let neighbours: Vec<usize> =
-            keep.iter().copied().filter(|&page| page != focused).collect();
-        for key in neighbours {
+        // Viewed pages go least-recently-viewed first.
+        let mut viewed: Vec<usize> =
+            self.map.keys().copied().filter(|&key| key != focused).collect();
+        viewed.sort_unstable_by_key(|&key| self.viewed[&key]);
+        for key in viewed {
             self.remove(key);
             if self.live_bytes <= self.budget {
                 return;
             }
         }
+        // Only the focused page is left, and it stays even over budget, so
+        // an oversized page cannot evict itself.
     }
 
     fn remove(&mut self, key: usize) {
@@ -129,8 +151,8 @@ impl Worker {
         Worker { tx, cache, stop, handle: Some(handle) }
     }
 
-    /// Tell the worker which page the user is on. Sending is latest-wins:
-    /// the worker drains pending focuses and serves only the newest.
+    /// Tell the worker which page the user is on. Every focus counts as a
+    /// viewed page and joins the decode trail.
     pub fn focus(&self, index: usize) {
         let _ = self.tx.send(index);
     }
@@ -153,10 +175,12 @@ impl Drop for Worker {
     }
 }
 
-/// Worker loop: latest-wins focus, then decode the ±2 window around it,
-/// nearest first. A focus update arriving mid-batch aborts the rest of the
-/// batch so no FIFO backlog forms. One decode in flight always runs to
-/// completion.
+/// Worker loop: every focus joins the pending trail with its window, and
+/// pages past `TRAIL_RADIUS` of the focus are dropped. One decode at a
+/// time, the undecided pending page nearest the focus first, ahead of the
+/// reader before behind. The channel is observed between decodes, so a
+/// newer focus overtakes the backlog. One decode in flight always runs
+/// to completion.
 fn run(
     source: &Source,
     rx: mpsc::Receiver<usize>,
@@ -164,47 +188,78 @@ fn run(
     cache: &Mutex<PageCache>,
     notify: &dyn Fn(),
 ) {
-    let mut current = match rx.recv() {
+    let len = source.len();
+    let mut focus = match rx.recv() {
+        Ok(SENTINEL) | Err(_) => return,
         Ok(index) => index,
-        Err(_) => return,
     };
-    while current != SENTINEL && !stop.load(Ordering::Relaxed) {
-        let decode_order = window(current, source.len());
-        let mut newer: Option<usize> = None;
-        for &index in &decode_order {
-            while let Ok(arrived) = rx.try_recv() {
-                if stop.load(Ordering::Relaxed) || arrived == SENTINEL {
-                    return;
-                }
-                newer = Some(arrived);
+    let mut arrivals: Vec<usize> = vec![focus];
+    let mut pending: BTreeSet<usize> = BTreeSet::new();
+    loop {
+        while let Ok(arrived) = rx.try_recv() {
+            if arrived == SENTINEL || stop.load(Ordering::Relaxed) {
+                return;
             }
-            if newer.is_some() {
-                break;
-            }
-            let done = cache.lock().expect("decode cache lock").map.contains_key(&index);
-            if done {
-                continue;
-            }
-            let outcome = decode_page(source, index);
+            arrivals.push(arrived);
+        }
+        if let Some(&newest) = arrivals.last() {
+            focus = newest;
             {
                 let mut pages = cache.lock().expect("decode cache lock");
-                pages.insert(
-                    index,
-                    match outcome {
-                        Ok(page) => Page::Ready(page),
-                        Err(message) => Page::Failed(message),
-                    },
-                    current,
-                    &decode_order,
-                );
+                for &arrived in &arrivals {
+                    pages.mark_viewed(arrived);
+                }
             }
-            notify();
+            pending.extend(arrivals.iter().copied());
+            pending.extend(window(focus, len));
+            retain_trail(&mut pending, focus);
+            arrivals.clear();
         }
-        current = match newer.or_else(|| rx.recv().ok()) {
-            Some(index) => index,
-            None => return,
+        let pick = {
+            let pages = cache.lock().expect("decode cache lock");
+            take_next(&mut pending, &pages, focus)
         };
+        let Some(index) = pick else {
+            // Nothing in the trail is undecided, so block until a focus.
+            let arrived = match rx.recv() {
+                Ok(SENTINEL) | Err(_) => return,
+                Ok(index) => index,
+            };
+            if stop.load(Ordering::Relaxed) {
+                return;
+            }
+            arrivals.push(arrived);
+            continue;
+        };
+        let outcome = decode_page(source, index);
+        {
+            let mut pages = cache.lock().expect("decode cache lock");
+            pages.insert(
+                index,
+                match outcome {
+                    Ok(page) => Page::Ready(page),
+                    Err(message) => Page::Failed(message),
+                },
+                focus,
+            );
+        }
+        pending.remove(&index);
+        notify();
     }
+}
+
+/// Decode priority key: distance to the focus first, and at equal distance
+/// a page ahead of the reader before one behind it.
+fn next_pick_key(page: usize, focus: usize) -> (usize, bool) {
+    (page.abs_diff(focus), page < focus)
+}
+
+/// The pending page to decode next, or `None` when the trail is fully
+/// decided. Pages that already hold an outcome leave the pending set,
+/// so a Ready or Failed page is never decoded twice.
+fn take_next(pending: &mut BTreeSet<usize>, cache: &PageCache, focus: usize) -> Option<usize> {
+    pending.retain(|page| !cache.map.contains_key(page));
+    pending.iter().copied().min_by_key(|&page| next_pick_key(page, focus))
 }
 
 /// One page through the panic boundary: a panicking decoder must not kill
@@ -254,11 +309,22 @@ pub fn window(current: usize, len: usize) -> Vec<usize> {
     pages
 }
 
+/// How many pages on each side of the focus may stay pending. A held key
+/// sends focuses faster than pages decode, so pages past this radius are
+/// dropped rather than queued for a reader that has already moved on.
+const TRAIL_RADIUS: i64 = 64;
+
+/// Drops pending pages farther than `TRAIL_RADIUS` from `focus`.
+fn retain_trail(pending: &mut BTreeSet<usize>, focus: usize) {
+    pending.retain(|&page| (page as i64 - focus as i64).abs() <= TRAIL_RADIUS);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::decode::testkit::{tiny_png, TempDir};
 
+    use std::sync::Condvar;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -269,27 +335,74 @@ mod tests {
     }
 
     #[test]
-    fn cache_evicts_far_pages_first() {
+    fn trail_retention_drops_pages_past_the_radius() {
+        let mut pending: BTreeSet<usize> = (0..=200).collect();
+        retain_trail(&mut pending, 100);
+        let kept = (100 - TRAIL_RADIUS as usize)..=(100 + TRAIL_RADIUS as usize);
+        assert_eq!(pending, kept.collect());
+    }
+
+    #[test]
+    fn next_pick_is_nearest_then_ahead() {
+        let mut cache = PageCache::new();
+        cache.insert(10, ready_page(10), 10);
+        let mut pending: BTreeSet<usize> = (8..=12).collect();
+        assert_eq!(take_next(&mut pending, &cache, 10), Some(11));
+        // Decided pages leave the trail rather than queue for a re-decode.
+        assert!(!pending.contains(&10));
+        let mut order = Vec::new();
+        while let Some(page) = take_next(&mut pending, &cache, 10) {
+            order.push(page);
+            pending.remove(&page);
+        }
+        assert_eq!(order, vec![11, 9, 12, 8]);
+    }
+
+    fn ready_page(label: u8) -> Page {
+        Page::Ready(Arc::new(
+            crate::decode::Decoded::rgba(
+                2,
+                1,
+                crate::decode::Format::Png,
+                vec![label; 8].into_boxed_slice(),
+            )
+            .unwrap(),
+        ))
+    }
+
+    #[test]
+    fn cache_evicts_speculative_pages_far_first() {
         let mut cache = PageCache::new();
         cache.budget = 8;
-        let page = |label: u8| {
-            Page::Ready(Arc::new(
-                crate::decode::Decoded::rgba(
-                    2,
-                    1,
-                    crate::decode::Format::Png,
-                    vec![label; 8].into_boxed_slice(),
-                )
-                .unwrap(),
-            ))
-        };
-        // Live bytes 8. Inserting another page (total 16 > 8) must evict the
-        // page outside the keep set, never the focused page.
-        cache.insert(1, page(1), 5, &[5, 4]);
-        cache.insert(5, page(5), 5, &[5, 4]);
-        assert!(cache.map.contains_key(&5));
+        cache.insert(1, ready_page(1), 5);
+        cache.insert(3, ready_page(3), 5);
+        assert!(cache.map.contains_key(&3));
         assert!(!cache.map.contains_key(&1));
         assert!(cache.live_bytes <= cache.budget);
+    }
+
+    #[test]
+    fn viewed_page_outlives_speculative_page() {
+        let mut cache = PageCache::new();
+        cache.budget = 8;
+        cache.mark_viewed(1);
+        cache.insert(1, ready_page(1), 5);
+        // Page 3 is nearer the focus but never viewed, so it goes first.
+        cache.insert(3, ready_page(3), 5);
+        assert!(cache.map.contains_key(&1));
+        assert!(!cache.map.contains_key(&3));
+    }
+
+    #[test]
+    fn viewed_pages_evict_least_recent_first() {
+        let mut cache = PageCache::new();
+        cache.budget = 8;
+        cache.mark_viewed(1);
+        cache.mark_viewed(2);
+        cache.insert(1, ready_page(1), 5);
+        cache.insert(2, ready_page(2), 5);
+        assert!(cache.map.contains_key(&2));
+        assert!(!cache.map.contains_key(&1));
     }
 
     #[test]
@@ -305,7 +418,7 @@ mod tests {
             )
             .unwrap(),
         ));
-        cache.insert(3, big, 3, &[3]);
+        cache.insert(3, big, 3);
         // The oversized focused page stays even though it alone busts budget.
         assert!(cache.map.contains_key(&3));
     }
@@ -354,5 +467,109 @@ mod tests {
             Some(Page::Ready(_)) => panic!("bad.png decoded as Ready?"),
             None => panic!("page 0 not decided in time"),
         }
+    }
+
+    fn tiny_source(tag: &str, len: usize) -> (TempDir, Arc<Source>) {
+        let dir = TempDir::new(tag);
+        for page in 0..len {
+            dir.write(&format!("p{page:03}.png"), &tiny_png(1, 1, [page as u8, 0, 0, 255]));
+        }
+        let source = Arc::new(Source::open(dir.path()).expect("temp source opens"));
+        (dir, source)
+    }
+
+    /// Parks the worker after each insert until the test releases that
+    /// insert's number. Focuses sent while parked are guaranteed queued
+    /// behind it, which pins the decode order for assertions.
+    #[derive(Clone)]
+    struct Gate(Arc<(Mutex<(u64, u64)>, Condvar)>);
+
+    impl Gate {
+        fn new() -> Gate {
+            Gate(Arc::new((Mutex::new((0, 0)), Condvar::new())))
+        }
+
+        fn hold(&self) {
+            let (state, cv) = &*self.0;
+            let mut g = state.lock().unwrap();
+            g.0 += 1;
+            let ticket = g.0;
+            // Times out so a failed assertion cannot hang Drop's join.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while g.1 < ticket && Instant::now() < deadline {
+                let (guard, _) = cv.wait_timeout(g, Duration::from_millis(50)).unwrap();
+                g = guard;
+            }
+        }
+
+        fn release(&self, through: u64) {
+            let (state, cv) = &*self.0;
+            state.lock().unwrap().1 = through;
+            cv.notify_all();
+        }
+    }
+
+    fn wait_ready(worker: &Worker, pages: &[usize]) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        for &page in pages {
+            while !matches!(worker.page(page), Some(Page::Ready(_))) {
+                assert!(Instant::now() < deadline, "page {page} not decoded in time");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    #[test]
+    fn rapid_focuses_decode_every_trail_page() {
+        let (_dir, source) = tiny_source("worker-skim", 50);
+        let worker = Worker::spawn(source, || {});
+        for page in 0..50 {
+            worker.focus(page);
+        }
+        wait_ready(&worker, &(0..50).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn trail_pages_past_the_radius_never_decode() {
+        let (_dir, source) = tiny_source("worker-bound", 140);
+        let gate = Gate::new();
+        let parked = gate.clone();
+        let worker = Worker::spawn(source, move || parked.hold());
+        worker.focus(0);
+        wait_ready(&worker, &[0]);
+        // All 140 focuses queue while the worker is parked on page 0.
+        for page in 1..140 {
+            worker.focus(page);
+        }
+        gate.release(u64::MAX);
+        wait_ready(&worker, &(75..140).collect::<Vec<_>>());
+        for page in 1..75 {
+            assert!(
+                worker.page(page).is_none(),
+                "page {page} decoded past the trail radius"
+            );
+        }
+    }
+
+    #[test]
+    fn newer_focus_overtakes_far_pending_pages() {
+        let (_dir, source) = tiny_source("worker-prio", 70);
+        let gate = Gate::new();
+        let parked = gate.clone();
+        let worker = Worker::spawn(source, move || parked.hold());
+        worker.focus(0);
+        wait_ready(&worker, &[0]);
+        worker.focus(60);
+        gate.release(1);
+        wait_ready(&worker, &[60]);
+        // The worker is parked on page 60's insert, so the old window
+        // pages 1 and 2 cannot have been decoded before it.
+        for page in [1, 2] {
+            assert!(
+                worker.page(page).is_none(),
+                "page {page} decoded before the focused page"
+            );
+        }
+        gate.release(u64::MAX);
     }
 }
