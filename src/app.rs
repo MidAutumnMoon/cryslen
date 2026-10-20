@@ -407,7 +407,8 @@ impl App {
     fn after_page_change(&mut self) {
         self.fit.page_turned();
         self.request_redraw();
-        self.worker.focus(self.state.index);
+        let spread = self.spread();
+        self.worker.focus(spread.first, spread.second);
     }
 }
 

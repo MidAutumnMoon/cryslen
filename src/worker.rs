@@ -14,7 +14,8 @@ use crate::source::Source;
 const PAGE_CACHE_BUDGET_BYTES: usize = 768 * 1024 * 1024;
 
 enum ToWorker {
-    Focus(usize),
+    /// The spread now on screen. The first page anchors decode priority.
+    Focus(usize, Option<usize>),
     Stop,
 }
 
@@ -138,10 +139,10 @@ impl Worker {
         Worker { tx, cache, handle: Some(handle) }
     }
 
-    /// Tell the worker which page the user is on. Every focus counts as a
-    /// viewed page and joins the decode trail.
-    pub fn focus(&self, index: usize) {
-        let _ = self.tx.send(ToWorker::Focus(index));
+    /// Tell the worker which spread the user is on. Both pages count as
+    /// viewed and join the decode trail. The first page anchors priority.
+    pub fn focus(&self, first: usize, second: Option<usize>) {
+        let _ = self.tx.send(ToWorker::Focus(first, second));
     }
 
     /// The decode outcome for one page, if it has been decided. Cloning a
@@ -174,26 +175,29 @@ fn run(
     notify: &dyn Fn(),
 ) {
     let len = source.len();
-    let mut focus = match rx.recv() {
-        Ok(ToWorker::Focus(index)) => index,
+    let (mut focus, mut arrivals): (usize, Vec<(usize, Option<usize>)>) = match rx.recv() {
+        Ok(ToWorker::Focus(first, second)) => (first, vec![(first, second)]),
         Ok(ToWorker::Stop) | Err(_) => return,
     };
-    let mut arrivals: Vec<usize> = vec![focus];
     let mut pending: BTreeSet<usize> = BTreeSet::new();
     loop {
         while let Ok(message) = rx.try_recv() {
-            let ToWorker::Focus(index) = message else { return };
-            arrivals.push(index);
+            let ToWorker::Focus(first, second) = message else { return };
+            arrivals.push((first, second));
         }
-        if let Some(&newest) = arrivals.last() {
+        if let Some(&(newest, _)) = arrivals.last() {
             focus = newest;
             {
                 let mut pages = cache.lock().expect("decode cache lock");
-                for &arrived in &arrivals {
+                for &(arrived, second) in &arrivals {
                     pages.mark_viewed(arrived);
+                    if let Some(second) = second {
+                        pages.mark_viewed(second);
+                    }
                 }
             }
-            pending.extend(arrivals.iter().copied());
+            pending.extend(arrivals.iter().map(|&(first, _)| first));
+            pending.extend(arrivals.iter().filter_map(|&(_, second)| second));
             pending.extend(neighbors(focus, len));
             retain_trail(&mut pending, focus);
             arrivals.clear();
@@ -204,7 +208,7 @@ fn run(
         };
         let Some(index) = pick else {
             let arrived = match rx.recv() {
-                Ok(ToWorker::Focus(index)) => index,
+                Ok(ToWorker::Focus(first, second)) => (first, second),
                 Ok(ToWorker::Stop) | Err(_) => return,
             };
             arrivals.push(arrived);
@@ -269,9 +273,9 @@ fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
 }
 
 /// How many pages on each side of the focused page to prefetch. The app
-/// focuses a spread's first page, and a double-mode turn steps two pages,
-/// so the far page of the next spread sits at distance 3. Single-page mode
-/// over-prefetches by the same margin, which the two-tier cache reclaims
+/// anchors each spread on its first page, and a double-mode turn steps two
+/// pages, so the far page of the next spread sits at distance 3. Single-page
+/// mode over-prefetches by the same margin, which the two-tier cache reclaims
 /// first as speculation.
 const PREFETCH_RADIUS: i64 = 3;
 
@@ -419,6 +423,23 @@ mod tests {
         assert!(!cache.map.contains_key(&1));
     }
 
+    // A full cache must evict the oldest viewed page, never the spread the
+    // user just turned to.
+    #[test]
+    fn saturating_insert_spares_the_newest_viewed_page() {
+        let mut cache = PageCache::new();
+        cache.budget = 16;
+        cache.mark_viewed(1);
+        cache.insert(1, ready_page(1), 7);
+        cache.mark_viewed(7);
+        cache.insert(7, ready_page(7), 7);
+        cache.mark_viewed(8);
+        cache.insert(8, ready_page(8), 7);
+        assert!(cache.map.contains_key(&7), "focused page stays");
+        assert!(cache.map.contains_key(&8), "newest viewed page stays");
+        assert!(!cache.map.contains_key(&1), "oldest viewed page goes");
+    }
+
     #[test]
     fn focused_page_survives_its_own_oversize() {
         let mut cache = PageCache::new();
@@ -448,7 +469,7 @@ mod tests {
         let worker = Worker::spawn(source, move || {
             *counted.lock().unwrap() += 1;
         });
-        worker.focus(1);
+        worker.focus(1, None);
 
         let deadline = Instant::now() + Duration::from_secs(20);
         while !matches!(worker.page(1), Some(PageState::Ready(_))) && Instant::now() < deadline {
@@ -470,7 +491,7 @@ mod tests {
         dir.write("ok.png", &tiny_png(2, 2, [0, 255, 0, 255]));
         let source = Arc::new(Source::open(dir.path()).expect("temp source opens"));
         let worker = Worker::spawn(source, || {});
-        worker.focus(0);
+        worker.focus(0, None);
         let deadline = Instant::now() + Duration::from_secs(20);
         while !matches!(worker.page(0), Some(PageState::Failed(_))) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
@@ -537,9 +558,22 @@ mod tests {
         let (_dir, source) = tiny_source("worker-skim", 50);
         let worker = Worker::spawn(source, || {});
         for page in 0..50 {
-            worker.focus(page);
+            worker.focus(page, None);
         }
         wait_ready(&worker, &(0..50).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn focused_spread_decodes_both_pages() {
+        let (_dir, source) = tiny_source("worker-double", 6);
+        let worker = Worker::spawn(source, || {});
+        worker.focus(3, Some(4));
+        wait_ready(&worker, &[3, 4]);
+        // The pair decodes arrive through neighbors anyway, so the spread
+        // wiring is pinned by the viewed marks.
+        let pages = worker.cache.lock().expect("decode cache lock");
+        assert!(pages.viewed.contains_key(&3));
+        assert!(pages.viewed.contains_key(&4));
     }
 
     #[test]
@@ -548,11 +582,11 @@ mod tests {
         let gate = Gate::new();
         let parked = gate.clone();
         let worker = Worker::spawn(source, move || parked.hold());
-        worker.focus(0);
+        worker.focus(0, None);
         wait_ready(&worker, &[0]);
         // All 140 focuses queue while the worker is parked on page 0.
         for page in 1..140 {
-            worker.focus(page);
+            worker.focus(page, None);
         }
         gate.release(u64::MAX);
         wait_ready(&worker, &(75..140).collect::<Vec<_>>());
@@ -570,9 +604,9 @@ mod tests {
         let gate = Gate::new();
         let parked = gate.clone();
         let worker = Worker::spawn(source, move || parked.hold());
-        worker.focus(0);
+        worker.focus(0, None);
         wait_ready(&worker, &[0]);
-        worker.focus(60);
+        worker.focus(60, None);
         gate.release(1);
         wait_ready(&worker, &[60]);
         // The worker is parked on page 60's insert, so the old window

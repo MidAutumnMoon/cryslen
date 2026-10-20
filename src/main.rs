@@ -94,7 +94,8 @@ fn run(open_path: &Path, land_on: Option<&str>) -> eros::Result<()> {
     let worker = Worker::spawn(Arc::clone(&source), move || {
         let _ = proxy.send_event(UserEvent::PagesUpdated);
     });
-    worker.focus(index);
+    // The app starts in single-page mode, so the landing spread is one page.
+    worker.focus(index, None);
 
     let mut app = App::new(source, worker, index, event_loop.create_proxy());
     event_loop.run_app(&mut app)?;
