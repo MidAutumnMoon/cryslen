@@ -156,12 +156,12 @@ pub struct App {
     /// GL init failure from `resumed`, which cannot return a Result. Main
     /// reports it after the event loop exits.
     pub start_error: Option<eros::ErrorUnion>,
-    /// What each seat holds, the last frame included. Holding the
-    /// decoded page is the design: worker eviction can drop the book's
-    /// entry, never the pixels on screen.
+    /// What each seat holds, the last frame included. Worker eviction
+    /// can drop the book's entry, never the pixels held here.
     held: [Option<Arc<Decoded>>; 2],
-    /// The spread last sent to the worker. Frame composition pins
-    /// against it: every spread change must retune.
+    /// The spread last sent to the worker. frame() asserts the
+    /// on-screen spread equals this, so every spread change must
+    /// retune.
     retuned_spread: Spread,
     /// Window size the GL surface was last resized to (physical px).
     last_surface_size: (u32, u32),
@@ -213,9 +213,8 @@ impl App {
         crate::view::spread_for(self.state.index, self.state.double, self.source.len())
     }
 
-    /// Apply one frame's seat decisions: adopt each wanted seat's Ready
-    /// page, hold undecided and failed seats on their last frame, and
-    /// refresh the layout memo from the held frames. Returns the
+    /// Show each seat's Ready page, hold undecided and failed seats on
+    /// their last frame, and refresh the layout memo. Returns the
     /// seat-ordered views for the status fold.
     fn display(&mut self, spread: Spread, snapshot: &SpreadView) -> [Option<SeatView>; 2] {
         let seat_views: [Option<SeatView>; 2] =
@@ -235,7 +234,7 @@ impl App {
                         gl.pages.bind(seat, page, decoded);
                     }
                 }
-                // Undecided or failed: hold the seat's frame.
+                // The seat holds its last frame.
                 (Some(_), Some(SeatView::Pending | SeatView::Failed(_))) => {}
                 // A wanted seat always has a view.
                 (Some(_), None) => {}

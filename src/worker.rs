@@ -1,7 +1,7 @@
 //! Decode worker: one thread serving the spread the app is showing. One
-//! book holds every decided page and the pending trail, the wanted
-//! spread never leaves it, and every other page leaves by recency then
-//! distance. No disk persistence at all.
+//! book holds every decided page and the pending trail. The wanted
+//! spread never leaves the book, and every other page leaves by recency
+//! then distance. No disk persistence at all.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap};
@@ -12,9 +12,9 @@ use crate::decode::Decoded;
 use crate::source::Source;
 use crate::view::Spread;
 
-/// Byte budget of the book: approximate decoded bytes it may hold. The
-/// wanted spread stays resident even over this budget, and frames the
-/// display holds outlive the book entirely.
+/// Approximate decoded bytes the book may hold. The wanted spread
+/// stays resident even over this budget. Frames the display holds
+/// outlive the book entirely.
 const BOOK_BUDGET_BYTES: usize = 768 * 1024 * 1024;
 
 enum ToWorker {
@@ -22,9 +22,8 @@ enum ToWorker {
     Stop,
 }
 
-/// One page's settled outcome. A failed page is sticky, so waiting,
-/// error display, and hold-last-frame are all pure reads of the book,
-/// and the failure follows the page across turns.
+/// One page's settled outcome. A failed page is sticky, so its error
+/// follows the page across turns.
 enum Outcome {
     Ready(Arc<Decoded>),
     Failed(String),
@@ -39,8 +38,9 @@ impl Outcome {
     }
 }
 
-/// The worker's answer for one wanted spread, in spread order. There is
-/// no unknown state: a page without an outcome reads as [`SeatView::Pending`].
+/// The worker's answer for one wanted spread, in spread order. A page
+/// without an outcome reads as [`SeatView::Pending`], so there is no
+/// unknown state.
 #[derive(Clone)]
 pub struct SpreadView {
     pub first: SeatView,
@@ -55,8 +55,8 @@ pub enum SeatView {
 }
 
 impl SpreadView {
-    /// Visual seating as [left, right], mirroring [`crate::view::Spread::seats`].
-    /// Manga reads first-right, so a lone page lands in the right seat.
+    /// Visual seating as [left, right], mirroring
+    /// [`crate::view::Spread::seats`].
     pub fn seats(&self, rtl: bool) -> [Option<&SeatView>; 2] {
         if rtl {
             [self.second.as_ref(), Some(&self.first)]
@@ -66,12 +66,11 @@ impl SpreadView {
     }
 }
 
-/// Decided pages and the pending trail under one lock, so every
-/// transition preserves the whole-book invariant: each page of the
-/// wanted spread is decided or pending, never neither. A wanted page
-/// joins the trail in `retune` and leaves it only by being decided in
-/// `store`, whose eviction cannot take a wanted page. The invariant has
-/// no exit.
+/// Decided pages and the pending trail under one lock. Every
+/// transition preserves the invariant that each page of the wanted
+/// spread is decided or pending, never neither. A wanted page joins the
+/// trail in `retune` and leaves it only by being decided in `store`,
+/// whose eviction cannot take a wanted page.
 struct Book {
     outcomes: HashMap<usize, Outcome>,
     pending: BTreeSet<usize>,
@@ -99,9 +98,8 @@ impl Book {
         }
     }
 
-    /// Point the worker at a spread. Both pages are recorded as last
-    /// wanted, joined to the trail with their neighbours, and protected
-    /// from trail pruning.
+    /// Point the worker at a spread. Both its pages join the trail and
+    /// are protected from trail pruning.
     fn retune(&mut self, wanted: Spread, page_count: usize) {
         self.recency_counter += 1;
         self.last_wanted.insert(wanted.first, self.recency_counter);
@@ -117,9 +115,9 @@ impl Book {
         self.assert_wanted_covered(&wanted);
     }
 
-    /// The pending page to decode next: the undecided page nearest the
-    /// spread's first, ahead of the reader before behind it. Pages that
-    /// already hold an outcome leave the pending set, so a page is never
+    /// The pending page to decode next. The undecided page nearest the
+    /// spread's first wins, ahead of the reader before behind at equal
+    /// distance. Decided pages leave the pending set, so a page is never
     /// decoded twice.
     fn take_next(&mut self, wanted: &Spread) -> Option<usize> {
         self.pending.retain(|page| !self.outcomes.contains_key(page));
@@ -129,9 +127,7 @@ impl Book {
             .min_by_key(|&page| next_pick_key(page, wanted.first))
     }
 
-    /// Decide a pending page, then evict until under budget. Wanted
-    /// pages never go, so an oversized spread stays over budget rather
-    /// than dropping a page the display is showing.
+    /// Decide a pending page, then evict until under budget.
     fn store(&mut self, page: usize, outcome: Outcome, wanted: &Spread) {
         let bytes = outcome.resident_bytes();
         if let Some(old) = self.outcomes.insert(page, outcome) {
@@ -145,8 +141,8 @@ impl Book {
         self.assert_wanted_covered(wanted);
     }
 
-    /// Both seats of the wanted spread in one lock acquisition. Cloning
-    /// a `Ready` page is an `Arc` bump.
+    /// Both seats of the wanted spread. Cloning a `Ready` page is an
+    /// `Arc` bump.
     fn snapshot(&self, wanted: &Spread) -> SpreadView {
         SpreadView {
             first: self.seat_view(wanted.first),
@@ -190,7 +186,7 @@ impl Book {
                 return;
             }
         }
-        // Only wanted pages remain, and they stay even over budget.
+        // The loop can end over budget when only wanted pages remain.
     }
 
     fn assert_wanted_covered(&self, wanted: &Spread) {
@@ -227,8 +223,7 @@ impl Worker {
         Worker { tx, book, handle: Some(handle) }
     }
 
-    /// Tell the worker which spread the app is now showing. Every
-    /// retune joins the spread to the decode trail.
+    /// Tell the worker which spread the app is now showing.
     pub fn retune(&self, wanted: Spread) {
         let _ = self.tx.send(ToWorker::Retune(wanted));
     }
@@ -250,12 +245,9 @@ impl Drop for Worker {
     }
 }
 
-/// Worker loop: every retune records the wanted pages and joins the
-/// pending trail, and pages past `TRAIL_RADIUS` of the wanted spread
-/// are dropped. One decode at a time, the undecided pending page
-/// nearest the spread first, ahead of the reader before behind. The
-/// channel is observed between decodes, so a newer spread overtakes the
-/// backlog. One decode in flight always runs to completion.
+/// Worker loop: the channel is observed between decodes, so a newer
+/// spread overtakes the backlog. One decode in flight always runs to
+/// completion.
 fn run(
     source: &Source,
     rx: mpsc::Receiver<ToWorker>,
@@ -303,8 +295,8 @@ fn run(
     }
 }
 
-/// Decode priority key: distance to the spread's first page, and at
-/// equal distance a page ahead of the reader before one behind it.
+/// Orders by distance to `anchor`, with `false` (ahead) sorting before
+/// `true` (behind) at equal distance.
 fn next_pick_key(page: usize, anchor: usize) -> (usize, bool) {
     (page.abs_diff(anchor), page < anchor)
 }
@@ -677,9 +669,8 @@ mod tests {
         let worker = Worker::spawn(source, || {});
         worker.retune(Spread { first: 3, second: Some(4) });
         wait_ready(&worker, &[3, 4]);
-        // Both pages being recorded as last wanted is what keeps a
-        // wanted spread in the book, so the wiring is pinned on those
-        // records.
+        // The last-wanted records are what keep a wanted spread in
+        // the book, so the wiring is pinned on them.
         let book = worker.book.lock().expect("decode book lock");
         assert!(book.last_wanted.contains_key(&3));
         assert!(book.last_wanted.contains_key(&4));

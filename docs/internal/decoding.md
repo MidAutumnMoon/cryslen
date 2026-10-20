@@ -106,10 +106,9 @@ write orientation tags, so fixtures for it must come from real files.
 ## Decode worker pattern (what makes skimming feel right)
 
 - One worker thread, mpsc retune channel carrying the wanted `Spread`.
-  Every retune records both pages as last wanted, joins them to a
-  pending trail with
-  their ±3 neighborhood, which covers the full next spread in double
-  page mode, and the trail is bounded to ±64 pages of the spread's
+  Every retune joins the spread to a pending trail with its ±3
+  neighborhood. The neighborhood covers the full next spread in double
+  page mode. The trail is bounded to ±64 pages of the spread's
   first page. Past that the reader has moved on, so pages are dropped
   instead of queued. The wanted spread itself never drops. The next
   decode is the undecided pending page nearest the spread, with pages
@@ -118,15 +117,13 @@ write orientation tags, so fixtures for it must come from real files.
   backlog. One in-flight decode always completes, and no cancellation
   tokens are needed.
 - Decided pages and the pending trail live in one book under one lock.
-  Cache values are outcomes (`Ready(Arc<Decoded>) | Failed(String)`).
-  Failures are sticky per page: waiting, error display, and
-  hold-last-frame all read the same book, and an error follows its page
-  across turns instead of a global slot.
+  Outcomes are `Ready(Arc<Decoded>) | Failed(String)`. Failures are
+  sticky per page, so an error follows its page across turns.
 - Byte budget in the hundreds of MiB. Eviction victims are never-wanted
   pages first, then least recently wanted, then farthest from the
-  spread. The wanted spread is never evicted, so each wanted page is
-  decided or pending at every instant and an oversized spread stays
-  over budget rather than losing a shown page.
+  spread. The wanted spread is never evicted. Each wanted page is
+  decided or pending at every instant. An oversized spread stays over
+  budget rather than losing a shown page.
 - The app reads one snapshot per frame, giving each seat Ready, Failed,
   or Pending. There is no unknown state.
 - Wrap decode in `catch_unwind`: a panicking decoder must degrade to a
