@@ -325,7 +325,7 @@ fn decode_image(bytes: &[u8], format: Format) -> Result<Decoded, DecodeError> {
     let mut oriented =
         image::DynamicImage::from_decoder(decoder).map_err(|e| DecodeError::Image(format, e))?;
     oriented.apply_orientation(orientation);
-    let rgba = oriented.to_rgba8();
+    let rgba = oriented.into_rgba8();
     let (width, height) = (rgba.width(), rgba.height());
     Decoded::rgba(width, height, format, rgba.into_raw().into_boxed_slice())
 }

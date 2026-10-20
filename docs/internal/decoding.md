@@ -83,7 +83,7 @@ Map `matrixCoefficients` per `avifCalcYUVCoefficients`
 
 `ImageReader::with_format(..).into_decoder()` → `decoder.orientation()`
 → `DynamicImage::from_decoder(..)` → `img.apply_orientation(orientation)`
-→ `to_rgba8()`. Zero extra dependencies. The encoder in tests cannot
+→ `into_rgba8()`. Zero extra dependencies. The encoder in tests cannot
 write orientation tags, so fixtures for it must come from real files.
 
 ## What does not exist (do not search again)

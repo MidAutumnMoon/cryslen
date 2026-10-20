@@ -39,7 +39,10 @@ impl Window {
             .with_name("cryslen", "cryslen")
             .with_resizable(true)
             .with_inner_size(winit::dpi::LogicalSize { width: INITIAL_WINDOW_WIDTH, height: INITIAL_WINDOW_HEIGHT })
-            .with_title("cryslen");
+            .with_title("cryslen")
+            // Hidden at creation. app.rs reveals the window after the
+            // first presented frame.
+            .with_visible(false);
 
         // glutin-winit's DisplayBuilder picks a config through a closure
         // that cannot fail, so using it would force a panic on an empty

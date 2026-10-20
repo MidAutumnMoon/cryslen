@@ -331,6 +331,38 @@ mod tests {
         assert_eq!(neighbors(9, 10), vec![9, 8, 7]);
     }
 
+    // Pins the coupling between PREFETCH_RADIUS and view's double-mode
+    // math. The app focuses a spread's first page and a turn steps two
+    // pages, so the window must hold both pages of the focused spread
+    // plus the next spread's first page.
+    #[test]
+    fn prefetch_window_covers_double_mode_turns() {
+        for len in [2usize, 9, 13] {
+            let spreads = 1 + (len - 1).div_ceil(2);
+            let mut focus = 0;
+            for turn in 0..spreads {
+                let window = neighbors(focus, len);
+                let spread = crate::view::spread_for(focus, true, len);
+                for page in [Some(spread.first), spread.second].into_iter().flatten() {
+                    assert!(
+                        window.contains(&page),
+                        "len {len}: spread page {page} outside focus {focus}"
+                    );
+                }
+                // The wrap turn jumps across the book, which prefetch
+                // cannot cover.
+                if turn + 1 < spreads {
+                    let next = crate::view::advance(focus, true, true, len);
+                    assert!(
+                        window.contains(&next),
+                        "len {len}: turn destination {next} outside focus {focus}"
+                    );
+                    focus = next;
+                }
+            }
+        }
+    }
+
     #[test]
     fn trail_retention_drops_pages_past_the_radius() {
         let mut pending: BTreeSet<usize> = (0..=200).collect();

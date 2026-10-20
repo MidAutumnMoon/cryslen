@@ -23,7 +23,7 @@ use source::Source;
 use worker::Worker;
 
 /// Parsed path argument. An image file opens its parent directory at that
-/// image. Everything else opens as-is.
+/// image. A directory or archive opens as itself.
 enum Arg {
     Archive(PathBuf),
     Image { dir: PathBuf, name: String },
@@ -36,20 +36,12 @@ fn main() -> ExitCode {
     };
     let path = Path::new(&arg);
 
-    let open = if path.is_file() && !is_archive(path) {
-        // Path::parent() yields Some("") for bare relative names ("pic.jpg").
-        let dir = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        let name = path
-            .file_name()
-            .expect("a file argument has a file name")
-            .to_string_lossy()
-            .into_owned();
-        Arg::Image { dir: dir.to_path_buf(), name }
-    } else {
-        Arg::Archive(path.to_path_buf())
+    let open = match classify(path) {
+        Ok(open) => open,
+        Err(e) => {
+            eprintln!("cy: {e}");
+            return ExitCode::FAILURE;
+        }
     };
     let (open_path, land_on) = match &open {
         Arg::Archive(archive) => (archive.as_path(), None),
@@ -63,6 +55,28 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Directories and archives open as sources. A file argument must be an
+/// image by extension, or it is a startup error.
+fn classify(path: &Path) -> eros::Result<Arg> {
+    if !path.is_file() || source::is_archive(path) {
+        return Ok(Arg::Archive(path.to_path_buf()));
+    }
+    let name = path
+        .file_name()
+        .expect("a file argument has a file name")
+        .to_string_lossy()
+        .into_owned();
+    if decode::format_from_name(&name).is_none() {
+        return Err(eros::error!("unsupported file type: {}", path.display()));
+    }
+    // Path::parent() yields Some("") for bare relative names ("pic.jpg").
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    Ok(Arg::Image { dir: dir.to_path_buf(), name })
 }
 
 fn run(open_path: &Path, land_on: Option<&str>) -> eros::Result<()> {
@@ -90,8 +104,39 @@ fn run(open_path: &Path, land_on: Option<&str>) -> eros::Result<()> {
     Ok(())
 }
 
-fn is_archive(path: &Path) -> bool {
-    let Some(ext) = path.extension().and_then(|e| e.to_str()) else { return false };
-    let ext = ext.to_ascii_lowercase();
-    matches!(ext.as_str(), "zip" | "cbz" | "7z" | "cb7")
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testkit::{tiny_png, TempDir};
+
+    #[test]
+    fn image_file_argument_opens_parent_dir() {
+        let dir = TempDir::new("main-arg-img");
+        dir.write("page.png", &tiny_png(1, 1, [0, 0, 0, 255]));
+        match classify(&dir.path().join("page.png")).expect("image file accepted") {
+            Arg::Image { dir: parent, name } => {
+                assert_eq!(parent, dir.path());
+                assert_eq!(name, "page.png");
+            }
+            Arg::Archive(_) => panic!("image file classified as a source path"),
+        }
+    }
+
+    #[test]
+    fn directory_and_archive_arguments_open_as_sources() {
+        let dir = TempDir::new("main-arg-src");
+        dir.write("book.cbz", b"not really a zip");
+        assert!(matches!(classify(&dir.path().join("book.cbz")), Ok(Arg::Archive(_))));
+        assert!(matches!(classify(dir.path()), Ok(Arg::Archive(_))));
+    }
+
+    #[test]
+    fn other_file_arguments_error() {
+        let dir = TempDir::new("main-arg-bad");
+        dir.write("notes.txt", b"not a page");
+        let Err(e) = classify(&dir.path().join("notes.txt")) else {
+            panic!("txt file accepted as an image or source");
+        };
+        assert!(e.to_string().contains("unsupported"), "{e}");
+    }
 }

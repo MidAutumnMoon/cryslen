@@ -44,6 +44,30 @@ impl std::fmt::Display for SourceError {
 
 impl std::error::Error for SourceError {}
 
+/// Which archive family a path's extension names. Both `Source::open` and
+/// main's argument classification dispatch on this one table.
+enum ArchiveKind {
+    Zip,
+    SevenZip,
+}
+
+fn archive_kind(path: &Path) -> Option<ArchiveKind> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "zip" | "cbz" => Some(ArchiveKind::Zip),
+        "7z" | "cb7" => Some(ArchiveKind::SevenZip),
+        _ => None,
+    }
+}
+
+pub(crate) fn is_archive(path: &Path) -> bool {
+    archive_kind(path).is_some()
+}
+
 /// Byte budget of the 7z tier. Whole books measure 208-383 MiB, so one
 /// tier holds an entire archive.
 const TIER_BUDGET_BYTES: usize = 512 * 1024 * 1024;
@@ -115,15 +139,10 @@ impl Source {
         if std::fs::metadata(path).map_err(|_| SourceError::NotFound(path.to_path_buf()))?.is_dir() {
             return Source::open_dir(path);
         }
-        let ext = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        match ext.as_str() {
-            "zip" | "cbz" => Source::open_zip(path),
-            "7z" | "cb7" => Source::open_sevenzip(path),
-            _ => Err(SourceError::Unsupported(path.to_path_buf())),
+        match archive_kind(path) {
+            Some(ArchiveKind::Zip) => Source::open_zip(path),
+            Some(ArchiveKind::SevenZip) => Source::open_sevenzip(path),
+            None => Err(SourceError::Unsupported(path.to_path_buf())),
         }
     }
 
