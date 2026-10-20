@@ -274,10 +274,12 @@ fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
-/// How many pages on each side of the focused page to prefetch. ±2 covers
-/// both modes' windows: single-page needs ±1, double-page spreads shift by
-/// two pages per turn.
-const PREFETCH_RADIUS: i64 = 2;
+/// How many pages on each side of the focused page to prefetch. The app
+/// focuses a spread's first page, and a double-mode turn steps two pages,
+/// so the far page of the next spread sits at distance 3. Single-page mode
+/// over-prefetches by the same margin, which the two-tier cache reclaims
+/// first as speculation.
+const PREFETCH_RADIUS: i64 = 3;
 
 /// Decode order around the focused page: the page itself, then neighbours
 /// out to [`PREFETCH_RADIUS`], nearest first (the current page included).
@@ -314,15 +316,15 @@ mod tests {
 
     #[test]
     fn neighbors_are_nearest_first() {
-        assert_eq!(neighbors(5, 10), vec![5, 4, 6, 3, 7]);
-        assert_eq!(neighbors(0, 4), vec![0, 1, 2]);
-        assert_eq!(neighbors(9, 10), vec![9, 8, 7]);
+        assert_eq!(neighbors(5, 10), vec![5, 4, 6, 3, 7, 2, 8]);
+        assert_eq!(neighbors(0, 4), vec![0, 1, 2, 3]);
+        assert_eq!(neighbors(9, 10), vec![9, 8, 7, 6]);
     }
 
     // Pins the coupling between PREFETCH_RADIUS and view's double-mode
     // math. The app focuses a spread's first page and a turn steps two
     // pages, so the window must hold both pages of the focused spread
-    // plus the next spread's first page.
+    // and of the next spread.
     #[test]
     fn prefetch_window_covers_double_mode_turns() {
         for len in [2usize, 9, 13] {
@@ -341,10 +343,16 @@ mod tests {
                 // cannot cover.
                 if turn + 1 < spreads {
                     let next = crate::view::advance(focus, true, true, len);
-                    assert!(
-                        window.contains(&next),
-                        "len {len}: turn destination {next} outside focus {focus}"
-                    );
+                    let next_spread = crate::view::spread_for(next, true, len);
+                    for page in [Some(next_spread.first), next_spread.second]
+                        .into_iter()
+                        .flatten()
+                    {
+                        assert!(
+                            window.contains(&page),
+                            "len {len}: next spread page {page} outside focus {focus}"
+                        );
+                    }
                     focus = next;
                 }
             }
