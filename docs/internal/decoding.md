@@ -106,7 +106,8 @@ write orientation tags, so fixtures for it must come from real files.
 ## Decode worker pattern (what makes skimming feel right)
 
 - One worker thread, mpsc retune channel carrying the wanted `Spread`.
-  Every retune stamps both pages, joins them to a pending trail with
+  Every retune records both pages as last wanted, joins them to a
+  pending trail with
   their ±3 neighborhood, which covers the full next spread in double
   page mode, and the trail is bounded to ±64 pages of the spread's
   first page. Past that the reader has moved on, so pages are dropped

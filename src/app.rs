@@ -56,15 +56,18 @@ struct FoldedStatus {
     dims: Option<(u32, u32)>,
 }
 
-/// Fold the seats' views into status facts. `views[i]` is the worker's
-/// view for `wanted[i]`.
-fn fold_status(wanted: [Option<usize>; 2], views: &[Option<SeatView>; 2]) -> FoldedStatus {
+/// Fold the seats' views into status facts. `seat_views[i]` is the
+/// worker's view for `wanted_pages[i]`.
+fn fold_status(
+    wanted_pages: [Option<usize>; 2],
+    seat_views: &[Option<SeatView>; 2],
+) -> FoldedStatus {
     let mut folded = FoldedStatus { waiting: false, error: None, format: None, dims: None };
-    for (seat, view) in views.iter().enumerate() {
-        if wanted[seat].is_some() && matches!(view, Some(SeatView::Pending)) {
+    for (seat, seat_view) in seat_views.iter().enumerate() {
+        if wanted_pages[seat].is_some() && matches!(seat_view, Some(SeatView::Pending)) {
             folded.waiting = true;
         }
-        match view {
+        match seat_view {
             Some(SeatView::Failed(message)) if folded.error.is_none() => {
                 folded.error = Some(message.clone());
             }
@@ -159,7 +162,7 @@ pub struct App {
     held: [Option<Arc<Decoded>>; 2],
     /// The spread last sent to the worker. Frame composition pins
     /// against it: every spread change must retune.
-    retuned: Spread,
+    retuned_spread: Spread,
     /// Window size the GL surface was last resized to (physical px).
     last_surface_size: (u32, u32),
     cursor: (f32, f32),
@@ -194,7 +197,7 @@ impl App {
             gl: None,
             start_error: None,
             held: [None, None],
-            retuned: spread,
+            retuned_spread: spread,
             last_surface_size: (0, 0),
             cursor: (0.0, 0.0),
             dragging: false,
@@ -214,12 +217,12 @@ impl App {
     /// page, hold undecided and failed seats on their last frame, and
     /// refresh the layout memo from the held frames. Returns the
     /// seat-ordered views for the status fold.
-    fn display(&mut self, spread: Spread, view: &SpreadView) -> [Option<SeatView>; 2] {
-        let views: [Option<SeatView>; 2] =
-            view.seats(self.state.rtl).map(|seat| seat.cloned());
-        let wanted = spread.seats(self.state.rtl);
+    fn display(&mut self, spread: Spread, snapshot: &SpreadView) -> [Option<SeatView>; 2] {
+        let seat_views: [Option<SeatView>; 2] =
+            snapshot.seats(self.state.rtl).map(|seat| seat.cloned());
+        let wanted_pages = spread.seats(self.state.rtl);
         for seat in 0..2 {
-            match (wanted[seat], views[seat].as_ref()) {
+            match (wanted_pages[seat], seat_views[seat].as_ref()) {
                 (None, _) => {
                     self.held[seat] = None;
                     if let Some(gl) = self.gl.as_mut() {
@@ -238,12 +241,12 @@ impl App {
                 (Some(_), None) => {}
             }
         }
-        let dims = self
+        let held_dims = self
             .held
             .each_ref()
-            .map(|held| held.as_ref().map(|d| (d.width, d.height)));
-        self.last_layout = crate::view::layout(dims);
-        views
+            .map(|seat_held| seat_held.as_ref().map(|decoded| (decoded.width, decoded.height)));
+        self.last_layout = crate::view::layout(held_dims);
+        seat_views
     }
 
     /// One frame: decide, upload, draw, present.
@@ -255,9 +258,9 @@ impl App {
         let win = (size.width as f32, size.height as f32);
 
         let spread = self.spread();
-        debug_assert_eq!(spread, self.retuned, "every spread change must retune the worker");
-        let view = self.worker.snapshot(&spread);
-        let views = self.display(spread, &view);
+        debug_assert_eq!(spread, self.retuned_spread, "every spread change must retune the worker");
+        let snapshot = self.worker.snapshot(&spread);
+        let seat_views = self.display(spread, &snapshot);
 
         // Refit when the composed spread changes shape, unless the user
         // has zoomed or panned: their view wins over geometry.
@@ -269,7 +272,7 @@ impl App {
             self.fit.fitted_to(total);
         }
 
-        let folded = fold_status(spread.seats(self.state.rtl), &views);
+        let folded = fold_status(spread.seats(self.state.rtl), &seat_views);
         self.waiting_since = if folded.waiting {
             Some(self.waiting_since.unwrap_or_else(Instant::now))
         } else {
@@ -388,7 +391,7 @@ impl App {
         self.fit.page_turned();
         self.request_redraw();
         let spread = self.spread();
-        self.retuned = spread;
+        self.retuned_spread = spread;
         self.worker.retune(spread);
     }
 }
