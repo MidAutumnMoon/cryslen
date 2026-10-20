@@ -140,7 +140,7 @@ impl Format {
 /// Planar YUV image. 8-bit planes are one byte per sample. 10/12-bit planes
 /// are `u16` samples with `depth` significant bits (normalize by
 /// `(1<<depth)-1`). Dimensions ride on [`Decoded`]. Plane sizes derive from
-/// them.
+/// them. Mono carries luma only, so its chroma planes stay empty.
 #[derive(Clone)]
 pub struct YuvImage {
     pub depth: u8,
@@ -395,17 +395,17 @@ mod avif {
                 Subsampling::Yuv422 => (width.div_ceil(2), height),
                 Subsampling::Yuv444 => (width, height),
             };
-            let (luma_plane, blue_plane, red_plane) = if subsampling == Subsampling::Mono {
-                (Plane::U8(Box::new([])), Plane::U8(Box::new([])), Plane::U8(Box::new([])))
+            let luma_plane = copy_plane(
+                (*avif_image_ptr).yuvPlanes[0],
+                (*avif_image_ptr).yuvRowBytes[0],
+                width,
+                height,
+                depth,
+            )?;
+            let (blue_plane, red_plane) = if subsampling == Subsampling::Mono {
+                (Plane::U8(Box::new([])), Plane::U8(Box::new([])))
             } else {
                 (
-                    copy_plane(
-                        (*avif_image_ptr).yuvPlanes[0],
-                        (*avif_image_ptr).yuvRowBytes[0],
-                        width,
-                        height,
-                        depth,
-                    )?,
                     copy_plane(
                         (*avif_image_ptr).yuvPlanes[1],
                         (*avif_image_ptr).yuvRowBytes[1],
@@ -712,6 +712,45 @@ mod tests {
         // testable for it.
         assert!(matches!(decode(b"\x00\x00\x00\x0cftypavif", "a.avif"), Err(DecodeError::Avif(..))));
         assert!(matches!(decode(&[0xFF, 0x0A, 0x00], "a.jxl"), Err(DecodeError::Corrupt(_))));
+    }
+
+    // 32x16 10-bit 4:0:0 fixture, a black-to-white grayscale gradient.
+    #[test]
+    fn avif_mono_fixture_decodes() {
+        let page = decode(include_bytes!("testdata/mono.avif"), "a.avif").expect("mono avif decodes");
+        assert_eq!(page.format, Format::Avif);
+        assert_eq!((page.width, page.height), (32, 16));
+        let Pixels::Yuv(y) = &page.pixels else {
+            panic!("avif must decode to yuv planes")
+        };
+        assert_eq!(y.subsampling, Subsampling::Mono);
+        let Plane::U16(luma) = &y.y else {
+            panic!("10-bit luma must be u16 samples")
+        };
+        assert_eq!(luma.len(), 32 * 16);
+        assert!(luma[0] < luma[luma.len() - 1]);
+        assert!(matches!(&y.cb, Plane::U8(b) if b.is_empty()));
+        assert!(matches!(&y.cr, Plane::U8(b) if b.is_empty()));
+    }
+
+    #[test]
+    fn yuv_mono_boundary() {
+        let mono = |y: Plane| YuvImage {
+            depth: 10,
+            subsampling: Subsampling::Mono,
+            full_range: true,
+            matrix: Matrix::Bt601,
+            y,
+            cb: Plane::U8(Box::new([])),
+            cr: Plane::U8(Box::new([])),
+        };
+        let real = mono(Plane::U16(vec![0; 32 * 16].into_boxed_slice()));
+        assert!(Decoded::yuv(32, 16, Format::Avif, real).is_ok());
+        let empty = mono(Plane::U16(Box::new([])));
+        assert!(matches!(
+            Decoded::yuv(32, 16, Format::Avif, empty),
+            Err(DecodeError::Corrupt("yuv plane extent"))
+        ));
     }
 
     // 8x8 lossless cjxl fixtures with solid top and bottom halves. gray.jxl is
