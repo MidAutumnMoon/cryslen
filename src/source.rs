@@ -1,6 +1,6 @@
 //! Page source: a directory or archive viewed as a natural-sorted list
 //! of pages. The `Source` owns persistent archive handles so zip and 7z
-//! files are not reopened per page. 7z sources additionally hold a
+//! files are not reopened per page. 7z sources also hold a
 //! decompressed-page tier filled by a background pass.
 
 use std::collections::{HashMap, VecDeque};

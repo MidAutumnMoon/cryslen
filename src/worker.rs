@@ -18,7 +18,7 @@ enum ToWorker {
     Stop,
 }
 
-/// Cache entry: the decode outcome, not just the success case. A failed
+/// Cache entry: the decode outcome, success or failure. A failed
 /// page is sticky, so waiting, error display, and hold-last-frame are all
 /// pure reads of this map, and the failure follows the page across turns.
 #[derive(Clone)]
