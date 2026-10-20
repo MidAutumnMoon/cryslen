@@ -86,8 +86,7 @@ impl Window {
         let context = not_current.make_current(&surface)?;
         // Non-blocking present plus pre_present_and_swap's
         // window.pre_present_notify() gives Wayland frame-callback pacing
-        // without a blocking eglSwapBuffers owning the event loop. Same
-        // choice eframe made.
+        // without a blocking eglSwapBuffers owning the event loop.
         surface
             .set_swap_interval(&context, glutin::surface::SwapInterval::DontWait)?;
 

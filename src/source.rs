@@ -68,8 +68,7 @@ pub(crate) fn is_archive(path: &Path) -> bool {
     archive_kind(path).is_some()
 }
 
-/// Byte budget of the 7z tier. Whole books measure 208-383 MiB, so one
-/// tier holds an entire archive.
+/// Byte budget of the 7z tier, sized to hold a whole archive's members.
 const TIER_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 
 /// Decompressed 7z members keyed by page index. The harvest pass and
@@ -117,8 +116,6 @@ fn lock_recovered<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
     }
 }
 
-/// A page source with persistent handles. Cheap to keep alive for the whole
-/// session. Shared with the decode worker behind an `Arc`.
 pub struct Source {
     kind: SourceKind,
     names: Vec<String>,
@@ -133,8 +130,7 @@ pub struct Source {
 }
 
 impl Source {
-    /// `path` is a directory, or `.zip`/`.cbz`/`.7z`/`.cb7` archive. Listing is
-    /// filtered to image extensions and natural-sorted (natord).
+    /// Listing is filtered to image extensions and natural-sorted.
     pub fn open(path: &Path) -> Result<Source, SourceError> {
         if std::fs::metadata(path).map_err(|_| SourceError::NotFound(path.to_path_buf()))?.is_dir() {
             return Source::open_dir(path);
@@ -158,8 +154,6 @@ impl Source {
         Source::from_names(SourceKind::Directory(dir.to_path_buf()), names)
     }
 
-    /// The archive handle opened here stays open for the session. `bytes`
-    /// reads go through it, avoiding a central-directory parse per page.
     fn open_zip(path: &Path) -> Result<Source, SourceError> {
         let file = std::fs::File::open(path).map_err(SourceError::Io)?;
         let zip = zip::ZipArchive::new(std::io::BufReader::new(file)).map_err(SourceError::Zip)?;
@@ -177,10 +171,6 @@ impl Source {
         Ok(source)
     }
 
-    /// The reader opened here stays for the session and serves `bytes`
-    /// reads. A harvest thread decompresses every page into the byte
-    /// tier in the background, so a solid block is decoded once per
-    /// archive.
     fn open_sevenzip(path: &Path) -> Result<Source, SourceError> {
         let archive = sevenz_rust2::ArchiveReader::open(path, sevenz_rust2::Password::empty())
             .map_err(SourceError::SevenZip)?;
@@ -238,9 +228,8 @@ impl Source {
         }
     }
 
-    /// Raw encoded bytes of one page. Archive reads go through the
-    /// session-held handles. 7z reads consult the byte tier first and
-    /// fill it on a miss, so repeat reads are an `Arc` refcount bump.
+    /// Raw encoded bytes of one page. 7z reads consult the byte tier first
+    /// and fill it on a miss, so repeat reads are an `Arc` refcount bump.
     pub fn bytes(&self, index: usize) -> Result<Arc<[u8]>, SourceError> {
         debug_assert!(index < self.names.len());
         let name = &self.names[index];
@@ -276,8 +265,6 @@ impl Source {
         }
     }
 
-    /// Whether the byte tier holds `index`. Test probe for the background
-    /// fill.
     #[cfg(test)]
     fn tier_has(&self, index: usize) -> bool {
         match &self.tier {

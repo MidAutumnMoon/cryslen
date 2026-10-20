@@ -13,7 +13,6 @@ use crate::source::Source;
 /// Cache budget: approximate decoded bytes the cache may hold.
 const PAGE_CACHE_BUDGET_BYTES: usize = 768 * 1024 * 1024;
 
-/// Message to the worker thread: decode around a focus, or stop.
 enum ToWorker {
     Focus(usize),
     Stop,
@@ -45,7 +44,6 @@ struct PageCache {
     map: HashMap<usize, PageState>,
     budget: usize,
     live_bytes: usize,
-    /// Recency stamp per page the user visited, for the eviction order.
     viewed: HashMap<usize, u64>,
     stamp: u64,
 }
@@ -61,7 +59,6 @@ impl PageCache {
         }
     }
 
-    /// Marks a page the user visited. Revisiting refreshes its recency.
     fn mark_viewed(&mut self, index: usize) {
         self.stamp += 1;
         self.viewed.insert(index, self.stamp);
@@ -84,7 +81,6 @@ impl PageCache {
         if self.live_bytes <= self.budget {
             return;
         }
-        // Speculative pages go first, farthest from the focus first.
         let mut speculative: Vec<usize> = self
             .map
             .keys()
@@ -98,7 +94,6 @@ impl PageCache {
                 return;
             }
         }
-        // Viewed pages go least-recently-viewed first.
         let mut viewed: Vec<usize> =
             self.map.keys().copied().filter(|&key| key != focused).collect();
         viewed.sort_unstable_by_key(|&key| self.viewed[&key]);
@@ -108,8 +103,8 @@ impl PageCache {
                 return;
             }
         }
-        // Only the focused page is left, and it stays even over budget, so
-        // an oversized page cannot evict itself.
+        // The focused page stays even over budget, so an oversized page
+        // cannot evict itself.
     }
 
     fn remove(&mut self, key: usize) {
@@ -208,7 +203,6 @@ fn run(
             take_next(&mut pending, &pages, focus)
         };
         let Some(index) = pick else {
-            // Nothing in the trail is undecided, so block until a focus.
             let arrived = match rx.recv() {
                 Ok(ToWorker::Focus(index)) => index,
                 Ok(ToWorker::Stop) | Err(_) => return,
@@ -282,7 +276,7 @@ fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
 const PREFETCH_RADIUS: i64 = 3;
 
 /// Decode order around the focused page: the page itself, then neighbours
-/// out to [`PREFETCH_RADIUS`], nearest first (the current page included).
+/// out to [`PREFETCH_RADIUS`], nearest first.
 fn neighbors(current: usize, len: usize) -> Vec<usize> {
     let mut pages: Vec<usize> = (0..=PREFETCH_RADIUS)
         .flat_map(|distance| {
@@ -301,7 +295,6 @@ fn neighbors(current: usize, len: usize) -> Vec<usize> {
 /// dropped rather than queued for a reader that has already moved on.
 const TRAIL_RADIUS: i64 = 64;
 
-/// Drops pending pages farther than `TRAIL_RADIUS` from `focus`.
 fn retain_trail(pending: &mut BTreeSet<usize>, focus: usize) {
     pending.retain(|&page| (page as i64 - focus as i64).abs() <= TRAIL_RADIUS);
 }
@@ -321,10 +314,7 @@ mod tests {
         assert_eq!(neighbors(9, 10), vec![9, 8, 7, 6]);
     }
 
-    // Pins the coupling between PREFETCH_RADIUS and view's double-mode
-    // math. The app focuses a spread's first page and a turn steps two
-    // pages, so the window must hold both pages of the focused spread
-    // and of the next spread.
+    // Pins PREFETCH_RADIUS against view's double-mode turn math.
     #[test]
     fn prefetch_window_covers_double_mode_turns() {
         for len in [2usize, 9, 13] {
@@ -373,7 +363,6 @@ mod tests {
         cache.insert(10, ready_page(10), 10);
         let mut pending: BTreeSet<usize> = (8..=12).collect();
         assert_eq!(take_next(&mut pending, &cache, 10), Some(11));
-        // Decided pages leave the trail rather than queue for a re-decode.
         assert!(!pending.contains(&10));
         let mut order = Vec::new();
         while let Some(page) = take_next(&mut pending, &cache, 10) {
@@ -444,7 +433,6 @@ mod tests {
             .unwrap(),
         ));
         cache.insert(3, big, 3);
-        // The oversized focused page stays even though it alone busts budget.
         assert!(cache.map.contains_key(&3));
     }
 
@@ -471,8 +459,8 @@ mod tests {
         };
         assert_eq!((page.width, page.height), (3, 2));
         assert!(*updates.lock().unwrap() > 0);
-        // Drop joins the thread. A hung stop path would hang the
-        // test suite here (no GL or event loop involved).
+        // Drop joins the worker here, so a broken stop path hangs the
+        // suite rather than failing an assert.
     }
 
     #[test]

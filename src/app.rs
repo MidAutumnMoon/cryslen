@@ -279,9 +279,8 @@ impl App {
         let spread = self.spread();
         let states = self.display(spread.seats(self.state.rtl));
 
-        // Refit when the composed spread changed shape (page turn, resize,
-        // newly decoded dims). Skip it when the user has zoomed or panned:
-        // their view wins over geometry.
+        // Refit when the composed spread changes shape, unless the user
+        // has zoomed or panned: their view wins over geometry.
         let total = self.last_layout.total();
         if self.fit.should_refit(total) {
             if !self.fit.user_moved {
@@ -296,8 +295,8 @@ impl App {
         } else {
             None
         };
-        // While waiting on a decode, wake up once when the 150 ms status
-        // grace expires so "decoding…" appears. Without this the loop stays
+        // While waiting on a decode, wake up once when the status grace
+        // expires so "decoding…" appears. Without this the loop stays
         // parked and the flag never shows.
         if let Some(since) = self.waiting_since {
             let elapsed = since.elapsed();
@@ -408,7 +407,7 @@ impl App {
     fn after_page_change(&mut self) {
         self.fit.page_turned();
         self.request_redraw();
-        self.worker.focus(self.state.index); // cheap, never blocks
+        self.worker.focus(self.state.index);
     }
 }
 
@@ -424,8 +423,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
         };
         let gl = window.glow();
         let egui = egui_glow::EguiGlow::new(event_loop, Arc::clone(&gl), None, None, true);
-        // Bridge egui repaint requests into the winit loop (arm-only: the
-        // deadline itself is fired by new_events -> ResumeTimeReached).
+        // Bridge egui repaint requests into the winit loop.
         if let Some(proxy) = self.proxy.clone() {
             let proxy = egui::mutex::Mutex::new(proxy);
             egui.egui_ctx.set_request_repaint_callback(move |info| {
@@ -459,7 +457,6 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
     }
 
     fn exiting(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) {
-        // Gl's Drop destroys egui's GL objects while the context is alive.
         self.gl = None;
     }
 

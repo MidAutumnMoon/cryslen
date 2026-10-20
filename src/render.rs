@@ -112,23 +112,18 @@ const FS_ES: &str = r#"
     }"#;
 
 /// Page-keyed texture cache plus the spread draw. Each entry is an RGBA
-/// texture or a YUV plane triple. Upload happens on the main thread at
-/// frame time, only for pages missing from the cache. Pan/zoom stay
-/// uniforms and never re-upload.
+/// texture or a YUV plane triple. Uploads run on the GL thread.
 pub struct PageTextures {
     gl: Arc<glow::Context>,
     program: <glow::Context as glow::HasContext>::Program,
     vao: <glow::Context as glow::HasContext>::VertexArray,
-    /// Page each seat draws (`None` when empty).
     seats: [Option<usize>; 2],
-    /// Uploaded textures by page, retained across visits until evicted.
     textures: HashMap<usize, Entry>,
     vbo: <glow::Context as glow::HasContext>::Buffer,
     max_tex: u32,
 }
 
-/// One cached page's GPU state. Plain data. The GL objects are freed by
-/// budget eviction and on drop.
+/// One cached page's GPU state, freed by budget eviction and on drop.
 struct Entry {
     textures: Textures,
     size: (u32, u32),
@@ -247,9 +242,7 @@ impl PageTextures {
         self.seats[seat] = None;
     }
 
-    /// Drop cached pages until the map fits [`TEXTURE_BUDGET_BYTES`]. Never
-    /// drops a bound page, so an oversized newcomer survives until a later
-    /// insert finds it unbound.
+    /// Drop cached pages until the map fits [`TEXTURE_BUDGET_BYTES`].
     fn evict_over_budget(&mut self) {
         let costs: HashMap<usize, usize> =
             self.textures.iter().map(|(page, entry)| (*page, entry.cost)).collect();
@@ -495,8 +488,7 @@ fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> Entry {
     }
 }
 
-/// Cache budget: approximate texture bytes the page cache may hold. Bound
-/// pages are never evicted, so the cache can sit above it.
+/// Cache budget: approximate texture bytes the cache may hold.
 const TEXTURE_BUDGET_BYTES: usize = 3 * 1024 * 1024 * 1024;
 
 /// Approximate texture bytes one page occupies: plane bytes, plus the mip
@@ -792,7 +784,6 @@ mod tests {
 
     #[test]
     fn r16_gles_entry_cost_skips_mips() {
-        // GLES R16: NEAREST filtering, so no mip chain.
         let yuv = crate::decode::YuvImage {
             depth: 10,
             subsampling: Subsampling::Mono,
