@@ -5,12 +5,15 @@
 //! calls (resource creation, swap) panic since context loss leaves nothing to
 //! show.
 //!
-//! Two page slots, YUV plane textures with shader-side conversion, spread
-//! layout draw. Chroma siting (avifChromaSamplePosition) is not applied: the
+//! Two page slots over a page-keyed texture cache, YUV plane textures with
+//! shader-side conversion, spread layout draw. Chroma siting
+//! (avifChromaSamplePosition) is not applied: the
 //! default co-sited/midway assumption biases chroma by at most half a texel,
 //! invisible in practice.
 
 use core::num::NonZeroU32;
+use std::cmp::Reverse;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use egui_winit::winit;
@@ -220,31 +223,35 @@ impl Window {
     }
 }
 
-/// Up to two page slots, each an RGBA texture or a YUV plane triple.
-/// Upload happens on the main thread at frame time. Pan/zoom stay uniforms
-/// and never re-upload.
+/// Up to two page slots over a page-keyed texture cache. Each entry is an
+/// RGBA texture or a YUV plane triple. Upload happens on the main thread at
+/// frame time, only for pages missing from the cache. Pan/zoom stay
+/// uniforms and never re-upload.
 ///
-/// Each slot remembers which page it holds, so `set` with an unchanged page
+/// Each slot remembers which page it shows, so `set` with an unchanged page
 /// is a no-op. Callers never need to mirror GPU state on their side.
 pub struct PageSlots {
     gl: Arc<glow::Context>,
     program: <glow::Context as glow::HasContext>::Program,
     vao: <glow::Context as glow::HasContext>::VertexArray,
-    slots: [Slot; 2],
+    /// Page each slot shows (`None` when empty).
+    slots: [Option<usize>; 2],
+    /// Uploaded textures by page, retained across visits until evicted.
+    textures: HashMap<usize, Entry>,
     vbo: <glow::Context as glow::HasContext>::Buffer,
     max_tex: u32,
 }
 
-/// One page slot's GPU state. Plain data. The GL objects are freed on
-/// replace and clear.
-struct Slot {
-    /// Page whose pixels the textures hold (`None` when empty).
-    page: Option<usize>,
-    texture: Option<Textures>,
+/// One cached page's GPU state. Plain data. The GL objects are freed by
+/// budget eviction and on drop.
+struct Entry {
+    textures: Textures,
     size: (u32, u32),
     uniforms: PageUniforms,
     /// Depth-normalize factor for U16-stored planes (1.0 otherwise).
     norm: f32,
+    /// Approximate GPU bytes, counted against [`TEXTURE_BUDGET_BYTES`].
+    cost: usize,
 }
 
 enum Textures {
@@ -268,7 +275,7 @@ const MONO_CHROMA_MIDPOINT_8: u8 = 128;
 
 const IDENTITY3: [f32; 9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
 
-/// Uniform set describing an RGBA slot (mode 0). Also the empty-slot default.
+/// Uniform set describing an RGBA page (mode 0).
 const RGBA_UNIFORMS: PageUniforms = PageUniforms {
     mode: 0,
     subsampling: Subsampling::Yuv444,
@@ -276,10 +283,6 @@ const RGBA_UNIFORMS: PageUniforms = PageUniforms {
     full_range: true,
     matrix: Matrix::Identity,
 };
-
-fn empty_slot() -> Slot {
-    Slot { page: None, texture: None, size: (0, 0), uniforms: RGBA_UNIFORMS, norm: 1.0 }
-}
 
 impl PageSlots {
     pub fn new(gl: Arc<glow::Context>) -> PageSlots {
@@ -325,11 +328,11 @@ impl PageSlots {
             }
         }
         let max_tex = unsafe { gl.get_parameter_i32(glow::MAX_TEXTURE_SIZE) } as u32;
-        PageSlots { gl, program, vao, slots: [empty_slot(), empty_slot()], vbo, max_tex }
+        PageSlots { gl, program, vao, slots: [None, None], textures: HashMap::new(), vbo, max_tex }
     }
 
-    /// Upload decoded pixels of `page` into visual slot `i` (0 = left,
-    /// 1 = right). Re-uploading the same page is a no-op.
+    /// Bind visual slot `i` (0 = left, 1 = right) to `page`, uploading its
+    /// textures only on a cache miss. Binding an unchanged page is a no-op.
     ///
     /// # Panics
     ///
@@ -337,7 +340,7 @@ impl PageSlots {
     /// rejects edges over its own cap first, so only a GPU advertising a
     /// smaller limit can trip this.
     pub fn set(&mut self, slot: usize, page: usize, decoded: &Decoded) {
-        if self.slots[slot].page == Some(page) {
+        if self.slots[slot] == Some(page) {
             return;
         }
         let (width, height) = (decoded.width, decoded.height);
@@ -348,70 +351,37 @@ impl PageSlots {
             "image {width}x{height} exceeds GL max texture size {} (tiling not implemented)",
             self.max_tex
         );
-        self.clear(slot);
-        let gl = &self.gl;
-        let textures = match &decoded.pixels {
-            Pixels::Rgba8(rgba_bytes) => {
-                assert_eq!(rgba_bytes.len(), width as usize * height as usize * 4, "rgba byte length");
-                Textures::Rgba(upload_rgba(gl, rgba_bytes, (width, height)))
-            }
-            Pixels::Yuv(yuv) => {
-                let ((luma_w, luma_h), (chroma_w, chroma_h)) =
-                    plane_dims((width, height), yuv.subsampling);
-                let wide = matches!(yuv.y, Plane::U16(_));
-                // GL_R16 is not filterable in GLES: LINEAR makes the texture
-                // incomplete (samples black); NEAREST without mips is the
-                // safe fallback on an ES context.
-                let filterable = !(gl.version().is_embedded && wide);
-                let expect = |plane: &Plane, want_samples: usize, what: &str| {
-                    let want_bytes = want_samples * if wide { 2 } else { 1 };
-                    assert_eq!(plane_bytes(plane).len(), want_bytes, "{what} plane bytes");
-                };
-                expect(&yuv.y, luma_w as usize * luma_h as usize, "y");
-                let luma_texture =
-                    upload_plane(gl, plane_bytes(&yuv.y), (luma_w, luma_h), wide, filterable);
-                let (cb_texture, cr_texture) = if yuv.subsampling == Subsampling::Mono {
-                    // 1x1 chroma at the range midpoint; the matrix cancels it
-                    // to neutral gray. LE pairs match plane_bytes' U16 layout.
-                    let midpoint_bytes: Vec<u8> = if wide {
-                        (1u32 << (yuv.depth.clamp(MIN_PLANE_DEPTH, MAX_PLANE_DEPTH) - 1))
-                            .to_le_bytes()
-                            .to_vec()
-                    } else {
-                        MONO_CHROMA_MIDPOINT_8.to_le_bytes().to_vec()
-                    };
-                    (upload_plane(gl, &midpoint_bytes, (1, 1), wide, filterable),
-                     upload_plane(gl, &midpoint_bytes, (1, 1), wide, filterable))
-                } else {
-                    expect(&yuv.cb, chroma_w as usize * chroma_h as usize, "cb");
-                    expect(&yuv.cr, chroma_w as usize * chroma_h as usize, "cr");
-                    (upload_plane(gl, plane_bytes(&yuv.cb), (chroma_w, chroma_h), wide, filterable),
-                     upload_plane(gl, plane_bytes(&yuv.cr), (chroma_w, chroma_h), wide, filterable))
-                };
-                self.slots[slot].norm = depth_norm(yuv.depth, wide);
-                Textures::Yuv { y: luma_texture, cb: cb_texture, cr: cr_texture }
-            }
-        };
-        self.slots[slot].page = Some(page);
-        self.slots[slot].texture = Some(textures);
-        self.slots[slot].size = (width, height);
-        self.slots[slot].uniforms = PageUniforms::from(&decoded.pixels);
+        self.slots[slot] = Some(page);
+        if self.textures.contains_key(&page) {
+            return;
+        }
+        let entry = upload_entry(&self.gl, decoded);
+        self.textures.insert(page, entry);
+        self.evict_over_budget();
     }
 
-    /// Clear a slot. Used when the page left the spread. Undecoded-but-wanted
-    /// pages keep their last frame instead, per the hold-last-frame rule.
+    /// Unbind a slot. Used when the page left the spread. The page's
+    /// textures stay cached. Undecoded-but-wanted pages keep their last
+    /// frame instead, per the hold-last-frame rule.
     pub fn clear(&mut self, slot: usize) {
-        if let Some(textures) = self.slots[slot].texture.take() {
-            delete_textures(&self.gl, &textures);
-            self.slots[slot].page = None;
-            self.slots[slot].size = (0, 0);
-            self.slots[slot].norm = 1.0;
-        }
+        self.slots[slot] = None;
     }
 
     /// Decoded size of the page held by the slot, if any.
     pub fn size(&self, slot: usize) -> Option<(u32, u32)> {
-        self.slots[slot].texture.as_ref().map(|_| self.slots[slot].size)
+        self.slots[slot].and_then(|page| self.textures.get(&page).map(|entry| entry.size))
+    }
+
+    /// Drop cached pages until the map fits [`TEXTURE_BUDGET_BYTES`]. Never
+    /// drops a bound page, so an oversized newcomer survives until a later
+    /// insert finds it unbound.
+    fn evict_over_budget(&mut self) {
+        let costs: HashMap<usize, usize> =
+            self.textures.iter().map(|(page, entry)| (*page, entry.cost)).collect();
+        for page in eviction_victims(&costs, self.slots, TEXTURE_BUDGET_BYTES) {
+            let entry = self.textures.remove(&page).expect("victim still cached");
+            delete_textures(&self.gl, &entry.textures);
+        }
     }
 
     /// Draw the spread laid out by `layout` with `view`.
@@ -434,8 +404,8 @@ impl PageSlots {
             gl.uniform_2_f32(uniform_location("u_win").as_ref(), win.0, win.1);
             for (slot, rect) in layout.rects.iter().enumerate() {
                 let Some(rect) = rect else { continue };
-                let Some(slot_state) = self.slots.get(slot) else { continue };
-                let Some(textures) = &slot_state.texture else { continue };
+                let Some(page) = self.slots.get(slot).copied().flatten() else { continue };
+                let Some(entry) = self.textures.get(&page) else { continue };
                 // Whole-pixel rect origin: LINEAR samples shimmer at 1:1 zoom
                 // on fractional offsets otherwise.
                 let screen_origin = (
@@ -446,17 +416,17 @@ impl PageSlots {
                 if screen_size.0 <= 0.0 || screen_size.1 <= 0.0 {
                     continue;
                 }
-                let page_uniforms = slot_state.uniforms;
+                let page_uniforms = entry.uniforms;
                 let (_, (chroma_width, chroma_height)) =
-                    plane_dims(slot_state.size, page_uniforms.subsampling);
+                    plane_dims(entry.size, page_uniforms.subsampling);
                 let (luma_anchor, chroma_anchor) = range_offsets(page_uniforms.full_range);
                 gl.uniform_2_f32(uniform_location("u_offset").as_ref(), screen_origin.0, screen_origin.1);
                 gl.uniform_2_f32(uniform_location("u_size").as_ref(), screen_size.0, screen_size.1);
                 gl.uniform_2_f32(uniform_location("u_scale").as_ref(), view.scale, view.scale);
                 gl.uniform_2_f32(
                     uniform_location("u_img").as_ref(),
-                    slot_state.size.0 as f32,
-                    slot_state.size.1 as f32,
+                    entry.size.0 as f32,
+                    entry.size.1 as f32,
                 );
                 gl.uniform_2_f32(
                     uniform_location("u_csize").as_ref(),
@@ -468,7 +438,7 @@ impl PageSlots {
                     uniform_location("u_chroma").as_ref(),
                     chroma_id(page_uniforms.subsampling) as i32,
                 );
-                gl.uniform_1_f32(uniform_location("u_norm").as_ref(), slot_state.norm);
+                gl.uniform_1_f32(uniform_location("u_norm").as_ref(), entry.norm);
                 gl.uniform_3_f32(
                     uniform_location("u_yuv_off").as_ref(),
                     luma_anchor,
@@ -481,7 +451,7 @@ impl PageSlots {
                     &yuv_to_rgb_matrix(page_uniforms.matrix, page_uniforms.full_range),
                 );
                 gl.active_texture(glow::TEXTURE0);
-                match textures {
+                match &entry.textures {
                     Textures::Rgba(rgba_texture) => {
                         gl.bind_texture(glow::TEXTURE_2D, Some(*rgba_texture))
                     }
@@ -503,10 +473,8 @@ impl Drop for PageSlots {
     fn drop(&mut self) {
         // GL objects must be deleted while their context is alive. The
         // window that owns the context is dropped after this struct.
-        for slot in &mut self.slots {
-            if let Some(textures) = slot.texture.take() {
-                delete_textures(&self.gl, &textures);
-            }
+        for (_, entry) in self.textures.drain() {
+            delete_textures(&self.gl, &entry.textures);
         }
         unsafe {
             self.gl.delete_program(self.program);
@@ -592,6 +560,113 @@ fn upload_plane(
         }
     }
     texture
+}
+
+/// Upload one page's textures plus the draw state that goes with them.
+fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> Entry {
+    let (width, height) = (decoded.width, decoded.height);
+    let (textures, norm, mips) = match &decoded.pixels {
+        Pixels::Rgba8(rgba_bytes) => {
+            assert_eq!(rgba_bytes.len(), width as usize * height as usize * 4, "rgba byte length");
+            (Textures::Rgba(upload_rgba(gl, rgba_bytes, (width, height))), 1.0, true)
+        }
+        Pixels::Yuv(yuv) => {
+            let ((luma_w, luma_h), (chroma_w, chroma_h)) =
+                plane_dims((width, height), yuv.subsampling);
+            let wide = matches!(yuv.y, Plane::U16(_));
+            // GL_R16 is not filterable in GLES: LINEAR makes the texture
+            // incomplete (samples black); NEAREST without mips is the
+            // safe fallback on an ES context.
+            let filterable = !(gl.version().is_embedded && wide);
+            let expect = |plane: &Plane, want_samples: usize, what: &str| {
+                let want_bytes = want_samples * if wide { 2 } else { 1 };
+                assert_eq!(plane_bytes(plane).len(), want_bytes, "{what} plane bytes");
+            };
+            expect(&yuv.y, luma_w as usize * luma_h as usize, "y");
+            let luma_texture =
+                upload_plane(gl, plane_bytes(&yuv.y), (luma_w, luma_h), wide, filterable);
+            let (cb_texture, cr_texture) = if yuv.subsampling == Subsampling::Mono {
+                // 1x1 chroma at the range midpoint; the matrix cancels it
+                // to neutral gray. LE pairs match plane_bytes' U16 layout.
+                let midpoint_bytes: Vec<u8> = if wide {
+                    (1u32 << (yuv.depth.clamp(MIN_PLANE_DEPTH, MAX_PLANE_DEPTH) - 1))
+                        .to_le_bytes()
+                        .to_vec()
+                } else {
+                    MONO_CHROMA_MIDPOINT_8.to_le_bytes().to_vec()
+                };
+                (upload_plane(gl, &midpoint_bytes, (1, 1), wide, filterable),
+                 upload_plane(gl, &midpoint_bytes, (1, 1), wide, filterable))
+            } else {
+                expect(&yuv.cb, chroma_w as usize * chroma_h as usize, "cb");
+                expect(&yuv.cr, chroma_w as usize * chroma_h as usize, "cr");
+                (upload_plane(gl, plane_bytes(&yuv.cb), (chroma_w, chroma_h), wide, filterable),
+                 upload_plane(gl, plane_bytes(&yuv.cr), (chroma_w, chroma_h), wide, filterable))
+            };
+            (Textures::Yuv { y: luma_texture, cb: cb_texture, cr: cr_texture },
+             depth_norm(yuv.depth, wide),
+             filterable)
+        }
+    };
+    Entry {
+        textures,
+        size: (width, height),
+        norm,
+        uniforms: PageUniforms::from(&decoded.pixels),
+        cost: entry_cost_bytes(decoded, mips),
+    }
+}
+
+/// Cache budget: approximate texture bytes the page cache may hold. Bound
+/// pages are never evicted, so the cache can sit above it.
+const TEXTURE_BUDGET_BYTES: usize = 3 * 1024 * 1024 * 1024;
+
+/// Approximate texture bytes one page occupies: plane bytes, plus the mip
+/// chain (`4/3` of the base levels) where mips are generated.
+fn entry_cost_bytes(decoded: &Decoded, mips: bool) -> usize {
+    let base = match &decoded.pixels {
+        Pixels::Rgba8(rgba) => rgba.len(),
+        Pixels::Yuv(yuv) => {
+            let per_sample = if matches!(yuv.y, Plane::U16(_)) { 2 } else { 1 };
+            let chroma = match yuv.subsampling {
+                // Mono uploads a 1x1 midpoint texture per chroma channel.
+                Subsampling::Mono => 2 * per_sample,
+                _ => plane_bytes(&yuv.cb).len() + plane_bytes(&yuv.cr).len(),
+            };
+            plane_bytes(&yuv.y).len() + chroma
+        }
+    };
+    if mips { base * 4 / 3 } else { base }
+}
+
+/// Pages to drop so the cached costs fit `budget` after a fresh insert.
+/// Candidates are unbound pages, farthest from the nearest bound page
+/// first, ties by higher page id. Bound pages never go, so the survivors
+/// can still sit above the budget until the next insert.
+fn eviction_victims(
+    costs: &HashMap<usize, usize>,
+    bound: [Option<usize>; 2],
+    budget: usize,
+) -> Vec<usize> {
+    let mut remaining: usize = costs.values().sum();
+    let mut candidates: Vec<usize> = costs
+        .keys()
+        .copied()
+        .filter(|page| !bound.contains(&Some(*page)))
+        .collect();
+    let distance = |page: usize| {
+        bound.iter().flatten().map(|b| page.abs_diff(*b)).min().unwrap_or(usize::MAX)
+    };
+    candidates.sort_unstable_by_key(|page| Reverse((distance(*page), *page)));
+    let mut victims = Vec::new();
+    for page in candidates {
+        if remaining <= budget {
+            break;
+        }
+        remaining -= costs[&page];
+        victims.push(page);
+    }
+    victims
 }
 
 /// How the shader should read a slot's texture set, derived CPU-side.
@@ -799,5 +874,64 @@ mod tests {
             (uniforms.mode, uniforms.subsampling, uniforms.depth, uniforms.full_range, uniforms.matrix),
             (1, Subsampling::Yuv420, 10, false, Matrix::Bt2020)
         );
+    }
+
+    #[test]
+    fn rgba_entry_cost_counts_the_mip_chain() {
+        let bytes = vec![0u8; 4 * 4 * 4].into_boxed_slice();
+        let decoded = Decoded::rgba(4, 4, crate::decode::Format::Png, bytes).expect("rgba page");
+        assert_eq!(entry_cost_bytes(&decoded, true), 64 * 4 / 3);
+    }
+
+    #[test]
+    fn yuv420_entry_cost_counts_the_mip_chain() {
+        let yuv = crate::decode::YuvImage {
+            depth: 8,
+            subsampling: Subsampling::Yuv420,
+            full_range: true,
+            matrix: Matrix::Bt709,
+            y: Plane::U8(vec![0u8; 4 * 4].into_boxed_slice()),
+            cb: Plane::U8(vec![0u8; 2 * 2].into_boxed_slice()),
+            cr: Plane::U8(vec![0u8; 2 * 2].into_boxed_slice()),
+        };
+        let decoded = Decoded::yuv(4, 4, crate::decode::Format::Avif, yuv).expect("yuv page");
+        assert_eq!(entry_cost_bytes(&decoded, true), (16 + 4 + 4) * 4 / 3);
+    }
+
+    #[test]
+    fn r16_gles_entry_cost_skips_mips() {
+        // GLES R16: NEAREST filtering, so no mip chain.
+        let yuv = crate::decode::YuvImage {
+            depth: 10,
+            subsampling: Subsampling::Mono,
+            full_range: true,
+            matrix: Matrix::Identity,
+            y: Plane::U16(vec![0u16; 4].into_boxed_slice()),
+            cb: Plane::U8(Box::default()),
+            cr: Plane::U8(Box::default()),
+        };
+        let decoded = Decoded::yuv(2, 2, crate::decode::Format::Avif, yuv).expect("yuv page");
+        assert_eq!(entry_cost_bytes(&decoded, false), 4 * 2 + 2 * 2);
+    }
+
+    #[test]
+    fn eviction_drops_unbound_pages_farthest_first() {
+        let costs = HashMap::from([(3usize, 10usize), (19, 10), (10, 10), (20, 10)]);
+        // 19 sits one page from slot 1's anchor, so 3 is the farther victim.
+        assert_eq!(eviction_victims(&costs, [Some(10), Some(20)], 35), vec![3]);
+        assert_eq!(eviction_victims(&costs, [Some(10), Some(20)], 25), vec![3, 19]);
+    }
+
+    #[test]
+    fn bound_pages_are_never_evicted() {
+        let costs = HashMap::from([(10usize, 10usize), (11, 10), (12, 10)]);
+        assert_eq!(eviction_victims(&costs, [Some(10), Some(11)], 0), vec![12]);
+        assert_eq!(eviction_victims(&costs, [Some(10), Some(11)], 30), vec![]);
+    }
+
+    #[test]
+    fn eviction_ties_break_to_the_higher_page() {
+        let costs = HashMap::from([(8usize, 10usize), (12, 10), (10, 10)]);
+        assert_eq!(eviction_victims(&costs, [Some(10), None], 25), vec![12]);
     }
 }

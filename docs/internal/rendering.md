@@ -117,8 +117,13 @@ a whole class of "slightly wrong colors" regressions without a GPU.
 
 ## Upload policy
 
-Texture uploads are expensive (full re-upload plus mipmap generation),
-so slots are page-keyed: `set(slot, page, decoded)` no-ops on the same
-page id and the app never mirrors GPU state. This is also what makes a
-future low-res-then-full-res or animation-frame pipeline cheap. Grow
-the identity key instead of adding a mirror array.
+Texture uploads are expensive, a full upload plus mipmap generation per
+plane, so uploaded pages stay in a page-keyed cache. `set(slot, page,
+decoded)` no-ops on the same page id, uploads only on a cache miss, and
+otherwise rebinds the slot to the cached textures. Page revisits and the
+RTL re-seat are pure binds. The app never mirrors GPU state on its side.
+Each entry counts its plane bytes plus the mip chain against a 3 GiB
+cap. An insert past the cap evicts unbound pages, farthest from the
+nearest bound page first. Bound pages are never evicted, so a page that
+alone exceeds the cap still renders and is dropped by a later insert
+once unbound.
