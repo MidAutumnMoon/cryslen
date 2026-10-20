@@ -28,7 +28,7 @@ pub fn show(ui: &mut egui::Ui, status: &StatusLine) {
 }
 
 /// The single status line, separate so it is directly testable.
-pub fn line(status: &StatusLine) -> String {
+fn line(status: &StatusLine) -> String {
     let mut head = format!("{}/{}", status.spread.first + 1, status.total);
     if let Some(second) = status.spread.second {
         head.push_str(&format!("-{}", second + 1));

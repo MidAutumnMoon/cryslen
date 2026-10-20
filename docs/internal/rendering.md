@@ -84,7 +84,7 @@ arboard bundle.
 
 ## Quad strategy
 
-A fixed -1..1 strip whose *vertex shader* places it at the slot's
+A fixed -1..1 strip whose *vertex shader* places it at the seat's
 screen rect from uniforms. Pan/zoom/rect changes never touch vertex
 data or re-upload textures. The rasterizer clips exactly and there is
 no letterbox overdraw (the app owns the clear). The alternative
@@ -119,9 +119,9 @@ a whole class of "slightly wrong colors" regressions without a GPU.
 ## Upload policy
 
 Texture uploads are expensive, a full upload plus mipmap generation per
-plane, so uploaded pages stay in a page-keyed cache. `set(slot, page,
+plane, so uploaded pages stay in a page-keyed cache. `set(seat, page,
 decoded)` no-ops on the same page id, uploads only on a cache miss, and
-otherwise rebinds the slot to the cached textures. Page revisits and the
+otherwise rebinds the seat to the cached textures. Page revisits and the
 RTL re-seat are pure binds. The app never mirrors GPU state on its side.
 Each entry counts its plane bytes plus the mip chain against a 3 GiB
 cap. An insert past the cap evicts unbound pages, farthest from the

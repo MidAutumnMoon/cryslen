@@ -4,7 +4,7 @@
 //! calls (resource creation, swap) panic since context loss leaves nothing to
 //! show.
 //!
-//! Two page slots over a page-keyed texture cache, YUV plane textures with
+//! Two page seats over a page-keyed texture cache, YUV plane textures with
 //! shader-side conversion, spread layout draw. Chroma siting
 //! (avifChromaSamplePosition) is not applied: the
 //! default co-sited/midway assumption biases chroma by at most half a texel,
@@ -19,7 +19,7 @@ use glow::HasContext;
 use crate::decode::{plane_bytes, plane_dims, Decoded, Matrix, Pixels, Plane, Subsampling};
 use crate::view::{SpreadLayout, View};
 
-/// Fixed -1..1 strip. The VS places it at the slot's screen rect from
+/// Fixed -1..1 strip. The VS places it at the seat's screen rect from
 /// uniforms, so pan/zoom never touch vertex data. Top-origin math lives in
 /// the VS, because GL clip space is bottom-origin while winit coords are
 /// top-origin.
@@ -27,8 +27,8 @@ const VS_CORE: &str = r#"
     #version 330 core
     in vec2 pos;
     uniform vec2 u_win;    // window size, px
-    uniform vec2 u_offset; // slot rect origin, screen px
-    uniform vec2 u_size;   // slot rect size, screen px
+    uniform vec2 u_offset; // seat rect origin, screen px
+    uniform vec2 u_size;   // seat rect size, screen px
     out vec2 v_px;
     void main() {
         vec2 px = u_offset + (pos * 0.5 + 0.5) * u_size;
@@ -110,19 +110,19 @@ const FS_ES: &str = r#"
         color = vec4(u_mat * (yuv * u_norm - u_yuv_off), 1.0);
     }"#;
 
-/// Up to two page slots over a page-keyed texture cache. Each entry is an
+/// Up to two page seats over a page-keyed texture cache. Each entry is an
 /// RGBA texture or a YUV plane triple. Upload happens on the main thread at
 /// frame time, only for pages missing from the cache. Pan/zoom stay
 /// uniforms and never re-upload.
 ///
-/// Each slot remembers which page it shows, so `set` with an unchanged page
+/// Each seat remembers which page it shows, so `set` with an unchanged page
 /// is a no-op. Callers never need to mirror GPU state on their side.
 pub struct PageSlots {
     gl: Arc<glow::Context>,
     program: <glow::Context as glow::HasContext>::Program,
     vao: <glow::Context as glow::HasContext>::VertexArray,
-    /// Page each slot shows (`None` when empty).
-    slots: [Option<usize>; 2],
+    /// Page each seat shows (`None` when empty).
+    seats: [Option<usize>; 2],
     /// Uploaded textures by page, retained across visits until evicted.
     textures: HashMap<usize, Entry>,
     vbo: <glow::Context as glow::HasContext>::Buffer,
@@ -158,9 +158,9 @@ const MONO_CHROMA_MIDPOINT_8: u8 = 128;
 
 const IDENTITY3: [f32; 9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
 
-/// Uniform set describing an RGBA page (mode 0).
+/// Uniform set describing an RGBA page.
 const RGBA_UNIFORMS: PageUniforms = PageUniforms {
-    mode: 0,
+    mode: Mode::Rgba,
     subsampling: Subsampling::Yuv444,
     depth: 8,
     full_range: true,
@@ -211,10 +211,10 @@ impl PageSlots {
             }
         }
         let max_tex = unsafe { gl.get_parameter_i32(glow::MAX_TEXTURE_SIZE) } as u32;
-        PageSlots { gl, program, vao, slots: [None, None], textures: HashMap::new(), vbo, max_tex }
+        PageSlots { gl, program, vao, seats: [None, None], textures: HashMap::new(), vbo, max_tex }
     }
 
-    /// Bind visual slot `i` (0 = left, 1 = right) to `page`, uploading its
+    /// Bind visual seat `i` (0 = left, 1 = right) to `page`, uploading its
     /// textures only on a cache miss. Binding an unchanged page is a no-op.
     ///
     /// # Panics
@@ -222,8 +222,8 @@ impl PageSlots {
     /// Panics if the page exceeds this context's MAX_TEXTURE_SIZE. Decode
     /// rejects edges over its own cap first, so only a GPU advertising a
     /// smaller limit can trip this.
-    pub fn set(&mut self, slot: usize, page: usize, decoded: &Decoded) {
-        if self.slots[slot] == Some(page) {
+    pub fn set(&mut self, seat: usize, page: usize, decoded: &Decoded) {
+        if self.seats[seat] == Some(page) {
             return;
         }
         let (width, height) = (decoded.width, decoded.height);
@@ -234,7 +234,7 @@ impl PageSlots {
             "image {width}x{height} exceeds GL max texture size {} (tiling not implemented)",
             self.max_tex
         );
-        self.slots[slot] = Some(page);
+        self.seats[seat] = Some(page);
         if self.textures.contains_key(&page) {
             return;
         }
@@ -243,16 +243,16 @@ impl PageSlots {
         self.evict_over_budget();
     }
 
-    /// Unbind a slot. Used when the page left the spread. The page's
+    /// Unbind a seat. Used when the page left the spread. The page's
     /// textures stay cached. Undecoded-but-wanted pages keep their last
     /// frame instead, per the hold-last-frame rule.
-    pub fn clear(&mut self, slot: usize) {
-        self.slots[slot] = None;
+    pub fn clear(&mut self, seat: usize) {
+        self.seats[seat] = None;
     }
 
-    /// Decoded size of the page held by the slot, if any.
-    pub fn size(&self, slot: usize) -> Option<(u32, u32)> {
-        self.slots[slot].and_then(|page| self.textures.get(&page).map(|entry| entry.size))
+    /// Decoded size of the page held by the seat, if any.
+    pub fn size(&self, seat: usize) -> Option<(u32, u32)> {
+        self.seats[seat].and_then(|page| self.textures.get(&page).map(|entry| entry.size))
     }
 
     /// Drop cached pages until the map fits [`TEXTURE_BUDGET_BYTES`]. Never
@@ -261,7 +261,7 @@ impl PageSlots {
     fn evict_over_budget(&mut self) {
         let costs: HashMap<usize, usize> =
             self.textures.iter().map(|(page, entry)| (*page, entry.cost)).collect();
-        for page in eviction_victims(&costs, self.slots, TEXTURE_BUDGET_BYTES) {
+        for page in eviction_victims(&costs, self.seats, TEXTURE_BUDGET_BYTES) {
             let entry = self.textures.remove(&page).expect("victim still cached");
             delete_textures(&self.gl, &entry.textures);
         }
@@ -285,9 +285,9 @@ impl PageSlots {
             let uniform_location =
                 |name: &str| gl.get_uniform_location(self.program, name);
             gl.uniform_2_f32(uniform_location("u_win").as_ref(), win.0, win.1);
-            for (slot, rect) in layout.rects.iter().enumerate() {
+            for (seat, rect) in layout.rects.iter().enumerate() {
                 let Some(rect) = rect else { continue };
-                let Some(page) = self.slots.get(slot).copied().flatten() else { continue };
+                let Some(page) = self.seats.get(seat).copied().flatten() else { continue };
                 let Some(entry) = self.textures.get(&page) else { continue };
                 // Whole-pixel rect origin: LINEAR samples shimmer at 1:1 zoom
                 // on fractional offsets otherwise.
@@ -316,7 +316,10 @@ impl PageSlots {
                     chroma_width as f32,
                     chroma_height as f32,
                 );
-                gl.uniform_1_i32(uniform_location("u_mode").as_ref(), page_uniforms.mode as i32);
+                gl.uniform_1_i32(
+                    uniform_location("u_mode").as_ref(),
+                    mode_id(page_uniforms.mode) as i32,
+                );
                 gl.uniform_1_i32(
                     uniform_location("u_chroma").as_ref(),
                     chroma_id(page_uniforms.subsampling) as i32,
@@ -552,15 +555,21 @@ fn eviction_victims(
     victims
 }
 
-/// How the shader should read a slot's texture set, derived CPU-side.
+/// Pixel layout of the cached page: interleaved RGBA or planar YUV.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Rgba,
+    Yuv,
+}
+
+/// How the shader should read a seat's texture set, derived CPU-side.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct PageUniforms {
-    /// 0 = RGBA, 1 = YUV
-    pub mode: u32,
-    pub subsampling: Subsampling,
-    pub depth: u8,
-    pub full_range: bool,
-    pub matrix: crate::decode::Matrix,
+struct PageUniforms {
+    mode: Mode,
+    subsampling: Subsampling,
+    depth: u8,
+    full_range: bool,
+    matrix: crate::decode::Matrix,
 }
 
 impl From<&Pixels> for PageUniforms {
@@ -568,13 +577,21 @@ impl From<&Pixels> for PageUniforms {
         match p {
             Pixels::Rgba8(_) => RGBA_UNIFORMS,
             Pixels::Yuv(yuv) => PageUniforms {
-                mode: 1,
+                mode: Mode::Yuv,
                 subsampling: yuv.subsampling,
                 depth: yuv.depth,
                 full_range: yuv.full_range,
                 matrix: yuv.matrix,
             },
         }
+    }
+}
+
+/// Shader mode id: 0 = RGBA, 1 = YUV.
+fn mode_id(mode: Mode) -> u32 {
+    match mode {
+        Mode::Rgba => 0,
+        Mode::Yuv => 1,
     }
 }
 
@@ -755,7 +772,7 @@ mod tests {
         let uniforms = PageUniforms::from(&yuv_pixels);
         assert_eq!(
             (uniforms.mode, uniforms.subsampling, uniforms.depth, uniforms.full_range, uniforms.matrix),
-            (1, Subsampling::Yuv420, 10, false, Matrix::Bt2020)
+            (Mode::Yuv, Subsampling::Yuv420, 10, false, Matrix::Bt2020)
         );
     }
 
@@ -800,7 +817,7 @@ mod tests {
     #[test]
     fn eviction_drops_unbound_pages_farthest_first() {
         let costs = HashMap::from([(3usize, 10usize), (19, 10), (10, 10), (20, 10)]);
-        // 19 sits one page from slot 1's anchor, so 3 is the farther victim.
+        // 19 sits one page from seat 1's anchor, so 3 is the farther victim.
         assert_eq!(eviction_victims(&costs, [Some(10), Some(20)], 35), vec![3]);
         assert_eq!(eviction_victims(&costs, [Some(10), Some(20)], 25), vec![3, 19]);
     }

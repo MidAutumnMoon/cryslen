@@ -106,7 +106,7 @@ write orientation tags, so fixtures for it must come from real files.
 ## Decode worker pattern (what makes skimming feel right)
 
 - One worker thread, mpsc focus channel. Every focus joins a pending
-  trail with its ±2 window, which covers both single- and double-page
+  trail with its ±2 neighborhood, which covers both single- and double-page
   turns. The trail is bounded to ±64 pages of the current focus. Past
   that the reader has moved on, so pages are dropped instead of queued.
   The next decode is the undecided pending page nearest the focus, with

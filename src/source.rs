@@ -13,7 +13,7 @@ use crate::decode::format_from_name;
 
 /// Where pages come from, decided by `Source::open` from one path argument.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SourceKind {
+enum SourceKind {
     Directory(PathBuf),
     Zip(PathBuf),
     SevenZip(PathBuf),
@@ -46,7 +46,7 @@ impl std::error::Error for SourceError {}
 
 /// Byte budget of the 7z tier. Whole books measure 208-383 MiB, so one
 /// tier holds an entire archive.
-const TIER_BYTES: usize = 512 * 1024 * 1024;
+const TIER_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 
 /// Decompressed 7z members keyed by page index. The harvest pass and
 /// `bytes` misses fill it. A fill that passes the byte budget evicts in
@@ -96,7 +96,7 @@ fn lock_recovered<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
 /// A page source with persistent handles. Cheap to keep alive for the whole
 /// session. Shared with the decode worker behind an `Arc`.
 pub struct Source {
-    pub kind: SourceKind,
+    kind: SourceKind,
     names: Vec<String>,
     zip: Option<Mutex<zip::ZipArchive<std::io::BufReader<std::fs::File>>>>,
     sevenzip: Option<Mutex<sevenz_rust2::ArchiveReader<std::fs::File>>>,
@@ -180,7 +180,7 @@ impl Source {
             .enumerate()
             .map(|(index, name)| (name.clone(), index))
             .collect();
-        let tier = Arc::new(Mutex::new(ByteTier::new(TIER_BYTES)));
+        let tier = Arc::new(Mutex::new(ByteTier::new(TIER_BUDGET_BYTES)));
         source.sevenzip = Some(Mutex::new(archive));
         source.tier = Some(Arc::clone(&tier));
         source.harvest = Some(spawn_harvest(path.to_path_buf(), pages, tier));
@@ -206,6 +206,7 @@ impl Source {
     }
 
     pub fn name(&self, index: usize) -> &str {
+        debug_assert!(index < self.names.len());
         &self.names[index]
     }
 
@@ -222,10 +223,8 @@ impl Source {
     /// session-held handles. 7z reads consult the byte tier first and
     /// fill it on a miss, so repeat reads are an `Arc` refcount bump.
     pub fn bytes(&self, index: usize) -> Result<Arc<[u8]>, SourceError> {
-        let name = self
-            .names
-            .get(index)
-            .ok_or_else(|| SourceError::Io(std::io::Error::other(format!("page {index} out of range"))))?;
+        debug_assert!(index < self.names.len());
+        let name = &self.names[index];
         match &self.kind {
             SourceKind::Directory(dir) => std::fs::read(dir.join(name))
                 .map(Arc::from)
@@ -417,7 +416,6 @@ mod tests {
         dir.write("p.png", &png);
         let source = Source::open(dir.path()).unwrap();
         assert_eq!(source.bytes(0).as_deref().ok(), Some(png.as_slice()));
-        assert!(source.bytes(1).is_err());
     }
 
     #[test]

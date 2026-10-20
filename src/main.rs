@@ -14,13 +14,20 @@ mod view;
 mod window;
 mod worker;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
 use app::{App, UserEvent};
 use source::Source;
 use worker::Worker;
+
+/// Parsed path argument. An image file opens its parent directory at that
+/// image. Everything else opens as-is.
+enum Arg {
+    Archive(PathBuf),
+    Image { dir: PathBuf, name: String },
+}
 
 fn main() -> ExitCode {
     let Some(arg) = std::env::args().nth(1) else {
@@ -29,19 +36,25 @@ fn main() -> ExitCode {
     };
     let path = Path::new(&arg);
 
-    let start = if path.is_file() && !is_archive(path) {
+    let open = if path.is_file() && !is_archive(path) {
         // Path::parent() yields Some("") for bare relative names ("pic.jpg").
         let dir = path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
-        Some((dir.to_path_buf(), name))
+        let name = path
+            .file_name()
+            .expect("a file argument has a file name")
+            .to_string_lossy()
+            .into_owned();
+        Arg::Image { dir: dir.to_path_buf(), name }
     } else {
-        None
+        Arg::Archive(path.to_path_buf())
     };
-    let open_path = start.as_ref().map_or(path, |(dir, _)| dir.as_path());
-    let land_on = start.as_ref().and_then(|(_, name)| name.as_deref());
+    let (open_path, land_on) = match &open {
+        Arg::Archive(archive) => (archive.as_path(), None),
+        Arg::Image { dir, name } => (dir.as_path(), Some(name.as_str())),
+    };
 
     match run(open_path, land_on) {
         Ok(()) => ExitCode::SUCCESS,

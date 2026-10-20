@@ -8,12 +8,12 @@ use std::time::{Duration, Instant};
 
 use egui_winit::winit;
 
-use crate::keys::{action, is_forward, Action};
+use crate::keys::Action;
 use crate::render::PageSlots;
 use crate::source::Source;
 use crate::view::{Spread, SpreadLayout, View};
 use crate::window::Window;
-use crate::worker::{Page, Worker};
+use crate::worker::{PageState, Worker};
 
 /// User events that wake the parked loop.
 pub enum UserEvent {
@@ -25,17 +25,17 @@ pub enum UserEvent {
 }
 
 /// Everything mode-ish about the viewing session. Plain data.
-pub struct State {
+struct State {
     /// Index of the spread's first page (a spread start).
-    pub index: usize,
-    pub double: bool,
-    pub rtl: bool,
-    pub view: View,
-    pub fullscreen: bool,
+    index: usize,
+    double: bool,
+    rtl: bool,
+    view: View,
+    fullscreen: bool,
 }
 
 /// Baked-in defaults (no config file, ever). Manga defaults: RTL on.
-pub const START: State = State {
+const DEFAULT_STATE: State = State {
     index: 0,
     double: false,
     rtl: true,
@@ -46,43 +46,43 @@ pub const START: State = State {
 /// The GL bundle: everything that exists only between `resumed` and exit.
 /// Field order is drop order: slots and egui are dropped while the window
 /// (which owns the GL context) is still alive.
-pub struct Gl {
-    pub slots: PageSlots,
-    pub egui: egui_glow::EguiGlow,
-    pub window: Window,
+struct Gl {
+    slots: PageSlots,
+    egui: egui_glow::EguiGlow,
+    window: Window,
 }
 
 pub struct App {
-    pub source: Arc<Source>,
-    pub worker: Worker,
-    pub state: State,
+    source: Arc<Source>,
+    worker: Worker,
+    state: State,
     /// GL exists only after `resumed` (winit requirement).
-    pub gl: Option<Gl>,
+    gl: Option<Gl>,
     /// GL init failure from `resumed`, which cannot return a Result. Main
     /// reports it after the event loop exits.
     pub start_error: Option<eros::ErrorUnion>,
     /// Window size the GL surface was last resized to (physical px).
-    pub last_win: (u32, u32),
-    pub cursor: (f32, f32),
-    pub dragging: bool,
+    last_surface_size: (u32, u32),
+    cursor: (f32, f32),
+    dragging: bool,
     /// Set while the current spread's first page is undecided. The last
     /// frame stays on screen (hold-last-frame rule) and the status line
     /// flags waiting after 150 ms. No spinner animation: it would force
     /// repaints.
-    pub waiting_since: Option<Instant>,
+    waiting_since: Option<Instant>,
     /// Layout of the spread currently on screen. Pan and zoom read this
     /// memo between frames.
-    pub last_layout: SpreadLayout,
+    last_layout: SpreadLayout,
     /// Spread total the current view was fitted to. NaN forces a refit on
     /// the next frame.
-    pub fitted_total: (f32, f32),
+    fitted_total: (f32, f32),
     /// The user zoomed or panned since the last fit. Their view wins over
     /// geometry, suppressing the auto-refit that fires when a late-decoded
     /// page changes the spread shape.
-    pub user_moved: bool,
+    user_moved: bool,
     /// Proxy for egui's repaint bridge. winit 0.30 cannot create one from
     /// `ActiveEventLoop` (only `EventLoop::create_proxy`, before `run_app`).
-    pub proxy: Option<winit::event_loop::EventLoopProxy<UserEvent>>,
+    proxy: Option<winit::event_loop::EventLoopProxy<UserEvent>>,
 }
 
 impl App {
@@ -95,10 +95,10 @@ impl App {
         App {
             source,
             worker,
-            state: State { index, ..START },
+            state: State { index, ..DEFAULT_STATE },
             gl: None,
             start_error: None,
-            last_win: (0, 0),
+            last_surface_size: (0, 0),
             cursor: (0.0, 0.0),
             dragging: false,
             waiting_since: None,
@@ -110,22 +110,22 @@ impl App {
     }
 
     /// Spread for the current index/mode, clamped to the book.
-    pub fn spread(&self) -> Spread {
+    fn spread(&self) -> Spread {
         crate::view::spread_for(self.state.index, self.state.double, self.source.len())
     }
 
     /// Upload what changed. A seat with a freshly decoded page shows it. An
-    /// undecided page keeps the slot's last frame (hold-last-frame rule). A
+    /// undecided page keeps the seat's last frame (hold-last-frame rule). A
     /// seat with no page in this spread is cleared.
     fn sync_slots(&mut self, spread: &Spread) {
         let seats = spread.seats(self.state.rtl);
         if let Some(gl) = self.gl.as_mut() {
-            for (slot, &page) in seats.iter().enumerate() {
+            for (seat, &page) in seats.iter().enumerate() {
                 let shown = page.and_then(|p| self.worker.page(p));
                 match (page, shown) {
-                    (Some(p), Some(Page::Ready(d))) => gl.slots.set(slot, p, &d),
-                    (None, _) => gl.slots.clear(slot),
-                    // Undecided or failed: keep whatever the slot shows.
+                    (Some(p), Some(PageState::Ready(d))) => gl.slots.set(seat, p, &d),
+                    (None, _) => gl.slots.clear(seat),
+                    // Undecided or failed: keep whatever the seat shows.
                     _ => {}
                 }
             }
@@ -138,7 +138,7 @@ impl App {
     }
 
     /// One frame: decide, upload, draw, present.
-    pub fn frame(&mut self) {
+    fn frame(&mut self) {
         let size = match self.surface_size() {
             Some(size) => size,
             None => return,
@@ -161,7 +161,7 @@ impl App {
         }
 
         self.waiting_since = match &first {
-            Some(Page::Ready(_)) | Some(Page::Failed(_)) => None,
+            Some(PageState::Ready(_)) | Some(PageState::Failed(_)) => None,
             None => Some(self.waiting_since.unwrap_or_else(Instant::now)),
         };
         // While waiting on a decode, wake up once when the 150 ms status
@@ -183,17 +183,17 @@ impl App {
             rtl: self.state.rtl,
             source_label: self.source.label(),
             format: match &first {
-                Some(Page::Ready(d)) => Some(d.format.label()),
+                Some(PageState::Ready(d)) => Some(d.format.label()),
                 _ => None,
             },
             dims: match &first {
-                Some(Page::Ready(d)) => Some((d.width, d.height)),
+                Some(PageState::Ready(d)) => Some((d.width, d.height)),
                 _ => None,
             },
             zoom_percent: self.state.view.scale * 100.0,
             waiting: self.waiting_since.is_some_and(|t| t.elapsed() >= WAIT_GRACE),
             error: match &first {
-                Some(Page::Failed(e)) => Some(e.clone()),
+                Some(PageState::Failed(e)) => Some(e.clone()),
                 _ => None,
             },
         };
@@ -217,10 +217,10 @@ impl App {
         if size.width == 0 || size.height == 0 {
             return None; // minimized
         }
-        if (size.width, size.height) != self.last_win {
+        if (size.width, size.height) != self.last_surface_size {
             gl.window.resize(size);
         }
-        self.last_win = (size.width, size.height);
+        self.last_surface_size = (size.width, size.height);
         Some(size)
     }
 
@@ -274,7 +274,7 @@ impl App {
             }
             Action::ResetView => self.needs_refit(),
             Action::Next | Action::Prev => {
-                let forward = is_forward(act, self.state.rtl);
+                let forward = act.is_forward(self.state.rtl);
                 self.state.index = crate::view::advance(
                     self.state.index,
                     forward,
@@ -383,7 +383,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
             WindowEvent::KeyboardInput { event: key, .. } => {
                 if key.state == ElementState::Pressed {
                     if let PhysicalKey::Code(code) = key.physical_key {
-                        if let Some(act) = action(code) {
+                        if let Some(act) = Action::from_key(code) {
                             if !key.repeat || act.repeats() {
                                 self.dispatch(act, event_loop);
                             }

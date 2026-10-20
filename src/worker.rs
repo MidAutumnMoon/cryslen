@@ -12,32 +12,28 @@ use crate::decode::Decoded;
 use crate::source::Source;
 
 /// Cache budget: approximate decoded bytes the cache may hold.
-const BUDGET_BYTES: usize = 768 * 1024 * 1024;
+const PAGE_CACHE_BUDGET_BYTES: usize = 768 * 1024 * 1024;
 
-/// Wakes the loop so it can observe `stop` and exit (sent by `Drop`).
-const SENTINEL: usize = usize::MAX;
+/// Message to the worker thread: decode around a focus, or stop.
+enum ToWorker {
+    Focus(usize),
+    Stop,
+}
+
 /// Cache entry: the decode outcome, not just the success case. A failed
 /// page is sticky, so waiting, error display, and hold-last-frame are all
 /// pure reads of this map, and the failure follows the page across turns.
-pub enum Page {
+#[derive(Clone)]
+pub enum PageState {
     Ready(Arc<Decoded>),
     Failed(String),
 }
 
-impl Clone for Page {
-    fn clone(&self) -> Self {
-        match self {
-            Page::Ready(d) => Page::Ready(Arc::clone(d)),
-            Page::Failed(e) => Page::Failed(e.clone()),
-        }
-    }
-}
-
-impl Page {
+impl PageState {
     fn resident_bytes(&self) -> usize {
         match self {
-            Page::Ready(d) => d.resident_bytes(),
-            Page::Failed(e) => e.len(),
+            PageState::Ready(d) => d.resident_bytes(),
+            PageState::Failed(e) => e.len(),
         }
     }
 }
@@ -47,7 +43,7 @@ impl Page {
 /// never-viewed pages go first, farthest from the focus first, then viewed
 /// pages least-recently-viewed first. The focused page never goes.
 struct PageCache {
-    map: HashMap<usize, Page>,
+    map: HashMap<usize, PageState>,
     budget: usize,
     live_bytes: usize,
     /// Recency stamp per page the user visited, for the eviction order.
@@ -59,7 +55,7 @@ impl PageCache {
     fn new() -> PageCache {
         PageCache {
             map: HashMap::new(),
-            budget: BUDGET_BYTES,
+            budget: PAGE_CACHE_BUDGET_BYTES,
             live_bytes: 0,
             viewed: HashMap::new(),
             stamp: 0,
@@ -74,7 +70,7 @@ impl PageCache {
 
     /// Store a page outcome, then evict until under budget. `focused`
     /// never goes, even when it alone exceeds the budget.
-    fn insert(&mut self, index: usize, page: Page, focused: usize) {
+    fn insert(&mut self, index: usize, page: PageState, focused: usize) {
         let bytes = page.resident_bytes();
         if let Some(old) = self.map.insert(index, page) {
             self.live_bytes -= old.resident_bytes();
@@ -126,7 +122,7 @@ impl PageCache {
 
 /// Handle to the worker. `focus` is cheap and never blocks.
 pub struct Worker {
-    tx: mpsc::Sender<usize>,
+    tx: mpsc::Sender<ToWorker>,
     cache: Arc<Mutex<PageCache>>,
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
@@ -137,7 +133,7 @@ impl Worker {
     /// and should send the winit user event. The worker itself knows nothing
     /// about winit.
     pub fn spawn(source: Arc<Source>, notify: impl Fn() + Send + Sync + 'static) -> Worker {
-        let (tx, rx) = mpsc::channel::<usize>();
+        let (tx, rx) = mpsc::channel::<ToWorker>();
         let cache = Arc::new(Mutex::new(PageCache::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let handle = std::thread::Builder::new()
@@ -154,12 +150,12 @@ impl Worker {
     /// Tell the worker which page the user is on. Every focus counts as a
     /// viewed page and joins the decode trail.
     pub fn focus(&self, index: usize) {
-        let _ = self.tx.send(index);
+        let _ = self.tx.send(ToWorker::Focus(index));
     }
 
     /// The decode outcome for one page, if it has been decided. Cloning a
     /// `Ready` page is an `Arc` bump.
-    pub fn page(&self, index: usize) -> Option<Page> {
+    pub fn page(&self, index: usize) -> Option<PageState> {
         self.cache.lock().expect("decode cache lock").map.get(&index).cloned()
     }
 }
@@ -167,15 +163,15 @@ impl Worker {
 impl Drop for Worker {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        // A final dummy focus wakes the loop so it observes `stop`.
-        let _ = self.tx.send(usize::MAX);
+        // The Stop message wakes the loop so it observes `stop`.
+        let _ = self.tx.send(ToWorker::Stop);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
     }
 }
 
-/// Worker loop: every focus joins the pending trail with its window, and
+/// Worker loop: every focus joins the pending trail with its neighbors, and
 /// pages past `TRAIL_RADIUS` of the focus are dropped. One decode at a
 /// time, the undecided pending page nearest the focus first, ahead of the
 /// reader before behind. The channel is observed between decodes, so a
@@ -183,24 +179,25 @@ impl Drop for Worker {
 /// to completion.
 fn run(
     source: &Source,
-    rx: mpsc::Receiver<usize>,
+    rx: mpsc::Receiver<ToWorker>,
     stop: &AtomicBool,
     cache: &Mutex<PageCache>,
     notify: &dyn Fn(),
 ) {
     let len = source.len();
     let mut focus = match rx.recv() {
-        Ok(SENTINEL) | Err(_) => return,
-        Ok(index) => index,
+        Ok(ToWorker::Focus(index)) => index,
+        Ok(ToWorker::Stop) | Err(_) => return,
     };
     let mut arrivals: Vec<usize> = vec![focus];
     let mut pending: BTreeSet<usize> = BTreeSet::new();
     loop {
-        while let Ok(arrived) = rx.try_recv() {
-            if arrived == SENTINEL || stop.load(Ordering::Relaxed) {
+        while let Ok(message) = rx.try_recv() {
+            let ToWorker::Focus(index) = message else { return };
+            if stop.load(Ordering::Relaxed) {
                 return;
             }
-            arrivals.push(arrived);
+            arrivals.push(index);
         }
         if let Some(&newest) = arrivals.last() {
             focus = newest;
@@ -211,7 +208,7 @@ fn run(
                 }
             }
             pending.extend(arrivals.iter().copied());
-            pending.extend(window(focus, len));
+            pending.extend(neighbors(focus, len));
             retain_trail(&mut pending, focus);
             arrivals.clear();
         }
@@ -222,8 +219,8 @@ fn run(
         let Some(index) = pick else {
             // Nothing in the trail is undecided, so block until a focus.
             let arrived = match rx.recv() {
-                Ok(SENTINEL) | Err(_) => return,
-                Ok(index) => index,
+                Ok(ToWorker::Focus(index)) => index,
+                Ok(ToWorker::Stop) | Err(_) => return,
             };
             if stop.load(Ordering::Relaxed) {
                 return;
@@ -237,8 +234,8 @@ fn run(
             pages.insert(
                 index,
                 match outcome {
-                    Ok(page) => Page::Ready(page),
-                    Err(message) => Page::Failed(message),
+                    Ok(page) => PageState::Ready(page),
+                    Err(message) => PageState::Failed(message),
                 },
                 focus,
             );
@@ -296,7 +293,7 @@ const PREFETCH_RADIUS: i64 = 2;
 
 /// Decode order around the focused page: the page itself, then neighbours
 /// out to [`PREFETCH_RADIUS`], nearest first (the current page included).
-pub fn window(current: usize, len: usize) -> Vec<usize> {
+fn neighbors(current: usize, len: usize) -> Vec<usize> {
     let mut pages: Vec<usize> = (0..=PREFETCH_RADIUS)
         .flat_map(|distance| {
             [current as i64 - distance, current as i64 + distance]
@@ -328,10 +325,10 @@ mod tests {
     use std::time::{Duration, Instant};
 
     #[test]
-    fn window_is_nearest_first() {
-        assert_eq!(window(5, 10), vec![5, 4, 6, 3, 7]);
-        assert_eq!(window(0, 4), vec![0, 1, 2]);
-        assert_eq!(window(9, 10), vec![9, 8, 7]);
+    fn neighbors_are_nearest_first() {
+        assert_eq!(neighbors(5, 10), vec![5, 4, 6, 3, 7]);
+        assert_eq!(neighbors(0, 4), vec![0, 1, 2]);
+        assert_eq!(neighbors(9, 10), vec![9, 8, 7]);
     }
 
     #[test]
@@ -358,8 +355,8 @@ mod tests {
         assert_eq!(order, vec![11, 9, 12, 8]);
     }
 
-    fn ready_page(label: u8) -> Page {
-        Page::Ready(Arc::new(
+    fn ready_page(label: u8) -> PageState {
+        PageState::Ready(Arc::new(
             crate::decode::Decoded::rgba(
                 2,
                 1,
@@ -409,7 +406,7 @@ mod tests {
     fn focused_page_survives_its_own_oversize() {
         let mut cache = PageCache::new();
         cache.budget = 10;
-        let big = Page::Ready(Arc::new(
+        let big = PageState::Ready(Arc::new(
             crate::decode::Decoded::rgba(
                 10,
                 10,
@@ -438,10 +435,10 @@ mod tests {
         worker.focus(1);
 
         let deadline = Instant::now() + Duration::from_secs(20);
-        while !matches!(worker.page(1), Some(Page::Ready(_))) && Instant::now() < deadline {
+        while !matches!(worker.page(1), Some(PageState::Ready(_))) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
-        let Page::Ready(page) = worker.page(1).expect("focused page decoded in time") else {
+        let PageState::Ready(page) = worker.page(1).expect("focused page decoded in time") else {
             panic!("not Ready");
         };
         assert_eq!((page.width, page.height), (3, 2));
@@ -459,12 +456,12 @@ mod tests {
         let worker = Worker::spawn(source, || {});
         worker.focus(0);
         let deadline = Instant::now() + Duration::from_secs(20);
-        while !matches!(worker.page(0), Some(Page::Failed(_))) && Instant::now() < deadline {
+        while !matches!(worker.page(0), Some(PageState::Failed(_))) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
         match worker.page(0) {
-            Some(Page::Failed(msg)) => assert!(msg.contains("page 1"), "{msg}"),
-            Some(Page::Ready(_)) => panic!("bad.png decoded as Ready?"),
+            Some(PageState::Failed(msg)) => assert!(msg.contains("page 1"), "{msg}"),
+            Some(PageState::Ready(_)) => panic!("bad.png decoded as Ready?"),
             None => panic!("page 0 not decided in time"),
         }
     }
@@ -512,7 +509,7 @@ mod tests {
     fn wait_ready(worker: &Worker, pages: &[usize]) {
         let deadline = Instant::now() + Duration::from_secs(20);
         for &page in pages {
-            while !matches!(worker.page(page), Some(Page::Ready(_))) {
+            while !matches!(worker.page(page), Some(PageState::Ready(_))) {
                 assert!(Instant::now() < deadline, "page {page} not decoded in time");
                 std::thread::sleep(Duration::from_millis(1));
             }

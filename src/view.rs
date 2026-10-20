@@ -54,7 +54,7 @@ fn spread_start(number: usize) -> usize {
 
 impl Spread {
     /// Visual seating as [left, right]. Western reads first-left. Manga
-    /// reads first-right, so a lone page lands in the right slot.
+    /// reads first-right, so a lone page lands in the right seat.
     pub fn seats(&self, rtl: bool) -> [Option<usize>; 2] {
         if rtl {
             [self.second, Some(self.first)]
@@ -79,9 +79,9 @@ pub struct PageRect {
     pub size: (f32, f32),
 }
 
-/// Layout of a spread's visual slots. `rects` is always [left, right]. Slot
-/// seating (which page goes where) was decided before layout by
-/// [`Spread::seats`]. A slot with no decoded page yet is `None`.
+/// Layout of a spread's visual seats. `rects` is always [left, right].
+/// Seating (which page goes where) was decided before layout by
+/// [`Spread::seats`]. A seat with no decoded page yet is `None`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SpreadLayout {
     pub rects: [Option<PageRect>; 2],
@@ -101,16 +101,16 @@ impl SpreadLayout {
 }
 
 /// Compose one or two pages side by side, top-aligned. `dims[i]` is the
-/// decoded size of visual slot i (0 = left, 1 = right). A still-decoding
-/// slot is None and joins the layout when it arrives.
+/// decoded size of visual seat i (0 = left, 1 = right). A still-decoding
+/// seat is None and joins the layout when it arrives.
 pub fn layout(dims: [Option<(u32, u32)>; 2]) -> SpreadLayout {
     let mut rects: [Option<PageRect>; 2] = [None, None];
-    let mut next_slot_x = 0.0;
-    for (slot, dims) in dims.iter().enumerate() {
+    let mut next_seat_x = 0.0;
+    for (seat, dims) in dims.iter().enumerate() {
         if let Some((width, height)) = *dims {
-            rects[slot] =
-                Some(PageRect { pos: (next_slot_x, 0.0), size: (width as f32, height as f32) });
-            next_slot_x += width as f32;
+            rects[seat] =
+                Some(PageRect { pos: (next_seat_x, 0.0), size: (width as f32, height as f32) });
+            next_seat_x += width as f32;
         }
     }
     SpreadLayout { rects }
@@ -131,8 +131,8 @@ pub fn fit(total: (f32, f32), win: (f32, f32)) -> View {
 /// Zoom scale bounds: `scale` is screen px per image px, so these cap how
 /// far in (40 px per image px) and out (1 image px covers 20 screen px) a
 /// page can be zoomed.
-pub const MIN_SCALE: f32 = 0.05;
-pub const MAX_SCALE: f32 = 40.0;
+const MIN_SCALE: f32 = 0.05;
+const MAX_SCALE: f32 = 40.0;
 
 /// Zoom by `factor`, keeping the image point under `cursor` (screen px)
 /// anchored. Clamps scale to [`MIN_SCALE`]..=[`MAX_SCALE`]. The anchor uses
@@ -154,17 +154,17 @@ pub fn pan(view: View, delta: (f32, f32)) -> View {
 
 /// Reachability margin for [`clamp`]: at most this many px of the spread may
 /// hang off any window edge (and a fully-visible spread stays centered).
-pub const KEEP: f32 = 64.0;
+const EDGE_KEEP_PX: f32 = 64.0;
 
-/// Clamp pan so the spread cannot be lost: at least `KEEP` px of it stays
-/// inside the window. An axis where the scaled spread fits the window is
-/// pinned to the centered position.
+/// Clamp pan so the spread cannot be lost: at least `EDGE_KEEP_PX` px of it
+/// stays inside the window. An axis where the scaled spread fits the window
+/// is pinned to the centered position.
 pub fn clamp(view: View, total: (f32, f32), window: (f32, f32)) -> View {
     let axis = |offset: f32, content: f32, window: f32| -> f32 {
         if content <= window {
             (window - content) / 2.0
         } else {
-            offset.clamp(window - content - KEEP, KEEP)
+            offset.clamp(window - content - EDGE_KEEP_PX, EDGE_KEEP_PX)
         }
     };
     let scaled = (total.0 * view.scale, total.1 * view.scale);
@@ -182,7 +182,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn layout_places_slots_left_to_right() {
+    fn layout_places_seats_left_to_right() {
         let l = layout([Some((100, 200)), Some((100, 200))]);
         assert_eq!(l.rects[0], Some(PageRect { pos: (0.0, 0.0), size: (100.0, 200.0) }));
         assert_eq!(l.rects[1], Some(PageRect { pos: (100.0, 0.0), size: (100.0, 200.0) }));
@@ -198,11 +198,11 @@ mod tests {
     }
 
     #[test]
-    fn layout_skips_undecoded_slots() {
+    fn layout_skips_undecoded_seats() {
         let l = layout([Some((100, 200)), None]);
         assert_eq!(l.rects[1], None);
         assert_eq!(l.total(), (100.0, 200.0));
-        // an undecoded left slot leaves the right page starting at x=0
+        // an undecoded left seat leaves the right page starting at x=0
         let l = layout([None, Some((100, 200))]);
         assert_eq!(l.rects[0], None);
         assert_eq!(l.rects[1], Some(PageRect { pos: (0.0, 0.0), size: (100.0, 200.0) }));
@@ -244,8 +244,8 @@ mod tests {
     fn clamp_oversized_keeps_edge_reachable() {
         // 2000 content px at scale 1 in a 500 px window
         let v = clamp(View { scale: 1.0, offset: (-5000.0, 0.0) }, (2000.0, 400.0), (500.0, 500.0));
-        assert!(v.offset.0 >= 500.0 - 2000.0 - KEEP - 1e-4, "{}", v.offset.0);
-        assert!(v.offset.0 <= KEEP + 1e-4);
+        assert!(v.offset.0 >= 500.0 - 2000.0 - EDGE_KEEP_PX - 1e-4, "{}", v.offset.0);
+        assert!(v.offset.0 <= EDGE_KEEP_PX + 1e-4);
         // y fits (400 < 500) so it is centered
         assert!((v.offset.1 - 50.0).abs() < 1e-4);
     }

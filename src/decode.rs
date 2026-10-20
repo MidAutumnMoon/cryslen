@@ -24,7 +24,7 @@ pub struct Decoded {
 
 impl Decoded {
     /// Interleaved RGBA, `4 * w * h` bytes, row-major, top-first.
-    pub fn rgba(
+    pub(crate) fn rgba(
         width: u32,
         height: u32,
         format: Format,
@@ -40,7 +40,7 @@ impl Decoded {
 
     /// Planar YUV sized per [`plane_dims`] for these dimensions. Called only
     /// by the `avif` decoder.
-    pub fn yuv(
+    pub(crate) fn yuv(
         width: u32,
         height: u32,
         format: Format,
@@ -90,7 +90,7 @@ fn checked_extent(width: u32, height: u32, bytes_per_pixel: usize) -> Result<usi
 }
 
 /// Hostile-header cap shared by all decoders, in pixels.
-pub const MAX_PIXELS: usize = 512 << 18;
+const MAX_PIXELS: usize = 512 << 18;
 
 /// Largest page edge accepted as one GL texture (the common desktop limit).
 const MAX_TEXTURE_EDGE: u32 = 16384;
