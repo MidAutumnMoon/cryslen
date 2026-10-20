@@ -64,15 +64,11 @@ enum SeatPlan {
 /// Decide one seat's frame. A wanted page that is Ready shows. An
 /// undecided or failed page holds the last frame, surfacing through the
 /// status fold instead. No wanted page clears the seat.
-fn seat_plan(
-    wanted: Option<usize>,
-    state: Option<&PageState>,
-    shown: Option<&ShownPage>,
-) -> SeatPlan {
-    match (wanted, state, shown) {
-        (None, _, _) => SeatPlan::Clear,
-        (Some(_), None, _) | (Some(_), Some(PageState::Failed(_)), _) => SeatPlan::Hold,
-        (Some(page), Some(PageState::Ready(decoded)), _) => SeatPlan::Show {
+fn seat_plan(wanted: Option<usize>, state: Option<&PageState>) -> SeatPlan {
+    match (wanted, state) {
+        (None, _) => SeatPlan::Clear,
+        (Some(_), None) | (Some(_), Some(PageState::Failed(_))) => SeatPlan::Hold,
+        (Some(page), Some(PageState::Ready(decoded))) => SeatPlan::Show {
             page,
             decoded: Arc::clone(decoded),
         },
@@ -135,7 +131,7 @@ impl Fit {
     }
 
     /// User zoom or pan. Their placement wins over later fit triggers.
-    fn user_moved(&mut self) {
+    fn note_user_move(&mut self) {
         self.user_moved = true;
     }
 
@@ -246,8 +242,8 @@ impl App {
             states[seat] = wanted[seat].and_then(|page| self.worker.page(page));
         }
         let plans = [
-            seat_plan(wanted[0], states[0].as_ref(), self.shown[0].as_ref()),
-            seat_plan(wanted[1], states[1].as_ref(), self.shown[1].as_ref()),
+            seat_plan(wanted[0], states[0].as_ref()),
+            seat_plan(wanted[1], states[1].as_ref()),
         ];
         for (seat, plan) in plans.into_iter().enumerate() {
             match plan {
@@ -530,7 +526,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                 let zoom_factor = (wheel_delta_y * WHEEL_ZOOM_SENSITIVITY).exp();
                 let zoomed = crate::view::zoom_at(self.state.view, self.cursor, zoom_factor);
                 self.state.view = crate::view::clamp(zoomed, total, window);
-                self.fit.user_moved();
+                self.fit.note_user_move();
                 self.request_redraw();
             }
             WindowEvent::MouseInput { state, button: winit::event::MouseButton::Left, .. } => {
@@ -544,7 +540,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                         (cursor_pos.0 - self.cursor.0, cursor_pos.1 - self.cursor.1);
                     let panned = crate::view::pan(self.state.view, pan_delta);
                     self.state.view = crate::view::clamp(panned, total, window);
-                    self.fit.user_moved();
+                    self.fit.note_user_move();
                     self.request_redraw();
                 }
                 self.cursor = cursor_pos;
@@ -589,16 +585,15 @@ mod tests {
 
     #[test]
     fn seat_plan_clears_a_seat_with_no_wanted_page() {
-        assert!(matches!(seat_plan(None, None, None), SeatPlan::Clear));
+        assert!(matches!(seat_plan(None, None), SeatPlan::Clear));
         let state = ready(2, 2);
-        assert!(matches!(seat_plan(None, Some(&state), None), SeatPlan::Clear));
+        assert!(matches!(seat_plan(None, Some(&state)), SeatPlan::Clear));
     }
 
     #[test]
     fn seat_plan_shows_a_ready_page_with_its_dims() {
         let state = ready(640, 480);
-        let held = ShownPage { page: 9, dims: (10, 10) };
-        match seat_plan(Some(3), Some(&state), Some(&held)) {
+        match seat_plan(Some(3), Some(&state)) {
             SeatPlan::Show { page, decoded } => {
                 assert_eq!(page, 3);
                 assert_eq!((decoded.width, decoded.height), (640, 480));
@@ -609,20 +604,13 @@ mod tests {
 
     #[test]
     fn seat_plan_holds_an_undecided_page() {
-        let held = ShownPage { page: 2, dims: (8, 8) };
-        assert!(matches!(seat_plan(Some(4), None, Some(&held)), SeatPlan::Hold));
-        // Nothing held: the seat stays empty.
-        assert!(matches!(seat_plan(Some(4), None, None), SeatPlan::Hold));
+        assert!(matches!(seat_plan(Some(4), None), SeatPlan::Hold));
     }
 
     #[test]
     fn seat_plan_holds_a_failed_page() {
         let failed = PageState::Failed("page 4: bad bitstream".into());
-        let held = ShownPage { page: 2, dims: (8, 8) };
-        assert!(matches!(
-            seat_plan(Some(4), Some(&failed), Some(&held)),
-            SeatPlan::Hold
-        ));
+        assert!(matches!(seat_plan(Some(4), Some(&failed)), SeatPlan::Hold));
     }
 
     #[test]
@@ -638,7 +626,7 @@ mod tests {
     fn user_move_survives_spread_shape_changes() {
         let mut fit = Fit::default();
         fit.fitted_to((100.0, 200.0));
-        fit.user_moved();
+        fit.note_user_move();
         assert!(fit.user_moved);
         // A late-decoded page changes the shape after the user moved.
         fit.fitted_to((120.0, 200.0));
@@ -649,7 +637,7 @@ mod tests {
     fn page_turn_discards_user_placement() {
         let mut fit = Fit::default();
         fit.fitted_to((100.0, 200.0));
-        fit.user_moved();
+        fit.note_user_move();
         fit.page_turned();
         assert!(fit.should_refit((100.0, 200.0)));
         assert!(!fit.user_moved);
@@ -659,7 +647,7 @@ mod tests {
     fn resize_discards_user_placement() {
         let mut fit = Fit::default();
         fit.fitted_to((100.0, 200.0));
-        fit.user_moved();
+        fit.note_user_move();
         fit.resized();
         assert!(fit.should_refit((100.0, 200.0)));
         assert!(!fit.user_moved);
@@ -669,7 +657,7 @@ mod tests {
     fn reset_view_discards_user_placement() {
         let mut fit = Fit::default();
         fit.fitted_to((100.0, 200.0));
-        fit.user_moved();
+        fit.note_user_move();
         fit.reset_view();
         assert!(fit.should_refit((100.0, 200.0)));
         assert!(!fit.user_moved);

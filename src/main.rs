@@ -25,7 +25,7 @@ use worker::Worker;
 /// Parsed path argument. An image file opens its parent directory at that
 /// image. A directory or archive opens as itself.
 enum Arg {
-    Archive(PathBuf),
+    Open(PathBuf),
     Image { dir: PathBuf, name: String },
 }
 
@@ -44,7 +44,7 @@ fn main() -> ExitCode {
         }
     };
     let (open_path, land_on) = match &open {
-        Arg::Archive(archive) => (archive.as_path(), None),
+        Arg::Open(path) => (path.as_path(), None),
         Arg::Image { dir, name } => (dir.as_path(), Some(name.as_str())),
     };
 
@@ -61,7 +61,7 @@ fn main() -> ExitCode {
 /// image by extension, or it is a startup error.
 fn classify(path: &Path) -> eros::Result<Arg> {
     if !path.is_file() || source::is_archive(path) {
-        return Ok(Arg::Archive(path.to_path_buf()));
+        return Ok(Arg::Open(path.to_path_buf()));
     }
     let name = path
         .file_name()
@@ -118,7 +118,7 @@ mod tests {
                 assert_eq!(parent, dir.path());
                 assert_eq!(name, "page.png");
             }
-            Arg::Archive(_) => panic!("image file classified as a source path"),
+            Arg::Open(_) => panic!("image file classified as a source path"),
         }
     }
 
@@ -126,8 +126,8 @@ mod tests {
     fn directory_and_archive_arguments_open_as_sources() {
         let dir = TempDir::new("main-arg-src");
         dir.write("book.cbz", b"not really a zip");
-        assert!(matches!(classify(&dir.path().join("book.cbz")), Ok(Arg::Archive(_))));
-        assert!(matches!(classify(dir.path()), Ok(Arg::Archive(_))));
+        assert!(matches!(classify(&dir.path().join("book.cbz")), Ok(Arg::Open(_))));
+        assert!(matches!(classify(dir.path()), Ok(Arg::Open(_))));
     }
 
     #[test]
