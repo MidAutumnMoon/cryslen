@@ -1,10 +1,11 @@
 //! Status overlay: one egui bottom panel, data in / text out.
 
+use crate::decode::Format;
 use crate::source::PageName;
 use crate::view::{Spread, ViewMode};
 
 /// Everything the status bar shows. Built by the app each frame. No
-/// logic lives here.
+/// logic lives here beyond formatting.
 pub struct StatusLine {
     pub total: usize,
     pub spread: Spread,
@@ -12,13 +13,22 @@ pub struct StatusLine {
     /// The mode-switch toast is showing.
     pub toast: bool,
     pub name: PageName,
-    /// Decoded format label, fused with the dims only when the
-    /// filename's extension claims a different format.
-    pub format: Option<&'static str>,
-    pub dims: Option<(u32, u32)>,
-    pub zoom_percent: f32,
+    /// Facts of the page the line speaks for, once it has decoded.
+    pub page: Option<PageFacts>,
+    /// Placement scale, screen px per image px.
+    pub zoom: f32,
     pub waiting: bool,
     pub error: Option<String>,
+}
+
+/// The decoded page as the status line sees it.
+pub struct PageFacts {
+    /// Format the decoder identified, the content truth.
+    pub decoded: Format,
+    /// Format the filename's extension claims. Listed pages always
+    /// carry one.
+    pub claimed: Option<Format>,
+    pub dims: (u32, u32),
 }
 
 /// Render the status bar into `ui`. egui 0.37 panels show into the
@@ -103,15 +113,18 @@ fn line(style: &egui::Style, status: &StatusLine) -> egui::text::LayoutJob {
     }
     section(&mut job, status.name.file.clone(), NAME_COLOR);
 
-    if let Some((w, h)) = status.dims {
+    if let Some(facts) = &status.page {
         section(&mut job, " · ".into(), plain);
-        let dims = match status.format {
-            Some(format) => format!("{format} {w}x{h}"),
-            None => format!("{w}x{h}"),
+        // A format label shows only when the filename's extension lies.
+        let (w, h) = facts.dims;
+        let dims = if facts.claimed != Some(facts.decoded) {
+            format!("{} {w}x{h}", facts.decoded.label())
+        } else {
+            format!("{w}x{h}")
         };
         section(&mut job, dims, plain);
     }
-    section(&mut job, format!(" · {:.0}%", status.zoom_percent), plain);
+    section(&mut job, format!(" · {:.0}%", status.zoom * 100.0), plain);
     if status.waiting {
         section(&mut job, " · decoding…".into(), plain);
     }
@@ -134,9 +147,12 @@ mod tests {
             name: PageName { parent: Some("b".into()), file: "010.png".into() },
             // The name claims png, the decoded page is jxl: the mismatch
             // fuses the format into the dims.
-            format: Some("jxl"),
-            dims: Some((6000, 4000)),
-            zoom_percent: 86.6,
+            page: Some(PageFacts {
+                decoded: Format::Jxl,
+                claimed: Some(Format::Png),
+                dims: (6000, 4000),
+            }),
+            zoom: 0.866,
             waiting: false,
             error: None,
         }
@@ -163,14 +179,23 @@ mod tests {
     }
 
     #[test]
+    fn matching_extension_hides_the_format() {
+        let mut s = status();
+        if let Some(page) = &mut s.page {
+            page.claimed = Some(Format::Jxl);
+        }
+        let job = line(&egui::Style::default(), &s);
+        assert_eq!(job.text, "12-13/214 · b/010.png · 6000x4000 · 87%");
+    }
+
+    #[test]
     fn single_page_head_and_uncolored_parent() {
         let style = egui::Style::default();
         let plain = style.visuals.text_color();
         let mut s = status();
         s.spread = Spread { first: 4, second: None };
-        s.format = None;
-        s.dims = None;
-        s.zoom_percent = 100.0;
+        s.page = None;
+        s.zoom = 1.0;
         let job = line(&style, &s);
         assert_eq!(job.text, "5/214 · b/010.png · 100%");
         assert_eq!(section_colors(&job), vec![HEAD_COLOR, plain, NAME_COLOR, plain]);

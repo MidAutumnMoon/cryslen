@@ -1,6 +1,6 @@
 //! View math: the view modes, the spread-pairing model (cover alone,
-//! then pairs), and how a composed spread (1–2 pages) is placed in the
-//! window. Pure data, no GL.
+//! then pairs), and the placement of a composed spread (1–2 pages) in
+//! the window. Pure data, no GL.
 
 /// A way of laying out and reading pages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,7 +18,7 @@ impl ViewMode {
     pub const ALL: [ViewMode; 3] = [ViewMode::Normal, ViewMode::Manga, ViewMode::Comic];
 
     /// Whether pages pair into spreads.
-    pub fn double(self) -> bool {
+    pub fn pairs(self) -> bool {
         matches!(self, ViewMode::Manga | ViewMode::Comic)
     }
 
@@ -69,7 +69,7 @@ pub struct Spread {
 pub fn spread_for(index: usize, mode: ViewMode, len: usize) -> Spread {
     let len = len.max(1);
     let index = index.min(len - 1);
-    if !mode.double() {
+    if !mode.pairs() {
         return Spread { first: index, second: None };
     }
     if index == 0 {
@@ -85,7 +85,7 @@ pub fn spread_for(index: usize, mode: ViewMode, len: usize) -> Spread {
 pub fn advance(current: usize, forward: bool, mode: ViewMode, len: usize) -> usize {
     let len = len.max(1);
     let current = current.min(len - 1);
-    if !mode.double() {
+    if !mode.pairs() {
         let next = if forward { current + 1 } else { current + len - 1 };
         return next % len;
     }
@@ -108,7 +108,7 @@ pub struct ModeSwitch {
 /// Where a switch from `old` to `new` lands. A pairing change moves
 /// to the new spread's start. A direction-only change keeps the page.
 pub fn switch_mode(old: ViewMode, new: ViewMode, index: usize, len: usize) -> ModeSwitch {
-    if old.double() == new.double() {
+    if old.pairs() == new.pairs() {
         ModeSwitch { index, pairing_changed: false }
     } else {
         ModeSwitch { index: spread_for(index, new, len).first, pairing_changed: true }
@@ -126,16 +126,21 @@ fn spread_start(number: usize) -> usize {
     if number > 0 { 2 * number - 1 } else { 0 }
 }
 
+/// Seat order as [left, right] under `mode`. Western reads first-left.
+/// Manga reads first-right, so the first page lands in the right seat
+/// and a lone page sits there.
+pub fn seating<T>(first: T, second: Option<T>, mode: ViewMode) -> [Option<T>; 2] {
+    if mode.rtl() {
+        [second, Some(first)]
+    } else {
+        [Some(first), second]
+    }
+}
+
 impl Spread {
-    /// Visual seating as [left, right] under `mode`. Western reads
-    /// first-left. Manga reads first-right, so a lone page lands in
-    /// the right seat.
+    /// Visual seating as [left, right] under `mode`.
     pub fn seats(&self, mode: ViewMode) -> [Option<usize>; 2] {
-        if mode.rtl() {
-            [self.second, Some(self.first)]
-        } else {
-            [Some(self.first), self.second]
-        }
+        seating(self.first, self.second, mode)
     }
 
     /// Whether `page` is one of this spread's pages.
@@ -147,7 +152,7 @@ impl Spread {
 /// Placement of the composed spread: scale is screen px per image px, offset
 /// is the screen position of the composed spread's top-left corner.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct View {
+pub struct Placement {
     pub scale: f32,
     pub offset: (f32, f32),
 }
@@ -196,13 +201,13 @@ pub fn layout(dims: [Option<(u32, u32)>; 2]) -> SpreadLayout {
     SpreadLayout { rects }
 }
 
-/// View that fits `total` into `win`, centered.
-pub fn fit(total: (f32, f32), win: (f32, f32)) -> View {
+/// Placement that fits `total` into `win`, centered.
+pub fn fit(total: (f32, f32), win: (f32, f32)) -> Placement {
     if total.0 <= 0.0 || total.1 <= 0.0 || win.0 <= 0.0 || win.1 <= 0.0 {
-        return View { scale: 1.0, offset: (0.0, 0.0) };
+        return Placement { scale: 1.0, offset: (0.0, 0.0) };
     }
     let scale = (win.0 / total.0).min(win.1 / total.1);
-    View {
+    Placement {
         scale,
         offset: ((win.0 - total.0 * scale) / 2.0, (win.1 - total.1 * scale) / 2.0),
     }
@@ -217,7 +222,7 @@ const MAX_SCALE: f32 = 40.0;
 /// Zoom by `factor`, keeping the image point under `cursor` (screen px)
 /// anchored. Clamps scale to [`MIN_SCALE`]..=[`MAX_SCALE`]. The anchor uses
 /// the *actual* factor applied so hitting the clamp does not shift the image.
-pub fn zoom_at(mut view: View, cursor: (f32, f32), factor: f32) -> View {
+pub fn zoom_at(mut view: Placement, cursor: (f32, f32), factor: f32) -> Placement {
     let old = view.scale;
     view.scale = (old * factor).clamp(MIN_SCALE, MAX_SCALE);
     let applied = view.scale / old;
@@ -228,8 +233,8 @@ pub fn zoom_at(mut view: View, cursor: (f32, f32), factor: f32) -> View {
 }
 
 /// Pan by `delta` screen px.
-pub fn pan(view: View, delta: (f32, f32)) -> View {
-    View { scale: view.scale, offset: (view.offset.0 + delta.0, view.offset.1 + delta.1) }
+pub fn pan(view: Placement, delta: (f32, f32)) -> Placement {
+    Placement { scale: view.scale, offset: (view.offset.0 + delta.0, view.offset.1 + delta.1) }
 }
 
 /// Reachability margin for [`clamp`]: at most this many px of the spread may
@@ -239,7 +244,7 @@ const EDGE_KEEP_PX: f32 = 64.0;
 /// Clamp pan so the spread cannot be lost: at least `EDGE_KEEP_PX` px of it
 /// stays inside the window. An axis where the scaled spread fits the window
 /// is pinned to the centered position.
-pub fn clamp(view: View, total: (f32, f32), window: (f32, f32)) -> View {
+pub fn clamp(view: Placement, total: (f32, f32), window: (f32, f32)) -> Placement {
     let axis = |offset: f32, content: f32, window: f32| -> f32 {
         if content <= window {
             (window - content) / 2.0
@@ -248,7 +253,7 @@ pub fn clamp(view: View, total: (f32, f32), window: (f32, f32)) -> View {
         }
     };
     let scaled = (total.0 * view.scale, total.1 * view.scale);
-    View {
+    Placement {
         scale: view.scale,
         offset: (
             axis(view.offset.0, scaled.0, window.0),
@@ -263,11 +268,11 @@ mod tests {
 
     #[test]
     fn mode_flags() {
-        assert!(!ViewMode::Normal.double());
+        assert!(!ViewMode::Normal.pairs());
         assert!(!ViewMode::Normal.rtl());
-        assert!(ViewMode::Manga.double());
+        assert!(ViewMode::Manga.pairs());
         assert!(ViewMode::Manga.rtl());
-        assert!(ViewMode::Comic.double());
+        assert!(ViewMode::Comic.pairs());
         assert!(!ViewMode::Comic.rtl());
     }
 
@@ -317,14 +322,14 @@ mod tests {
     #[test]
     fn fit_degenerate_inputs_are_inert() {
         let v = fit((0.0, 0.0), (500.0, 500.0));
-        assert_eq!(v, View { scale: 1.0, offset: (0.0, 0.0) });
+        assert_eq!(v, Placement { scale: 1.0, offset: (0.0, 0.0) });
         let v = fit((100.0, 100.0), (0.0, 0.0));
-        assert_eq!(v, View { scale: 1.0, offset: (0.0, 0.0) });
+        assert_eq!(v, Placement { scale: 1.0, offset: (0.0, 0.0) });
     }
 
     #[test]
     fn zoom_keeps_cursor_anchored() {
-        let v = View { scale: 2.0, offset: (100.0, 50.0) };
+        let v = Placement { scale: 2.0, offset: (100.0, 50.0) };
         let v = zoom_at(v, (300.0, 200.0), 2.0);
         // image pixel under the cursor before: (300-100)/2 = 100; after: (300-offset)/4
         assert!((300.0 - v.offset.0) / v.scale - 100.0 < 0.01);
@@ -332,16 +337,16 @@ mod tests {
 
     #[test]
     fn zoom_clamps_scale() {
-        let v = zoom_at(View { scale: 30.0, offset: (0.0, 0.0) }, (0.0, 0.0), 100.0);
+        let v = zoom_at(Placement { scale: 30.0, offset: (0.0, 0.0) }, (0.0, 0.0), 100.0);
         assert_eq!(v.scale, MAX_SCALE);
-        let v = zoom_at(View { scale: 0.1, offset: (0.0, 0.0) }, (0.0, 0.0), 0.001);
+        let v = zoom_at(Placement { scale: 0.1, offset: (0.0, 0.0) }, (0.0, 0.0), 0.001);
         assert_eq!(v.scale, MIN_SCALE);
     }
 
     #[test]
     fn clamp_oversized_keeps_edge_reachable() {
         // 2000 content px at scale 1 in a 500 px window
-        let v = clamp(View { scale: 1.0, offset: (-5000.0, 0.0) }, (2000.0, 400.0), (500.0, 500.0));
+        let v = clamp(Placement { scale: 1.0, offset: (-5000.0, 0.0) }, (2000.0, 400.0), (500.0, 500.0));
         assert!(v.offset.0 >= 500.0 - 2000.0 - EDGE_KEEP_PX - 1e-4, "{}", v.offset.0);
         assert!(v.offset.0 <= EDGE_KEEP_PX + 1e-4);
         // y fits (400 < 500) so it is centered
@@ -361,7 +366,7 @@ mod tests {
 
     #[test]
     fn clamp_never_changes_scale() {
-        let v = clamp(View { scale: 7.0, offset: (1e9, -1e9) }, (100.0, 100.0), (50.0, 50.0));
+        let v = clamp(Placement { scale: 7.0, offset: (1e9, -1e9) }, (100.0, 100.0), (50.0, 50.0));
         assert_eq!(v.scale, 7.0);
     }
 

@@ -224,6 +224,8 @@ impl Source {
         self.names.len()
     }
 
+    /// Entry name of one page. For archives this includes the inner
+    /// path; for directories it is the bare filename.
     pub fn name(&self, index: usize) -> &str {
         debug_assert!(index < self.names.len());
         &self.names[index]

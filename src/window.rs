@@ -14,6 +14,9 @@ pub struct Window {
     gl: Arc<glow::Context>,
     surface: glutin::surface::Surface<glutin::surface::WindowSurface>,
     context: glutin::context::PossiblyCurrentContext,
+    /// Size the surface was last resized to (physical px). Creation
+    /// counts as the first resize.
+    resized_to: (u32, u32),
 }
 
 impl Window {
@@ -94,20 +97,26 @@ impl Window {
             let s = std::ffi::CString::new(s).expect("GL proc name without interior NUL");
             gl_display.get_proc_address(&s)
         }));
-        Ok(Window { winit: window, gl, surface, context })
+        Ok(Window { winit: window, gl, surface, context, resized_to: (w, h) })
     }
 
     pub fn glow(&self) -> Arc<glow::Context> {
         Arc::clone(&self.gl)
     }
 
-    pub fn resize(&self, size: winit::dpi::PhysicalSize<u32>) {
+    /// Resize the surface when the window size changed since the last
+    /// call. No-op otherwise.
+    pub fn resize(&mut self, size: winit::dpi::PhysicalSize<u32>) {
+        if (size.width, size.height) == self.resized_to {
+            return;
+        }
         use glutin::prelude::GlSurface as _;
         self.surface.resize(
             &self.context,
             size.width.try_into().expect("nonzero surface width"),
             size.height.try_into().expect("nonzero surface height"),
         );
+        self.resized_to = (size.width, size.height);
     }
 
     /// Frame-callback notify then non-blocking swap.

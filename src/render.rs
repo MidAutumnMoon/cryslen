@@ -18,7 +18,7 @@ use std::sync::Arc;
 use glow::HasContext;
 
 use crate::decode::{plane_bytes, plane_dims, Decoded, Matrix, Pixels, Plane, Subsampling};
-use crate::view::{SpreadLayout, View};
+use crate::view::{Placement, SpreadLayout};
 
 /// Fixed -1..1 strip. The VS places it at the seat's screen rect from
 /// uniforms, so pan/zoom never touch vertex data. Top-origin math lives in
@@ -252,10 +252,10 @@ impl PageTextures {
         }
     }
 
-    /// Draw the spread laid out by `layout` with `view`.
+    /// Draw the spread laid out by `layout` with `placement`.
     ///
     /// Does not clear. The app owns the framebuffer clear each frame.
-    pub fn draw(&self, win: (f32, f32), layout: &SpreadLayout, view: &View) {
+    pub fn draw(&self, win: (f32, f32), layout: &SpreadLayout, placement: &Placement) {
         let gl = &self.gl;
         if win.0 <= 0.0 || win.1 <= 0.0 {
             return;
@@ -277,10 +277,10 @@ impl PageTextures {
                 // Whole-pixel rect origin: LINEAR samples shimmer at 1:1 zoom
                 // on fractional offsets otherwise.
                 let screen_origin = (
-                    (view.offset.0 + rect.pos.0 * view.scale).round(),
-                    (view.offset.1 + rect.pos.1 * view.scale).round(),
+                    (placement.offset.0 + rect.pos.0 * placement.scale).round(),
+                    (placement.offset.1 + rect.pos.1 * placement.scale).round(),
                 );
-                let screen_size = (rect.size.0 * view.scale, rect.size.1 * view.scale);
+                let screen_size = (rect.size.0 * placement.scale, rect.size.1 * placement.scale);
                 if screen_size.0 <= 0.0 || screen_size.1 <= 0.0 {
                     continue;
                 }
@@ -290,7 +290,7 @@ impl PageTextures {
                 let (luma_anchor, chroma_anchor) = range_offsets(page_uniforms.full_range);
                 gl.uniform_2_f32(uniform_location("u_offset").as_ref(), screen_origin.0, screen_origin.1);
                 gl.uniform_2_f32(uniform_location("u_size").as_ref(), screen_size.0, screen_size.1);
-                gl.uniform_2_f32(uniform_location("u_scale").as_ref(), view.scale, view.scale);
+                gl.uniform_2_f32(uniform_location("u_scale").as_ref(), placement.scale, placement.scale);
                 gl.uniform_2_f32(
                     uniform_location("u_img").as_ref(),
                     entry.size.0 as f32,

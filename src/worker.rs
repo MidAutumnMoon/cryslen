@@ -22,22 +22,6 @@ enum ToWorker {
     Stop,
 }
 
-/// One page's settled outcome. A failed page is sticky, so its error
-/// follows the page across turns.
-enum Outcome {
-    Ready(Arc<Decoded>),
-    Failed(String),
-}
-
-impl Outcome {
-    fn resident_bytes(&self) -> usize {
-        match self {
-            Outcome::Ready(decoded) => decoded.resident_bytes(),
-            Outcome::Failed(message) => message.len(),
-        }
-    }
-}
-
 /// The worker's answer for one wanted spread, in spread order. A page
 /// without an outcome reads as [`SeatView::Pending`], so there is no
 /// unknown state.
@@ -47,6 +31,9 @@ pub struct SpreadView {
     pub second: Option<SeatView>,
 }
 
+/// One page's view: decided (`Ready`, `Failed`) or still [`Pending`].
+/// The book stores decided views only. A failed page is sticky, so its
+/// error follows the page across turns.
 #[derive(Clone)]
 pub enum SeatView {
     Ready(Arc<Decoded>),
@@ -54,25 +41,32 @@ pub enum SeatView {
     Pending,
 }
 
-impl SpreadView {
-    /// Visual seating as [left, right] under `mode`, mirroring
-    /// [`crate::view::Spread::seats`].
-    pub fn seats(&self, mode: ViewMode) -> [Option<&SeatView>; 2] {
-        if mode.rtl() {
-            [self.second.as_ref(), Some(&self.first)]
-        } else {
-            [Some(&self.first), self.second.as_ref()]
+impl SeatView {
+    fn resident_bytes(&self) -> usize {
+        match self {
+            SeatView::Ready(decoded) => decoded.resident_bytes(),
+            SeatView::Failed(message) => message.len(),
+            SeatView::Pending => 0,
         }
     }
 }
 
-/// Decided pages and the pending trail under one lock. Every
-/// transition preserves the invariant that each page of the wanted
-/// spread is decided or pending, never neither. A wanted page joins the
-/// trail in `retune` and leaves it only by being decided in `store`,
-/// whose eviction cannot take a wanted page.
+impl SpreadView {
+    /// Visual seating as [left, right] under `mode`, by the shared rule
+    /// in [`crate::view::seating`].
+    pub fn seats(&self, mode: ViewMode) -> [Option<&SeatView>; 2] {
+        crate::view::seating(&self.first, self.second.as_ref(), mode)
+    }
+}
+
+/// Decided pages and the pending trail under one lock. The book owns the
+/// newest wanted spread; every transition preserves the invariant that
+/// each of its pages is decided or pending, never neither. A wanted page
+/// joins the trail in `retune` and leaves it only by being decided in
+/// `store`, whose eviction cannot take a wanted page.
 struct Book {
-    outcomes: HashMap<usize, Outcome>,
+    wanted: Spread,
+    outcomes: HashMap<usize, SeatView>,
     pending: BTreeSet<usize>,
     /// When each page was last wanted, written only by `retune`. A page
     /// never recorded here was never wanted and leaves the book first.
@@ -89,6 +83,7 @@ const NEVER_WANTED_RANK: u64 = 0;
 impl Book {
     fn new() -> Book {
         Book {
+            wanted: Spread { first: 0, second: None },
             outcomes: HashMap::new(),
             pending: BTreeSet::new(),
             last_wanted: HashMap::new(),
@@ -101,6 +96,7 @@ impl Book {
     /// Point the worker at a spread. Both its pages join the trail and
     /// are protected from trail pruning.
     fn retune(&mut self, wanted: Spread, page_count: usize) {
+        self.wanted = wanted;
         self.recency_counter += 1;
         self.last_wanted.insert(wanted.first, self.recency_counter);
         if let Some(second) = wanted.second {
@@ -112,23 +108,23 @@ impl Book {
         }
         self.pending.extend(neighbors(wanted.first, page_count));
         retain_trail(&mut self.pending, wanted.first, &wanted);
-        self.assert_wanted_covered(&wanted);
+        self.assert_wanted_covered();
     }
 
     /// The pending page to decode next. The undecided page nearest the
     /// spread's first wins, ahead of the reader before behind at equal
     /// distance. Decided pages leave the pending set, so a page is never
     /// decoded twice.
-    fn take_next(&mut self, wanted: &Spread) -> Option<usize> {
+    fn take_next(&mut self) -> Option<usize> {
         self.pending.retain(|page| !self.outcomes.contains_key(page));
         self.pending
             .iter()
             .copied()
-            .min_by_key(|&page| next_pick_key(page, wanted.first))
+            .min_by_key(|&page| next_pick_key(page, self.wanted.first))
     }
 
     /// Decide a pending page, then evict until under budget.
-    fn store(&mut self, page: usize, outcome: Outcome, wanted: &Spread) {
+    fn store(&mut self, page: usize, outcome: SeatView) {
         let bytes = outcome.resident_bytes();
         if let Some(old) = self.outcomes.insert(page, outcome) {
             self.live_bytes -= old.resident_bytes();
@@ -136,9 +132,9 @@ impl Book {
         self.live_bytes += bytes;
         self.pending.remove(&page);
         if self.live_bytes > self.budget {
-            self.evict(wanted);
+            self.evict();
         }
-        self.assert_wanted_covered(wanted);
+        self.assert_wanted_covered();
     }
 
     /// Both seats of the wanted spread. Cloning a `Ready` page is an
@@ -151,20 +147,17 @@ impl Book {
     }
 
     fn seat_view(&self, page: usize) -> SeatView {
-        match self.outcomes.get(&page) {
-            Some(Outcome::Ready(decoded)) => SeatView::Ready(Arc::clone(decoded)),
-            Some(Outcome::Failed(message)) => SeatView::Failed(message.clone()),
-            None => SeatView::Pending,
-        }
+        self.outcomes.get(&page).cloned().unwrap_or(SeatView::Pending)
     }
 
     /// Eviction victims are never-wanted pages first, then least
     /// recently wanted, then farthest from the spread. A wanted page has
     /// no path into the victim list.
-    fn evict(&mut self, wanted: &Spread) {
+    fn evict(&mut self) {
         if self.live_bytes <= self.budget {
             return;
         }
+        let wanted = self.wanted;
         let mut victims: Vec<usize> = self
             .outcomes
             .keys()
@@ -189,11 +182,11 @@ impl Book {
         // The loop can end over budget when only wanted pages remain.
     }
 
-    fn assert_wanted_covered(&self, wanted: &Spread) {
+    fn assert_wanted_covered(&self) {
         let covered =
             |page: usize| self.outcomes.contains_key(&page) || self.pending.contains(&page);
-        debug_assert!(covered(wanted.first));
-        if let Some(second) = wanted.second {
+        debug_assert!(covered(self.wanted.first));
+        if let Some(second) = self.wanted.second {
             debug_assert!(covered(second));
         }
     }
@@ -255,26 +248,23 @@ fn run(
     notify: &dyn Fn(),
 ) {
     let page_count = source.len();
-    let (mut wanted, mut retunes): (Spread, Vec<Spread>) = match rx.recv() {
-        Ok(ToWorker::Retune(wanted)) => (wanted, vec![wanted]),
+    let mut retunes: Vec<Spread> = vec![match rx.recv() {
+        Ok(ToWorker::Retune(wanted)) => wanted,
         Ok(ToWorker::Stop) | Err(_) => return,
-    };
+    }];
     loop {
         while let Ok(message) = rx.try_recv() {
             let ToWorker::Retune(spread) = message else { return };
             retunes.push(spread);
         }
-        if let Some(&newest) = retunes.last() {
-            wanted = newest;
-            {
-                let mut book = book.lock().expect("decode book lock");
-                for &spread in &retunes {
-                    book.retune(spread, page_count);
-                }
+        if !retunes.is_empty() {
+            let mut book = book.lock().expect("decode book lock");
+            for &spread in &retunes {
+                book.retune(spread, page_count);
             }
             retunes.clear();
         }
-        let Some(page_index) = book.lock().expect("decode book lock").take_next(&wanted) else {
+        let Some(page_index) = book.lock().expect("decode book lock").take_next() else {
             let arrived = match rx.recv() {
                 Ok(ToWorker::Retune(spread)) => spread,
                 Ok(ToWorker::Stop) | Err(_) => return,
@@ -286,10 +276,10 @@ fn run(
         {
             let mut book = book.lock().expect("decode book lock");
             let outcome = match outcome {
-                Ok(page) => Outcome::Ready(page),
-                Err(message) => Outcome::Failed(message),
+                Ok(page) => SeatView::Ready(page),
+                Err(message) => SeatView::Failed(message),
             };
-            book.store(page_index, outcome, &wanted);
+            book.store(page_index, outcome);
         }
         notify();
     }
@@ -442,22 +432,22 @@ mod tests {
     #[test]
     fn next_pick_is_nearest_then_ahead() {
         let mut book = Book::new();
-        let wanted = Spread { first: 10, second: Some(11) };
+        book.wanted = Spread { first: 10, second: Some(11) };
         book.pending.extend([10, 11]);
-        book.store(10, ready_page(10), &wanted);
+        book.store(10, ready_page(10));
         book.pending.extend(8..=12);
-        assert_eq!(book.take_next(&wanted), Some(11));
+        assert_eq!(book.take_next(), Some(11));
         assert!(!book.pending.contains(&10));
         let mut order = Vec::new();
-        while let Some(page) = book.take_next(&wanted) {
+        while let Some(page) = book.take_next() {
             order.push(page);
             book.pending.remove(&page);
         }
         assert_eq!(order, vec![11, 9, 12, 8]);
     }
 
-    fn ready_page(label: u8) -> Outcome {
-        Outcome::Ready(Arc::new(
+    fn ready_page(label: u8) -> SeatView {
+        SeatView::Ready(Arc::new(
             crate::decode::Decoded::rgba(
                 2,
                 1,
@@ -474,8 +464,8 @@ mod tests {
         book.budget = 8;
         let wanted = Spread { first: 5, second: Some(6) };
         book.retune(wanted, 10);
-        book.store(1, ready_page(1), &wanted);
-        book.store(3, ready_page(3), &wanted);
+        book.store(1, ready_page(1));
+        book.store(3, ready_page(3));
         assert!(book.outcomes.contains_key(&3));
         assert!(!book.outcomes.contains_key(&1));
         assert!(book.live_bytes <= book.budget);
@@ -488,9 +478,9 @@ mod tests {
         let wanted = Spread { first: 5, second: Some(6) };
         book.retune(Spread { first: 1, second: None }, 10);
         book.retune(wanted, 10);
-        book.store(1, ready_page(1), &wanted);
+        book.store(1, ready_page(1));
         // Page 3 is nearer the spread but was never wanted, so it goes.
-        book.store(3, ready_page(3), &wanted);
+        book.store(3, ready_page(3));
         assert!(book.outcomes.contains_key(&1));
         assert!(!book.outcomes.contains_key(&3));
     }
@@ -503,8 +493,8 @@ mod tests {
         book.retune(Spread { first: 1, second: None }, 10);
         book.retune(Spread { first: 2, second: None }, 10);
         book.retune(wanted, 10);
-        book.store(1, ready_page(1), &wanted);
-        book.store(2, ready_page(2), &wanted);
+        book.store(1, ready_page(1));
+        book.store(2, ready_page(2));
         assert!(book.outcomes.contains_key(&2));
         assert!(!book.outcomes.contains_key(&1));
     }
@@ -518,9 +508,9 @@ mod tests {
         let wanted = Spread { first: 7, second: Some(8) };
         book.retune(Spread { first: 1, second: None }, 20);
         book.retune(wanted, 20);
-        book.store(1, ready_page(1), &wanted);
-        book.store(7, ready_page(7), &wanted);
-        book.store(8, ready_page(8), &wanted);
+        book.store(1, ready_page(1));
+        book.store(7, ready_page(7));
+        book.store(8, ready_page(8));
         assert!(book.outcomes.contains_key(&7));
         assert!(book.outcomes.contains_key(&8));
         assert!(!book.outcomes.contains_key(&1));
@@ -535,7 +525,7 @@ mod tests {
         book.budget = 10;
         let wanted = Spread { first: 3, second: Some(4) };
         book.retune(wanted, 10);
-        let oversize_page = Outcome::Ready(Arc::new(
+        let oversize_page = SeatView::Ready(Arc::new(
             crate::decode::Decoded::rgba(
                 10,
                 10,
@@ -544,7 +534,7 @@ mod tests {
             )
             .unwrap(),
         ));
-        book.store(3, oversize_page, &wanted);
+        book.store(3, oversize_page);
         assert!(book.outcomes.contains_key(&3));
     }
 
