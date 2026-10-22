@@ -2,9 +2,7 @@
 //! then pairs), and how a composed spread (1–2 pages) is placed in the
 //! window. Pure data, no GL.
 
-/// A way of laying out and reading pages. `Normal` shows one page per
-/// screen. `Manga` and `Comic` show spreads and differ only in
-/// direction.
+/// A way of laying out and reading pages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewMode {
     /// One page per screen, left to right.
@@ -98,7 +96,7 @@ pub fn advance(current: usize, forward: bool, mode: ViewMode, len: usize) -> usi
     spread_start(next)
 }
 
-/// What a mode switch does to the session.
+/// The outcome of a mode switch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModeSwitch {
     /// The spread start to land on.
@@ -107,9 +105,8 @@ pub struct ModeSwitch {
     pub pairing_changed: bool,
 }
 
-/// Landing page when the mode switches from `old` to `new`. A pairing
-/// change lands on the new spread's start. A direction-only change
-/// keeps the page.
+/// Where a switch from `old` to `new` lands. A pairing change moves
+/// to the new spread's start. A direction-only change keeps the page.
 pub fn switch_mode(old: ViewMode, new: ViewMode, index: usize, len: usize) -> ModeSwitch {
     if old.double() == new.double() {
         ModeSwitch { index, pairing_changed: false }
@@ -447,7 +444,6 @@ mod tests {
 
     #[test]
     fn mode_switch_reclamps_only_on_pairing_change() {
-        // A pairing change lands on the new spread's start.
         assert_eq!(
             switch_mode(ViewMode::Normal, ViewMode::Manga, 2, 10),
             ModeSwitch { index: 1, pairing_changed: true }
@@ -456,7 +452,6 @@ mod tests {
         let s = switch_mode(ViewMode::Normal, ViewMode::Comic, 0, 10);
         assert_eq!(s.index, 0);
         assert!(s.pairing_changed);
-        // A direction-only change keeps the page.
         assert_eq!(
             switch_mode(ViewMode::Manga, ViewMode::Comic, 5, 10),
             ModeSwitch { index: 5, pairing_changed: false }

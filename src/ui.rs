@@ -2,8 +2,8 @@
 
 use crate::view::{Spread, ViewMode};
 
-/// Everything the status bar shows. Built by the app each frame from
-/// plain state. No logic lives here.
+/// Everything the status bar shows. Built by the app each frame. No
+/// logic lives here.
 pub struct StatusLine {
     pub total: usize,
     pub spread: Spread,
@@ -18,17 +18,13 @@ pub struct StatusLine {
     pub error: Option<String>,
 }
 
-/// Render the bottom status bar. Monospace, single row, no
-/// interaction. Book facts on the left. The mode group on the right,
-/// active mode colored. egui 0.37 panels show into a `&mut Ui` (what
-/// `EguiGlow::run` hands over), not into the context. Example left
-/// side: `12/214-13 · cbz · jxl 6000x4000 · 87% · decoding…`
+/// Render the status bar into `ui`. egui 0.37 panels show into the
+/// `&mut Ui` that `EguiGlow::run` hands over, not into a context.
 pub fn show(ui: &mut egui::Ui, status: &StatusLine) {
     egui::Panel::bottom("status").show(ui, |ui| {
         // Sides measures the right end from what it renders, so the
-        // facts truncate at the group's true edge. `shrink_left()` is
-        // load-bearing. Without it the group parks beside the facts
-        // instead of at the right edge.
+        // facts truncate at the group's true edge. Without
+        // `shrink_left()` the group parks beside the facts.
         egui::Sides::new().shrink_left().show(
             ui,
             |ui| {
@@ -39,8 +35,9 @@ pub fn show(ui: &mut egui::Ui, status: &StatusLine) {
     });
 }
 
-/// The right end of the bar. The mode group, with the active mode
-/// colored and the rest gray. A showing toast sits left of it.
+/// The mode group plus a showing toast to its left. The Sides right
+/// side lays out right-to-left, so the display order iterates in
+/// reverse.
 fn right_end(ui: &mut egui::Ui, status: &StatusLine) {
     for (i, &mode) in ViewMode::ALL.iter().enumerate().rev() {
         let text = egui::RichText::new(group_label(mode)).monospace();
@@ -139,7 +136,6 @@ mod tests {
         assert_eq!(group_label(ViewMode::Comic), "Comic (c)");
     }
 
-    /// One painted text item: its glyph text, screen rect, elided flag.
     struct TextItem {
         text: String,
         rect: egui::Rect,
@@ -159,9 +155,8 @@ mod tests {
     }
 
     /// Render the bar headlessly on a `width`-wide screen and return
-    /// the text items of the settled frame. egui runs fully on the
-    /// CPU here. Only the texture upload would need a GPU, and
-    /// `drop_without_applying_deltas` skips it.
+    /// the text items of the settled frame. Only the texture upload
+    /// needs a GPU, and `drop_without_applying_deltas` skips it.
     fn render(width: f32, status: &StatusLine) -> Vec<TextItem> {
         let ctx = egui::Context::default();
         let input = || egui::RawInput {
@@ -186,9 +181,12 @@ mod tests {
 
     /// The panel frame's inner margin is the flush-left and
     /// flush-right anchor. `ROUND` tolerates pixel rounding.
-    const EDGE: f32 = 8.0;
+    const PANEL_MARGIN: f32 = 8.0;
     const ROUND: f32 = 0.51;
+    /// Screen widths: wide enough to show everything, narrow enough to
+    /// force elision.
     const WIDE: f32 = 1280.0;
+    const NARROW: f32 = 480.0;
 
     #[test]
     fn facts_flush_left_and_never_shift() {
@@ -196,7 +194,7 @@ mod tests {
         let mut with_toast = status();
         with_toast.toast = true;
         let toast = render(WIDE, &with_toast);
-        assert!((find(&plain, "12/214-13").rect.left() - EDGE).abs() < ROUND);
+        assert!((find(&plain, "12/214-13").rect.left() - PANEL_MARGIN).abs() < ROUND);
         assert_eq!(
             find(&plain, "12/214-13").rect.left(),
             find(&toast, "12/214-13").rect.left()
@@ -213,7 +211,10 @@ mod tests {
             let comic = find(items, "Comic (c)");
             let rightmost = items.iter().map(|t| t.rect.right()).fold(f32::MIN, f32::max);
             assert!((rightmost - comic.rect.right()).abs() < ROUND, "group must be rightmost");
-            assert!((comic.rect.right() - (WIDE - EDGE)).abs() < ROUND, "group must be flush right");
+            assert!(
+                (comic.rect.right() - (WIDE - PANEL_MARGIN)).abs() < ROUND,
+                "group must be flush right"
+            );
         }
         assert_eq!(
             find(&plain, "Comic (c)").rect,
@@ -234,7 +235,7 @@ mod tests {
 
     #[test]
     fn facts_truncate_instead_of_pushing_the_group() {
-        let narrow = render(480.0, &status());
+        let narrow = render(NARROW, &status());
         let facts = find(&narrow, "12/214");
         assert!(facts.elided, "facts must elide on a narrow screen");
         assert!(facts.text.ends_with('…'));

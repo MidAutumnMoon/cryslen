@@ -7,7 +7,6 @@ use winit::keyboard::KeyCode;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Action {
     Quit,
-    /// Switch to a view mode outright.
     SelectMode(ViewMode),
     ToggleFullscreen,
     ResetView,
@@ -41,7 +40,7 @@ impl Action {
         }
     }
 
-    /// Whether a held key keeps firing this action. Only paging repeats.
+    /// Whether a held key keeps firing this action.
     pub(crate) fn repeats(self) -> bool {
         matches!(self, Action::Right | Action::Left | Action::Forward | Action::Back)
     }

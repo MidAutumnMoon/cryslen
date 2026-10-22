@@ -18,8 +18,8 @@ use crate::worker::{SeatView, SpreadView, Worker};
 
 /// User events that wake the parked loop.
 pub enum UserEvent {
-    /// Wake the loop after this delay, whoever asked. Arming only:
-    /// `new_events` fires the redraw when the deadline is reached.
+    /// Wake the loop after this delay. Arming only: `new_events`
+    /// fires the redraw when the deadline is reached.
     Repaint(Duration),
     /// The decode book changed. Redraw to pick up newly decided pages.
     PagesUpdated,
@@ -290,8 +290,8 @@ impl App {
             }
         }
 
-        // Likewise, wake once when the mode toast expires so it goes
-        // away without other traffic.
+        // Wake once at expiry so the toast disappears without other
+        // traffic.
         self.mode_toast_since =
             self.mode_toast_since.filter(|&since| since.elapsed() < MODE_TOAST);
         if let Some(since) = self.mode_toast_since {
