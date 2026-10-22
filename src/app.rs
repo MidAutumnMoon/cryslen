@@ -12,7 +12,7 @@ use crate::decode::Decoded;
 use crate::keys::Action;
 use crate::render::PageTextures;
 use crate::source::Source;
-use crate::view::{Spread, SpreadLayout, View};
+use crate::view::{Spread, SpreadLayout, View, ViewMode};
 use crate::window::Window;
 use crate::worker::{SeatView, SpreadView, Worker};
 
@@ -29,17 +29,15 @@ pub enum UserEvent {
 struct State {
     /// Index of the spread's first page (a spread start).
     index: usize,
-    double: bool,
-    rtl: bool,
+    mode: ViewMode,
     view: View,
     fullscreen: bool,
 }
 
-/// Baked-in defaults (no config file, ever). Manga defaults: RTL on.
+/// Baked-in defaults (no config file, ever).
 const DEFAULT_STATE: State = State {
     index: 0,
-    double: false,
-    rtl: true,
+    mode: ViewMode::Normal,
     view: View { scale: 1.0, offset: (0.0, 0.0) },
     fullscreen: false,
 };
@@ -171,6 +169,8 @@ pub struct App {
     /// screen (hold-last-frame rule) and the status line flags waiting
     /// after 150 ms. No spinner animation: it would force repaints.
     waiting_since: Option<Instant>,
+    /// Set while the mode-switch toast is showing in the status bar.
+    mode_toast_since: Option<Instant>,
     /// Layout of the spread currently on screen. Pan and zoom read this
     /// memo between frames.
     last_layout: SpreadLayout,
@@ -188,7 +188,7 @@ impl App {
         proxy: winit::event_loop::EventLoopProxy<UserEvent>,
     ) -> App {
         let state = State { index, ..DEFAULT_STATE };
-        let spread = crate::view::spread_for(state.index, state.double, source.len());
+        let spread = crate::view::spread_for(state.index, state.mode.double(), source.len());
         worker.retune(spread);
         App {
             source,
@@ -202,6 +202,7 @@ impl App {
             cursor: (0.0, 0.0),
             dragging: false,
             waiting_since: None,
+            mode_toast_since: None,
             last_layout: SpreadLayout::default(),
             fit: Fit::default(),
             proxy: Some(proxy),
@@ -210,7 +211,7 @@ impl App {
 
     /// Spread for the current index/mode, clamped to the book.
     fn spread(&self) -> Spread {
-        crate::view::spread_for(self.state.index, self.state.double, self.source.len())
+        crate::view::spread_for(self.state.index, self.state.mode.double(), self.source.len())
     }
 
     /// Show each seat's Ready page, hold undecided and failed seats on
@@ -218,8 +219,8 @@ impl App {
     /// seat-ordered views for the status fold.
     fn display(&mut self, spread: Spread, snapshot: &SpreadView) -> [Option<SeatView>; 2] {
         let seat_views: [Option<SeatView>; 2] =
-            snapshot.seats(self.state.rtl).map(|seat| seat.cloned());
-        let wanted_pages = spread.seats(self.state.rtl);
+            snapshot.seats(self.state.mode.rtl()).map(|seat| seat.cloned());
+        let wanted_pages = spread.seats(self.state.mode.rtl());
         for seat in 0..2 {
             match (wanted_pages[seat], seat_views[seat].as_ref()) {
                 (None, _) => {
@@ -271,7 +272,7 @@ impl App {
             self.fit.fitted_to(total);
         }
 
-        let folded = fold_status(spread.seats(self.state.rtl), &seat_views);
+        let folded = fold_status(spread.seats(self.state.mode.rtl()), &seat_views);
         self.waiting_since = if folded.waiting {
             Some(self.waiting_since.unwrap_or_else(Instant::now))
         } else {
@@ -289,11 +290,22 @@ impl App {
             }
         }
 
+        // Likewise, wake once when the mode toast expires so it goes
+        // away without other traffic.
+        self.mode_toast_since =
+            self.mode_toast_since.filter(|&since| since.elapsed() < MODE_TOAST);
+        if let Some(since) = self.mode_toast_since {
+            let remaining = MODE_TOAST.saturating_sub(since.elapsed());
+            if let Some(proxy) = &self.proxy {
+                let _ = proxy.send_event(UserEvent::Repaint(remaining));
+            }
+        }
+
         let status = crate::ui::StatusLine {
             total: self.source.len(),
             spread,
-            double: self.state.double,
-            rtl: self.state.rtl,
+            mode: self.state.mode,
+            toast: self.mode_toast_since.is_some(),
             source_label: self.source.label(),
             format: folded.format,
             dims: folded.dims,
@@ -347,19 +359,21 @@ impl App {
     fn dispatch(&mut self, act: Action, event_loop: &winit::event_loop::ActiveEventLoop) {
         match act {
             Action::Quit => event_loop.exit(),
-            Action::ToggleDouble => {
-                self.state.double = !self.state.double;
-                self.state.index = crate::view::spread_for(
-                    self.state.index,
-                    self.state.double,
-                    self.source.len(),
-                )
-                .first;
-                self.after_page_change();
-            }
-            Action::ToggleRtl => {
-                self.state.rtl = !self.state.rtl;
-                self.request_redraw(); // same pages, seats swap
+            Action::SelectMode(mode) => {
+                let pairing_changed = mode.double() != self.state.mode.double();
+                self.state.mode = mode;
+                self.mode_toast_since = Some(Instant::now());
+                if pairing_changed {
+                    self.state.index = crate::view::spread_for(
+                        self.state.index,
+                        mode.double(),
+                        self.source.len(),
+                    )
+                    .first;
+                    self.after_page_change();
+                } else {
+                    self.request_redraw(); // same pages, seats swap
+                }
             }
             Action::ToggleFullscreen => {
                 self.state.fullscreen = !self.state.fullscreen;
@@ -373,12 +387,12 @@ impl App {
                 self.fit.reset_view();
                 self.request_redraw();
             }
-            Action::Next | Action::Prev => {
-                let forward = act.is_forward(self.state.rtl);
+            Action::Right | Action::Left | Action::Forward | Action::Back => {
+                let forward = act.is_forward(self.state.mode);
                 self.state.index = crate::view::advance(
                     self.state.index,
                     forward,
-                    self.state.double,
+                    self.state.mode.double(),
                     self.source.len(),
                 );
                 self.after_page_change();
@@ -422,9 +436,17 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, event_loop: &winit::event_loop::ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Repaint(delay) => {
-                if let Some(deadline) = Instant::now().checked_add(delay) {
-                    event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(deadline));
+                let Some(deadline) = Instant::now().checked_add(delay) else { return };
+                // A repaint request must never delay an already-armed
+                // earlier wake, so keep the sooner deadline.
+                if let winit::event_loop::ControlFlow::WaitUntil(armed) =
+                    event_loop.control_flow()
+                {
+                    if armed <= deadline {
+                        return;
+                    }
                 }
+                event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(deadline));
             }
             UserEvent::PagesUpdated => self.request_redraw(),
         }
@@ -538,6 +560,9 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
 
 /// How long a page may stay undecided before the status line says so.
 const WAIT_GRACE: Duration = Duration::from_millis(150);
+
+/// How long a mode switch's toast stays on screen.
+const MODE_TOAST: Duration = Duration::from_millis(1500);
 
 /// Wheel zoom sensitivity: e^(`WHEEL_ZOOM_SENSITIVITY` * lines) per event,
 /// so one notch is ~×1.16 and three notches ~×1.6.

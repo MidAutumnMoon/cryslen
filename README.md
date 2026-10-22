@@ -9,8 +9,9 @@
 - Pages from directories, `.zip`/`.cbz`, and `.7z`/`.cb7` archives
 - Opens JPEG, PNG, GIF, WebP, BMP, TIFF, AVIF, and JPEG XL files.
   Animated files show their first frame.
-- Reads right-to-left by default (manga)
-- Double-page mode: the cover alone, then page pairs
+- View modes: `normal` single page, `manga` and `comic` double page
+  (right to left and left to right)
+- Double-page modes show the cover alone, then page pairs
 - Background decoding and prefetch keep page turns fast
 - Smooth pan and zoom
 - Hold an arrow key to flip through the book. Paging wraps at the ends.
@@ -27,5 +28,6 @@ Pass a single image and cy opens its folder at that page.
 
 ## Keys
 
-`←/→` or `Space` page · `d` double-page · `m` RTL · `f` fullscreen · `r` refit ·
-wheel zoom · drag pan · `q` quit. No config file. Knobs live in the source.
+`←/→` or `Space` page · `n`/`m`/`c` normal, manga, comic mode · `f` fullscreen ·
+`r` refit · wheel zoom · drag pan · `q` quit. No config file. Knobs live in the
+source.

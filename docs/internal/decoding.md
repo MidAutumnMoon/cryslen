@@ -107,8 +107,8 @@ write orientation tags, so fixtures for it must come from real files.
 
 - One worker thread, mpsc retune channel carrying the wanted `Spread`.
   Every retune joins the spread to a pending trail with its ±3
-  neighborhood. The neighborhood covers the full next spread in double
-  page mode. The trail is bounded to ±64 pages of the spread's
+  neighborhood. The neighborhood covers the full next spread in the
+  double-page modes. The trail is bounded to ±64 pages of the spread's
   first page. Past that the reader has moved on, so pages are dropped
   instead of queued. The wanted spread itself never drops. The next
   decode is the undecided pending page nearest the spread, with pages

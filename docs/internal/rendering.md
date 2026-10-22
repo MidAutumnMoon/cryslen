@@ -122,7 +122,7 @@ Texture uploads are expensive, a full upload plus mipmap generation per
 plane, so uploaded pages stay in a page-keyed cache. `bind(seat, page,
 decoded)` no-ops on the same page id, uploads only on a cache miss, and
 otherwise rebinds the seat to the cached textures. Page revisits and the
-RTL re-seat are pure binds. The app owns what each seat shows (`shown`
+mode re-seat are pure binds. The app owns what each seat shows (`held`
 per seat) and drives the cache with per-seat show/hold/clear decisions.
 Each entry counts its plane bytes plus the mip chain against a 3 GiB
 cap. An insert past the cap evicts unbound pages, farthest from the

@@ -1,6 +1,63 @@
-//! View math: the spread-pairing model (cover alone, then pairs) and
-//! how a composed spread (1–2 pages) is placed in the window. Pure
-//! data, no GL.
+//! View math: the view modes, the spread-pairing model (cover alone,
+//! then pairs), and how a composed spread (1–2 pages) is placed in the
+//! window. Pure data, no GL.
+
+/// A way of laying out and reading pages. `Normal` shows one page per
+/// screen. `Manga` and `Comic` show spreads and differ only in
+/// direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewMode {
+    /// One page per screen, left to right.
+    Normal,
+    /// Spreads, right to left.
+    Manga,
+    /// Spreads, left to right.
+    Comic,
+}
+
+impl ViewMode {
+    /// The modes in status-bar display order.
+    pub const ALL: [ViewMode; 3] = [ViewMode::Normal, ViewMode::Manga, ViewMode::Comic];
+
+    /// Whether pages pair into spreads.
+    pub fn double(self) -> bool {
+        matches!(self, ViewMode::Manga | ViewMode::Comic)
+    }
+
+    /// Whether reading runs right to left.
+    pub fn rtl(self) -> bool {
+        self == ViewMode::Manga
+    }
+
+    /// Name shown in the status-bar group.
+    pub fn label(self) -> &'static str {
+        match self {
+            ViewMode::Normal => "Normal",
+            ViewMode::Manga => "Manga",
+            ViewMode::Comic => "Comic",
+        }
+    }
+
+    /// The key that selects this mode, shown next to the name. Must
+    /// match the binding in `crate::keys::from_key`.
+    pub fn shortcut(self) -> &'static str {
+        match self {
+            ViewMode::Normal => "n",
+            ViewMode::Manga => "m",
+            ViewMode::Comic => "c",
+        }
+    }
+
+    /// One line stating the mode's effect, shown on switch.
+    pub fn effect(self) -> &'static str {
+        match self {
+            ViewMode::Normal => "left to right · single page",
+            ViewMode::Manga => "right to left · double page",
+            ViewMode::Comic => "left to right · double page",
+        }
+    }
+}
+
 /// Which pages one screen shows. The cover is alone, afterwards pairs,
 /// 0-based: `0`, `1+2`, `3+4`, ...
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,6 +242,24 @@ pub fn clamp(view: View, total: (f32, f32), window: (f32, f32)) -> View {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mode_flags() {
+        assert!(!ViewMode::Normal.double());
+        assert!(!ViewMode::Normal.rtl());
+        assert!(ViewMode::Manga.double());
+        assert!(ViewMode::Manga.rtl());
+        assert!(ViewMode::Comic.double());
+        assert!(!ViewMode::Comic.rtl());
+    }
+
+    #[test]
+    fn mode_table_strings() {
+        assert_eq!(ViewMode::ALL, [ViewMode::Normal, ViewMode::Manga, ViewMode::Comic]);
+        assert_eq!(ViewMode::Normal.effect(), "left to right · single page");
+        assert_eq!(ViewMode::Manga.effect(), "right to left · double page");
+        assert_eq!(ViewMode::Comic.effect(), "left to right · double page");
+    }
 
     #[test]
     fn layout_places_seats_left_to_right() {
