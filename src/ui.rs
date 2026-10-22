@@ -1,5 +1,6 @@
 //! Status overlay: one egui bottom panel, data in / text out.
 
+use crate::source::PageName;
 use crate::view::{Spread, ViewMode};
 
 /// Everything the status bar shows. Built by the app each frame. No
@@ -10,7 +11,9 @@ pub struct StatusLine {
     pub mode: ViewMode,
     /// The mode-switch toast is showing.
     pub toast: bool,
-    pub source_label: &'static str,
+    pub name: PageName,
+    /// Decoded format label, fused with the dims only when the
+    /// filename's extension claims a different format.
     pub format: Option<&'static str>,
     pub dims: Option<(u32, u32)>,
     pub zoom_percent: f32,
@@ -28,7 +31,8 @@ pub fn show(ui: &mut egui::Ui, status: &StatusLine) {
         egui::Sides::new().shrink_left().show(
             ui,
             |ui| {
-                ui.add(egui::Label::new(egui::RichText::new(line(status)).monospace()).truncate());
+                let job = line(ui.style(), status);
+                ui.add(egui::Label::new(job).truncate());
             },
             |ui| right_end(ui, status),
         );
@@ -45,7 +49,7 @@ fn right_end(ui: &mut egui::Ui, status: &StatusLine) {
             if mode == status.mode { text.color(mode_color(mode)).strong() } else { text.weak() };
         ui.label(text);
         if i > 0 {
-            ui.label(egui::RichText::new("/").weak().monospace());
+            ui.label(egui::RichText::new("·").weak().monospace());
         }
     }
     if status.toast {
@@ -67,24 +71,54 @@ fn mode_color(mode: ViewMode) -> egui::Color32 {
     }
 }
 
-/// The left-side facts, separate so they are directly testable.
-fn line(status: &StatusLine) -> String {
-    let mut head = format!("{}/{}", status.spread.first + 1, status.total);
+/// Muted hue for the spread range, quieter than the mode colors so the
+/// group keeps the bar's strongest accent.
+const HEAD_COLOR: egui::Color32 = egui::Color32::from_rgb(0xc2, 0x9e, 0x6f);
+
+/// Muted hue for the current file's basename.
+const NAME_COLOR: egui::Color32 = egui::Color32::from_rgb(0xa2, 0x92, 0xc5);
+
+/// The left-side facts as one job of colored sections, separate so they
+/// are directly testable. One job, one label: the whole line keeps
+/// eliding together on narrow screens.
+fn line(style: &egui::Style, status: &StatusLine) -> egui::text::LayoutJob {
+    let font = egui::TextStyle::Monospace.resolve(style);
+    let plain = style.visuals.text_color();
+    let section = |job: &mut egui::text::LayoutJob, text: String, color: egui::Color32| {
+        job.append(&text, 0.0, egui::TextFormat::simple(font.clone(), color));
+    };
+    let mut job = egui::text::LayoutJob::default();
+
+    let mut head = format!("{}", status.spread.first + 1);
     if let Some(second) = status.spread.second {
         head.push_str(&format!("-{}", second + 1));
     }
-    let mut segs = vec![head, status.source_label.to_string()];
-    if let (Some(format), Some((w, h))) = (status.format, status.dims) {
-        segs.push(format!("{format} {w}x{h}"));
+    section(&mut job, head, HEAD_COLOR);
+    section(&mut job, format!("/{}", status.total), plain);
+
+    section(&mut job, " · ".into(), plain);
+    if let Some(parent) = &status.name.parent {
+        section(&mut job, parent.clone(), plain);
+        section(&mut job, "/".into(), plain);
     }
-    segs.push(format!("{:.0}%", status.zoom_percent));
+    section(&mut job, status.name.file.clone(), NAME_COLOR);
+
+    if let Some((w, h)) = status.dims {
+        section(&mut job, " · ".into(), plain);
+        let dims = match status.format {
+            Some(format) => format!("{format} {w}x{h}"),
+            None => format!("{w}x{h}"),
+        };
+        section(&mut job, dims, plain);
+    }
+    section(&mut job, format!(" · {:.0}%", status.zoom_percent), plain);
     if status.waiting {
-        segs.push("decoding…".into());
+        section(&mut job, " · decoding…".into(), plain);
     }
     if let Some(error) = &status.error {
-        segs.push(error.clone());
+        section(&mut job, format!(" · {error}"), plain);
     }
-    segs.join(" · ")
+    job
 }
 
 #[cfg(test)]
@@ -97,7 +131,9 @@ mod tests {
             spread: Spread { first: 11, second: Some(12) },
             mode: ViewMode::Manga,
             toast: false,
-            source_label: "cbz",
+            name: PageName { parent: Some("b".into()), file: "010.png".into() },
+            // The name claims png, the decoded page is jxl: the mismatch
+            // fuses the format into the dims.
             format: Some("jxl"),
             dims: Some((6000, 4000)),
             zoom_percent: 86.6,
@@ -106,9 +142,48 @@ mod tests {
         }
     }
 
+    /// Section colors in append order. Sections carry no text slices
+    /// here; the text and the deterministic append order pin the mapping.
+    fn section_colors(job: &egui::text::LayoutJob) -> Vec<egui::Color32> {
+        job.sections.iter().map(|s| s.format.color).collect()
+    }
+
     #[test]
-    fn full_line() {
-        assert_eq!(line(&status()), "12/214-13 · cbz · jxl 6000x4000 · 87%");
+    fn facts_text_and_section_colors() {
+        let style = egui::Style::default();
+        let plain = style.visuals.text_color();
+        let job = line(&style, &status());
+        assert_eq!(job.text, "12-13/214 · b/010.png · jxl 6000x4000 · 87%");
+        assert_eq!(
+            section_colors(&job),
+            // Equal adjacent formats merge: head | range-total, parent |
+            // basename | dims, zoom.
+            vec![HEAD_COLOR, plain, NAME_COLOR, plain]
+        );
+    }
+
+    #[test]
+    fn single_page_head_and_uncolored_parent() {
+        let style = egui::Style::default();
+        let plain = style.visuals.text_color();
+        let mut s = status();
+        s.spread = Spread { first: 4, second: None };
+        s.format = None;
+        s.dims = None;
+        s.zoom_percent = 100.0;
+        let job = line(&style, &s);
+        assert_eq!(job.text, "5/214 · b/010.png · 100%");
+        assert_eq!(section_colors(&job), vec![HEAD_COLOR, plain, NAME_COLOR, plain]);
+    }
+
+    #[test]
+    fn head_leads_with_the_spread_range() {
+        let style = egui::Style::default();
+        let mut s = status();
+        s.spread = Spread { first: 49, second: Some(50) };
+        s.total = 2146;
+        let job = line(&style, &s);
+        assert!(job.text.starts_with("50-51/2146 · "));
     }
 
     #[test]
@@ -116,17 +191,8 @@ mod tests {
         let mut s = status();
         s.waiting = true;
         s.error = Some("boom".into());
-        assert!(line(&s).ends_with("· decoding… · boom"));
-    }
-
-    #[test]
-    fn single_page_and_unknown_format() {
-        let mut s = status();
-        s.spread = Spread { first: 4, second: None };
-        s.format = None;
-        s.dims = None;
-        s.zoom_percent = 100.0;
-        assert_eq!(line(&s), "5/214 · cbz · 100%");
+        let job = line(&egui::Style::default(), &s);
+        assert!(job.text.ends_with("· decoding… · boom"));
     }
 
     #[test]
@@ -194,10 +260,10 @@ mod tests {
         let mut with_toast = status();
         with_toast.toast = true;
         let toast = render(WIDE, &with_toast);
-        assert!((find(&plain, "12/214-13").rect.left() - PANEL_MARGIN).abs() < ROUND);
+        assert!((find(&plain, "12-13/214").rect.left() - PANEL_MARGIN).abs() < ROUND);
         assert_eq!(
-            find(&plain, "12/214-13").rect.left(),
-            find(&toast, "12/214-13").rect.left()
+            find(&plain, "12-13/214").rect.left(),
+            find(&toast, "12-13/214").rect.left()
         );
     }
 
@@ -236,11 +302,11 @@ mod tests {
     #[test]
     fn facts_truncate_instead_of_pushing_the_group() {
         let narrow = render(NARROW, &status());
-        let facts = find(&narrow, "12/214");
+        let facts = find(&narrow, "12-13");
         assert!(facts.elided, "facts must elide on a narrow screen");
         assert!(facts.text.ends_with('…'));
         assert!(facts.rect.right() <= find(&narrow, "Comic (c)").rect.left());
         let wide = render(WIDE, &status());
-        assert!(!find(&wide, "12/214").elided);
+        assert!(!find(&wide, "12-13").elided);
     }
 }

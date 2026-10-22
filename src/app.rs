@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use egui_winit::winit;
 
-use crate::decode::Decoded;
+use crate::decode::{Decoded, Format};
 use crate::keys::Action;
 use crate::render::PageTextures;
 use crate::source::Source;
@@ -46,37 +46,49 @@ const DEFAULT_STATE: State = State {
 struct FoldedStatus {
     /// A wanted seat is still undecided.
     waiting: bool,
-    /// First failure among the seats, in seat order.
+    /// First failure among the seats, in reading order.
     error: Option<String>,
-    /// Format of the first Ready seat, left preferred.
-    format: Option<&'static str>,
-    /// Dims of the first Ready seat, left preferred.
+    /// Format of the first Ready seat in reading order.
+    format: Option<Format>,
+    /// Dims of the first Ready seat in reading order.
     dims: Option<(u32, u32)>,
 }
 
-/// Fold the seats' views into status facts. `seat_views[i]` is the
-/// worker's view for `wanted_pages[i]`.
-fn fold_status(
-    wanted_pages: [Option<usize>; 2],
-    seat_views: &[Option<SeatView>; 2],
-) -> FoldedStatus {
+/// Fold the seats' views into status facts, visiting the seats in reading
+/// order so the spread's lead page speaks. `seat_views[i]` is the worker's
+/// view for `spread.seats(mode)[i]`. A seat still deciding yields its place
+/// to the other one. A failed page stops the fold: its facts do not exist,
+/// and the partner's would describe the wrong page.
+fn fold_status(spread: Spread, mode: ViewMode, seat_views: &[Option<SeatView>; 2]) -> FoldedStatus {
     let mut folded = FoldedStatus { waiting: false, error: None, format: None, dims: None };
+    let wanted = spread.seats(mode);
     for (seat, seat_view) in seat_views.iter().enumerate() {
-        if wanted_pages[seat].is_some() && matches!(seat_view, Some(SeatView::Pending)) {
+        if wanted[seat].is_some() && matches!(seat_view, Some(SeatView::Pending)) {
             folded.waiting = true;
         }
-        match seat_view {
-            Some(SeatView::Failed(message)) if folded.error.is_none() => {
+    }
+    // Manga reads the right seat first.
+    let reading_order: [usize; 2] = if mode.rtl() { [1, 0] } else { [0, 1] };
+    for seat in reading_order {
+        match &seat_views[seat] {
+            Some(SeatView::Failed(message)) => {
                 folded.error = Some(message.clone());
+                break;
             }
             Some(SeatView::Ready(decoded)) if folded.format.is_none() => {
-                folded.format = Some(decoded.format.label());
+                folded.format = Some(decoded.format);
                 folded.dims = Some((decoded.width, decoded.height));
             }
             _ => {}
         }
     }
     folded
+}
+
+/// The decoded format as a status segment, shown only when the filename's
+/// extension claims a different format.
+fn mismatched_format(decoded: Option<Format>, claimed: Option<Format>) -> Option<&'static str> {
+    decoded.filter(|&d| claimed != Some(d)).map(|d| d.label())
 }
 
 /// The auto-fit protocol: which spread total the view was fitted to, and
@@ -272,7 +284,7 @@ impl App {
             self.fit.fitted_to(total);
         }
 
-        let folded = fold_status(spread.seats(self.state.mode), &seat_views);
+        let folded = fold_status(spread, self.state.mode, &seat_views);
         self.waiting_since = if folded.waiting {
             Some(self.waiting_since.unwrap_or_else(Instant::now))
         } else {
@@ -301,13 +313,14 @@ impl App {
             }
         }
 
+        let claimed = crate::decode::format_from_name(self.source.name(spread.first));
         let status = crate::ui::StatusLine {
             total: self.source.len(),
             spread,
             mode: self.state.mode,
             toast: self.mode_toast_since.is_some(),
-            source_label: self.source.label(),
-            format: folded.format,
+            name: self.source.page_name(spread.first),
+            format: mismatched_format(folded.format, claimed),
             dims: folded.dims,
             zoom_percent: self.state.view.scale * 100.0,
             waiting: self.waiting_since.is_some_and(|t| t.elapsed() >= WAIT_GRACE),
@@ -421,6 +434,11 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
         };
         let gl = window.glow();
         let egui = egui_glow::EguiGlow::new(event_loop, Arc::clone(&gl), None, None, true);
+        // System fonts join the family fallback chains lazily, for filename
+        // characters the built-in fonts cannot render. The provider reaches
+        // fontconfig by dlopen, which the devShell's LD_LIBRARY_PATH serves.
+        egui.egui_ctx
+            .add_font_provider(Arc::new(egui_system_font_provider::SystemFontProvider::new()));
         // Bridge egui repaint requests into the winit loop.
         if let Some(proxy) = self.proxy.clone() {
             let proxy = egui::mutex::Mutex::new(proxy);
@@ -591,15 +609,17 @@ mod tests {
 
     #[test]
     fn fold_waits_on_any_pending_wanted_seat() {
+        let spread = Spread { first: 0, second: Some(1) };
         let both_decided = [Some(ready(2, 2)), Some(SeatView::Failed("x".into()))];
-        assert!(!fold_status([Some(0), Some(1)], &both_decided).waiting);
+        assert!(!fold_status(spread, ViewMode::Comic, &both_decided).waiting);
         let right_pending = [Some(ready(2, 2)), Some(SeatView::Pending)];
-        assert!(fold_status([Some(0), Some(1)], &right_pending).waiting);
+        assert!(fold_status(spread, ViewMode::Comic, &right_pending).waiting);
         let left_pending = [Some(SeatView::Pending), Some(ready(2, 2))];
-        assert!(fold_status([Some(0), Some(1)], &left_pending).waiting);
+        assert!(fold_status(spread, ViewMode::Comic, &left_pending).waiting);
         // An unwanted seat is never waited on.
+        let single_spread = Spread { first: 0, second: None };
         let single = [Some(ready(2, 2)), None];
-        assert!(!fold_status([Some(0), None], &single).waiting);
+        assert!(!fold_status(single_spread, ViewMode::Normal, &single).waiting);
     }
 
     #[test]
@@ -653,22 +673,52 @@ mod tests {
     }
 
     #[test]
-    fn fold_reports_the_first_error_in_seat_order() {
-        let both_failed =
-            [Some(SeatView::Failed("left".into())), Some(SeatView::Failed("right".into()))];
-        assert_eq!(fold_status([Some(0), Some(1)], &both_failed).error.as_deref(), Some("left"));
-        let right_failed = [Some(ready(2, 2)), Some(SeatView::Failed("right".into()))];
-        assert_eq!(fold_status([Some(0), Some(1)], &right_failed).error.as_deref(), Some("right"));
+    fn fold_reports_the_first_error_in_reading_order() {
+        let spread = Spread { first: 0, second: Some(1) };
+        let both_failed = [Some(SeatView::Failed("seat0".into())), Some(SeatView::Failed("seat1".into()))];
+        assert_eq!(fold_status(spread, ViewMode::Comic, &both_failed).error.as_deref(), Some("seat0"));
+        // Manga reads the right seat first, so its error wins.
+        assert_eq!(fold_status(spread, ViewMode::Manga, &both_failed).error.as_deref(), Some("seat1"));
+        let right_failed = [Some(ready(2, 2)), Some(SeatView::Failed("seat1".into()))];
+        assert_eq!(fold_status(spread, ViewMode::Comic, &right_failed).error.as_deref(), Some("seat1"));
     }
 
     #[test]
-    fn fold_takes_format_and_dims_from_the_leftmost_ready_seat() {
-        let only_right = [None, Some(ready(800, 600))];
-        let folded = fold_status([Some(0), Some(1)], &only_right);
-        assert_eq!(folded.format, Some("png"));
-        assert_eq!(folded.dims, Some((800, 600)));
-        let both = [Some(ready(640, 480)), Some(ready(800, 600))];
-        let folded = fold_status([Some(0), Some(1)], &both);
+    fn fold_takes_format_and_dims_from_the_lead_page() {
+        let spread = Spread { first: 0, second: Some(1) };
+        // In Manga the lead page sits in the right seat.
+        let both = [Some(ready(800, 600)), Some(ready(640, 480))];
+        let folded = fold_status(spread, ViewMode::Manga, &both);
+        assert_eq!(folded.format, Some(Format::Png));
         assert_eq!(folded.dims, Some((640, 480)));
+        let folded = fold_status(spread, ViewMode::Comic, &both);
+        assert_eq!(folded.dims, Some((800, 600)));
+        // A still-deciding lead seat yields its place to the other page.
+        let lead_pending = [Some(ready(800, 600)), Some(SeatView::Pending)];
+        let folded = fold_status(spread, ViewMode::Manga, &lead_pending);
+        assert_eq!(folded.dims, Some((800, 600)));
+        assert!(folded.waiting);
+        // A failed lead stops the fold: no facts, and the partner's would
+        // describe the wrong page.
+        let lead_failed = [Some(ready(800, 600)), Some(SeatView::Failed("seat1".into()))];
+        let folded = fold_status(spread, ViewMode::Manga, &lead_failed);
+        assert_eq!(folded.dims, None);
+        assert_eq!(folded.error.as_deref(), Some("seat1"));
+        // The partner's decode still counts as waiting even then.
+        let failed_and_pending = [Some(SeatView::Pending), Some(SeatView::Failed("x".into()))];
+        let folded = fold_status(spread, ViewMode::Manga, &failed_and_pending);
+        assert!(folded.waiting);
+        assert_eq!(folded.dims, None);
+        // An empty seat never speaks.
+        let only_right = [None, Some(ready(800, 600))];
+        let folded = fold_status(spread, ViewMode::Manga, &only_right);
+        assert_eq!(folded.dims, Some((800, 600)));
+    }
+
+    #[test]
+    fn format_segment_shows_only_on_extension_mismatch() {
+        assert_eq!(mismatched_format(Some(Format::Jpeg), Some(Format::Png)), Some("jpeg"));
+        assert_eq!(mismatched_format(Some(Format::Png), Some(Format::Png)), None);
+        assert_eq!(mismatched_format(None, Some(Format::Png)), None);
     }
 }

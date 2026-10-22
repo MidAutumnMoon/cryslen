@@ -44,6 +44,16 @@ impl std::fmt::Display for SourceError {
 
 impl std::error::Error for SourceError {}
 
+/// What the status line calls the current page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageName {
+    /// Directory shown before the basename, e.g. a volume inside an archive.
+    /// Flat archives and anonymous paths have none.
+    pub parent: Option<String>,
+    /// The basename with its extension, e.g. `image001.avif`.
+    pub file: String,
+}
+
 /// Which archive family a path's extension names. Both `Source::open` and
 /// main's argument classification dispatch on this one table.
 enum ArchiveKind {
@@ -219,13 +229,22 @@ impl Source {
         &self.names[index]
     }
 
-    /// Short source label for the status line, e.g. "dir", "cbz", "cb7".
-    pub fn label(&self) -> &'static str {
-        match self.kind {
-            SourceKind::Directory(_) => "dir",
-            SourceKind::Zip(_) => "cbz",
-            SourceKind::SevenZip(_) => "cb7",
-        }
+    /// The status line's name segment for one page: the basename plus its
+    /// immediate parent directory. Archive entries carry their inner
+    /// directory; directory pages get the opened directory itself.
+    pub fn page_name(&self, index: usize) -> PageName {
+        debug_assert!(index < self.names.len());
+        let entry = &self.names[index];
+        let file = entry.rsplit('/').next().unwrap_or(entry).to_string();
+        let parent = match &self.kind {
+            SourceKind::Directory(dir) => {
+                dir.file_name().map(|n| n.to_string_lossy().into_owned())
+            }
+            SourceKind::Zip(_) | SourceKind::SevenZip(_) => entry.rsplit_once('/').map(|(p, _)| {
+                p.rsplit('/').next().unwrap_or(p).to_string()
+            }),
+        };
+        PageName { parent, file }
     }
 
     /// Raw encoded bytes of one page. 7z reads consult the byte tier first
@@ -330,7 +349,10 @@ mod tests {
     fn sevenz_listing_and_read() {
         let source = Source::open(std::path::Path::new(SEVENZ_FIXTURE)).expect("7z opens");
         assert_eq!(source.len(), 2);
-        assert_eq!(source.label(), "cb7");
+        assert_eq!(
+            source.page_name(0),
+            PageName { parent: None, file: "p1.png".into() }
+        );
         assert_eq!(source.names, ["p1.png", "p2.png"]);
         let bytes = source.bytes(0).expect("first page reads");
         assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
@@ -410,7 +432,13 @@ mod tests {
         dir.write("notes.txt", b"not a page");
         let source = Source::open(dir.path()).expect("dir opens");
         assert_eq!(source.len(), 4);
-        assert_eq!(source.label(), "dir");
+        assert_eq!(
+            source.page_name(2),
+            PageName {
+                parent: Some(dir.path().file_name().unwrap().to_string_lossy().into_owned()),
+                file: "c10.png".into(),
+            }
+        );
         assert_eq!(source.names, ["c1.png", "c2.png", "c10.png", "cover.PNG"]);
         assert_eq!(source.name(2), "c10.png");
     }
@@ -433,7 +461,9 @@ mod tests {
             let mut zip = zip::ZipWriter::new(file);
             let options = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
-            for (name, color) in [("b/010.png", 1u8), ("b/002.png", 2), ("b/020.png", 3)] {
+            for (name, color) in
+                [("b/010.png", 1u8), ("b/002.png", 2), ("b/020.png", 3), ("b/deep/005.png", 4)]
+            {
                 zip.start_file(name, options).unwrap();
                 zip.write_all(&tiny_png(2, 2, [color, 0, 0, 255])).unwrap();
             }
@@ -442,8 +472,13 @@ mod tests {
             zip.finish().unwrap();
         }
         let source = Source::open(&zip_path).expect("zip opens");
-        assert_eq!(source.label(), "cbz");
-        assert_eq!(source.names, ["b/002.png", "b/010.png", "b/020.png"]);
+        assert_eq!(source.names, ["b/002.png", "b/010.png", "b/020.png", "b/deep/005.png"]);
+        assert_eq!(source.page_name(1), PageName { parent: Some("b".into()), file: "010.png".into() });
+        // A nested entry shows its immediate parent, not the whole path.
+        assert_eq!(
+            source.page_name(3),
+            PageName { parent: Some("deep".into()), file: "005.png".into() }
+        );
         let page = source.bytes(1).expect("entry readable");
         let decoded = crate::decode::decode(&page, "b/010.png").unwrap();
         assert_eq!(decoded.width, 2);

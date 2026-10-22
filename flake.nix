@@ -28,6 +28,8 @@
               libxkbcommon
               libGL
               libinput
+              # egui_system_font_provider dlopens libfontconfig at runtime
+              fontconfig
             ]);
           };
         });

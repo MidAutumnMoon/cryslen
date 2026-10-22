@@ -49,9 +49,9 @@ impl ViewMode {
     /// One line stating the mode's effect, shown on switch.
     pub fn effect(self) -> &'static str {
         match self {
-            ViewMode::Normal => "left to right · single page",
-            ViewMode::Manga => "right to left · double page",
-            ViewMode::Comic => "left to right · double page",
+            ViewMode::Normal => "left to right, single page",
+            ViewMode::Manga => "right to left, double page",
+            ViewMode::Comic => "left to right, double page",
         }
     }
 }
@@ -274,9 +274,9 @@ mod tests {
     #[test]
     fn mode_table_strings() {
         assert_eq!(ViewMode::ALL, [ViewMode::Normal, ViewMode::Manga, ViewMode::Comic]);
-        assert_eq!(ViewMode::Normal.effect(), "left to right · single page");
-        assert_eq!(ViewMode::Manga.effect(), "right to left · double page");
-        assert_eq!(ViewMode::Comic.effect(), "left to right · double page");
+        assert_eq!(ViewMode::Normal.effect(), "left to right, single page");
+        assert_eq!(ViewMode::Manga.effect(), "right to left, double page");
+        assert_eq!(ViewMode::Comic.effect(), "left to right, double page");
     }
 
     #[test]
