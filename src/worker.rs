@@ -10,7 +10,7 @@ use std::thread::JoinHandle;
 
 use crate::decode::Decoded;
 use crate::source::Source;
-use crate::view::Spread;
+use crate::view::{Spread, ViewMode};
 
 /// Approximate decoded bytes the book may hold. The wanted spread
 /// stays resident even over this budget. Frames the display holds
@@ -55,10 +55,10 @@ pub enum SeatView {
 }
 
 impl SpreadView {
-    /// Visual seating as [left, right], mirroring
+    /// Visual seating as [left, right] under `mode`, mirroring
     /// [`crate::view::Spread::seats`].
-    pub fn seats(&self, rtl: bool) -> [Option<&SeatView>; 2] {
-        if rtl {
+    pub fn seats(&self, mode: ViewMode) -> [Option<&SeatView>; 2] {
+        if mode.rtl() {
             [self.second.as_ref(), Some(&self.first)]
         } else {
             [Some(&self.first), self.second.as_ref()]
@@ -386,7 +386,7 @@ mod tests {
             let mut focus = 0;
             for turn in 0..spreads {
                 let window = neighbors(focus, page_count);
-                let spread = crate::view::spread_for(focus, true, page_count);
+                let spread = crate::view::spread_for(focus, ViewMode::Manga, page_count);
                 for page in [Some(spread.first), spread.second].into_iter().flatten() {
                     assert!(
                         window.contains(&page),
@@ -396,8 +396,9 @@ mod tests {
                 // The wrap turn jumps across the book, which prefetch
                 // cannot cover.
                 if turn + 1 < spreads {
-                    let next = crate::view::advance(focus, true, true, page_count);
-                    let next_spread = crate::view::spread_for(next, true, page_count);
+                    let next = crate::view::advance(focus, true, ViewMode::Manga, page_count);
+                    let next_spread =
+                        crate::view::spread_for(next, ViewMode::Manga, page_count);
                     for page in [Some(next_spread.first), next_spread.second]
                         .into_iter()
                         .flatten()
@@ -416,12 +417,17 @@ mod tests {
     #[test]
     fn view_seating_follows_reading_direction() {
         let lone = SpreadView { first: SeatView::Pending, second: None };
-        assert!(matches!(lone.seats(true), [None, Some(SeatView::Pending)]));
-        assert!(matches!(lone.seats(false), [Some(SeatView::Pending), None]));
+        assert!(matches!(lone.seats(ViewMode::Manga), [None, Some(SeatView::Pending)]));
+        assert!(matches!(lone.seats(ViewMode::Normal), [Some(SeatView::Pending), None]));
         let pair =
             SpreadView { first: SeatView::Pending, second: Some(SeatView::Failed("x".into())) };
-        assert!(matches!(pair.seats(true), [Some(SeatView::Failed(_)), Some(SeatView::Pending)]));
-        assert!(matches!(pair.seats(false), [Some(SeatView::Pending), Some(SeatView::Failed(_))]));
+        assert!(
+            matches!(pair.seats(ViewMode::Manga), [Some(SeatView::Failed(_)), Some(SeatView::Pending)])
+        );
+        assert!(matches!(
+            pair.seats(ViewMode::Normal),
+            [Some(SeatView::Pending), Some(SeatView::Failed(_))]
+        ));
     }
 
     #[test]

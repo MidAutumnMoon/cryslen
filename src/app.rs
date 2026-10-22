@@ -18,8 +18,8 @@ use crate::worker::{SeatView, SpreadView, Worker};
 
 /// User events that wake the parked loop.
 pub enum UserEvent {
-    /// egui wants a repaint after this delay. Arming only: `new_events`
-    /// fires the redraw when the deadline is reached.
+    /// Wake the loop after this delay, whoever asked. Arming only:
+    /// `new_events` fires the redraw when the deadline is reached.
     Repaint(Duration),
     /// The decode book changed. Redraw to pick up newly decided pages.
     PagesUpdated,
@@ -188,7 +188,7 @@ impl App {
         proxy: winit::event_loop::EventLoopProxy<UserEvent>,
     ) -> App {
         let state = State { index, ..DEFAULT_STATE };
-        let spread = crate::view::spread_for(state.index, state.mode.double(), source.len());
+        let spread = crate::view::spread_for(state.index, state.mode, source.len());
         worker.retune(spread);
         App {
             source,
@@ -211,7 +211,7 @@ impl App {
 
     /// Spread for the current index/mode, clamped to the book.
     fn spread(&self) -> Spread {
-        crate::view::spread_for(self.state.index, self.state.mode.double(), self.source.len())
+        crate::view::spread_for(self.state.index, self.state.mode, self.source.len())
     }
 
     /// Show each seat's Ready page, hold undecided and failed seats on
@@ -219,8 +219,8 @@ impl App {
     /// seat-ordered views for the status fold.
     fn display(&mut self, spread: Spread, snapshot: &SpreadView) -> [Option<SeatView>; 2] {
         let seat_views: [Option<SeatView>; 2] =
-            snapshot.seats(self.state.mode.rtl()).map(|seat| seat.cloned());
-        let wanted_pages = spread.seats(self.state.mode.rtl());
+            snapshot.seats(self.state.mode).map(|seat| seat.cloned());
+        let wanted_pages = spread.seats(self.state.mode);
         for seat in 0..2 {
             match (wanted_pages[seat], seat_views[seat].as_ref()) {
                 (None, _) => {
@@ -272,7 +272,7 @@ impl App {
             self.fit.fitted_to(total);
         }
 
-        let folded = fold_status(spread.seats(self.state.mode.rtl()), &seat_views);
+        let folded = fold_status(spread.seats(self.state.mode), &seat_views);
         self.waiting_since = if folded.waiting {
             Some(self.waiting_since.unwrap_or_else(Instant::now))
         } else {
@@ -360,16 +360,16 @@ impl App {
         match act {
             Action::Quit => event_loop.exit(),
             Action::SelectMode(mode) => {
-                let pairing_changed = mode.double() != self.state.mode.double();
+                let switch = crate::view::switch_mode(
+                    self.state.mode,
+                    mode,
+                    self.state.index,
+                    self.source.len(),
+                );
                 self.state.mode = mode;
+                self.state.index = switch.index;
                 self.mode_toast_since = Some(Instant::now());
-                if pairing_changed {
-                    self.state.index = crate::view::spread_for(
-                        self.state.index,
-                        mode.double(),
-                        self.source.len(),
-                    )
-                    .first;
+                if switch.pairing_changed {
                     self.after_page_change();
                 } else {
                     self.request_redraw(); // same pages, seats swap
@@ -392,7 +392,7 @@ impl App {
                 self.state.index = crate::view::advance(
                     self.state.index,
                     forward,
-                    self.state.mode.double(),
+                    self.state.mode,
                     self.source.len(),
                 );
                 self.after_page_change();

@@ -70,7 +70,7 @@ fn mode_color(mode: ViewMode) -> egui::Color32 {
     }
 }
 
-/// The single status line, separate so it is directly testable.
+/// The left-side facts, separate so they are directly testable.
 fn line(status: &StatusLine) -> String {
     let mut head = format!("{}/{}", status.spread.first + 1, status.total);
     if let Some(second) = status.spread.second {

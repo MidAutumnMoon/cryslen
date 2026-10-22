@@ -66,12 +66,12 @@ pub struct Spread {
     pub second: Option<usize>,
 }
 
-/// Spread containing `index` when double-page mode is on/off, clamped to the
-/// book: an odd tail shows one page (`second: None`), never a phantom page.
-pub fn spread_for(index: usize, double: bool, len: usize) -> Spread {
+/// Spread containing `index` under `mode`, clamped to the book: an
+/// odd tail shows one page (`second: None`), never a phantom page.
+pub fn spread_for(index: usize, mode: ViewMode, len: usize) -> Spread {
     let len = len.max(1);
     let index = index.min(len - 1);
-    if !double {
+    if !mode.double() {
         return Spread { first: index, second: None };
     }
     if index == 0 {
@@ -82,12 +82,12 @@ pub fn spread_for(index: usize, double: bool, len: usize) -> Spread {
 }
 
 /// Next/previous spread start from `current`, wrapping at the ends.
-/// Forward from the last spread lands on the cover, and backward from the
-/// cover on the last spread. Always returns a spread *start*.
-pub fn advance(current: usize, forward: bool, double: bool, len: usize) -> usize {
+/// Forward from the last spread lands on the cover, and backward from
+/// the cover on the last spread. Always returns a spread *start*.
+pub fn advance(current: usize, forward: bool, mode: ViewMode, len: usize) -> usize {
     let len = len.max(1);
     let current = current.min(len - 1);
-    if !double {
+    if !mode.double() {
         let next = if forward { current + 1 } else { current + len - 1 };
         return next % len;
     }
@@ -96,6 +96,26 @@ pub fn advance(current: usize, forward: bool, double: bool, len: usize) -> usize
     let number = spread_number(current);
     let next = if forward { (number + 1) % spreads } else { (number + spreads - 1) % spreads };
     spread_start(next)
+}
+
+/// What a mode switch does to the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModeSwitch {
+    /// The spread start to land on.
+    pub index: usize,
+    /// Whether the pairing changed, demanding the page-turn treatment.
+    pub pairing_changed: bool,
+}
+
+/// Landing page when the mode switches from `old` to `new`. A pairing
+/// change lands on the new spread's start. A direction-only change
+/// keeps the page.
+pub fn switch_mode(old: ViewMode, new: ViewMode, index: usize, len: usize) -> ModeSwitch {
+    if old.double() == new.double() {
+        ModeSwitch { index, pairing_changed: false }
+    } else {
+        ModeSwitch { index: spread_for(index, new, len).first, pairing_changed: true }
+    }
 }
 
 /// 0-based spread number of a page. The cover is 0, and pages 1 and 2
@@ -110,10 +130,11 @@ fn spread_start(number: usize) -> usize {
 }
 
 impl Spread {
-    /// Visual seating as [left, right]. Western reads first-left. Manga
-    /// reads first-right, so a lone page lands in the right seat.
-    pub fn seats(&self, rtl: bool) -> [Option<usize>; 2] {
-        if rtl {
+    /// Visual seating as [left, right] under `mode`. Western reads
+    /// first-left. Manga reads first-right, so a lone page lands in
+    /// the right seat.
+    pub fn seats(&self, mode: ViewMode) -> [Option<usize>; 2] {
+        if mode.rtl() {
             [self.second, Some(self.first)]
         } else {
             [Some(self.first), self.second]
@@ -349,63 +370,63 @@ mod tests {
 
     #[test]
     fn cover_alone_then_pairs() {
-        assert_eq!(spread_for(0, true, 10), Spread { first: 0, second: None });
-        assert_eq!(spread_for(1, true, 10), Spread { first: 1, second: Some(2) });
-        assert_eq!(spread_for(2, true, 10), Spread { first: 1, second: Some(2) });
-        assert_eq!(spread_for(3, true, 10), Spread { first: 3, second: Some(4) });
-        assert_eq!(spread_for(0, false, 10), Spread { first: 0, second: None });
-        assert_eq!(spread_for(5, false, 10), Spread { first: 5, second: None });
+        assert_eq!(spread_for(0, ViewMode::Manga, 10), Spread { first: 0, second: None });
+        assert_eq!(spread_for(1, ViewMode::Manga, 10), Spread { first: 1, second: Some(2) });
+        assert_eq!(spread_for(2, ViewMode::Manga, 10), Spread { first: 1, second: Some(2) });
+        assert_eq!(spread_for(3, ViewMode::Manga, 10), Spread { first: 3, second: Some(4) });
+        assert_eq!(spread_for(0, ViewMode::Normal, 10), Spread { first: 0, second: None });
+        assert_eq!(spread_for(5, ViewMode::Normal, 10), Spread { first: 5, second: None });
     }
 
     #[test]
     fn odd_tail_clamps_at_source() {
         // 7 pages: index 6 lives in pair (5, 6).
-        assert_eq!(spread_for(6, true, 7), Spread { first: 5, second: Some(6) });
+        assert_eq!(spread_for(6, ViewMode::Manga, 7), Spread { first: 5, second: Some(6) });
         // 6 pages: the would-be pair (5, 6) shows page 5 alone, with no
         // phantom page.
-        assert_eq!(spread_for(5, true, 6), Spread { first: 5, second: None });
+        assert_eq!(spread_for(5, ViewMode::Manga, 6), Spread { first: 5, second: None });
         // Out-of-range index clamps to the last page.
-        assert_eq!(spread_for(99, true, 6).first, 5);
+        assert_eq!(spread_for(99, ViewMode::Manga, 6).first, 5);
     }
 
     #[test]
     fn advance_steps_and_wraps() {
-        assert_eq!(advance(1, true, true, 10), 3);
-        assert_eq!(advance(3, false, true, 10), 1);
+        assert_eq!(advance(1, true, ViewMode::Manga, 10), 3);
+        assert_eq!(advance(3, false, ViewMode::Manga, 10), 1);
         // 8 is the second page of the last spread (7, 8).
-        assert_eq!(advance(8, true, true, 9), 0);
-        assert_eq!(advance(1, false, true, 10), 0);
-        assert_eq!(advance(4, true, false, 10), 5);
+        assert_eq!(advance(8, true, ViewMode::Manga, 9), 0);
+        assert_eq!(advance(1, false, ViewMode::Manga, 10), 0);
+        assert_eq!(advance(4, true, ViewMode::Normal, 10), 5);
         // The cover's next spread starts at 1, not 2 (status-line bug class).
-        assert_eq!(advance(0, true, true, 10), 1);
+        assert_eq!(advance(0, true, ViewMode::Manga, 10), 1);
     }
 
     #[test]
     fn advance_wraps_at_both_ends() {
         // Single mode: last page to first and back.
-        assert_eq!(advance(9, true, false, 10), 0);
-        assert_eq!(advance(0, false, false, 10), 9);
+        assert_eq!(advance(9, true, ViewMode::Normal, 10), 0);
+        assert_eq!(advance(0, false, ViewMode::Normal, 10), 9);
         // Double mode with a lone tail page.
-        assert_eq!(advance(9, true, true, 10), 0);
-        assert_eq!(advance(0, false, true, 10), 9);
+        assert_eq!(advance(9, true, ViewMode::Manga, 10), 0);
+        assert_eq!(advance(0, false, ViewMode::Manga, 10), 9);
         // Double mode ending on a full pair.
-        assert_eq!(advance(7, true, true, 9), 0);
-        assert_eq!(advance(0, false, true, 9), 7);
+        assert_eq!(advance(7, true, ViewMode::Manga, 9), 0);
+        assert_eq!(advance(0, false, ViewMode::Manga, 9), 7);
         // Odd tail: 6 pages are 0 | 1,2 | 3,4 | 5.
-        assert_eq!(advance(5, true, true, 6), 0);
-        assert_eq!(advance(0, false, true, 6), 5);
+        assert_eq!(advance(5, true, ViewMode::Manga, 6), 0);
+        assert_eq!(advance(0, false, ViewMode::Manga, 6), 5);
     }
 
     #[test]
     fn advance_round_trips_through_spread_starts() {
         // A mid-spread page round-trips to its spread start, not to itself.
         for len in [1, 2, 3, 6, 9, 10] {
-            for &double in &[false, true] {
+            for &mode in &ViewMode::ALL {
                 for page in 0..len {
                     for &forward in &[false, true] {
-                        let stepped = advance(page, forward, double, len);
-                        let back = advance(stepped, !forward, double, len);
-                        assert_eq!(back, spread_for(page, double, len).first);
+                        let stepped = advance(page, forward, mode, len);
+                        let back = advance(stepped, !forward, mode, len);
+                        assert_eq!(back, spread_for(page, mode, len).first);
                     }
                 }
             }
@@ -414,23 +435,46 @@ mod tests {
 
     #[test]
     fn advance_tiny_books() {
-        assert_eq!(advance(0, true, true, 1), 0);
-        assert_eq!(advance(0, false, false, 1), 0);
+        assert_eq!(advance(0, true, ViewMode::Manga, 1), 0);
+        assert_eq!(advance(0, false, ViewMode::Normal, 1), 0);
         // 2 pages, double mode: cover and one lone page cycle into each
         // other.
-        assert_eq!(advance(0, true, true, 2), 1);
-        assert_eq!(advance(1, true, true, 2), 0);
+        assert_eq!(advance(0, true, ViewMode::Manga, 2), 1);
+        assert_eq!(advance(1, true, ViewMode::Manga, 2), 0);
         // A zero-length book never exists, but the math must tolerate it.
-        assert_eq!(advance(0, true, true, 0), 0);
+        assert_eq!(advance(0, true, ViewMode::Manga, 0), 0);
+    }
+
+    #[test]
+    fn mode_switch_reclamps_only_on_pairing_change() {
+        // A pairing change lands on the new spread's start.
+        assert_eq!(
+            switch_mode(ViewMode::Normal, ViewMode::Manga, 2, 10),
+            ModeSwitch { index: 1, pairing_changed: true }
+        );
+        // The cover stays the cover.
+        let s = switch_mode(ViewMode::Normal, ViewMode::Comic, 0, 10);
+        assert_eq!(s.index, 0);
+        assert!(s.pairing_changed);
+        // A direction-only change keeps the page.
+        assert_eq!(
+            switch_mode(ViewMode::Manga, ViewMode::Comic, 5, 10),
+            ModeSwitch { index: 5, pairing_changed: false }
+        );
+        // So does re-selecting the mode.
+        let s = switch_mode(ViewMode::Manga, ViewMode::Manga, 5, 10);
+        assert_eq!(s.index, 5);
+        assert!(!s.pairing_changed);
     }
 
     #[test]
     fn seats_follow_reading_direction() {
         let s = Spread { first: 1, second: Some(2) };
-        assert_eq!(s.seats(false), [Some(1), Some(2)]);
-        assert_eq!(s.seats(true), [Some(2), Some(1)]);
+        assert_eq!(s.seats(ViewMode::Normal), [Some(1), Some(2)]);
+        assert_eq!(s.seats(ViewMode::Comic), [Some(1), Some(2)]);
+        assert_eq!(s.seats(ViewMode::Manga), [Some(2), Some(1)]);
         let lone = Spread { first: 5, second: None };
-        assert_eq!(lone.seats(false), [Some(5), None]);
-        assert_eq!(lone.seats(true), [None, Some(5)]);
+        assert_eq!(lone.seats(ViewMode::Normal), [Some(5), None]);
+        assert_eq!(lone.seats(ViewMode::Manga), [None, Some(5)]);
     }
 }
