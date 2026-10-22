@@ -22,16 +22,16 @@ enum ToWorker {
     Stop,
 }
 
-/// The worker's answer for one wanted spread, in spread order. A page
-/// without an outcome reads as [`SeatView::Pending`], so there is no
-/// unknown state.
+/// The worker's answer for one wanted spread, in spread order. An
+/// undecided page reads as [`SeatView::Pending`], so there is no unknown
+/// state.
 #[derive(Clone)]
 pub struct SpreadView {
     pub first: SeatView,
     pub second: Option<SeatView>,
 }
 
-/// One page's view: decided (`Ready`, `Failed`) or still [`Pending`].
+/// One page's view: decided (`Ready`, `Failed`) or still [`SeatView::Pending`].
 /// The book stores decided views only. A failed page is sticky, so its
 /// error follows the page across turns.
 #[derive(Clone)]
@@ -66,7 +66,7 @@ impl SpreadView {
 /// `store`, whose eviction cannot take a wanted page.
 struct Book {
     wanted: Spread,
-    outcomes: HashMap<usize, SeatView>,
+    decided: HashMap<usize, SeatView>,
     pending: BTreeSet<usize>,
     /// When each page was last wanted, written only by `retune`. A page
     /// never recorded here was never wanted and leaves the book first.
@@ -84,7 +84,7 @@ impl Book {
     fn new() -> Book {
         Book {
             wanted: Spread { first: 0, second: None },
-            outcomes: HashMap::new(),
+            decided: HashMap::new(),
             pending: BTreeSet::new(),
             last_wanted: HashMap::new(),
             recency_counter: 0,
@@ -116,7 +116,7 @@ impl Book {
     /// distance. Decided pages leave the pending set, so a page is never
     /// decoded twice.
     fn take_next(&mut self) -> Option<usize> {
-        self.pending.retain(|page| !self.outcomes.contains_key(page));
+        self.pending.retain(|page| !self.decided.contains_key(page));
         self.pending
             .iter()
             .copied()
@@ -124,9 +124,9 @@ impl Book {
     }
 
     /// Decide a pending page, then evict until under budget.
-    fn store(&mut self, page: usize, outcome: SeatView) {
-        let bytes = outcome.resident_bytes();
-        if let Some(old) = self.outcomes.insert(page, outcome) {
+    fn store(&mut self, page: usize, seat_view: SeatView) {
+        let bytes = seat_view.resident_bytes();
+        if let Some(old) = self.decided.insert(page, seat_view) {
             self.live_bytes -= old.resident_bytes();
         }
         self.live_bytes += bytes;
@@ -147,7 +147,7 @@ impl Book {
     }
 
     fn seat_view(&self, page: usize) -> SeatView {
-        self.outcomes.get(&page).cloned().unwrap_or(SeatView::Pending)
+        self.decided.get(&page).cloned().unwrap_or(SeatView::Pending)
     }
 
     /// Eviction victims are never-wanted pages first, then least
@@ -159,7 +159,7 @@ impl Book {
         }
         let wanted = self.wanted;
         let mut victims: Vec<usize> = self
-            .outcomes
+            .decided
             .keys()
             .copied()
             .filter(|&page| !wanted.contains(page))
@@ -172,7 +172,7 @@ impl Book {
             )
         });
         for page in victims {
-            if let Some(old) = self.outcomes.remove(&page) {
+            if let Some(old) = self.decided.remove(&page) {
                 self.live_bytes -= old.resident_bytes();
             }
             if self.live_bytes <= self.budget {
@@ -184,7 +184,7 @@ impl Book {
 
     fn assert_wanted_covered(&self) {
         let covered =
-            |page: usize| self.outcomes.contains_key(&page) || self.pending.contains(&page);
+            |page: usize| self.decided.contains_key(&page) || self.pending.contains(&page);
         debug_assert!(covered(self.wanted.first));
         if let Some(second) = self.wanted.second {
             debug_assert!(covered(second));
@@ -221,8 +221,7 @@ impl Worker {
         let _ = self.tx.send(ToWorker::Retune(wanted));
     }
 
-    /// The current outcome for both seats of `wanted`, read under one
-    /// lock.
+    /// The current view for both seats of `wanted`, read under one lock.
     pub fn snapshot(&self, wanted: &Spread) -> SpreadView {
         self.book.lock().expect("decode book lock").snapshot(wanted)
     }
@@ -272,14 +271,14 @@ fn run(
             retunes.push(arrived);
             continue;
         };
-        let outcome = decode_page(source, page_index);
+        let decoded = decode_page(source, page_index);
         {
             let mut book = book.lock().expect("decode book lock");
-            let outcome = match outcome {
+            let seat_view = match decoded {
                 Ok(page) => SeatView::Ready(page),
                 Err(message) => SeatView::Failed(message),
             };
-            book.store(page_index, outcome);
+            book.store(page_index, seat_view);
         }
         notify();
     }
@@ -466,8 +465,8 @@ mod tests {
         book.retune(wanted, 10);
         book.store(1, ready_page(1));
         book.store(3, ready_page(3));
-        assert!(book.outcomes.contains_key(&3));
-        assert!(!book.outcomes.contains_key(&1));
+        assert!(book.decided.contains_key(&3));
+        assert!(!book.decided.contains_key(&1));
         assert!(book.live_bytes <= book.budget);
     }
 
@@ -481,8 +480,8 @@ mod tests {
         book.store(1, ready_page(1));
         // Page 3 is nearer the spread but was never wanted, so it goes.
         book.store(3, ready_page(3));
-        assert!(book.outcomes.contains_key(&1));
-        assert!(!book.outcomes.contains_key(&3));
+        assert!(book.decided.contains_key(&1));
+        assert!(!book.decided.contains_key(&3));
     }
 
     #[test]
@@ -495,8 +494,8 @@ mod tests {
         book.retune(wanted, 10);
         book.store(1, ready_page(1));
         book.store(2, ready_page(2));
-        assert!(book.outcomes.contains_key(&2));
-        assert!(!book.outcomes.contains_key(&1));
+        assert!(book.decided.contains_key(&2));
+        assert!(!book.decided.contains_key(&1));
     }
 
     // The endgame pin: a full book must evict the oldest unwanted page,
@@ -511,9 +510,9 @@ mod tests {
         book.store(1, ready_page(1));
         book.store(7, ready_page(7));
         book.store(8, ready_page(8));
-        assert!(book.outcomes.contains_key(&7));
-        assert!(book.outcomes.contains_key(&8));
-        assert!(!book.outcomes.contains_key(&1));
+        assert!(book.decided.contains_key(&7));
+        assert!(book.decided.contains_key(&8));
+        assert!(!book.decided.contains_key(&1));
         let snapshot = book.snapshot(&wanted);
         assert!(matches!(snapshot.first, SeatView::Ready(_)));
         assert!(matches!(snapshot.second, Some(SeatView::Ready(_))));
@@ -535,7 +534,7 @@ mod tests {
             .unwrap(),
         ));
         book.store(3, oversize_page);
-        assert!(book.outcomes.contains_key(&3));
+        assert!(book.decided.contains_key(&3));
     }
 
     #[test]

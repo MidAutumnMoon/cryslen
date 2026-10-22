@@ -117,7 +117,8 @@ write orientation tags, so fixtures for it must come from real files.
   backlog. One in-flight decode always completes, and no cancellation
   tokens are needed.
 - Decided pages and the pending trail live in one book under one lock.
-  Outcomes are `Ready(Arc<Decoded>) | Failed(String)`. Failures are
+  Stored views are `SeatView::Ready(Arc<Decoded>) | SeatView::Failed(String)`,
+  with `Pending` synthesized for snapshots. Failures are
   sticky per page, so an error follows its page across turns.
 - Byte budget in the hundreds of MiB. Eviction victims are never-wanted
   pages first, then least recently wanted, then farthest from the

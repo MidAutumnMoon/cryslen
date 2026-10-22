@@ -91,7 +91,7 @@ struct Fit {
 }
 
 impl Fit {
-    /// Whether the view must be fitted to `total` this frame.
+    /// Whether the placement must be fitted to `total` this frame.
     fn should_refit(&self, total: (f32, f32)) -> bool {
         self.settled != Some(total)
     }
@@ -166,7 +166,7 @@ pub struct App {
     dragging: bool,
     /// Set while any wanted seat is undecided. The last frame stays on
     /// screen (hold-last-frame rule) and the status line flags waiting
-    /// after 150 ms. No spinner animation: it would force repaints.
+    /// after [`WAIT_GRACE`]. No spinner animation: it would force repaints.
     waiting_since: Option<Instant>,
     /// Set while the mode-switch toast is showing in the status bar.
     mode_toast_since: Option<Instant>,
@@ -321,7 +321,7 @@ impl App {
         gl.window.winit.set_visible(true);
     }
 
-    /// Physical surface size, resizing the GL surface when it changed.
+    /// Physical surface size, resizing the GL surface to match.
     /// None when there is no window yet or it is minimized.
     fn surface_size(&mut self) -> Option<winit::dpi::PhysicalSize<u32>> {
         let gl = self.gl.as_mut()?;
@@ -415,8 +415,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
         let gl = window.glow();
         let egui = egui_glow::EguiGlow::new(event_loop, Arc::clone(&gl), None, None, true);
         // System fonts join the family fallback chains lazily, for filename
-        // characters the built-in fonts cannot render. The provider reaches
-        // fontconfig by dlopen, which the devShell's LD_LIBRARY_PATH serves.
+        // characters the built-in fonts cannot render.
         egui.egui_ctx
             .add_font_provider(Arc::new(egui_system_font_provider::SystemFontProvider::new()));
         // Bridge egui repaint requests into the winit loop.
@@ -677,8 +676,7 @@ mod tests {
         let folded = fold_status(spread, ViewMode::Manga, &lead_pending);
         assert_eq!(folded.page, Some((Format::Png, (800, 600))));
         assert!(folded.waiting);
-        // A failed lead stops the fold: no facts, and the partner's would
-        // describe the wrong page.
+        // A failed lead stops the fold.
         let lead_failed = [Some(ready(800, 600)), Some(SeatView::Failed("seat1".into()))];
         let folded = fold_status(spread, ViewMode::Manga, &lead_failed);
         assert_eq!(folded.page, None);

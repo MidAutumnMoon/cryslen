@@ -117,12 +117,12 @@ fn line(style: &egui::Style, status: &StatusLine) -> egui::text::LayoutJob {
         section(&mut job, " · ".into(), plain);
         // A format label shows only when the filename's extension lies.
         let (w, h) = facts.dims;
-        let dims = if facts.claimed != Some(facts.decoded) {
+        let dims_text = if facts.claimed != Some(facts.decoded) {
             format!("{} {w}x{h}", facts.decoded.label())
         } else {
             format!("{w}x{h}")
         };
-        section(&mut job, dims, plain);
+        section(&mut job, dims_text, plain);
     }
     section(&mut job, format!(" · {:.0}%", status.zoom * 100.0), plain);
     if status.waiting {

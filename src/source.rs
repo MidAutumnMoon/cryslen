@@ -240,10 +240,10 @@ impl Source {
         let file = entry.rsplit('/').next().unwrap_or(entry).to_string();
         let parent = match &self.kind {
             SourceKind::Directory(dir) => {
-                dir.file_name().map(|n| n.to_string_lossy().into_owned())
+                dir.file_name().map(|name| name.to_string_lossy().into_owned())
             }
-            SourceKind::Zip(_) | SourceKind::SevenZip(_) => entry.rsplit_once('/').map(|(p, _)| {
-                p.rsplit('/').next().unwrap_or(p).to_string()
+            SourceKind::Zip(_) | SourceKind::SevenZip(_) => entry.rsplit_once('/').map(|(path, _)| {
+                path.rsplit('/').next().unwrap_or(path).to_string()
             }),
         };
         PageName { parent, file }

@@ -165,7 +165,7 @@ pub struct PageRect {
 }
 
 /// Layout of a spread's visual seats. `rects` is always [left, right].
-/// Seating (which page goes where) was decided before layout by
+/// Seating (which page goes where) is decided before layout by
 /// [`Spread::seats`]. A seat with no decoded page yet is `None`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SpreadLayout {
@@ -214,7 +214,7 @@ pub fn fit(total: (f32, f32), win: (f32, f32)) -> Placement {
 }
 
 /// Zoom scale bounds: `scale` is screen px per image px, so these cap how
-/// far in (40 px per image px) and out (1 image px covers 20 screen px) a
+/// far in (40 px per image px) and out (20 image px per screen px) a
 /// page can be zoomed.
 const MIN_SCALE: f32 = 0.05;
 const MAX_SCALE: f32 = 40.0;
@@ -222,19 +222,22 @@ const MAX_SCALE: f32 = 40.0;
 /// Zoom by `factor`, keeping the image point under `cursor` (screen px)
 /// anchored. Clamps scale to [`MIN_SCALE`]..=[`MAX_SCALE`]. The anchor uses
 /// the *actual* factor applied so hitting the clamp does not shift the image.
-pub fn zoom_at(mut view: Placement, cursor: (f32, f32), factor: f32) -> Placement {
-    let old = view.scale;
-    view.scale = (old * factor).clamp(MIN_SCALE, MAX_SCALE);
-    let applied = view.scale / old;
+pub fn zoom_at(mut placement: Placement, cursor: (f32, f32), factor: f32) -> Placement {
+    let old = placement.scale;
+    placement.scale = (old * factor).clamp(MIN_SCALE, MAX_SCALE);
+    let applied = placement.scale / old;
     // keep the image pixel under the cursor fixed: off' = cursor - (cursor-off)*applied
-    view.offset = (cursor.0 - (cursor.0 - view.offset.0) * applied,
-                   cursor.1 - (cursor.1 - view.offset.1) * applied);
-    view
+    placement.offset = (cursor.0 - (cursor.0 - placement.offset.0) * applied,
+                        cursor.1 - (cursor.1 - placement.offset.1) * applied);
+    placement
 }
 
 /// Pan by `delta` screen px.
-pub fn pan(view: Placement, delta: (f32, f32)) -> Placement {
-    Placement { scale: view.scale, offset: (view.offset.0 + delta.0, view.offset.1 + delta.1) }
+pub fn pan(placement: Placement, delta: (f32, f32)) -> Placement {
+    Placement {
+        scale: placement.scale,
+        offset: (placement.offset.0 + delta.0, placement.offset.1 + delta.1),
+    }
 }
 
 /// Reachability margin for [`clamp`]: at most this many px of the spread may
@@ -244,7 +247,7 @@ const EDGE_KEEP_PX: f32 = 64.0;
 /// Clamp pan so the spread cannot be lost: at least `EDGE_KEEP_PX` px of it
 /// stays inside the window. An axis where the scaled spread fits the window
 /// is pinned to the centered position.
-pub fn clamp(view: Placement, total: (f32, f32), window: (f32, f32)) -> Placement {
+pub fn clamp(placement: Placement, total: (f32, f32), window: (f32, f32)) -> Placement {
     let axis = |offset: f32, content: f32, window: f32| -> f32 {
         if content <= window {
             (window - content) / 2.0
@@ -252,12 +255,12 @@ pub fn clamp(view: Placement, total: (f32, f32), window: (f32, f32)) -> Placemen
             offset.clamp(window - content - EDGE_KEEP_PX, EDGE_KEEP_PX)
         }
     };
-    let scaled = (total.0 * view.scale, total.1 * view.scale);
+    let scaled = (total.0 * placement.scale, total.1 * placement.scale);
     Placement {
-        scale: view.scale,
+        scale: placement.scale,
         offset: (
-            axis(view.offset.0, scaled.0, window.0),
-            axis(view.offset.1, scaled.1, window.1),
+            axis(placement.offset.0, scaled.0, window.0),
+            axis(placement.offset.1, scaled.1, window.1),
         ),
     }
 }
@@ -399,7 +402,7 @@ mod tests {
         assert_eq!(advance(8, true, ViewMode::Manga, 9), 0);
         assert_eq!(advance(1, false, ViewMode::Manga, 10), 0);
         assert_eq!(advance(4, true, ViewMode::Normal, 10), 5);
-        // The cover's next spread starts at 1, not 2 (status-line bug class).
+        // The cover's next spread starts at 1, not 2.
         assert_eq!(advance(0, true, ViewMode::Manga, 10), 1);
     }
 
