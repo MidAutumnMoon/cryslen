@@ -5,9 +5,8 @@
 //! color conversion. JXL uses jxl-rs with a scoped-thread parallel runner.
 //!
 //! All functions here are panics-clean for corrupt input: they return
-//! `DecodeError`, never panic. Any panic that still escapes is contained by
-//! the worker's `catch_unwind` in `decode_page`. The FFI `unsafe` for AVIF
-//! is confined to the `avif` submodule.
+//! `DecodeError`, never panic. The FFI `unsafe` for AVIF is confined to
+//! the `avif` submodule.
 
 use std::error::Error;
 use std::fmt;
@@ -16,8 +15,8 @@ use ::jxl::error::Error as JxlError;
 
 /// Decoded page: dimensions plus pixels in one of two layouts. Construct via
 /// [`Decoded::rgba`] / [`Decoded::yuv`], which validate that pixel extents
-/// match the dimensions. Extent bugs surface as worker decode errors here,
-/// not as display-time panics.
+/// match the dimensions. Extent bugs surface as construction errors, not
+/// display-time panics.
 #[derive(Clone)]
 pub struct Decoded {
     pub width: u32,
@@ -242,8 +241,8 @@ pub fn decode(bytes: &[u8], name: &str) -> Result<Decoded, DecodeError> {
     }
 }
 
-/// Extension -> format table. Also the listing filter for page sources:
-/// one table decides both what can decode and what gets listed.
+/// Extension -> format table. The same table decides what can decode and
+/// what gets listed as a page.
 pub(crate) fn format_from_name(name: &str) -> Option<Format> {
     use std::path::Path;
 
@@ -264,8 +263,7 @@ pub(crate) fn format_from_name(name: &str) -> Option<Format> {
     })
 }
 
-/// Magic-byte sniffing. `None` only means "no known signature": the caller
-/// falls back to the extension.
+/// Magic-byte sniffing. `None` only means no known signature.
 fn sniff(bytes: &[u8]) -> Option<Format> {
     if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
         return Some(Format::Jpeg);
@@ -338,8 +336,8 @@ fn decode_image(bytes: &[u8], format: Format) -> Result<Decoded, DecodeError> {
 }
 
 /// libavif FFI: decoder over the in-memory file, YUV planes copied out
-/// directly (avifImageYUVToRGB would cost a full RGB conversion we do on the
-/// GPU instead.
+/// directly. avifImageYUVToRGB would do the RGB conversion on the CPU.
+/// The GPU does it at draw time.
 mod avif {
     use libavif_sys::*;
 
@@ -605,8 +603,8 @@ mod jxl {
     }
 
     /// Scoped-thread runner. Per-task errors inside the threads are
-    /// swallowed. A genuinely broken codestream fails the sequential
-    /// `process` call right after.
+    /// swallowed. A broken codestream fails the sequential `process`
+    /// call right after.
     struct Pool(usize);
     impl JxlParallelRunner for Pool {
         fn run(&mut self, num: usize, fun: &JxlParallelRunnerFun<'_>) -> error::Result<()> {
@@ -636,7 +634,7 @@ mod jxl {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, reason = "test code fails fast by design")]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, reason = "a panic in test code is inconsequential")]
 mod tests {
     use super::*;
     use crate::testkit;

@@ -15,8 +15,7 @@ use crate::source::Source;
 use crate::view::{Spread, ViewMode};
 
 /// Approximate decoded bytes the book may hold. The wanted spread
-/// stays resident even over this budget. Frames the display holds
-/// outlive the book entirely.
+/// stays resident even over this budget.
 const BOOK_BUDGET_BYTES: usize = 768 * 1024 * 1024;
 
 enum ToWorker {
@@ -54,8 +53,7 @@ impl SeatView {
 }
 
 impl SpreadView {
-    /// Visual seating as [left, right] under `mode`, by the shared rule
-    /// in [`crate::view::seating`].
+    /// Visual seating as [left, right] under `mode`.
     pub fn seats(&self, mode: ViewMode) -> [Option<&SeatView>; 2] {
         use crate::view;
 
@@ -240,14 +238,12 @@ impl Worker {
     /// The current view for both seats of `wanted`, read under one lock.
     pub fn snapshot(&self, wanted: &Spread) -> SpreadView {
         // A poisoned book lock means a panic struck mid-mutation, so
-        // live_bytes may no longer match the decided entries. Crash
-        // rather than run on drifted state; source.rs's cache locks
-        // recover (lock_recovered) because their guarded data stays
-        // independently valid. Unreachable in release: decode runs
-        // outside the lock, inside catch_unwind.
+        // live_bytes may not match the decided entries. Crash rather than
+        // run on drifted state. Poisoning is unreachable in release
+        // because decode runs outside the lock.
         #[expect(
             clippy::expect_used,
-            reason = "a poisoned book lock means drifted state; crash rather than recover"
+            reason = "a poisoned book lock means drifted state, so crash rather than recover"
         )]
         let book = self.book.lock().expect("decode book lock");
         book.snapshot(wanted)
@@ -286,7 +282,7 @@ fn run(
         if !retunes.is_empty() {
             #[expect(
                 clippy::expect_used,
-                reason = "a poisoned book lock means drifted state; see Worker::snapshot"
+                reason = "a poisoned book lock means drifted state, so crash rather than recover"
             )]
             let mut book = book.lock().expect("decode book lock");
             for &spread in &retunes {
@@ -298,7 +294,7 @@ fn run(
         // so the lock is not held across the blocking recv below.
         #[expect(
             clippy::expect_used,
-            reason = "a poisoned book lock means drifted state; see Worker::snapshot"
+            reason = "a poisoned book lock means drifted state, so crash rather than recover"
         )]
         let Some(page_index) = book.lock().expect("decode book lock").take_next() else {
             let arrived = match rx.recv() {
@@ -312,7 +308,7 @@ fn run(
         {
             #[expect(
                 clippy::expect_used,
-                reason = "a poisoned book lock means drifted state; see Worker::snapshot"
+                reason = "a poisoned book lock means drifted state, so crash rather than recover"
             )]
             let mut book = book.lock().expect("decode book lock");
             let seat_view = match decoded {
@@ -363,11 +359,10 @@ fn panic_message(panic: Box<dyn Any + Send>) -> String {
     }
 }
 
-/// How many pages on each side of the wanted spread to prefetch. The
-/// app anchors each spread on its first page, and a double-mode turn
-/// steps two pages, so the far page of the next spread sits at distance
-/// 3. Single-page mode over-prefetches by the same margin, which the
-/// book reclaims first as never-wanted.
+/// How many pages on each side of the wanted spread's first page to
+/// prefetch. A double-mode turn steps two pages, so the far page of the
+/// next spread sits at distance 3. Single-page mode over-prefetches by
+/// the same margin, which the book reclaims first as never-wanted.
 const PREFETCH_RADIUS: i64 = 3;
 
 /// Decode order around the wanted spread: its first page, then
@@ -398,7 +393,7 @@ fn retain_trail(pending: &mut BTreeSet<usize>, anchor: usize, wanted: &Spread) {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, reason = "test code fails fast by design")]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, reason = "a panic in test code is inconsequential")]
 mod tests {
     use super::*;
     use crate::decode::Format;

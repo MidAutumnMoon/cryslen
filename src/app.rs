@@ -160,10 +160,7 @@ pub struct App {
     state: State,
     /// GL exists only after `resumed` (winit requirement).
     gl: Option<Gl>,
-    /// Fatal GL error: startup failure from `resumed` or a frame's swap
-    /// failure. winit handlers return (), so main reports it after the
-    /// event loop exits.
-    pub start_error: Option<eros::ErrorUnion>,
+    pub fatal_error: Option<eros::ErrorUnion>,
     /// What each seat holds, the last frame included. Worker eviction
     /// can drop the book's entry, never the pixels held here.
     held: [Option<Arc<Decoded>>; 2],
@@ -184,7 +181,7 @@ pub struct App {
     last_layout: SpreadLayout,
     fit: Fit,
     /// Proxy for egui's repaint bridge. winit 0.30 cannot create one from
-    /// `ActiveEventLoop` (only `EventLoop::create_proxy`, before `run_app`).
+    /// `ActiveEventLoop`.
     proxy: EventLoopProxy<UserEvent>,
 }
 
@@ -203,7 +200,7 @@ impl App {
             worker,
             state,
             gl: None,
-            start_error: None,
+            fatal_error: None,
             held: [None, None],
             retuned_spread: spread,
             cursor: (0.0, 0.0),
@@ -341,7 +338,7 @@ impl App {
         let gl = self.gl.as_mut()?;
         let size = gl.window.winit.inner_size();
         if size.width == 0 || size.height == 0 {
-            return None; // minimized
+            return None;
         }
         gl.window.resize(size);
         Some(size)
@@ -422,7 +419,7 @@ impl ApplicationHandler<UserEvent> for App {
         let window = match Window::new(event_loop) {
             Ok(window) => window,
             Err(error) => {
-                self.start_error = Some(error);
+                self.fatal_error = Some(error);
                 event_loop.exit();
                 return;
             }
@@ -431,19 +428,17 @@ impl ApplicationHandler<UserEvent> for App {
         let pages = match PageTextures::new(Arc::clone(&gl)) {
             Ok(pages) => pages,
             Err(error) => {
-                self.start_error = Some(error);
+                self.fatal_error = Some(error);
                 event_loop.exit();
                 return;
             }
         };
-        // EguiGlow::new can still panic on shader failure (an upstream
-        // unwrap, egui_glow TODO). Accepted dependency risk.
+        // `EguiGlow::new` can panic. Accepted upstream risk.
         let egui = egui_glow::EguiGlow::new(event_loop, Arc::clone(&gl), None, None, true);
         // System fonts join the family fallback chains lazily, for filename
         // characters the built-in fonts cannot render.
         egui.egui_ctx
             .add_font_provider(Arc::new(egui_system_font_provider::SystemFontProvider::new()));
-        // Bridge egui repaint requests into the winit loop.
         {
             use egui::mutex::Mutex;
 
@@ -556,7 +551,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::RedrawRequested => {
                 if let Err(error) = self.frame() {
-                    self.start_error = Some(error);
+                    self.fatal_error = Some(error);
                     event_loop.exit();
                     return;
                 }
@@ -584,7 +579,7 @@ const WHEEL_ZOOM_SENSITIVITY: f32 = 0.15;
 const PIXELS_PER_WHEEL_LINE: f32 = 40.0;
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, reason = "test code fails fast by design")]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, reason = "a panic in test code is inconsequential")]
 mod tests {
     use super::*;
 

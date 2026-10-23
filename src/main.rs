@@ -8,7 +8,7 @@ mod keys;
 mod render;
 mod source;
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, reason = "test code fails fast by design")]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, reason = "a panic in test code is inconsequential")]
 pub(crate) mod testkit;
 mod ui;
 mod view;
@@ -89,7 +89,6 @@ fn run(open_path: &Path, land_on: Option<&str>) -> eros::Result<()> {
 
     let source = Arc::new(Source::open(open_path)?);
 
-    // Page to land on: the named file if given, else the first page.
     let index = land_on
         .and_then(|name| (0..source.len()).find(|&page_index| source.name(page_index).eq_ignore_ascii_case(name)))
         .unwrap_or(0);
@@ -103,14 +102,14 @@ fn run(open_path: &Path, land_on: Option<&str>) -> eros::Result<()> {
 
     let mut app = App::new(source, worker, index, event_loop.create_proxy());
     event_loop.run_app(&mut app)?;
-    if let Some(error) = app.start_error.take() {
+    if let Some(error) = app.fatal_error.take() {
         return Err(error);
     }
     Ok(())
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, reason = "test code fails fast by design")]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, reason = "a panic in test code is inconsequential")]
 mod tests {
     use super::*;
     use crate::testkit::{tiny_png, TempDir};

@@ -1,16 +1,14 @@
-//! GL rendering: the page quad renderer. All GL `unsafe` lives here and in
-//! window.rs, behind safe functions (the only other unsafe in cryslen is
-//! decode.rs's libavif FFI block, behind the `avif` feature). GL init and
-//! swap failures propagate as errors and exit cleanly through `start_error`
-//! in app.rs. Runtime texture-creation failure still panics: per-page
-//! recovery would be possible but is deliberately not built (complexity,
-//! an upstream egui unwrap at runtime, rare on target hardware).
+//! GL rendering: the page quad renderer.
+//!
+//! Runtime texture-creation failure panics. Recovery is deliberately
+//! not built. An upstream `egui_glow` unwrap can panic at runtime
+//! anyway, so recovery could not be total. The failure is also rare on
+//! target hardware.
 //!
 //! A page-keyed texture cache plus the two-seat spread draw, YUV plane
-//! textures with shader-side conversion. The app owns what each seat
-//! displays and drives the cache with per-seat bind/clear calls.
-//! Chroma siting (avifChromaSamplePosition) is not applied: the
-//! default co-sited/midway assumption biases chroma by at most half a texel,
+//! textures with shader-side conversion. Chroma siting
+//! (avifChromaSamplePosition) is not applied: the default
+//! co-sited/midway assumption biases chroma by at most half a texel,
 //! invisible in practice.
 
 use std::cmp::Reverse;
@@ -402,7 +400,7 @@ fn delete_textures(gl: &glow::Context, textures: &Textures) {
 fn new_texture(gl: &glow::Context, filterable: bool) -> <glow::Context as HasContext>::Texture {
     #[expect(
         clippy::expect_used,
-        reason = "texture-creation failure panics by policy; see the module doc"
+        reason = "texture-creation failure panics by policy"
     )]
     let texture = unsafe { gl.create_texture().expect("GL texture object") };
     unsafe {
@@ -543,10 +541,9 @@ fn entry_cost_bytes(decoded: &Decoded, mips: bool) -> usize {
 }
 
 /// Pages to drop so the cached costs fit `budget` after a fresh insert.
-/// Every cached page arrives as a (page, cost) pair. Candidates are
-/// unbound pages, farthest from the nearest bound page first, ties by
-/// higher page id. Bound pages never go, so the survivors can still sit
-/// above the budget until the next insert.
+/// Candidates are unbound pages, farthest from the nearest bound page
+/// first, ties by higher page id. Bound pages never go, so the survivors
+/// can still sit above the budget until the next insert.
 fn eviction_victims(
     costs: impl IntoIterator<Item = (usize, usize)>,
     bound: [Option<usize>; 2],
@@ -696,7 +693,7 @@ fn yuv_to_rgb_matrix(matrix: Matrix, full_range: bool) -> [f32; 9] {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, reason = "test code fails fast by design")]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, reason = "a panic in test code is inconsequential")]
 mod tests {
     use super::*;
     use crate::decode::Format;

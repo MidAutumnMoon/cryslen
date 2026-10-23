@@ -81,7 +81,7 @@ pub(crate) fn is_archive(path: &Path) -> bool {
 const TIER_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 
 /// Decompressed 7z members keyed by page index. The harvest pass and
-/// `bytes` misses fill it. A fill that passes the byte budget evicts in
+/// `bytes` misses fill it. A fill that exceeds the byte budget evicts in
 /// insertion order. Directories lean on the OS page cache and zip
 /// inflate is cheap, so only 7z sources carry a tier.
 struct ByteTier {
@@ -104,7 +104,7 @@ impl ByteTier {
     /// index keeps its incumbent, so the byte count stays exact.
     #[expect(
         clippy::expect_used,
-        reason = "every map key has exactly one order entry (paired insert/evict removal), and live_bytes > budget with an empty map is impossible; pinned by the ByteTier tests"
+        reason = "every map key has exactly one order entry because inserts and evicts touch both together, so over budget with an empty map is impossible. The ByteTier tests pin this"
     )]
     fn insert(&mut self, index: usize, data: Arc<[u8]>) {
         if data.len() > self.budget || self.map.contains_key(&index) {
@@ -305,14 +305,14 @@ impl Source {
 /// The reader is the thread's own, not the retained one, so a `bytes`
 /// miss never waits behind the pass. Every entry is read to its end even
 /// when it is not a page, because a solid block's later members decode
-/// only after the earlier ones are consumed. A read error ends the pass.
-/// Pages then still come from `bytes` through the retained reader.
+/// only after the earlier ones are consumed. A spawn error skips the
+/// pass and a read error ends it. Either way, pages load through
+/// `bytes` and the retained reader.
 fn spawn_harvest(path: PathBuf, pages: HashMap<String, usize>, tier: Arc<Mutex<ByteTier>>) {
     use std::thread::Builder;
 
     // Dropping the handle detaches the thread, so quitting never waits
-    // on it. A spawn error only skips the prefetch; pages still load
-    // through `bytes`.
+    // on it.
     drop(Builder::new()
         .name("cy-harvest".into())
         .spawn(move || {
@@ -339,7 +339,7 @@ fn sort_pages(names: &mut [String]) {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, reason = "test code fails fast by design")]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, reason = "a panic in test code is inconsequential")]
 mod tests {
     use super::*;
     use crate::decode;

@@ -36,8 +36,7 @@ impl ViewMode {
         }
     }
 
-    /// The key that selects this mode, shown next to the name. Must
-    /// match the binding in `crate::keys::from_key`.
+    /// The key that selects this mode, shown next to the name.
     pub fn shortcut(self) -> &'static str {
         match self {
             Self::Normal => "n",
@@ -266,7 +265,7 @@ pub fn clamp(placement: Placement, total: (f32, f32), window: (f32, f32)) -> Pla
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, reason = "test code fails fast by design")]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, reason = "a panic in test code is inconsequential")]
 mod tests {
     use super::*;
 

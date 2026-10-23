@@ -1,5 +1,4 @@
-//! Window and GL context creation (glutin-on-winit). Creation and swap
-//! return errors for main to report.
+//! Window and GL context creation (glutin-on-winit).
 
 use core::num::NonZeroU32;
 use std::sync::Arc;
@@ -14,7 +13,7 @@ use winit::raw_window_handle::HasWindowHandle as _;
 use winit::window::Window as WinitWindow;
 
 /// Window + EGL context + surface. vsync is DontWait, so the app must call
-/// `pre_present_and_swap()` to present (Wayland frame pacing inside).
+/// `pre_present_and_swap()` to present.
 pub struct Window {
     pub winit: WinitWindow,
     gl: Arc<glow::Context>,
@@ -59,8 +58,7 @@ impl Window {
             .with_resizable(true)
             .with_inner_size(LogicalSize { width: INITIAL_WINDOW_WIDTH, height: INITIAL_WINDOW_HEIGHT })
             .with_title("cryslen")
-            // Hidden at creation. app.rs reveals the window after the
-            // first presented frame.
+            // Hidden at creation, revealed after the first presented frame.
             .with_visible(false);
 
         // glutin-winit's DisplayBuilder picks a config through a closure
@@ -139,7 +137,6 @@ impl Window {
         self.resized_to = (size.width, size.height);
     }
 
-    /// Frame-callback notify then non-blocking swap.
     pub fn pre_present_and_swap(&self) -> eros::Result<()> {
         use glutin::prelude::GlSurface as _;
         self.winit.pre_present_notify();
