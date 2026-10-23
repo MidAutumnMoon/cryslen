@@ -30,7 +30,9 @@ enum Arg {
 }
 
 fn main() -> ExitCode {
-    let Some(arg) = std::env::args().nth(1) else {
+    use std::env;
+
+    let Some(arg) = env::args().nth(1) else {
         eprintln!("usage: cy <dir | archive | image-file>");
         return ExitCode::from(2);
     };
@@ -80,6 +82,8 @@ fn classify(path: &Path) -> eros::Result<Arg> {
 }
 
 fn run(open_path: &Path, land_on: Option<&str>) -> eros::Result<()> {
+    use winit::event_loop::EventLoop;
+
     let source = Arc::new(Source::open(open_path)?);
 
     // Page to land on: the named file if given, else the first page.
@@ -87,8 +91,7 @@ fn run(open_path: &Path, land_on: Option<&str>) -> eros::Result<()> {
         .and_then(|name| (0..source.len()).find(|&i| source.name(i).eq_ignore_ascii_case(name)))
         .unwrap_or(0);
 
-    let event_loop =
-        winit::event_loop::EventLoop::<UserEvent>::with_user_event().build()?;
+    let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
 
     let worker = Worker::spawn(Arc::clone(&source), move || {

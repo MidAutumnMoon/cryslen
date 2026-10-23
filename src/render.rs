@@ -553,7 +553,7 @@ struct PageUniforms {
     subsampling: Subsampling,
     depth: u8,
     full_range: bool,
-    matrix: crate::decode::Matrix,
+    matrix: Matrix,
 }
 
 impl From<&Pixels> for PageUniforms {
@@ -662,6 +662,8 @@ fn yuv_to_rgb_matrix(matrix: Matrix, full_range: bool) -> [f32; 9] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decode::Format;
+    use crate::decode::YuvImage;
 
     /// Row `row`, column `col` of the math matrix (storage is column-major).
     fn element(matrix: &[f32; 9], row: usize, col: usize) -> f32 {
@@ -746,7 +748,7 @@ mod tests {
     #[test]
     fn page_uniforms_from_pixels() {
         assert_eq!(PageUniforms::from(&Pixels::Rgba8(Box::default())), RGBA_UNIFORMS);
-        let yuv_pixels = Pixels::Yuv(crate::decode::YuvImage {
+        let yuv_pixels = Pixels::Yuv(YuvImage {
             depth: 10,
             subsampling: Subsampling::Yuv420,
             full_range: false,
@@ -763,13 +765,13 @@ mod tests {
     #[test]
     fn rgba_entry_cost_counts_the_mip_chain() {
         let bytes = vec![0u8; 4 * 4 * 4].into_boxed_slice();
-        let decoded = Decoded::rgba(4, 4, crate::decode::Format::Png, bytes).expect("rgba page");
+        let decoded = Decoded::rgba(4, 4, Format::Png, bytes).expect("rgba page");
         assert_eq!(entry_cost_bytes(&decoded, true), 64 * 4 / 3);
     }
 
     #[test]
     fn yuv420_entry_cost_counts_the_mip_chain() {
-        let yuv = crate::decode::YuvImage {
+        let yuv = YuvImage {
             depth: 8,
             subsampling: Subsampling::Yuv420,
             full_range: true,
@@ -778,13 +780,13 @@ mod tests {
             cb: Plane::U8(vec![0u8; 2 * 2].into_boxed_slice()),
             cr: Plane::U8(vec![0u8; 2 * 2].into_boxed_slice()),
         };
-        let decoded = Decoded::yuv(4, 4, crate::decode::Format::Avif, yuv).expect("yuv page");
+        let decoded = Decoded::yuv(4, 4, Format::Avif, yuv).expect("yuv page");
         assert_eq!(entry_cost_bytes(&decoded, true), (16 + 4 + 4) * 4 / 3);
     }
 
     #[test]
     fn r16_gles_entry_cost_skips_mips() {
-        let yuv = crate::decode::YuvImage {
+        let yuv = YuvImage {
             depth: 10,
             subsampling: Subsampling::Mono,
             full_range: true,
@@ -793,7 +795,7 @@ mod tests {
             cb: Plane::U8(Box::default()),
             cr: Plane::U8(Box::default()),
         };
-        let decoded = Decoded::yuv(2, 2, crate::decode::Format::Avif, yuv).expect("yuv page");
+        let decoded = Decoded::yuv(2, 2, Format::Avif, yuv).expect("yuv page");
         assert_eq!(entry_cost_bytes(&decoded, false), 4 * 2 + 2 * 2);
     }
 

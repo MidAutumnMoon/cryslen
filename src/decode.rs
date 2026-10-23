@@ -10,6 +10,11 @@
 //! belt-and-braces. The FFI `unsafe` for AVIF is confined to the `avif`
 //! submodule.
 
+use std::error::Error;
+use std::fmt;
+
+use ::jxl::error::Error as JxlError;
+
 /// Decoded page: dimensions plus pixels in one of two layouts. Construct via
 /// [`Decoded::rgba`] / [`Decoded::yuv`], which validate that pixel extents
 /// match the dimensions. Extent bugs surface as worker decode errors here,
@@ -204,13 +209,13 @@ pub enum DecodeError {
     Corrupt(&'static str),
     Unsupported(&'static str),
     Image(Format, image::ImageError),
-    Jxl(::jxl::error::Error),
+    Jxl(JxlError),
     /// libavif call failure with its step and avifResult detail.
     Avif(&'static str, String),
 }
 
-impl std::fmt::Display for DecodeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             DecodeError::NotAnImage => write!(f, "not an image"),
             DecodeError::Corrupt(what) => write!(f, "corrupt: {what}"),
@@ -222,7 +227,7 @@ impl std::fmt::Display for DecodeError {
     }
 }
 
-impl std::error::Error for DecodeError {}
+impl Error for DecodeError {}
 
 /// Decode one page. `name` is the page filename (extension fallback).
 /// Static: animated images show their first frame.
@@ -241,7 +246,9 @@ pub fn decode(bytes: &[u8], name: &str) -> Result<Decoded, DecodeError> {
 /// Extension -> format table. Also the listing filter for page sources:
 /// one table decides both what can decode and what gets listed.
 pub(crate) fn format_from_name(name: &str) -> Option<Format> {
-    let ext = std::path::Path::new(name)
+    use std::path::Path;
+
+    let ext = Path::new(name)
         .extension()
         .and_then(|e| e.to_str())?
         .to_ascii_lowercase();
@@ -304,6 +311,7 @@ fn sniff_ftyp_avif(bytes: &[u8]) -> bool {
 /// image-crate path: decode with a concrete decoder so EXIF orientation is
 /// readable, then applies it.
 fn decode_image(bytes: &[u8], format: Format) -> Result<Decoded, DecodeError> {
+    use std::io::Cursor;
     use image::ImageDecoder as _;
 
     let image_format = match format {
@@ -315,7 +323,7 @@ fn decode_image(bytes: &[u8], format: Format) -> Result<Decoded, DecodeError> {
         Format::Tiff => image::ImageFormat::Tiff,
         Format::Avif | Format::Jxl => return Err(DecodeError::Unsupported("internal dispatch")),
     };
-    let reader = image::ImageReader::with_format(std::io::Cursor::new(bytes), image_format);
+    let reader = image::ImageReader::with_format(Cursor::new(bytes), image_format);
     let mut decoder = reader.into_decoder().map_err(|e| DecodeError::Image(format, e))?;
     // Orientation only swaps w and h, and the cap checks both, so this
     // pre-orientation check catches rotated pages too.
@@ -441,14 +449,18 @@ mod avif {
     }
 
     fn threads() -> i32 {
-        std::thread::available_parallelism().map_or(1, |n| n.get()).min(MAX_THREADS) as i32
+        use std::thread;
+
+        thread::available_parallelism().map_or(1, |n| n.get()).min(MAX_THREADS) as i32
     }
 
     unsafe fn check(code: avifResult, what: &'static str) -> Result<(), DecodeError> {
+        use std::ffi::CStr;
+
         if code == AVIF_RESULT_OK {
             return Ok(());
         }
-        let detail = std::ffi::CStr::from_ptr(avifResultToString(code)).to_string_lossy();
+        let detail = CStr::from_ptr(avifResultToString(code)).to_string_lossy();
         Err(DecodeError::Avif(what, detail.into_owned()))
     }
 
@@ -461,6 +473,8 @@ mod avif {
         height: usize,
         depth: u32,
     ) -> Result<Plane, DecodeError> {
+        use std::slice;
+
         if plane_ptr.is_null() {
             return Err(DecodeError::Corrupt("avif: missing plane"));
         }
@@ -471,7 +485,7 @@ mod avif {
             }
             let mut out = Vec::with_capacity(width * height);
             for row in 0..height {
-                let src = std::slice::from_raw_parts(plane_ptr.add(row * row_stride), width);
+                let src = slice::from_raw_parts(plane_ptr.add(row * row_stride), width);
                 out.extend_from_slice(src);
             }
             Ok(Plane::U8(out.into_boxed_slice()))
@@ -482,7 +496,7 @@ mod avif {
             }
             let mut out = Vec::with_capacity(width * height);
             for row in 0..height {
-                let src = std::slice::from_raw_parts(
+                let src = slice::from_raw_parts(
                     plane_ptr.add(row * row_stride) as *const u16,
                     width,
                 );
@@ -505,10 +519,13 @@ mod avif {
 /// jxl-rs low-level decode with a scoped-thread parallel runner. The decoder
 /// fills opaque alpha when the file has none.
 mod jxl {
+    use std::thread;
+
     use jxl::api::{
         states, JxlColorType, JxlDataFormat, JxlDecoder, JxlDecoderOptions, JxlOutputBuffer,
         JxlParallelRunner, JxlParallelRunnerFun, JxlPixelFormat, ProcessingResult,
     };
+    use jxl::error;
 
     use super::{DecodeError, Decoded, Format};
 
@@ -518,9 +535,12 @@ mod jxl {
     const READ_CHUNK_BYTES: usize = 1 << 20;
 
     pub fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
+        use std::io::BufReader;
+        use std::io::Cursor;
+        use std::slice;
+
         let mut runner = Pool(threads());
-        let mut input =
-            std::io::BufReader::with_capacity(READ_CHUNK_BYTES, std::io::Cursor::new(bytes));
+        let mut input = BufReader::with_capacity(READ_CHUNK_BYTES, Cursor::new(bytes));
 
         // pass 1: headers -> image size
         let decoder = JxlDecoder::<states::Initialized>::new(JxlDecoderOptions::default());
@@ -563,7 +583,7 @@ mod jxl {
         let mut output = JxlOutputBuffer::new(&mut rgba_buffer, height, width * 4);
         loop {
             match decoder
-                .process(&mut input, std::slice::from_mut(&mut output), Some(&mut runner))
+                .process(&mut input, slice::from_mut(&mut output), Some(&mut runner))
             {
                 Ok(ProcessingResult::Complete { .. }) => break,
                 Ok(ProcessingResult::NeedsMoreInput { fallback, .. }) => decoder = fallback,
@@ -580,7 +600,7 @@ mod jxl {
     }
 
     fn threads() -> usize {
-        std::thread::available_parallelism().map_or(1, |n| n.get()).min(MAX_THREADS)
+        thread::available_parallelism().map_or(1, |n| n.get()).min(MAX_THREADS)
     }
 
     /// Scoped-thread runner. Per-task errors inside the threads are
@@ -588,13 +608,13 @@ mod jxl {
     /// `process` call right after.
     struct Pool(usize);
     impl JxlParallelRunner for Pool {
-        fn run(&mut self, num: usize, fun: &JxlParallelRunnerFun<'_>) -> jxl::error::Result<()> {
+        fn run(&mut self, num: usize, fun: &JxlParallelRunnerFun<'_>) -> error::Result<()> {
             let thread_count = self.0.min(num);
             if thread_count < 2 {
                 return (0..num).try_for_each(fun);
             }
             let chunk = num.div_ceil(thread_count);
-            std::thread::scope(|s| {
+            thread::scope(|s| {
                 for thread_index in 0..thread_count {
                     let fun: &JxlParallelRunnerFun = fun;
                     s.spawn(move || {
@@ -640,10 +660,12 @@ mod tests {
 
     #[test]
     fn jpeg_roundtrip() {
+        use std::io::Cursor;
+
         let img = image::RgbImage::from_pixel(5, 2, image::Rgb([200, 100, 50]));
         let mut jpg = Vec::new();
         image::DynamicImage::ImageRgb8(img)
-            .write_to(&mut std::io::Cursor::new(&mut jpg), image::ImageFormat::Jpeg)
+            .write_to(&mut Cursor::new(&mut jpg), image::ImageFormat::Jpeg)
             .expect("encode jpeg");
         let page = decode(&jpg, "p.jpg").expect("jpeg decodes");
         assert_eq!(page.format, Format::Jpeg);
@@ -652,10 +674,12 @@ mod tests {
 
     #[test]
     fn truncated_jpeg_is_an_error_not_panic() {
+        use std::io::Cursor;
+
         let img = image::RgbImage::from_pixel(32, 32, image::Rgb([1, 2, 3]));
         let mut jpg = Vec::new();
         image::DynamicImage::ImageRgb8(img)
-            .write_to(&mut std::io::Cursor::new(&mut jpg), image::ImageFormat::Jpeg)
+            .write_to(&mut Cursor::new(&mut jpg), image::ImageFormat::Jpeg)
             .unwrap();
         assert!(matches!(decode(&jpg[..20], "p.jpg"), Err(DecodeError::Image(Format::Jpeg, _))));
     }

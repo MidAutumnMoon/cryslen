@@ -5,22 +5,28 @@ use core::num::NonZeroU32;
 use std::sync::Arc;
 
 use egui_winit::winit;
+use glutin::context::PossiblyCurrentContext;
+use glutin::surface::Surface;
+use glutin::surface::WindowSurface;
+use winit::dpi::PhysicalSize;
+use winit::event_loop::ActiveEventLoop;
 use winit::raw_window_handle::HasWindowHandle as _;
+use winit::window::Window as WinitWindow;
 
 /// Window + EGL context + surface. vsync is DontWait, so the app must call
 /// `pre_present_and_swap()` to present (Wayland frame pacing inside).
 pub struct Window {
-    pub winit: winit::window::Window,
+    pub winit: WinitWindow,
     gl: Arc<glow::Context>,
-    surface: glutin::surface::Surface<glutin::surface::WindowSurface>,
-    context: glutin::context::PossiblyCurrentContext,
+    surface: Surface<WindowSurface>,
+    context: PossiblyCurrentContext,
     /// Size the surface was last resized to (physical px). Creation
     /// counts as the first resize.
     resized_to: (u32, u32),
 }
 
 impl Window {
-    pub fn new(event_loop: &winit::event_loop::ActiveEventLoop) -> eros::Result<Window> {
+    pub fn new(event_loop: &ActiveEventLoop) -> eros::Result<Window> {
         unsafe { Self::create(event_loop) }
     }
 
@@ -30,18 +36,28 @@ impl Window {
     ///
     /// `event_loop` must be the loop this window runs on, because the raw
     /// display handle taken from it backs the GL display.
-    unsafe fn create(event_loop: &winit::event_loop::ActiveEventLoop) -> eros::Result<Window> {
+    unsafe fn create(event_loop: &ActiveEventLoop) -> eros::Result<Window> {
+        use glutin::config::ConfigTemplateBuilder;
+        use glutin::context::ContextApi;
+        use glutin::context::ContextAttributesBuilder;
         use glutin::context::NotCurrentGlContext as _;
+        use glutin::display::Display;
+        use glutin::display::DisplayApiPreference;
         use glutin::display::GlDisplay as _;
         use glutin::prelude::GlSurface as _;
+        use glutin::surface::SurfaceAttributesBuilder;
+        use glutin::surface::SwapInterval;
+        use std::ffi::CString;
+        use winit::dpi::LogicalSize;
         use winit::raw_window_handle::HasDisplayHandle as _;
 
         use winit::platform::wayland::WindowAttributesExtWayland as _;
+        use winit::window::WindowAttributes;
 
-        let attrs = winit::window::WindowAttributes::default()
+        let attrs = WindowAttributes::default()
             .with_name("cryslen", "cryslen")
             .with_resizable(true)
-            .with_inner_size(winit::dpi::LogicalSize { width: INITIAL_WINDOW_WIDTH, height: INITIAL_WINDOW_HEIGHT })
+            .with_inner_size(LogicalSize { width: INITIAL_WINDOW_WIDTH, height: INITIAL_WINDOW_HEIGHT })
             .with_title("cryslen")
             // Hidden at creation. app.rs reveals the window after the
             // first presented frame.
@@ -51,11 +67,11 @@ impl Window {
         // that cannot fail, so using it would force a panic on an empty
         // config list.
         let raw_display = event_loop.display_handle()?.as_raw();
-        let gl_display = glutin::display::Display::new(
+        let gl_display = Display::new(
             raw_display,
-            glutin::display::DisplayApiPreference::Egl,
+            DisplayApiPreference::Egl,
         )?;
-        let template = glutin::config::ConfigTemplateBuilder::new().build();
+        let template = ConfigTemplateBuilder::new().build();
         let gl_config = gl_display
             .find_configs(template)?
             .next()
@@ -64,9 +80,9 @@ impl Window {
         let window = glutin_winit::finalize_window(event_loop, attrs, &gl_config)?;
         let raw_window = window.window_handle().expect("window handle").as_raw();
         let ctx_attrs =
-            glutin::context::ContextAttributesBuilder::new().build(Some(raw_window));
-        let fallback = glutin::context::ContextAttributesBuilder::new()
-            .with_context_api(glutin::context::ContextApi::Gles(None))
+            ContextAttributesBuilder::new().build(Some(raw_window));
+        let fallback = ContextAttributesBuilder::new()
+            .with_context_api(ContextApi::Gles(None))
             .build(Some(raw_window));
         let not_current = match gl_display.create_context(&gl_config, &ctx_attrs) {
             Ok(context) => context,
@@ -79,7 +95,7 @@ impl Window {
 
         let (w, h): (u32, u32) = window.inner_size().into();
         let surface_attrs =
-            glutin::surface::SurfaceAttributesBuilder::<glutin::surface::WindowSurface>::new()
+            SurfaceAttributesBuilder::<WindowSurface>::new()
                 .build(
                     raw_window,
                     NonZeroU32::new(w).expect("nonzero window width"),
@@ -91,10 +107,10 @@ impl Window {
         // window.pre_present_notify() gives Wayland frame-callback pacing
         // without a blocking eglSwapBuffers owning the event loop.
         surface
-            .set_swap_interval(&context, glutin::surface::SwapInterval::DontWait)?;
+            .set_swap_interval(&context, SwapInterval::DontWait)?;
 
         let gl = Arc::new(glow::Context::from_loader_function(|s| {
-            let s = std::ffi::CString::new(s).expect("GL proc name without interior NUL");
+            let s = CString::new(s).expect("GL proc name without interior NUL");
             gl_display.get_proc_address(&s)
         }));
         Ok(Window { winit: window, gl, surface, context, resized_to: (w, h) })
@@ -106,7 +122,7 @@ impl Window {
 
     /// Resize the surface when the window size changed since the last
     /// call. No-op otherwise.
-    pub fn resize(&mut self, size: winit::dpi::PhysicalSize<u32>) {
+    pub fn resize(&mut self, size: PhysicalSize<u32>) {
         if (size.width, size.height) == self.resized_to {
             return;
         }

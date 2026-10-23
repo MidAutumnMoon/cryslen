@@ -3,6 +3,7 @@
 //! spread never leaves the book, and every other page leaves by recency
 //! then distance. No disk persistence at all.
 
+use std::any::Any;
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{mpsc, Arc, Mutex};
@@ -55,7 +56,9 @@ impl SpreadView {
     /// Visual seating as [left, right] under `mode`, by the shared rule
     /// in [`crate::view::seating`].
     pub fn seats(&self, mode: ViewMode) -> [Option<&SeatView>; 2] {
-        crate::view::seating(&self.first, self.second.as_ref(), mode)
+        use crate::view;
+
+        view::seating(&self.first, self.second.as_ref(), mode)
     }
 }
 
@@ -204,9 +207,11 @@ impl Worker {
     /// page and should send the winit user event. The worker itself
     /// knows nothing about winit.
     pub fn spawn(source: Arc<Source>, notify: impl Fn() + Send + Sync + 'static) -> Worker {
+        use std::thread::Builder;
+
         let (tx, rx) = mpsc::channel::<ToWorker>();
         let book = Arc::new(Mutex::new(Book::new()));
-        let handle = std::thread::Builder::new()
+        let handle = Builder::new()
             .name("cy-decode".into())
             .spawn({
                 let book = Arc::clone(&book);
@@ -293,11 +298,16 @@ fn next_pick_key(page: usize, anchor: usize) -> (usize, bool) {
 /// One page through the panic boundary: a panicking decoder must not kill
 /// the only worker thread. The error string is the status-line message.
 fn decode_page(source: &Source, page_index: usize) -> Result<Arc<Decoded>, String> {
+    use std::panic;
+    use std::panic::AssertUnwindSafe;
+
+    use crate::decode;
+
     let name = source.name(page_index).to_owned();
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+    let result = panic::catch_unwind(AssertUnwindSafe(
         || -> eros::Result<Decoded> {
             let bytes = source.bytes(page_index)?;
-            Ok(crate::decode::decode(&bytes, &name)?)
+            Ok(decode::decode(&bytes, &name)?)
         },
     ));
     match result {
@@ -307,7 +317,7 @@ fn decode_page(source: &Source, page_index: usize) -> Result<Arc<Decoded>, Strin
     }
 }
 
-fn panic_message(panic: Box<dyn std::any::Any + Send>) -> String {
+fn panic_message(panic: Box<dyn Any + Send>) -> String {
     if let Some(text) = panic.downcast_ref::<&str>() {
         format!("decoder panicked: {text}")
     } else if let Some(text) = panic.downcast_ref::<String>() {
@@ -354,10 +364,12 @@ fn retain_trail(pending: &mut BTreeSet<usize>, anchor: usize, wanted: &Spread) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decode::Format;
     use crate::testkit::{tiny_png, TempDir};
     use crate::view::Spread;
 
     use std::sync::Condvar;
+    use std::thread;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -370,12 +382,14 @@ mod tests {
     // Pins PREFETCH_RADIUS against view's double-mode turn math.
     #[test]
     fn prefetch_window_covers_double_mode_turns() {
+        use crate::view;
+
         for page_count in [2usize, 9, 13] {
             let spreads = 1 + (page_count - 1).div_ceil(2);
             let mut focus = 0;
             for turn in 0..spreads {
                 let window = neighbors(focus, page_count);
-                let spread = crate::view::spread_for(focus, ViewMode::Manga, page_count);
+                let spread = view::spread_for(focus, ViewMode::Manga, page_count);
                 for page in [Some(spread.first), spread.second].into_iter().flatten() {
                     assert!(
                         window.contains(&page),
@@ -385,9 +399,9 @@ mod tests {
                 // The wrap turn jumps across the book, which prefetch
                 // cannot cover.
                 if turn + 1 < spreads {
-                    let next = crate::view::advance(focus, true, ViewMode::Manga, page_count);
+                    let next = view::advance(focus, true, ViewMode::Manga, page_count);
                     let next_spread =
-                        crate::view::spread_for(next, ViewMode::Manga, page_count);
+                        view::spread_for(next, ViewMode::Manga, page_count);
                     for page in [Some(next_spread.first), next_spread.second]
                         .into_iter()
                         .flatten()
@@ -447,10 +461,10 @@ mod tests {
 
     fn ready_page(label: u8) -> SeatView {
         SeatView::Ready(Arc::new(
-            crate::decode::Decoded::rgba(
+            Decoded::rgba(
                 2,
                 1,
-                crate::decode::Format::Png,
+                Format::Png,
                 vec![label; 8].into_boxed_slice(),
             )
             .unwrap(),
@@ -525,10 +539,10 @@ mod tests {
         let wanted = Spread { first: 3, second: Some(4) };
         book.retune(wanted, 10);
         let oversize_page = SeatView::Ready(Arc::new(
-            crate::decode::Decoded::rgba(
+            Decoded::rgba(
                 10,
                 10,
-                crate::decode::Format::Png,
+                Format::Png,
                 vec![0; 400].into_boxed_slice(),
             )
             .unwrap(),
@@ -557,7 +571,7 @@ mod tests {
             SeatView::Ready(_)
         ) && Instant::now() < deadline
         {
-            std::thread::sleep(Duration::from_millis(10));
+            thread::sleep(Duration::from_millis(10));
         }
         let SeatView::Ready(page) =
             worker.snapshot(&Spread { first: 1, second: None }).first
@@ -583,7 +597,7 @@ mod tests {
         while !matches!(worker.snapshot(&wanted).first, SeatView::Failed(_))
             && Instant::now() < deadline
         {
-            std::thread::sleep(Duration::from_millis(10));
+            thread::sleep(Duration::from_millis(10));
         }
         match worker.snapshot(&wanted).first {
             SeatView::Failed(msg) => assert!(msg.contains("page 1"), "{msg}"),
@@ -640,7 +654,7 @@ mod tests {
                     SeatView::Ready(_) => break,
                     SeatView::Failed(msg) => panic!("page {page} failed: {msg}"),
                     SeatView::Pending if Instant::now() < deadline => {
-                        std::thread::sleep(Duration::from_millis(1));
+                        thread::sleep(Duration::from_millis(1));
                     }
                     SeatView::Pending => panic!("page {page} not decoded in time"),
                 }

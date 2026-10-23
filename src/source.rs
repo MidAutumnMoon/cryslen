@@ -4,10 +4,18 @@
 //! decompressed-page tier filled by a background pass.
 
 use std::collections::{HashMap, VecDeque};
+use std::error::Error;
+use std::fmt;
+use std::fs;
+use std::fs::File;
+use std::io::BufReader;
+use std::io::Error as IoError;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
+
+use zip::result::ZipError;
 
 use crate::decode::format_from_name;
 
@@ -24,13 +32,13 @@ pub enum SourceError {
     NotFound(PathBuf),
     Empty,
     Unsupported(PathBuf),
-    Zip(zip::result::ZipError),
+    Zip(ZipError),
     SevenZip(sevenz_rust2::Error),
-    Io(std::io::Error),
+    Io(IoError),
 }
 
-impl std::fmt::Display for SourceError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for SourceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SourceError::NotFound(p) => write!(f, "not found: {}", p.display()),
             SourceError::Empty => write!(f, "no image pages found"),
@@ -42,7 +50,7 @@ impl std::fmt::Display for SourceError {
     }
 }
 
-impl std::error::Error for SourceError {}
+impl Error for SourceError {}
 
 /// What the status line calls the current page.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -129,8 +137,8 @@ fn lock_recovered<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
 pub struct Source {
     kind: SourceKind,
     names: Vec<String>,
-    zip: Option<Mutex<zip::ZipArchive<std::io::BufReader<std::fs::File>>>>,
-    sevenzip: Option<Mutex<sevenz_rust2::ArchiveReader<std::fs::File>>>,
+    zip: Option<Mutex<zip::ZipArchive<BufReader<File>>>>,
+    sevenzip: Option<Mutex<sevenz_rust2::ArchiveReader<File>>>,
     /// Decompressed 7z members, shared with the harvest thread.
     tier: Option<Arc<Mutex<ByteTier>>>,
     /// Dropping detaches the harvest thread so quitting does not wait out
@@ -142,7 +150,7 @@ pub struct Source {
 impl Source {
     /// Listing is filtered to image extensions and natural-sorted.
     pub fn open(path: &Path) -> Result<Source, SourceError> {
-        if std::fs::metadata(path).map_err(|_| SourceError::NotFound(path.to_path_buf()))?.is_dir() {
+        if fs::metadata(path).map_err(|_| SourceError::NotFound(path.to_path_buf()))?.is_dir() {
             return Source::open_dir(path);
         }
         match archive_kind(path) {
@@ -153,7 +161,7 @@ impl Source {
     }
 
     fn open_dir(dir: &Path) -> Result<Source, SourceError> {
-        let mut names: Vec<String> = std::fs::read_dir(dir)
+        let mut names: Vec<String> = fs::read_dir(dir)
             .map_err(SourceError::Io)?
             .filter_map(|entry| entry.ok())
             .filter(|entry| entry.file_type().is_ok_and(|t| t.is_file()))
@@ -165,8 +173,8 @@ impl Source {
     }
 
     fn open_zip(path: &Path) -> Result<Source, SourceError> {
-        let file = std::fs::File::open(path).map_err(SourceError::Io)?;
-        let zip = zip::ZipArchive::new(std::io::BufReader::new(file)).map_err(SourceError::Zip)?;
+        let file = File::open(path).map_err(SourceError::Io)?;
+        let zip = zip::ZipArchive::new(BufReader::new(file)).map_err(SourceError::Zip)?;
         // Non-UTF-8 entry names are skipped (zip 9 reports them as errors).
         let mut names: Vec<String> = zip
             .file_names()
@@ -255,7 +263,7 @@ impl Source {
         debug_assert!(index < self.names.len());
         let name = &self.names[index];
         match &self.kind {
-            SourceKind::Directory(dir) => std::fs::read(dir.join(name))
+            SourceKind::Directory(dir) => fs::read(dir.join(name))
                 .map(Arc::from)
                 .map_err(SourceError::Io),
             SourceKind::Zip(_) => {
@@ -265,7 +273,7 @@ impl Source {
                 let mut buf = Vec::new();
                 entry
                     .read_to_end(&mut buf)
-                    .map_err(|e| SourceError::Zip(zip::result::ZipError::Io(e)))?;
+                    .map_err(|e| SourceError::Zip(ZipError::Io(e)))?;
                 Ok(buf.into())
             }
             SourceKind::SevenZip(_) => {
@@ -306,7 +314,9 @@ fn spawn_harvest(
     pages: HashMap<String, usize>,
     tier: Arc<Mutex<ByteTier>>,
 ) -> JoinHandle<()> {
-    std::thread::Builder::new()
+    use std::thread::Builder;
+
+    Builder::new()
         .name("cy-harvest".into())
         .spawn(move || {
             let Ok(mut reader) =
@@ -335,6 +345,7 @@ fn sort_pages(names: &mut [String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::decode;
     use crate::testkit::{tiny_png, TempDir};
 
     use std::io::Write as _;
@@ -349,7 +360,7 @@ mod tests {
 
     #[test]
     fn sevenz_listing_and_read() {
-        let source = Source::open(std::path::Path::new(SEVENZ_FIXTURE)).expect("7z opens");
+        let source = Source::open(Path::new(SEVENZ_FIXTURE)).expect("7z opens");
         assert_eq!(source.len(), 2);
         assert_eq!(
             source.page_name(0),
@@ -361,13 +372,13 @@ mod tests {
         let width = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
         let height = u32::from_be_bytes(bytes[20..24].try_into().unwrap());
         assert_eq!((width, height), (40, 30));
-        let decoded_page = crate::decode::decode(&bytes, "p1.png").expect("decodes");
+        let decoded_page = decode::decode(&bytes, "p1.png").expect("decodes");
         assert_eq!((decoded_page.width, decoded_page.height), (width, height));
     }
 
     #[test]
     fn sevenz_repeat_read_served_from_tier() {
-        let source = Source::open(std::path::Path::new(SEVENZ_FIXTURE)).expect("7z opens");
+        let source = Source::open(Path::new(SEVENZ_FIXTURE)).expect("7z opens");
         let first = source.bytes(0).expect("first page reads");
         // Either bytes or the harvest thread may have filled the tier, and
         // both write the same member's bytes.
@@ -378,10 +389,12 @@ mod tests {
 
     #[test]
     fn sevenz_harvest_fills_tier() {
-        let source = Source::open(std::path::Path::new(SEVENZ_FIXTURE)).expect("7z opens");
+        use std::thread;
+
+        let source = Source::open(Path::new(SEVENZ_FIXTURE)).expect("7z opens");
         let deadline = Instant::now() + Duration::from_secs(20);
         while !(source.tier_has(0) && source.tier_has(1)) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(50));
+            thread::sleep(Duration::from_millis(50));
         }
         assert!(source.tier_has(0) && source.tier_has(1), "both fixture pages harvested");
     }
@@ -456,12 +469,14 @@ mod tests {
 
     #[test]
     fn zip_listing_and_read() {
+        use zip::write::SimpleFileOptions;
+
         let dir = TempDir::new("pagezip");
         let zip_path = dir.path().join("book.cbz");
         {
-            let file = std::fs::File::create(&zip_path).unwrap();
+            let file = File::create(&zip_path).unwrap();
             let mut zip = zip::ZipWriter::new(file);
-            let options = zip::write::SimpleFileOptions::default()
+            let options = SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
             for (name, color) in
                 [("b/010.png", 1u8), ("b/002.png", 2), ("b/020.png", 3), ("b/deep/005.png", 4)]
@@ -482,7 +497,7 @@ mod tests {
             PageName { parent: Some("deep".into()), file: "005.png".into() }
         );
         let page = source.bytes(1).expect("entry readable");
-        let decoded = crate::decode::decode(&page, "b/010.png").unwrap();
+        let decoded = decode::decode(&page, "b/010.png").unwrap();
         assert_eq!(decoded.width, 2);
     }
 

@@ -124,14 +124,16 @@ mod tests {
 
     #[test]
     fn page_turn_respects_rtl() {
+        use crate::view;
+
         // advance() composes with is_forward. In manga, rightward from
         // page 1 moves to the cover while forward moves deeper in.
         let right = Action::Right.is_forward(ViewMode::Manga);
-        assert_eq!(crate::view::advance(1, right, ViewMode::Manga, 10), 0);
+        assert_eq!(view::advance(1, right, ViewMode::Manga, 10), 0);
         let forward = Action::Forward.is_forward(ViewMode::Manga);
-        assert_eq!(crate::view::advance(1, forward, ViewMode::Manga, 10), 3);
+        assert_eq!(view::advance(1, forward, ViewMode::Manga, 10), 3);
         let right = Action::Right.is_forward(ViewMode::Normal);
-        assert_eq!(crate::view::advance(1, right, ViewMode::Normal, 10), 2);
+        assert_eq!(view::advance(1, right, ViewMode::Normal, 10), 2);
     }
 
     #[test]

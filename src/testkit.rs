@@ -1,14 +1,17 @@
 //! Scratch inputs shared by the source/decode/worker unit tests.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Solid-color PNG straight from the image encoder.
 pub fn tiny_png(w: u32, h: u32, rgba: [u8; 4]) -> Vec<u8> {
+    use std::io::Cursor;
+
     let img = image::RgbaImage::from_pixel(w, h, image::Rgba(rgba));
     let mut buf = Vec::new();
     image::DynamicImage::ImageRgba8(img)
-        .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
+        .write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)
         .expect("encode png");
     buf
 }
@@ -19,13 +22,16 @@ static DIRS: AtomicU64 = AtomicU64::new(0);
 
 impl TempDir {
     pub fn new(tag: &str) -> TempDir {
-        let path = std::env::temp_dir().join(format!(
+        use std::env;
+        use std::process;
+
+        let path = env::temp_dir().join(format!(
             "cryslen-{}-{}-{}",
             tag,
-            std::process::id(),
+            process::id(),
             DIRS.fetch_add(1, Ordering::Relaxed),
         ));
-        std::fs::create_dir_all(&path).expect("create temp dir");
+        fs::create_dir_all(&path).expect("create temp dir");
         TempDir(path)
     }
 
@@ -34,12 +40,12 @@ impl TempDir {
     }
 
     pub fn write(&self, name: &str, bytes: &[u8]) {
-        std::fs::write(self.0.join(name), bytes).expect("write temp file");
+        fs::write(self.0.join(name), bytes).expect("write temp file");
     }
 }
 
 impl Drop for TempDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        let _ = fs::remove_dir_all(&self.0);
     }
 }

@@ -1,5 +1,7 @@
 //! Status overlay: one egui bottom panel, data in / text out.
 
+use egui::text::LayoutJob;
+
 use crate::decode::Format;
 use crate::source::PageName;
 use crate::view::{Spread, ViewMode};
@@ -91,13 +93,13 @@ const NAME_COLOR: egui::Color32 = egui::Color32::from_rgb(0xa2, 0x92, 0xc5);
 /// The left-side facts as one job of colored sections, separate so they
 /// are directly testable. One job, one label: the whole line keeps
 /// eliding together on narrow screens.
-fn line(style: &egui::Style, status: &StatusLine) -> egui::text::LayoutJob {
+fn line(style: &egui::Style, status: &StatusLine) -> LayoutJob {
     let font = egui::TextStyle::Monospace.resolve(style);
     let plain = style.visuals.text_color();
-    let section = |job: &mut egui::text::LayoutJob, text: String, color: egui::Color32| {
+    let section = |job: &mut LayoutJob, text: String, color: egui::Color32| {
         job.append(&text, 0.0, egui::TextFormat::simple(font.clone(), color));
     };
-    let mut job = egui::text::LayoutJob::default();
+    let mut job = LayoutJob::default();
 
     let mut head = format!("{}", status.spread.first + 1);
     if let Some(second) = status.spread.second {
@@ -160,7 +162,7 @@ mod tests {
 
     /// Section colors in append order. Sections carry no text slices
     /// here; the text and the deterministic append order pin the mapping.
-    fn section_colors(job: &egui::text::LayoutJob) -> Vec<egui::Color32> {
+    fn section_colors(job: &LayoutJob) -> Vec<egui::Color32> {
         job.sections.iter().map(|s| s.format.color).collect()
     }
 
@@ -249,6 +251,8 @@ mod tests {
     /// the text items of the settled frame. Only the texture upload
     /// needs a GPU, and `drop_without_applying_deltas` skips it.
     fn render(width: f32, status: &StatusLine) -> Vec<TextItem> {
+        use std::mem;
+
         let ctx = egui::Context::default();
         let input = || egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -259,7 +263,7 @@ mod tests {
         };
         ctx.run_ui(input(), |ui| show(ui, status)).drop_without_applying_deltas();
         let mut out = ctx.run_ui(input(), |ui| show(ui, status));
-        let shapes = std::mem::take(&mut out.shapes);
+        let shapes = mem::take(&mut out.shapes);
         out.drop_without_applying_deltas();
         let mut items = Vec::new();
         shapes.iter().for_each(|cs| walk(&cs.shape, &mut items));

@@ -6,12 +6,20 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use egui_winit::winit;
+use winit::application::ApplicationHandler;
+use winit::dpi::PhysicalSize;
+use winit::event::StartCause;
+use winit::event::WindowEvent;
+use winit::event_loop::ActiveEventLoop;
+use winit::event_loop::ControlFlow;
+use winit::event_loop::EventLoopProxy;
+use winit::window::WindowId;
 
 use crate::decode::{Decoded, Format};
 use crate::keys::Action;
 use crate::render::PageTextures;
 use crate::source::Source;
+use crate::view;
 use crate::view::{Placement, Spread, SpreadLayout, ViewMode};
 use crate::window::Window;
 use crate::worker::{SeatView, SpreadView, Worker};
@@ -176,7 +184,7 @@ pub struct App {
     fit: Fit,
     /// Proxy for egui's repaint bridge. winit 0.30 cannot create one from
     /// `ActiveEventLoop` (only `EventLoop::create_proxy`, before `run_app`).
-    proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+    proxy: EventLoopProxy<UserEvent>,
 }
 
 impl App {
@@ -184,10 +192,10 @@ impl App {
         source: Arc<Source>,
         worker: Worker,
         index: usize,
-        proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+        proxy: EventLoopProxy<UserEvent>,
     ) -> App {
         let state = State { index, ..DEFAULT_STATE };
-        let spread = crate::view::spread_for(state.index, state.mode, source.len());
+        let spread = view::spread_for(state.index, state.mode, source.len());
         worker.retune(spread);
         App {
             source,
@@ -209,7 +217,7 @@ impl App {
 
     /// Spread for the current index/mode, clamped to the book.
     fn spread(&self) -> Spread {
-        crate::view::spread_for(self.state.index, self.state.mode, self.source.len())
+        view::spread_for(self.state.index, self.state.mode, self.source.len())
     }
 
     /// Show each seat's Ready page, hold undecided and failed seats on
@@ -243,12 +251,17 @@ impl App {
             .held
             .each_ref()
             .map(|seat_held| seat_held.as_ref().map(|decoded| (decoded.width, decoded.height)));
-        self.last_layout = crate::view::layout(held_dims);
+        self.last_layout = view::layout(held_dims);
         seat_views
     }
 
     /// One frame: decide, upload, draw, present.
     fn frame(&mut self) {
+        use crate::decode;
+        use crate::ui;
+        use crate::ui::PageFacts;
+        use crate::ui::StatusLine;
+
         let size = match self.surface_size() {
             Some(size) => size,
             None => return,
@@ -265,7 +278,7 @@ impl App {
         let total = self.last_layout.total();
         if self.fit.should_refit(total) {
             if !self.fit.user_moved {
-                self.state.placement = crate::view::fit(total, win);
+                self.state.placement = view::fit(total, win);
             }
             self.fit.settle(total);
         }
@@ -295,10 +308,9 @@ impl App {
             let _ = self.proxy.send_event(UserEvent::Repaint(remaining));
         }
 
-        let claimed = crate::decode::format_from_name(self.source.name(spread.first));
-        let page =
-            folded.page.map(|(decoded, dims)| crate::ui::PageFacts { decoded, claimed, dims });
-        let status = crate::ui::StatusLine {
+        let claimed = decode::format_from_name(self.source.name(spread.first));
+        let page = folded.page.map(|(decoded, dims)| PageFacts { decoded, claimed, dims });
+        let status = StatusLine {
             total: self.source.len(),
             spread,
             mode: self.state.mode,
@@ -313,7 +325,7 @@ impl App {
         let Some(gl) = self.gl.as_mut() else { return };
         gl.egui.painter.clear([size.width, size.height], [0.08, 0.08, 0.09, 1.0]);
         gl.pages.draw(win, &self.last_layout, &self.state.placement);
-        gl.egui.run(&gl.window.winit, |ui| crate::ui::show(ui, &status));
+        gl.egui.run(&gl.window.winit, |ui| ui::show(ui, &status));
         gl.egui.paint(&gl.window.winit);
         gl.window.pre_present_and_swap();
         // Reveal only after the first frame is presented, so the window
@@ -323,7 +335,7 @@ impl App {
 
     /// Physical surface size, resizing the GL surface to match.
     /// None when there is no window yet or it is minimized.
-    fn surface_size(&mut self) -> Option<winit::dpi::PhysicalSize<u32>> {
+    fn surface_size(&mut self) -> Option<PhysicalSize<u32>> {
         let gl = self.gl.as_mut()?;
         let size = gl.window.winit.inner_size();
         if size.width == 0 || size.height == 0 {
@@ -349,11 +361,11 @@ impl App {
         (self.last_layout.total(), window.unwrap_or((0.0, 0.0)))
     }
 
-    fn dispatch(&mut self, act: Action, event_loop: &winit::event_loop::ActiveEventLoop) {
+    fn dispatch(&mut self, act: Action, event_loop: &ActiveEventLoop) {
         match act {
             Action::Quit => event_loop.exit(),
             Action::SelectMode(mode) => {
-                let switch = crate::view::switch_mode(
+                let switch = view::switch_mode(
                     self.state.mode,
                     mode,
                     self.state.index,
@@ -369,10 +381,11 @@ impl App {
                 }
             }
             Action::ToggleFullscreen => {
+                use winit::window::Fullscreen;
+
                 if let Some(gl) = self.gl.as_ref() {
                     let entering = gl.window.winit.fullscreen().is_none();
-                    let fullscreen_request =
-                        entering.then_some(winit::window::Fullscreen::Borderless(None));
+                    let fullscreen_request = entering.then_some(Fullscreen::Borderless(None));
                     gl.window.winit.set_fullscreen(fullscreen_request);
                 }
             }
@@ -382,7 +395,7 @@ impl App {
             }
             Action::Right | Action::Left | Action::Forward | Action::Back => {
                 let forward = act.is_forward(self.state.mode);
-                self.state.index = crate::view::advance(
+                self.state.index = view::advance(
                     self.state.index,
                     forward,
                     self.state.mode,
@@ -402,8 +415,8 @@ impl App {
     }
 }
 
-impl winit::application::ApplicationHandler<UserEvent> for App {
-    fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+impl ApplicationHandler<UserEvent> for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let window = match Window::new(event_loop) {
             Ok(window) => window,
             Err(e) => {
@@ -420,7 +433,9 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
             .add_font_provider(Arc::new(egui_system_font_provider::SystemFontProvider::new()));
         // Bridge egui repaint requests into the winit loop.
         {
-            let proxy = egui::mutex::Mutex::new(self.proxy.clone());
+            use egui::mutex::Mutex;
+
+            let proxy = Mutex::new(self.proxy.clone());
             egui.egui_ctx.set_request_repaint_callback(move |info| {
                 let _ = proxy.lock().send_event(UserEvent::Repaint(info.delay));
             });
@@ -430,46 +445,36 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
         self.gl = Some(Gl { pages, egui, window });
     }
 
-    fn user_event(&mut self, event_loop: &winit::event_loop::ActiveEventLoop, event: UserEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Repaint(delay) => {
                 let Some(deadline) = Instant::now().checked_add(delay) else { return };
                 // A repaint request must never delay an already-armed
                 // earlier wake, so keep the sooner deadline.
-                if let winit::event_loop::ControlFlow::WaitUntil(armed) =
-                    event_loop.control_flow()
-                {
+                if let ControlFlow::WaitUntil(armed) = event_loop.control_flow() {
                     if armed <= deadline {
                         return;
                     }
                 }
-                event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(deadline));
+                event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
             }
             UserEvent::PagesUpdated => self.request_redraw(),
         }
     }
 
-    fn new_events(
-        &mut self,
-        _event_loop: &winit::event_loop::ActiveEventLoop,
-        cause: winit::event::StartCause,
-    ) {
-        if let winit::event::StartCause::ResumeTimeReached { .. } = cause {
+    fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: StartCause) {
+        if let StartCause::ResumeTimeReached { .. } = cause {
             self.request_redraw();
         }
     }
 
-    fn exiting(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) {
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         self.gl = None;
     }
 
-    fn window_event(
-        &mut self,
-        event_loop: &winit::event_loop::ActiveEventLoop,
-        _id: winit::window::WindowId,
-        event: winit::event::WindowEvent,
-    ) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
+        use winit::event::MouseButton;
         use winit::keyboard::PhysicalKey;
 
         if matches!(event, WindowEvent::CloseRequested | WindowEvent::Destroyed) {
@@ -524,12 +529,12 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                 let (total, window) = self.geometry();
                 // Scroll up (positive dy) zooms in.
                 let zoom_factor = (wheel_delta_y * WHEEL_ZOOM_SENSITIVITY).exp();
-                let zoomed = crate::view::zoom_at(self.state.placement, self.cursor, zoom_factor);
-                self.state.placement = crate::view::clamp(zoomed, total, window);
+                let zoomed = view::zoom_at(self.state.placement, self.cursor, zoom_factor);
+                self.state.placement = view::clamp(zoomed, total, window);
                 self.fit.note_user_move();
                 self.request_redraw();
             }
-            WindowEvent::MouseInput { state, button: winit::event::MouseButton::Left, .. } => {
+            WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
                 self.dragging = *state == ElementState::Pressed && !egui_wants;
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -538,8 +543,8 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
                     let (total, window) = self.geometry();
                     let pan_delta =
                         (cursor_pos.0 - self.cursor.0, cursor_pos.1 - self.cursor.1);
-                    let panned = crate::view::pan(self.state.placement, pan_delta);
-                    self.state.placement = crate::view::clamp(panned, total, window);
+                    let panned = view::pan(self.state.placement, pan_delta);
+                    self.state.placement = view::clamp(panned, total, window);
                     self.fit.note_user_move();
                     self.request_redraw();
                 }
@@ -548,7 +553,7 @@ impl winit::application::ApplicationHandler<UserEvent> for App {
             WindowEvent::RedrawRequested => {
                 self.frame();
                 // Park until the next input, so idle costs nothing.
-                event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+                event_loop.set_control_flow(ControlFlow::Wait);
             }
             _ => {}
         }
@@ -576,10 +581,10 @@ mod tests {
 
     fn ready(w: u32, h: u32) -> SeatView {
         SeatView::Ready(Arc::new(
-            crate::decode::Decoded::rgba(
+            Decoded::rgba(
                 w,
                 h,
-                crate::decode::Format::Png,
+                Format::Png,
                 vec![0u8; w as usize * h as usize * 4].into_boxed_slice(),
             )
             .expect("valid rgba page"),
