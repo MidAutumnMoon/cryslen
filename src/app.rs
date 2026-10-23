@@ -3,7 +3,6 @@
 //! State is a single plain struct. Every event maps to an `Action` first
 //! (pure, testable), then mutates state.
 
-use std::iter::zip;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -65,13 +64,15 @@ struct FoldedStatus {
 /// to the other one. A failed page stops the fold: its facts do not exist,
 /// and the partner's would describe the wrong page.
 fn fold_status(spread: Spread, mode: ViewMode, seat_views: &[Option<SeatView>; 2]) -> FoldedStatus {
-    let waiting = zip(spread.seats(mode), seat_views)
-        .any(|(want, view)| want.is_some() && matches!(view, Some(SeatView::Pending)));
+    use std::iter;
+
+    let waiting = iter::zip(spread.seats(mode), seat_views)
+        .any(|(wanted, view)| wanted.is_some() && matches!(view, Some(SeatView::Pending)));
     let mut folded = FoldedStatus { waiting, error: None, page: None };
     // Manga reads the right seat first.
     let [left, right] = seat_views;
-    let ordered = if mode.rtl() { [right, left] } else { [left, right] };
-    for seat_view in ordered {
+    let reading_order = if mode.rtl() { [right, left] } else { [left, right] };
+    for seat_view in reading_order {
         match seat_view {
             Some(SeatView::Failed(message)) => {
                 folded.error = Some(message.clone());
@@ -583,7 +584,7 @@ const WHEEL_ZOOM_SENSITIVITY: f32 = 0.15;
 /// so zoom speed does not vary with output scaling.
 const PIXELS_PER_WHEEL_LINE: f32 = 40.0;
 
-/// Pixel-mode wheel motion as zoom lines, normalized by output scale.
+/// Pixel-mode wheel motion as zoom lines.
 #[expect(
     clippy::cast_possible_truncation,
     reason = "wheel lines feed an exponential zoom sensitivity, so one f64-to-f32 rounding is immaterial"

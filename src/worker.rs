@@ -7,7 +7,6 @@ use std::any::Any;
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap};
 use std::io;
-use std::iter::once;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -371,7 +370,9 @@ const PREFETCH_RADIUS: usize = 3;
 /// Decode order around the wanted spread: its first page, then
 /// neighbours out to [`PREFETCH_RADIUS`], nearest first.
 fn neighbors(current: usize, page_count: usize) -> Vec<usize> {
-    once(current)
+    use std::iter;
+
+    iter::once(current)
         .chain(
             (1..=PREFETCH_RADIUS)
                 .flat_map(|distance| [current.checked_sub(distance), current.checked_add(distance)])

@@ -18,7 +18,8 @@ use std::sync::Arc;
 use glow::HasContext;
 
 use crate::decode::{plane_bytes, plane_dims, Decoded, Matrix, Pixels, Plane, Subsampling};
-use crate::view::{px_f32, Placement, Seat, SpreadLayout};
+use crate::view;
+use crate::view::{Placement, Seat, SpreadLayout};
 
 /// Fixed -1..1 strip. The VS places it at the seat's screen rect from
 /// uniforms, so pan/zoom never touch vertex data. Top-origin math lives in
@@ -309,7 +310,7 @@ impl PageTextures {
             gl.bind_vertex_array(Some(self.vao));
             let uniform_location =
                 |name: &str| gl.get_uniform_location(self.program, name);
-            let win = px_f32(size);
+            let win = view::px_f32(size);
             gl.uniform_2_f32(uniform_location("u_win").as_ref(), win.0, win.1);
             for (rect, page) in layout.rects.iter().zip(self.seats.iter()) {
                 let Some(rect) = rect else { continue };
@@ -332,9 +333,9 @@ impl PageTextures {
                 gl.uniform_2_f32(uniform_location("u_offset").as_ref(), screen_origin.0, screen_origin.1);
                 gl.uniform_2_f32(uniform_location("u_size").as_ref(), screen_size.0, screen_size.1);
                 gl.uniform_2_f32(uniform_location("u_scale").as_ref(), placement.scale, placement.scale);
-                let img = px_f32(entry.size);
+                let img = view::px_f32(entry.size);
                 gl.uniform_2_f32(uniform_location("u_img").as_ref(), img.0, img.1);
-                let csize = px_f32((chroma_width, chroma_height));
+                let csize = view::px_f32((chroma_width, chroma_height));
                 gl.uniform_2_f32(uniform_location("u_csize").as_ref(), csize.0, csize.1);
                 gl.uniform_1_i32(
                     uniform_location("u_mode").as_ref(),
@@ -620,7 +621,6 @@ impl From<&Pixels> for PageUniforms {
     }
 }
 
-/// Shader mode id: 0 = RGBA, 1 = YUV.
 fn mode_id(mode: Mode) -> i32 {
     match mode {
         Mode::Rgba => 0,
@@ -628,7 +628,6 @@ fn mode_id(mode: Mode) -> i32 {
     }
 }
 
-/// Shader subsampling id: 0 mono, 1 = 420, 2 = 422, 3 = 444.
 fn chroma_id(subsampling: Subsampling) -> i32 {
     match subsampling {
         Subsampling::Mono => 0,

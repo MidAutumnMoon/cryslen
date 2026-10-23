@@ -304,8 +304,8 @@ fn sniff_ftyp_avif(bytes: &[u8]) -> bool {
     })
 }
 
-/// Brand region of the leading `ftyp` box, bytes 8 to the box end. A box
-/// length under 12 still yields the 4-byte major brand region.
+/// Brand region of the leading `ftyp` box. A box length under 12 still
+/// yields the 4-byte major brand region.
 fn ftyp_brands(bytes: &[u8]) -> Option<&[u8]> {
     let box_len = u32::from_be_bytes(bytes.get(..4)?.try_into().ok()?) as usize;
     let kind: [u8; 4] = bytes.get(4..8)?.try_into().ok()?;
@@ -535,8 +535,7 @@ mod avif {
     }
 }
 
-/// jxl-rs low-level decode with a scoped-thread parallel runner. The decoder
-/// fills opaque alpha when the file has none.
+/// The decoder fills opaque alpha when the file has none.
 mod jxl {
     use std::thread;
 
