@@ -3,6 +3,7 @@
 //! State is a single plain struct. Every event maps to an `Action` first
 //! (pure, testable), then mutates state.
 
+use std::iter::zip;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -20,7 +21,7 @@ use crate::keys::Action;
 use crate::render::PageTextures;
 use crate::source::Source;
 use crate::view;
-use crate::view::{Placement, Spread, SpreadLayout, ViewMode};
+use crate::view::{Placement, Seat, Spread, SpreadLayout, ViewMode};
 use crate::window::Window;
 use crate::worker::{SeatView, SpreadView, Worker};
 
@@ -64,17 +65,14 @@ struct FoldedStatus {
 /// to the other one. A failed page stops the fold: its facts do not exist,
 /// and the partner's would describe the wrong page.
 fn fold_status(spread: Spread, mode: ViewMode, seat_views: &[Option<SeatView>; 2]) -> FoldedStatus {
-    let mut folded = FoldedStatus { waiting: false, error: None, page: None };
-    let wanted = spread.seats(mode);
-    for (seat, seat_view) in seat_views.iter().enumerate() {
-        if wanted[seat].is_some() && matches!(seat_view, Some(SeatView::Pending)) {
-            folded.waiting = true;
-        }
-    }
+    let waiting = zip(spread.seats(mode), seat_views)
+        .any(|(want, view)| want.is_some() && matches!(view, Some(SeatView::Pending)));
+    let mut folded = FoldedStatus { waiting, error: None, page: None };
     // Manga reads the right seat first.
-    let reading_order: [usize; 2] = if mode.rtl() { [1, 0] } else { [0, 1] };
-    for seat in reading_order {
-        match &seat_views[seat] {
+    let [left, right] = seat_views;
+    let ordered = if mode.rtl() { [right, left] } else { [left, right] };
+    for seat_view in ordered {
+        match seat_view {
             Some(SeatView::Failed(message)) => {
                 folded.error = Some(message.clone());
                 break;
@@ -225,16 +223,20 @@ impl App {
         let seat_views: [Option<SeatView>; 2] =
             snapshot.seats(self.state.mode).map(|seat| seat.cloned());
         let wanted_pages = spread.seats(self.state.mode);
-        for seat in 0..2 {
-            match (wanted_pages[seat], seat_views[seat].as_ref()) {
+        for ((seat, wanted), (view, held)) in Seat::ALL
+            .into_iter()
+            .zip(wanted_pages)
+            .zip(seat_views.each_ref().into_iter().zip(self.held.each_mut()))
+        {
+            match (wanted, view) {
                 (None, _) => {
-                    self.held[seat] = None;
+                    *held = None;
                     if let Some(gl) = self.gl.as_mut() {
                         gl.pages.clear(seat);
                     }
                 }
                 (Some(page), Some(SeatView::Ready(decoded))) => {
-                    self.held[seat] = Some(Arc::clone(decoded));
+                    *held = Some(Arc::clone(decoded));
                     if let Some(gl) = self.gl.as_mut() {
                         gl.pages.bind(seat, page, decoded);
                     }
@@ -264,7 +266,7 @@ impl App {
             Some(size) => size,
             None => return Ok(()),
         };
-        let win = (size.width as f32, size.height as f32);
+        let win = view::px_f32((size.width, size.height));
 
         let spread = self.spread();
         debug_assert_eq!(spread, self.retuned_spread, "every spread change must retune the worker");
@@ -306,7 +308,7 @@ impl App {
             let _ = self.proxy.send_event(UserEvent::Repaint(remaining));
         }
 
-        let claimed = decode::format_from_name(self.source.name(spread.first));
+        let claimed = self.source.name(spread.first).and_then(decode::format_from_name);
         let page = folded.page.map(|(decoded, dims)| PageFacts { decoded, claimed, dims });
         let status = StatusLine {
             total: self.source.len(),
@@ -322,7 +324,7 @@ impl App {
 
         let Some(gl) = self.gl.as_mut() else { return Ok(()) };
         gl.egui.painter.clear([size.width, size.height], [0.08, 0.08, 0.09, 1.0]);
-        gl.pages.draw(win, &self.last_layout, &self.state.placement);
+        gl.pages.draw((size.width, size.height), &self.last_layout, &self.state.placement);
         gl.egui.run(&gl.window.winit, |ui| ui::show(ui, &status));
         gl.egui.paint(&gl.window.winit);
         gl.window.pre_present_and_swap()?;
@@ -355,7 +357,7 @@ impl App {
     fn geometry(&self) -> ((f32, f32), (f32, f32)) {
         let window = self.gl.as_ref().map(|gl| {
             let window_size = gl.window.winit.inner_size();
-            (window_size.width as f32, window_size.height as f32)
+            view::px_f32((window_size.width, window_size.height))
         });
         (self.last_layout.total(), window.unwrap_or((0.0, 0.0)))
     }
@@ -521,8 +523,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let wheel_delta_y = match delta {
                     MouseScrollDelta::LineDelta(_, lines) => *lines,
                     MouseScrollDelta::PixelDelta(pixels) => {
-                        pixels.y as f32
-                            / (PIXELS_PER_WHEEL_LINE * gl.window.winit.scale_factor() as f32)
+                        wheel_lines(pixels.y, gl.window.winit.scale_factor())
                     }
                 };
                 let (total, window) = self.geometry();
@@ -537,6 +538,10 @@ impl ApplicationHandler<UserEvent> for App {
                 self.dragging = *state == ElementState::Pressed && !egui_wants;
             }
             WindowEvent::CursorMoved { position, .. } => {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "cursor positions are window-scale px, exact in f32"
+                )]
                 let cursor_pos = (position.x as f32, position.y as f32);
                 if self.dragging && !egui_wants {
                     let (total, window) = self.geometry();
@@ -577,6 +582,15 @@ const WHEEL_ZOOM_SENSITIVITY: f32 = 0.15;
 /// many physical px of scroll equal one "line", normalized by scale factor
 /// so zoom speed does not vary with output scaling.
 const PIXELS_PER_WHEEL_LINE: f32 = 40.0;
+
+/// Pixel-mode wheel motion as zoom lines, normalized by output scale.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "wheel lines feed an exponential zoom sensitivity, so one f64-to-f32 rounding is immaterial"
+)]
+fn wheel_lines(dy: f64, scale_factor: f64) -> f32 {
+    (dy / (f64::from(PIXELS_PER_WHEEL_LINE) * scale_factor)) as f32
+}
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, reason = "a panic in test code is inconsequential")]

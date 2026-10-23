@@ -235,14 +235,17 @@ impl Source {
 
     /// Entry name of one page. For archives this includes the inner
     /// path; for directories it is the bare filename.
-    pub fn name(&self, index: usize) -> &str {
-        debug_assert!(index < self.names.len());
-        &self.names[index]
+    pub fn name(&self, index: usize) -> Option<&str> {
+        self.names.get(index).map(String::as_str)
     }
 
     /// The status line's name segment for one page: the basename plus its
     /// immediate parent directory. Archive entries carry their inner
     /// directory; directory pages get the opened directory itself.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "the page list is non-empty and immutable, and every page index is clamped to its length before reaching here"
+    )]
     pub fn page_name(&self, index: usize) -> PageName {
         debug_assert!(index < self.names.len());
         let entry = &self.names[index];
@@ -260,6 +263,10 @@ impl Source {
 
     /// Raw encoded bytes of one page. 7z reads consult the byte tier first
     /// and fill it on a miss, so repeat reads are an `Arc` refcount bump.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "the page list is non-empty and immutable, and every page index is clamped to its length before reaching here"
+    )]
     pub fn bytes(&self, index: usize) -> Result<Arc<[u8]>, SourceError> {
         debug_assert!(index < self.names.len());
         let name = &self.names[index];
@@ -365,9 +372,15 @@ mod tests {
         );
         assert_eq!(source.names, ["p1.png", "p2.png"]);
         let bytes = source.bytes(0).expect("first page reads");
-        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
-        let width = u32::from_be_bytes(bytes[16..20].try_into().unwrap());
-        let height = u32::from_be_bytes(bytes[20..24].try_into().unwrap());
+        assert_eq!(bytes.get(..8), Some(&b"\x89PNG\r\n\x1a\n"[..]));
+        let be_u32 = |at: usize| {
+            bytes
+                .get(at..at + 4)
+                .and_then(|word| word.try_into().ok())
+                .map(u32::from_be_bytes)
+        };
+        let width = be_u32(16).expect("fixture ihdr width");
+        let height = be_u32(20).expect("fixture ihdr height");
         assert_eq!((width, height), (40, 30));
         let decoded_page = decode::decode(&bytes, "p1.png").expect("decodes");
         assert_eq!((decoded_page.width, decoded_page.height), (width, height));
@@ -452,7 +465,7 @@ mod tests {
             }
         );
         assert_eq!(source.names, ["c1.png", "c2.png", "c10.png", "cover.PNG"]);
-        assert_eq!(source.name(2), "c10.png");
+        assert_eq!(source.name(2), Some("c10.png"));
     }
 
     #[test]

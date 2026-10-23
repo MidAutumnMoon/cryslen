@@ -81,19 +81,21 @@ impl Decoded {
 }
 
 /// Pixel count with a hostile-header cap (matches the image crate's 512 MiB
-/// allocation ceiling) times `bytes_per_pixel`.
+/// allocation ceiling).
+fn checked_pixels(width: u32, height: u32, what: &'static str) -> Result<u32, DecodeError> {
+    width
+        .checked_mul(height)
+        .filter(|&count| (1..=MAX_PIXELS).contains(&count))
+        .ok_or(DecodeError::Corrupt(what))
+}
+
+/// Byte extent: [`checked_pixels`] times `bytes_per_pixel`.
 fn checked_extent(width: u32, height: u32, bytes_per_pixel: usize) -> Result<usize, DecodeError> {
-    let pixel_count = (width as u64)
-        .checked_mul(height as u64)
-        .filter(|&count| count <= MAX_PIXELS as u64);
-    match pixel_count {
-        Some(count) if count > 0 => Ok(count as usize * bytes_per_pixel),
-        _ => Err(DecodeError::Corrupt("bad dimensions")),
-    }
+    Ok(checked_pixels(width, height, "bad dimensions")? as usize * bytes_per_pixel)
 }
 
 /// Hostile-header cap shared by all decoders, in pixels.
-const MAX_PIXELS: usize = 512 << 18;
+const MAX_PIXELS: u32 = 512 << 18;
 
 /// Largest page edge accepted as one GL texture (the common desktop limit).
 const MAX_TEXTURE_EDGE: u32 = 16384;
@@ -274,7 +276,7 @@ fn sniff(bytes: &[u8]) -> Option<Format> {
     if bytes.starts_with(b"GIF8") {
         return Some(Format::Gif);
     }
-    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+    if bytes.starts_with(b"RIFF") && bytes.get(8..12).is_some_and(|tag| tag == b"WEBP") {
         return Some(Format::Webp);
     }
     if bytes.starts_with(b"BM") {
@@ -297,12 +299,21 @@ fn sniff(bytes: &[u8]) -> Option<Format> {
 
 /// AVIF files start with an ISOBMFF `ftyp` box.
 fn sniff_ftyp_avif(bytes: &[u8]) -> bool {
-    if bytes.len() < 12 || &bytes[4..8] != b"ftyp" {
-        return false;
+    ftyp_brands(bytes).is_some_and(|brands| {
+        brands.as_chunks::<4>().0.iter().any(|brand| brand == b"avif" || brand == b"avis")
+    })
+}
+
+/// Brand region of the leading `ftyp` box, bytes 8 to the box end. A box
+/// length under 12 still yields the 4-byte major brand region.
+fn ftyp_brands(bytes: &[u8]) -> Option<&[u8]> {
+    let box_len = u32::from_be_bytes(bytes.get(..4)?.try_into().ok()?) as usize;
+    let kind: [u8; 4] = bytes.get(4..8)?.try_into().ok()?;
+    if kind != *b"ftyp" {
+        return None;
     }
-    let box_len = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize;
     let end = box_len.max(12).min(bytes.len());
-    bytes[8..end].as_chunks::<4>().0.iter().any(|brand| brand == b"avif" || brand == b"avis")
+    bytes.get(8..end)
 }
 
 /// image-crate path: decode with a concrete decoder so EXIF orientation is
@@ -365,16 +376,16 @@ mod avif {
             if avif_image_ptr.is_null() {
                 return Err(DecodeError::Corrupt("avif: no image"));
             }
-            let (width, height) =
-                ((*avif_image_ptr).width as usize, (*avif_image_ptr).height as usize);
-            let depth = (*avif_image_ptr).depth;
-            if !matches!(depth, 8 | 10 | 12 | 16) {
-                return Err(DecodeError::Corrupt("avif: bad depth"));
-            }
-            if (width as u64) * (height as u64) > super::MAX_PIXELS as u64 {
-                return Err(DecodeError::Corrupt("avif: bad dimensions"));
-            }
-            super::check_dims(width as u32, height as u32)?;
+            let (width, height) = ((*avif_image_ptr).width, (*avif_image_ptr).height);
+            let depth = match (*avif_image_ptr).depth {
+                8 => 8u8,
+                10 => 10,
+                12 => 12,
+                16 => 16,
+                _ => return Err(DecodeError::Corrupt("avif: bad depth")),
+            };
+            super::checked_pixels(width, height, "avif: bad dimensions")?;
+            super::check_dims(width, height)?;
             let subsampling = match (*avif_image_ptr).yuvFormat {
                 AVIF_PIXEL_FORMAT_YUV444 => Subsampling::Yuv444,
                 AVIF_PIXEL_FORMAT_YUV422 => Subsampling::Yuv422,
@@ -383,7 +394,7 @@ mod avif {
                 _ => return Err(DecodeError::Unsupported("avif: pixel format")),
             };
             let full_range = (*avif_image_ptr).yuvRange == AVIF_RANGE_FULL;
-            let matrix = match (*avif_image_ptr).matrixCoefficients as u32 {
+            let matrix = match u32::from((*avif_image_ptr).matrixCoefficients) {
                 AVIF_MATRIX_COEFFICIENTS_IDENTITY => Matrix::Identity,
                 AVIF_MATRIX_COEFFICIENTS_BT709 => Matrix::Bt709,
                 AVIF_MATRIX_COEFFICIENTS_BT2020_NCL => Matrix::Bt2020,
@@ -405,7 +416,7 @@ mod avif {
                 (*avif_image_ptr).yuvRowBytes[0],
                 width,
                 height,
-                depth,
+                u32::from(depth),
             )?;
             let (blue_plane, red_plane) = if subsampling == Subsampling::Mono {
                 (Plane::U8(Box::new([])), Plane::U8(Box::new([])))
@@ -416,24 +427,24 @@ mod avif {
                         (*avif_image_ptr).yuvRowBytes[1],
                         chroma_width,
                         chroma_height,
-                        depth,
+                        u32::from(depth),
                     )?,
                     copy_plane(
                         (*avif_image_ptr).yuvPlanes[2],
                         (*avif_image_ptr).yuvRowBytes[2],
                         chroma_width,
                         chroma_height,
-                        depth,
+                        u32::from(depth),
                     )?,
                 )
             };
 
             super::Decoded::yuv(
-                width as u32,
-                height as u32,
+                width,
+                height,
                 Format::Avif,
                 YuvImage {
-                    depth: depth as u8,
+                    depth,
                     subsampling,
                     full_range,
                     matrix,
@@ -445,6 +456,11 @@ mod avif {
         }
     }
 
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_possible_wrap,
+        reason = "the thread count is min(available, MAX_THREADS) before the C-int maxThreads field, so the narrowing cannot occur"
+    )]
     fn threads() -> i32 {
         use std::thread;
 
@@ -468,8 +484,8 @@ mod avif {
     unsafe fn copy_plane(
         plane_ptr: *const u8,
         row_stride: u32,
-        width: usize,
-        height: usize,
+        width: u32,
+        height: u32,
         depth: u32,
     ) -> Result<Plane, DecodeError> {
         use std::slice;
@@ -477,6 +493,7 @@ mod avif {
         if plane_ptr.is_null() {
             return Err(DecodeError::Corrupt("avif: missing plane"));
         }
+        let (width, height) = (width as usize, height as usize);
         let row_stride = row_stride as usize;
         if depth == 8 {
             if row_stride < width {
@@ -493,15 +510,18 @@ mod avif {
             if row_stride < bytes {
                 return Err(DecodeError::Corrupt("avif: bad stride"));
             }
-            let mut out = Vec::with_capacity(width * height);
+            let mut raw = Vec::with_capacity(bytes * height);
             for row in 0..height {
-                let src = slice::from_raw_parts(
-                    plane_ptr.add(row * row_stride) as *const u16,
-                    width,
-                );
-                out.extend_from_slice(src);
+                let src = slice::from_raw_parts(plane_ptr.add(row * row_stride), bytes);
+                raw.extend_from_slice(src);
             }
-            Ok(Plane::U16(out.into_boxed_slice()))
+            let samples = raw
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| u16::from_ne_bytes(*pair))
+                .collect::<Box<[u16]>>();
+            Ok(Plane::U16(samples))
         }
     }
 
@@ -551,12 +571,16 @@ mod jxl {
             Err(error) => return Err(DecodeError::Jxl(error)),
         };
         let (width, height) = decoder.basic_info().size;
-        let pixels =
-            width.checked_mul(height).filter(|&px| px <= super::MAX_PIXELS);
-        let Some(pixel_count) = pixels else {
-            return Err(DecodeError::Corrupt("jxl: bad dimensions"));
-        };
-        super::check_dims(width as u32, height as u32)?;
+        #[expect(
+            clippy::map_err_ignore,
+            reason = "the dropped conversion error says only that the value does not fit, which the message states"
+        )]
+        let (width, height) = (
+            u32::try_from(width).map_err(|_| DecodeError::Corrupt("jxl: bad dimensions"))?,
+            u32::try_from(height).map_err(|_| DecodeError::Corrupt("jxl: bad dimensions"))?,
+        );
+        let pixel_count = super::checked_pixels(width, height, "jxl: bad dimensions")?;
+        super::check_dims(width, height)?;
 
         let extra_channels = decoder.basic_info().extra_channels.len();
         decoder.set_pixel_format(JxlPixelFormat {
@@ -578,8 +602,9 @@ mod jxl {
         };
 
         // pass 3: pixels
-        let mut rgba_buffer = vec![0_u8; pixel_count * 4];
-        let mut output = JxlOutputBuffer::new(&mut rgba_buffer, height, width * 4);
+        let mut rgba_buffer = vec![0_u8; pixel_count as usize * 4];
+        let mut output =
+            JxlOutputBuffer::new(&mut rgba_buffer, height as usize, width as usize * 4);
         loop {
             match decoder
                 .process(&mut input, slice::from_mut(&mut output), Some(&mut runner))
@@ -591,8 +616,8 @@ mod jxl {
         }
 
         Decoded::rgba(
-            width as u32,
-            height as u32,
+            width,
+            height,
             Format::Jxl,
             rgba_buffer.into_boxed_slice(),
         )
@@ -648,7 +673,7 @@ mod tests {
         match page.pixels {
             Pixels::Rgba8(bytes) => {
                 assert_eq!(bytes.len(), 4 * 4 * 3);
-                assert_eq!(&bytes[..4], &[10, 20, 30, 255]);
+                assert_eq!(bytes.get(..4), Some(&[10, 20, 30, 255][..]));
             }
             Pixels::Yuv(_) => panic!("png must decode to rgba"),
         }
@@ -681,7 +706,8 @@ mod tests {
         image::DynamicImage::ImageRgb8(img)
             .write_to(&mut Cursor::new(&mut jpg), image::ImageFormat::Jpeg)
             .unwrap();
-        assert!(matches!(decode(&jpg[..20], "p.jpg"), Err(DecodeError::Image(Format::Jpeg, _))));
+        let truncated: Vec<u8> = jpg.iter().take(20).copied().collect();
+        assert!(matches!(decode(&truncated, "p.jpg"), Err(DecodeError::Image(Format::Jpeg, _))));
     }
 
     #[test]
@@ -752,7 +778,7 @@ mod tests {
             panic!("10-bit luma must be u16 samples")
         };
         assert_eq!(luma.len(), 32 * 16);
-        assert!(luma[0] < luma[luma.len() - 1]);
+        assert!(luma.first() < luma.last());
         assert!(matches!(&yuv.cb, Plane::U8(bytes) if bytes.is_empty()));
         assert!(matches!(&yuv.cr, Plane::U8(bytes) if bytes.is_empty()));
     }
@@ -787,8 +813,8 @@ mod tests {
         match page.pixels {
             // gray replicates to r=g=b
             Pixels::Rgba8(bytes) => {
-                assert_eq!(&bytes[..4], &[0x20, 0x20, 0x20, 0xFF]);
-                assert_eq!(&bytes[128..132], &[0xE0, 0xE0, 0xE0, 0xFF]);
+                assert_eq!(bytes.get(..4), Some(&[0x20, 0x20, 0x20, 0xFF][..]));
+                assert_eq!(bytes.get(128..132), Some(&[0xE0, 0xE0, 0xE0, 0xFF][..]));
             }
             Pixels::Yuv(_) => panic!("jxl must decode to rgba"),
         }
@@ -798,8 +824,8 @@ mod tests {
         match page.pixels {
             // the file's own alpha rides in the fourth byte
             Pixels::Rgba8(bytes) => {
-                assert_eq!(&bytes[..4], &[0x40, 0x80, 0xC0, 0xFF]);
-                assert_eq!(&bytes[128..132], &[0x40, 0x80, 0xC0, 0x80]);
+                assert_eq!(bytes.get(..4), Some(&[0x40, 0x80, 0xC0, 0xFF][..]));
+                assert_eq!(bytes.get(128..132), Some(&[0x40, 0x80, 0xC0, 0x80][..]));
             }
             Pixels::Yuv(_) => panic!("jxl must decode to rgba"),
         }

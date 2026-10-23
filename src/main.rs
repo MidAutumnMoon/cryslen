@@ -90,7 +90,11 @@ fn run(open_path: &Path, land_on: Option<&str>) -> eros::Result<()> {
     let source = Arc::new(Source::open(open_path)?);
 
     let index = land_on
-        .and_then(|name| (0..source.len()).find(|&page_index| source.name(page_index).eq_ignore_ascii_case(name)))
+        .and_then(|name| {
+            (0..source.len()).find(|&page_index| {
+                source.name(page_index).is_some_and(|entry| entry.eq_ignore_ascii_case(name))
+            })
+        })
         .unwrap_or(0);
 
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;

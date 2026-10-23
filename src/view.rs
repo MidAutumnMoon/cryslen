@@ -125,6 +125,18 @@ fn spread_start(number: usize) -> usize {
     if number > 0 { 2 * number - 1 } else { 0 }
 }
 
+/// One of the two seats of an on-screen spread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Seat {
+    Left,
+    Right,
+}
+
+impl Seat {
+    /// The seats in on-screen order.
+    pub const ALL: [Self; 2] = [Self::Left, Self::Right];
+}
+
 /// Seat order as [left, right] under `mode`. Western reads first-left.
 /// Manga reads first-right, so the first page lands in the right seat
 /// and a lone page sits there.
@@ -184,20 +196,27 @@ impl SpreadLayout {
     }
 }
 
+/// Pixel extents as floats: the view model's integer-to-float boundary.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "page edges are capped at 16384 px and window extents are physical-device sized, both far below f32's exact-integer range 2^24"
+)]
+pub fn px_f32(dims: (u32, u32)) -> (f32, f32) {
+    (dims.0 as f32, dims.1 as f32)
+}
+
 /// Compose one or two pages side by side, top-aligned. `dims[i]` is the
 /// decoded size of visual seat i (0 = left, 1 = right). A still-decoding
 /// seat is None and joins the layout when it arrives.
 pub fn layout(dims: [Option<(u32, u32)>; 2]) -> SpreadLayout {
-    let mut rects: [Option<PageRect>; 2] = [None, None];
     let mut next_seat_x = 0.0;
-    for (seat, dims) in dims.iter().enumerate() {
-        if let Some((width, height)) = *dims {
-            rects[seat] =
-                Some(PageRect { pos: (next_seat_x, 0.0), size: (width as f32, height as f32) });
-            next_seat_x += width as f32;
-        }
+    SpreadLayout {
+        rects: dims.map(|seat_dims| seat_dims.map(px_f32).map(|(width, height)| {
+            let rect = PageRect { pos: (next_seat_x, 0.0), size: (width, height) };
+            next_seat_x += width;
+            rect
+        })),
     }
-    SpreadLayout { rects }
 }
 
 /// Placement that fits `total` into `win`, centered.

@@ -18,7 +18,7 @@ use std::sync::Arc;
 use glow::HasContext;
 
 use crate::decode::{plane_bytes, plane_dims, Decoded, Matrix, Pixels, Plane, Subsampling};
-use crate::view::{Placement, SpreadLayout};
+use crate::view::{px_f32, Placement, Seat, SpreadLayout};
 
 /// Fixed -1..1 strip. The VS places it at the seat's screen rect from
 /// uniforms, so pan/zoom never touch vertex data. Top-origin math lives in
@@ -219,11 +219,16 @@ impl PageTextures {
 
             // Sampler units are fixed. Draw rebinds textures only.
             gl.use_program(Some(program));
-            for (unit, name) in ["u_tex0", "u_tex1", "u_tex2"].iter().enumerate() {
-                gl.uniform_1_i32(gl.get_uniform_location(program, name).as_ref(), unit as i32);
+            for (unit, name) in [(0_i32, "u_tex0"), (1, "u_tex1"), (2, "u_tex2")] {
+                gl.uniform_1_i32(gl.get_uniform_location(program, name).as_ref(), unit);
             }
         }
-        let max_tex = unsafe { gl.get_parameter_i32(glow::MAX_TEXTURE_SIZE) } as u32;
+        #[expect(
+            clippy::map_err_ignore,
+            reason = "the dropped conversion error says only that the value is out of range, which the message states"
+        )]
+        let max_tex = u32::try_from(unsafe { gl.get_parameter_i32(glow::MAX_TEXTURE_SIZE) })
+            .map_err(|_| eros::error!("GL MAX_TEXTURE_SIZE is not a positive GLint"))?;
         Ok(Self { gl, program, vao, seats: [None, None], textures: HashMap::new(), vbo, max_tex })
     }
 
@@ -236,8 +241,8 @@ impl PageTextures {
     /// Panics if the page exceeds this context's MAX_TEXTURE_SIZE. Decode
     /// rejects edges over its own cap first, so only a GPU advertising a
     /// smaller limit can trip this.
-    pub fn bind(&mut self, seat: usize, page: usize, decoded: &Decoded) {
-        if self.seats[seat] == Some(page) {
+    pub fn bind(&mut self, seat: Seat, page: usize, decoded: &Decoded) {
+        if *self.seat_slot(seat) == Some(page) {
             return;
         }
         let (width, height) = (decoded.width, decoded.height);
@@ -248,7 +253,7 @@ impl PageTextures {
             "image {width}x{height} exceeds GL max texture size {} (tiling not implemented)",
             self.max_tex
         );
-        self.seats[seat] = Some(page);
+        *self.seat_slot(seat) = Some(page);
         if self.textures.contains_key(&page) {
             return;
         }
@@ -258,8 +263,16 @@ impl PageTextures {
     }
 
     /// Stop drawing `seat`. The page's textures stay cached.
-    pub fn clear(&mut self, seat: usize) {
-        self.seats[seat] = None;
+    pub fn clear(&mut self, seat: Seat) {
+        *self.seat_slot(seat) = None;
+    }
+
+    fn seat_slot(&mut self, seat: Seat) -> &mut Option<usize> {
+        let [left, right] = &mut self.seats;
+        match seat {
+            Seat::Left => left,
+            Seat::Right => right,
+        }
     }
 
     /// Drop cached pages until the map fits [`TEXTURE_BUDGET_BYTES`].
@@ -282,25 +295,26 @@ impl PageTextures {
     /// Draw the spread laid out by `layout` with `placement`.
     ///
     /// Does not clear. The app owns the framebuffer clear each frame.
-    pub fn draw(&self, win: (f32, f32), layout: &SpreadLayout, placement: &Placement) {
+    pub fn draw(&self, size: (u32, u32), layout: &SpreadLayout, placement: &Placement) {
         let gl = &self.gl;
-        if win.0 <= 0.0 || win.1 <= 0.0 {
+        if size.0 == 0 || size.1 == 0 {
             return;
         }
         unsafe {
             // Own the state this draw depends on: egui's paint leaves BLEND
             // enabled, and nothing resets the viewport after a resize.
-            gl.viewport(0, 0, win.0 as i32, win.1 as i32);
+            gl.viewport(0, 0, gl_int(size.0), gl_int(size.1));
             gl.disable(glow::BLEND);
             gl.use_program(Some(self.program));
             gl.bind_vertex_array(Some(self.vao));
             let uniform_location =
                 |name: &str| gl.get_uniform_location(self.program, name);
+            let win = px_f32(size);
             gl.uniform_2_f32(uniform_location("u_win").as_ref(), win.0, win.1);
-            for (seat, rect) in layout.rects.iter().enumerate() {
+            for (rect, page) in layout.rects.iter().zip(self.seats.iter()) {
                 let Some(rect) = rect else { continue };
-                let Some(page) = self.seats.get(seat).copied().flatten() else { continue };
-                let Some(entry) = self.textures.get(&page) else { continue };
+                let Some(page) = page else { continue };
+                let Some(entry) = self.textures.get(page) else { continue };
                 // Whole-pixel rect origin: LINEAR samples shimmer at 1:1 zoom
                 // on fractional offsets otherwise.
                 let screen_origin = (
@@ -318,23 +332,17 @@ impl PageTextures {
                 gl.uniform_2_f32(uniform_location("u_offset").as_ref(), screen_origin.0, screen_origin.1);
                 gl.uniform_2_f32(uniform_location("u_size").as_ref(), screen_size.0, screen_size.1);
                 gl.uniform_2_f32(uniform_location("u_scale").as_ref(), placement.scale, placement.scale);
-                gl.uniform_2_f32(
-                    uniform_location("u_img").as_ref(),
-                    entry.size.0 as f32,
-                    entry.size.1 as f32,
-                );
-                gl.uniform_2_f32(
-                    uniform_location("u_csize").as_ref(),
-                    chroma_width as f32,
-                    chroma_height as f32,
-                );
+                let img = px_f32(entry.size);
+                gl.uniform_2_f32(uniform_location("u_img").as_ref(), img.0, img.1);
+                let csize = px_f32((chroma_width, chroma_height));
+                gl.uniform_2_f32(uniform_location("u_csize").as_ref(), csize.0, csize.1);
                 gl.uniform_1_i32(
                     uniform_location("u_mode").as_ref(),
-                    mode_id(page_uniforms.mode) as i32,
+                    mode_id(page_uniforms.mode),
                 );
                 gl.uniform_1_i32(
                     uniform_location("u_chroma").as_ref(),
-                    chroma_id(page_uniforms.subsampling) as i32,
+                    chroma_id(page_uniforms.subsampling),
                 );
                 gl.uniform_1_f32(uniform_location("u_norm").as_ref(), entry.norm);
                 gl.uniform_3_f32(
@@ -395,6 +403,14 @@ fn delete_textures(gl: &glow::Context, textures: &Textures) {
     }
 }
 
+#[expect(
+    clippy::cast_possible_wrap,
+    reason = "GL enums, 16384-capped texture edges, and window px all sit far below i32; this is the GL ABI's u32-enum to i32-parameter seam"
+)]
+fn gl_int(value: u32) -> i32 {
+    value as i32
+}
+
 /// Texture with viewer defaults. CLAMP keeps edge texels from bleeding.
 /// `filterable` false (GLES R16) means NEAREST and no mips.
 fn new_texture(gl: &glow::Context, filterable: bool) -> <glow::Context as HasContext>::Texture {
@@ -405,8 +421,8 @@ fn new_texture(gl: &glow::Context, filterable: bool) -> <glow::Context as HasCon
     let texture = unsafe { gl.create_texture().expect("GL texture object") };
     unsafe {
         gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as _);
-        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as _);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, gl_int(glow::CLAMP_TO_EDGE));
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, gl_int(glow::CLAMP_TO_EDGE));
         let (min, mag) = if filterable {
             // Mipmapped minification: fit view of a 50MP page minifies ~8x;
             // LINEAR-only shimmer.
@@ -414,8 +430,8 @@ fn new_texture(gl: &glow::Context, filterable: bool) -> <glow::Context as HasCon
         } else {
             (glow::NEAREST, glow::NEAREST)
         };
-        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, min as _);
-        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, mag as _);
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, gl_int(min));
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, gl_int(mag));
     }
     texture
 }
@@ -428,8 +444,8 @@ fn upload_rgba(
     let texture = new_texture(gl, true);
     unsafe {
         gl.tex_image_2d(
-            glow::TEXTURE_2D, 0, glow::RGBA8 as _,
-            dims.0 as i32, dims.1 as i32, 0,
+            glow::TEXTURE_2D, 0, gl_int(glow::RGBA8),
+            gl_int(dims.0), gl_int(dims.1), 0,
             glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(Some(data)),
         );
         gl.generate_mipmap(glow::TEXTURE_2D);
@@ -453,8 +469,8 @@ fn upload_plane(
         // every row after the first.
         gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
         gl.tex_image_2d(
-            glow::TEXTURE_2D, 0, internal as _,
-            dims.0 as i32, dims.1 as i32, 0,
+            glow::TEXTURE_2D, 0, gl_int(internal),
+            gl_int(dims.0), gl_int(dims.1), 0,
             glow::RED, ty, glow::PixelUnpackData::Slice(Some(data)),
         );
         if filterable {
@@ -605,7 +621,7 @@ impl From<&Pixels> for PageUniforms {
 }
 
 /// Shader mode id: 0 = RGBA, 1 = YUV.
-fn mode_id(mode: Mode) -> u32 {
+fn mode_id(mode: Mode) -> i32 {
     match mode {
         Mode::Rgba => 0,
         Mode::Yuv => 1,
@@ -613,7 +629,7 @@ fn mode_id(mode: Mode) -> u32 {
 }
 
 /// Shader subsampling id: 0 mono, 1 = 420, 2 = 422, 3 = 444.
-fn chroma_id(subsampling: Subsampling) -> u32 {
+fn chroma_id(subsampling: Subsampling) -> i32 {
     match subsampling {
         Subsampling::Mono => 0,
         Subsampling::Yuv420 => 1,
@@ -645,6 +661,10 @@ fn range_offsets(full_range: bool) -> (f32, f32) {
 /// Normalizes R16 sampler output for U16-stored planes: sampling divides by
 /// [`R16_STORAGE_MAX`] but only `depth` bits are significant. 1.0 for 8-bit
 /// storage.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "the depth mask 2^depth - 1 is at most 65535, exact in f32"
+)]
 fn depth_norm(depth: u8, wide: bool) -> f32 {
     if !wide {
         return 1.0;
@@ -700,6 +720,10 @@ mod tests {
     use crate::decode::YuvImage;
 
     /// Row `row`, column `col` of the math matrix (storage is column-major).
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "row and col are literal 0..3 coordinates into the fixed 3x3 matrix under test"
+    )]
     fn element(matrix: &[f32; 9], row: usize, col: usize) -> f32 {
         matrix[col * 3 + row]
     }

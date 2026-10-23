@@ -7,6 +7,7 @@ use std::any::Any;
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap};
 use std::io;
+use std::iter::once;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -335,11 +336,13 @@ fn decode_page(source: &Source, page_index: usize) -> Result<Arc<Decoded>, Strin
 
     use crate::decode;
 
-    let name = source.name(page_index).to_owned();
+    let Some(name) = source.name(page_index) else {
+        return Err(format!("page {}: no such page", page_index + 1));
+    };
     let result = panic::catch_unwind(AssertUnwindSafe(
         || -> eros::Result<Decoded> {
             let bytes = source.bytes(page_index)?;
-            Ok(decode::decode(&bytes, &name)?)
+            Ok(decode::decode(&bytes, name)?)
         },
     ));
     match result {
@@ -363,33 +366,29 @@ fn panic_message(panic: Box<dyn Any + Send>) -> String {
 /// prefetch. A double-mode turn steps two pages, so the far page of the
 /// next spread sits at distance 3. Single-page mode over-prefetches by
 /// the same margin, which the book reclaims first as never-wanted.
-const PREFETCH_RADIUS: i64 = 3;
+const PREFETCH_RADIUS: usize = 3;
 
 /// Decode order around the wanted spread: its first page, then
 /// neighbours out to [`PREFETCH_RADIUS`], nearest first.
 fn neighbors(current: usize, page_count: usize) -> Vec<usize> {
-    let mut pages: Vec<usize> = (0..=PREFETCH_RADIUS)
-        .flat_map(|distance| {
-            [current as i64 - distance, current as i64 + distance]
-        })
-        .filter(|&page| (0..page_count as i64).contains(&page))
-        .map(|page| page as usize)
-        .collect();
-    pages.sort_unstable_by_key(|&page| (page.abs_diff(current), page));
-    pages.dedup();
-    pages
+    once(current)
+        .chain(
+            (1..=PREFETCH_RADIUS)
+                .flat_map(|distance| [current.checked_sub(distance), current.checked_add(distance)])
+                .flatten(),
+        )
+        .filter(|&page| page < page_count)
+        .collect()
 }
 
 /// How many pages on each side of the wanted spread may stay pending. A
 /// held key sends retunes faster than pages decode, so pages past this
 /// radius are dropped rather than queued for a reader that has already
 /// moved on. The wanted spread itself never drops.
-const TRAIL_RADIUS: i64 = 64;
+const TRAIL_RADIUS: usize = 64;
 
 fn retain_trail(pending: &mut BTreeSet<usize>, anchor: usize, wanted: &Spread) {
-    pending.retain(|&page| {
-        (page as i64 - anchor as i64).abs() <= TRAIL_RADIUS || wanted.contains(page)
-    });
+    pending.retain(|&page| page.abs_diff(anchor) <= TRAIL_RADIUS || wanted.contains(page));
 }
 
 #[cfg(test)]
@@ -470,7 +469,7 @@ mod tests {
         let mut pending: BTreeSet<usize> = (0..=200).collect();
         let wanted = Spread { first: 100, second: Some(101) };
         retain_trail(&mut pending, 100, &wanted);
-        let kept = (100 - TRAIL_RADIUS as usize)..=(100 + TRAIL_RADIUS as usize);
+        let kept = (100 - TRAIL_RADIUS)..=(100 + TRAIL_RADIUS);
         assert_eq!(pending, kept.collect());
     }
 
@@ -586,8 +585,8 @@ mod tests {
     #[test]
     fn retune_decodes_and_notifies() {
         let dir = TempDir::new("worker");
-        for page in 0..3 {
-            dir.write(&format!("p{page}.png"), &tiny_png(3, 2, [page as u8, 0, 0, 255]));
+        for page in 0u8..3 {
+            dir.write(&format!("p{page}.png"), &tiny_png(3, 2, [page, 0, 0, 255]));
         }
         let source = Arc::new(Source::open(dir.path()).expect("temp source opens"));
         let updates = Arc::new(Mutex::new(0usize));
@@ -639,10 +638,10 @@ mod tests {
         }
     }
 
-    fn tiny_source(tag: &str, page_count: usize) -> (TempDir, Arc<Source>) {
+    fn tiny_source(tag: &str, page_count: u8) -> (TempDir, Arc<Source>) {
         let dir = TempDir::new(tag);
         for page in 0..page_count {
-            dir.write(&format!("p{page:03}.png"), &tiny_png(1, 1, [page as u8, 0, 0, 255]));
+            dir.write(&format!("p{page:03}.png"), &tiny_png(1, 1, [page, 0, 0, 255]));
         }
         let source = Arc::new(Source::open(dir.path()).expect("temp source opens"));
         (dir, source)
