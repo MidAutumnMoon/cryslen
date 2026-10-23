@@ -188,7 +188,7 @@ impl PageTextures {
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
             gl.buffer_data_u8_slice(
                 glow::ARRAY_BUFFER,
-                bytemuck::cast_slice(&[-1.0f32, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0]),
+                bytemuck::cast_slice(&[-1.0_f32, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0]),
                 glow::STATIC_DRAW,
             );
 
@@ -460,7 +460,7 @@ fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> Entry {
                 // 1x1 chroma at the range midpoint; the matrix cancels it
                 // to neutral gray. LE pairs match plane_bytes' U16 layout.
                 let midpoint_bytes: Vec<u8> = if wide {
-                    (1u32 << (yuv.depth.clamp(MIN_PLANE_DEPTH, MAX_PLANE_DEPTH) - 1))
+                    (1_u32 << (yuv.depth.clamp(MIN_PLANE_DEPTH, MAX_PLANE_DEPTH) - 1))
                         .to_le_bytes()
                         .to_vec()
                 } else {
@@ -621,7 +621,7 @@ fn depth_norm(depth: u8, wide: bool) -> f32 {
     if !wide {
         return 1.0;
     }
-    R16_STORAGE_MAX / ((1u32 << depth.clamp(MIN_PLANE_DEPTH, MAX_PLANE_DEPTH)) - 1) as f32
+    R16_STORAGE_MAX / ((1_u32 << depth.clamp(MIN_PLANE_DEPTH, MAX_PLANE_DEPTH)) - 1) as f32
 }
 
 /// Plane bit depths the R8/R16 texture paths accept.

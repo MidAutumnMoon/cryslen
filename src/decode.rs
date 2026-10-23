@@ -581,7 +581,7 @@ mod jxl {
         };
 
         // pass 3: pixels
-        let mut rgba_buffer = vec![0u8; pixel_count * 4];
+        let mut rgba_buffer = vec![0_u8; pixel_count * 4];
         let mut output = JxlOutputBuffer::new(&mut rgba_buffer, height, width * 4);
         loop {
             match decoder
