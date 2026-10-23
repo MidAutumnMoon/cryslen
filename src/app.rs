@@ -160,8 +160,9 @@ pub struct App {
     state: State,
     /// GL exists only after `resumed` (winit requirement).
     gl: Option<Gl>,
-    /// GL init failure from `resumed`, which cannot return a Result. Main
-    /// reports it after the event loop exits.
+    /// Fatal GL error: startup failure from `resumed` or a frame's swap
+    /// failure. winit handlers return (), so main reports it after the
+    /// event loop exits.
     pub start_error: Option<eros::ErrorUnion>,
     /// What each seat holds, the last frame included. Worker eviction
     /// can drop the book's entry, never the pixels held here.
@@ -256,7 +257,7 @@ impl App {
     }
 
     /// One frame: decide, upload, draw, present.
-    fn frame(&mut self) {
+    fn frame(&mut self) -> eros::Result<()> {
         use crate::decode;
         use crate::ui;
         use crate::ui::PageFacts;
@@ -264,7 +265,7 @@ impl App {
 
         let size = match self.surface_size() {
             Some(size) => size,
-            None => return,
+            None => return Ok(()),
         };
         let win = (size.width as f32, size.height as f32);
 
@@ -322,15 +323,16 @@ impl App {
             error: folded.error,
         };
 
-        let Some(gl) = self.gl.as_mut() else { return };
+        let Some(gl) = self.gl.as_mut() else { return Ok(()) };
         gl.egui.painter.clear([size.width, size.height], [0.08, 0.08, 0.09, 1.0]);
         gl.pages.draw(win, &self.last_layout, &self.state.placement);
         gl.egui.run(&gl.window.winit, |ui| ui::show(ui, &status));
         gl.egui.paint(&gl.window.winit);
-        gl.window.pre_present_and_swap();
+        gl.window.pre_present_and_swap()?;
         // Reveal only after the first frame is presented, so the window
         // never maps empty.
         gl.window.winit.set_visible(true);
+        Ok(())
     }
 
     /// Physical surface size, resizing the GL surface to match.
@@ -426,6 +428,16 @@ impl ApplicationHandler<UserEvent> for App {
             }
         };
         let gl = window.glow();
+        let pages = match PageTextures::new(Arc::clone(&gl)) {
+            Ok(pages) => pages,
+            Err(error) => {
+                self.start_error = Some(error);
+                event_loop.exit();
+                return;
+            }
+        };
+        // EguiGlow::new can still panic on shader failure (an upstream
+        // unwrap, egui_glow TODO). Accepted dependency risk.
         let egui = egui_glow::EguiGlow::new(event_loop, Arc::clone(&gl), None, None, true);
         // System fonts join the family fallback chains lazily, for filename
         // characters the built-in fonts cannot render.
@@ -440,7 +452,6 @@ impl ApplicationHandler<UserEvent> for App {
                 let _ = proxy.lock().send_event(UserEvent::Repaint(info.delay));
             });
         }
-        let pages = PageTextures::new(gl);
         window.winit.request_redraw();
         self.gl = Some(Gl { pages, egui, window });
     }
@@ -480,15 +491,12 @@ impl ApplicationHandler<UserEvent> for App {
         if matches!(event, WindowEvent::CloseRequested | WindowEvent::Destroyed) {
             event_loop.exit();
         }
-        if self.gl.is_none() {
-            return;
-        }
+        let Some(gl) = self.gl.as_mut() else { return };
 
         // Give egui the event first. If it wants the pointer, we don't
         // pan or zoom.
         let egui_wants = {
-            let Gl { egui, window, .. } =
-                self.gl.as_mut().expect("gl is Some (returned early when absent)");
+            let Gl { egui, window, .. } = gl;
             let response = egui.on_window_event(&window.winit, &event);
             let wants = egui.egui_ctx.egui_wants_pointer_input();
             if response.repaint {
@@ -515,15 +523,11 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } if !egui_wants => {
-                let wheel_delta_y = {
-                    let Some(gl) = self.gl.as_ref() else { return };
-                    match delta {
-                        MouseScrollDelta::LineDelta(_, lines) => *lines,
-                        MouseScrollDelta::PixelDelta(pixels) => {
-                            pixels.y as f32
-                                / (PIXELS_PER_WHEEL_LINE
-                                    * gl.window.winit.scale_factor() as f32)
-                        }
+                let wheel_delta_y = match delta {
+                    MouseScrollDelta::LineDelta(_, lines) => *lines,
+                    MouseScrollDelta::PixelDelta(pixels) => {
+                        pixels.y as f32
+                            / (PIXELS_PER_WHEEL_LINE * gl.window.winit.scale_factor() as f32)
                     }
                 };
                 let (total, window) = self.geometry();
@@ -551,7 +555,11 @@ impl ApplicationHandler<UserEvent> for App {
                 self.cursor = cursor_pos;
             }
             WindowEvent::RedrawRequested => {
-                self.frame();
+                if let Err(error) = self.frame() {
+                    self.start_error = Some(error);
+                    event_loop.exit();
+                    return;
+                }
                 // Park until the next input, so idle costs nothing.
                 event_loop.set_control_flow(ControlFlow::Wait);
             }
@@ -576,6 +584,7 @@ const WHEEL_ZOOM_SENSITIVITY: f32 = 0.15;
 const PIXELS_PER_WHEEL_LINE: f32 = 40.0;
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, reason = "test code fails fast by design")]
 mod tests {
     use super::*;
 

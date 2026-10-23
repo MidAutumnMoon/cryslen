@@ -1,8 +1,10 @@
 //! GL rendering: the page quad renderer. All GL `unsafe` lives here and in
 //! window.rs, behind safe functions (the only other unsafe in cryslen is
-//! decode.rs's libavif FFI block, behind the `avif` feature). Runtime GL
-//! calls (resource creation, swap) panic since context loss leaves nothing to
-//! show.
+//! decode.rs's libavif FFI block, behind the `avif` feature). GL init and
+//! swap failures propagate as errors and exit cleanly through `start_error`
+//! in app.rs. Runtime texture-creation failure still panics: per-page
+//! recovery would be possible but is deliberately not built (complexity,
+//! an upstream egui unwrap at runtime, rare on target hardware).
 //!
 //! A page-keyed texture cache plus the two-seat spread draw, YUV plane
 //! textures with shader-side conversion. The app owns what each seat
@@ -161,29 +163,45 @@ const RGBA_UNIFORMS: PageUniforms = PageUniforms {
 };
 
 impl PageTextures {
-    pub fn new(gl: Arc<glow::Context>) -> Self {
+    pub fn new(gl: Arc<glow::Context>) -> eros::Result<Self> {
         let (vs, fs) = if gl.version().is_embedded { (VS_ES, FS_ES) } else { (VS_CORE, FS_CORE) };
-        let compile = |kind, src| unsafe {
-            let shader = gl.create_shader(kind).expect("GL shader object");
-            gl.shader_source(shader, src);
-            gl.compile_shader(shader);
-            assert!(
-                gl.get_shader_compile_status(shader),
-                "{}",
-                gl.get_shader_info_log(shader)
-            );
-            shader
+        let compile = |kind, src| -> eros::Result<_> {
+            unsafe {
+                let shader = gl
+                    .create_shader(kind)
+                    .map_err(|error| eros::error!("GL shader object creation failed: {error}"))?;
+                gl.shader_source(shader, src);
+                gl.compile_shader(shader);
+                if !gl.get_shader_compile_status(shader) {
+                    return Err(eros::error!(
+                        "GL shader compile failed: {}",
+                        gl.get_shader_info_log(shader)
+                    ));
+                }
+                Ok(shader)
+            }
         };
         let (program, vbo, vao);
         unsafe {
-            program = gl.create_program().expect("GL program object");
-            vbo = gl.create_buffer().expect("GL buffer object");
-            vao = gl.create_vertex_array().expect("GL vertex array object");
+            program = gl
+                .create_program()
+                .map_err(|error| eros::error!("GL program object creation failed: {error}"))?;
+            vbo = gl
+                .create_buffer()
+                .map_err(|error| eros::error!("GL buffer object creation failed: {error}"))?;
+            vao = gl
+                .create_vertex_array()
+                .map_err(|error| eros::error!("GL vertex array object creation failed: {error}"))?;
 
-            gl.attach_shader(program, compile(glow::VERTEX_SHADER, vs));
-            gl.attach_shader(program, compile(glow::FRAGMENT_SHADER, fs));
+            gl.attach_shader(program, compile(glow::VERTEX_SHADER, vs)?);
+            gl.attach_shader(program, compile(glow::FRAGMENT_SHADER, fs)?);
             gl.link_program(program);
-            assert!(gl.get_program_link_status(program), "{}", gl.get_program_info_log(program));
+            if !gl.get_program_link_status(program) {
+                return Err(eros::error!(
+                    "GL program link failed: {}",
+                    gl.get_program_info_log(program)
+                ));
+            }
 
             gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
             gl.buffer_data_u8_slice(
@@ -193,6 +211,10 @@ impl PageTextures {
             );
 
             gl.bind_vertex_array(Some(vao));
+            #[expect(
+                clippy::expect_used,
+                reason = "the attribute is declared and used in this file's in-tree shader sources, so failure means an in-tree regression"
+            )]
             let loc = gl.get_attrib_location(program, "pos").expect("pos attribute in page shader");
             gl.enable_vertex_attrib_array(loc);
             gl.vertex_attrib_pointer_f32(loc, 2, glow::FLOAT, false, 8, 0);
@@ -204,7 +226,7 @@ impl PageTextures {
             }
         }
         let max_tex = unsafe { gl.get_parameter_i32(glow::MAX_TEXTURE_SIZE) } as u32;
-        Self { gl, program, vao, seats: [None, None], textures: HashMap::new(), vbo, max_tex }
+        Ok(Self { gl, program, vao, seats: [None, None], textures: HashMap::new(), vbo, max_tex })
     }
 
     /// Record that `seat` draws `page`, uploading its textures only on a
@@ -244,12 +266,19 @@ impl PageTextures {
 
     /// Drop cached pages until the map fits [`TEXTURE_BUDGET_BYTES`].
     fn evict_over_budget(&mut self) {
-        let costs: HashMap<usize, usize> =
-            self.textures.iter().map(|(page, entry)| (*page, entry.cost)).collect();
-        for page in eviction_victims(&costs, self.seats, TEXTURE_BUDGET_BYTES) {
-            let entry = self.textures.remove(&page).expect("victim still cached");
-            delete_textures(&self.gl, &entry.textures);
-        }
+        let victims = eviction_victims(
+            self.textures.iter().map(|(page, entry)| (*page, entry.cost)),
+            self.seats,
+            TEXTURE_BUDGET_BYTES,
+        );
+        self.textures.retain(|page, entry| {
+            if victims.contains(page) {
+                delete_textures(&self.gl, &entry.textures);
+                false
+            } else {
+                true
+            }
+        });
     }
 
     /// Draw the spread laid out by `layout` with `placement`.
@@ -371,6 +400,10 @@ fn delete_textures(gl: &glow::Context, textures: &Textures) {
 /// Texture with viewer defaults. CLAMP keeps edge texels from bleeding.
 /// `filterable` false (GLES R16) means NEAREST and no mips.
 fn new_texture(gl: &glow::Context, filterable: bool) -> <glow::Context as HasContext>::Texture {
+    #[expect(
+        clippy::expect_used,
+        reason = "texture-creation failure panics by policy; see the module doc"
+    )]
     let texture = unsafe { gl.create_texture().expect("GL texture object") };
     unsafe {
         gl.bind_texture(glow::TEXTURE_2D, Some(texture));
@@ -510,20 +543,18 @@ fn entry_cost_bytes(decoded: &Decoded, mips: bool) -> usize {
 }
 
 /// Pages to drop so the cached costs fit `budget` after a fresh insert.
-/// Candidates are unbound pages, farthest from the nearest bound page
-/// first, ties by higher page id. Bound pages never go, so the survivors
-/// can still sit above the budget until the next insert.
+/// Every cached page arrives as a (page, cost) pair. Candidates are
+/// unbound pages, farthest from the nearest bound page first, ties by
+/// higher page id. Bound pages never go, so the survivors can still sit
+/// above the budget until the next insert.
 fn eviction_victims(
-    costs: &HashMap<usize, usize>,
+    costs: impl IntoIterator<Item = (usize, usize)>,
     bound: [Option<usize>; 2],
     budget: usize,
 ) -> Vec<usize> {
-    let mut remaining: usize = costs.values().sum();
-    let mut candidates: Vec<usize> = costs
-        .keys()
-        .copied()
-        .filter(|page| !bound.contains(&Some(*page)))
-        .collect();
+    let mut candidates: Vec<(usize, usize)> = costs.into_iter().collect();
+    let mut remaining: usize = candidates.iter().map(|&(_, cost)| cost).sum();
+    candidates.retain(|&(page, _)| !bound.contains(&Some(page)));
     let distance = |page: usize| {
         bound
             .iter()
@@ -532,13 +563,13 @@ fn eviction_victims(
             .min()
             .unwrap_or(usize::MAX)
     };
-    candidates.sort_unstable_by_key(|page| Reverse((distance(*page), *page)));
+    candidates.sort_unstable_by_key(|&(page, _)| Reverse((distance(page), page)));
     let mut victims = Vec::new();
-    for page in candidates {
+    for (page, cost) in candidates {
         if remaining <= budget {
             break;
         }
-        remaining -= costs[&page];
+        remaining -= cost;
         victims.push(page);
     }
     victims
@@ -665,6 +696,7 @@ fn yuv_to_rgb_matrix(matrix: Matrix, full_range: bool) -> [f32; 9] {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, reason = "test code fails fast by design")]
 mod tests {
     use super::*;
     use crate::decode::Format;
@@ -806,22 +838,22 @@ mod tests {
 
     #[test]
     fn eviction_drops_unbound_pages_farthest_first() {
-        let costs = HashMap::from([(3usize, 10usize), (19, 10), (10, 10), (20, 10)]);
+        let costs = [(3usize, 10usize), (19, 10), (10, 10), (20, 10)];
         // 19 sits one page from seat 1's anchor, so 3 is the farther victim.
-        assert_eq!(eviction_victims(&costs, [Some(10), Some(20)], 35), vec![3]);
-        assert_eq!(eviction_victims(&costs, [Some(10), Some(20)], 25), vec![3, 19]);
+        assert_eq!(eviction_victims(costs, [Some(10), Some(20)], 35), vec![3]);
+        assert_eq!(eviction_victims(costs, [Some(10), Some(20)], 25), vec![3, 19]);
     }
 
     #[test]
     fn bound_pages_are_never_evicted() {
-        let costs = HashMap::from([(10usize, 10usize), (11, 10), (12, 10)]);
-        assert_eq!(eviction_victims(&costs, [Some(10), Some(11)], 0), vec![12]);
-        assert_eq!(eviction_victims(&costs, [Some(10), Some(11)], 30), vec![]);
+        let costs = [(10usize, 10usize), (11, 10), (12, 10)];
+        assert_eq!(eviction_victims(costs, [Some(10), Some(11)], 0), vec![12]);
+        assert_eq!(eviction_victims(costs, [Some(10), Some(11)], 30), vec![]);
     }
 
     #[test]
     fn eviction_ties_break_to_the_higher_page() {
-        let costs = HashMap::from([(8usize, 10usize), (12, 10), (10, 10)]);
-        assert_eq!(eviction_victims(&costs, [Some(10), None], 25), vec![12]);
+        let costs = [(8usize, 10usize), (12, 10), (10, 10)];
+        assert_eq!(eviction_victims(costs, [Some(10), None], 25), vec![12]);
     }
 }

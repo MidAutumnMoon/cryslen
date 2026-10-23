@@ -1,5 +1,5 @@
-//! Window and GL context creation (glutin-on-winit). Creation returns
-//! errors for main to report.
+//! Window and GL context creation (glutin-on-winit). Creation and swap
+//! return errors for main to report.
 
 use core::num::NonZeroU32;
 use std::sync::Arc;
@@ -78,7 +78,7 @@ impl Window {
             .ok_or_else(|| eros::error!("no GL config matched the template"))?;
 
         let window = glutin_winit::finalize_window(event_loop, attrs, &gl_config)?;
-        let raw_window = window.window_handle().expect("window handle").as_raw();
+        let raw_window = window.window_handle()?.as_raw();
         let ctx_attrs =
             ContextAttributesBuilder::new().build(Some(raw_window));
         let fallback = ContextAttributesBuilder::new()
@@ -98,8 +98,8 @@ impl Window {
             SurfaceAttributesBuilder::<WindowSurface>::new()
                 .build(
                     raw_window,
-                    NonZeroU32::new(width).expect("nonzero window width"),
-                    NonZeroU32::new(height).expect("nonzero window height"),
+                    NonZeroU32::new(width).ok_or_else(|| eros::error!("window width is zero"))?,
+                    NonZeroU32::new(height).ok_or_else(|| eros::error!("window height is zero"))?,
                 );
         let surface = gl_display.create_window_surface(&gl_config, &surface_attrs)?;
         let context = not_current.make_current(&surface)?;
@@ -110,6 +110,10 @@ impl Window {
             .set_swap_interval(&context, SwapInterval::DontWait)?;
 
         let gl = Arc::new(glow::Context::from_loader_function(|symbol| {
+            #[expect(
+                clippy::expect_used,
+                reason = "symbol names are static ASCII GL entry points, NUL-free by construction"
+            )]
             let symbol = CString::new(symbol).expect("GL proc name without interior NUL");
             gl_display.get_proc_address(&symbol)
         }));
@@ -121,25 +125,26 @@ impl Window {
     }
 
     /// Resize the surface when the window size changed since the last
-    /// call. No-op otherwise.
+    /// call. A zero size (minimized) and an unchanged size are no-ops.
     pub fn resize(&mut self, size: PhysicalSize<u32>) {
+        let (Some(width), Some(height)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
+        else {
+            return;
+        };
         if (size.width, size.height) == self.resized_to {
             return;
         }
         use glutin::prelude::GlSurface as _;
-        self.surface.resize(
-            &self.context,
-            size.width.try_into().expect("nonzero surface width"),
-            size.height.try_into().expect("nonzero surface height"),
-        );
+        self.surface.resize(&self.context, width, height);
         self.resized_to = (size.width, size.height);
     }
 
     /// Frame-callback notify then non-blocking swap.
-    pub fn pre_present_and_swap(&self) {
+    pub fn pre_present_and_swap(&self) -> eros::Result<()> {
         use glutin::prelude::GlSurface as _;
         self.winit.pre_present_notify();
-        self.surface.swap_buffers(&self.context).expect("swap buffers (GL context lost)");
+        self.surface.swap_buffers(&self.context)?;
+        Ok(())
     }
 }
 

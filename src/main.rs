@@ -8,6 +8,7 @@ mod keys;
 mod render;
 mod source;
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, reason = "test code fails fast by design")]
 pub(crate) mod testkit;
 mod ui;
 mod view;
@@ -32,11 +33,12 @@ enum Arg {
 fn main() -> ExitCode {
     use std::env;
 
-    let Some(arg) = env::args().nth(1) else {
+    // env::args panics on non-UTF-8 argv, which file managers pass.
+    let Some(arg_os) = env::args_os().nth(1) else {
         eprintln!("usage: cy <dir | archive | image-file>");
         return ExitCode::from(2);
     };
-    let path = Path::new(&arg);
+    let path = Path::new(&arg_os);
 
     let open = match classify(path) {
         Ok(open) => open,
@@ -62,14 +64,15 @@ fn main() -> ExitCode {
 /// Directories and archives open as sources. A file argument must be an
 /// image by extension, or it is a startup error.
 fn classify(path: &Path) -> eros::Result<Arg> {
+    // A path with no file-name component cannot be a file argument,
+    // so it opens as a source.
+    let Some(name) = path.file_name() else {
+        return Ok(Arg::Open(path.to_path_buf()));
+    };
     if !path.is_file() || source::is_archive(path) {
         return Ok(Arg::Open(path.to_path_buf()));
     }
-    let name = path
-        .file_name()
-        .expect("a file argument has a file name")
-        .to_string_lossy()
-        .into_owned();
+    let name = name.to_string_lossy().into_owned();
     if decode::format_from_name(&name).is_none() {
         return Err(eros::error!("unsupported file type: {}", path.display()));
     }
@@ -96,7 +99,7 @@ fn run(open_path: &Path, land_on: Option<&str>) -> eros::Result<()> {
 
     let worker = Worker::spawn(Arc::clone(&source), move || {
         let _ = proxy.send_event(UserEvent::PagesUpdated);
-    });
+    })?;
 
     let mut app = App::new(source, worker, index, event_loop.create_proxy());
     event_loop.run_app(&mut app)?;
@@ -107,6 +110,7 @@ fn run(open_path: &Path, land_on: Option<&str>) -> eros::Result<()> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, reason = "test code fails fast by design")]
 mod tests {
     use super::*;
     use crate::testkit::{tiny_png, TempDir};

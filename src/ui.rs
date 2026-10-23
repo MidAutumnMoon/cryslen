@@ -137,6 +137,7 @@ fn line(style: &egui::Style, status: &StatusLine) -> LayoutJob {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, reason = "test code fails fast by design")]
 mod tests {
     use super::*;
 

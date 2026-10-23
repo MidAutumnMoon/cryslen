@@ -6,6 +6,7 @@
 use std::any::Any;
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap};
+use std::io;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -138,6 +139,7 @@ impl Book {
             self.evict();
         }
         self.assert_wanted_covered();
+        self.assert_live_bytes();
     }
 
     /// Both seats of the wanted spread. Cloning a `Ready` page is an
@@ -193,6 +195,16 @@ impl Book {
             debug_assert!(covered(second));
         }
     }
+
+    /// `live_bytes` always equals the summed resident bytes of the
+    /// decided entries.
+    fn assert_live_bytes(&self) {
+        debug_assert_eq!(
+            self.live_bytes,
+            self.decided.values().map(SeatView::resident_bytes).sum(),
+            "live_bytes matches the summed resident bytes"
+        );
+    }
 }
 
 /// Handle to the worker. `retune` is cheap and never blocks.
@@ -206,7 +218,7 @@ impl Worker {
     /// Spawn the worker for `source`. `notify` fires after every decided
     /// page and should send the winit user event. The worker itself
     /// knows nothing about winit.
-    pub fn spawn(source: Arc<Source>, notify: impl Fn() + Send + Sync + 'static) -> Self {
+    pub fn spawn(source: Arc<Source>, notify: impl Fn() + Send + Sync + 'static) -> io::Result<Self> {
         use std::thread::Builder;
 
         let (tx, rx) = mpsc::channel::<ToWorker>();
@@ -216,9 +228,8 @@ impl Worker {
             .spawn({
                 let book = Arc::clone(&book);
                 move || run(&source, rx, &book, &notify)
-            })
-            .expect("spawn decode worker");
-        Self { tx, book, handle: Some(handle) }
+            })?;
+        Ok(Self { tx, book, handle: Some(handle) })
     }
 
     /// Tell the worker which spread the app is now showing.
@@ -228,7 +239,18 @@ impl Worker {
 
     /// The current view for both seats of `wanted`, read under one lock.
     pub fn snapshot(&self, wanted: &Spread) -> SpreadView {
-        self.book.lock().expect("decode book lock").snapshot(wanted)
+        // A poisoned book lock means a panic struck mid-mutation, so
+        // live_bytes may no longer match the decided entries. Crash
+        // rather than run on drifted state; source.rs's cache locks
+        // recover (lock_recovered) because their guarded data stays
+        // independently valid. Unreachable in release: decode runs
+        // outside the lock, inside catch_unwind.
+        #[expect(
+            clippy::expect_used,
+            reason = "a poisoned book lock means drifted state; crash rather than recover"
+        )]
+        let book = self.book.lock().expect("decode book lock");
+        book.snapshot(wanted)
     }
 }
 
@@ -262,12 +284,22 @@ fn run(
             retunes.push(spread);
         }
         if !retunes.is_empty() {
+            #[expect(
+                clippy::expect_used,
+                reason = "a poisoned book lock means drifted state; see Worker::snapshot"
+            )]
             let mut book = book.lock().expect("decode book lock");
             for &spread in &retunes {
                 book.retune(spread, page_count);
             }
             retunes.clear();
         }
+        // The scrutinee's MutexGuard drops before the else block runs,
+        // so the lock is not held across the blocking recv below.
+        #[expect(
+            clippy::expect_used,
+            reason = "a poisoned book lock means drifted state; see Worker::snapshot"
+        )]
         let Some(page_index) = book.lock().expect("decode book lock").take_next() else {
             let arrived = match rx.recv() {
                 Ok(ToWorker::Retune(spread)) => spread,
@@ -278,6 +310,10 @@ fn run(
         };
         let decoded = decode_page(source, page_index);
         {
+            #[expect(
+                clippy::expect_used,
+                reason = "a poisoned book lock means drifted state; see Worker::snapshot"
+            )]
             let mut book = book.lock().expect("decode book lock");
             let seat_view = match decoded {
                 Ok(page) => SeatView::Ready(page),
@@ -362,6 +398,7 @@ fn retain_trail(pending: &mut BTreeSet<usize>, anchor: usize, wanted: &Spread) {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, reason = "test code fails fast by design")]
 mod tests {
     use super::*;
     use crate::decode::Format;
@@ -562,7 +599,8 @@ mod tests {
         let counted = Arc::clone(&updates);
         let worker = Worker::spawn(source, move || {
             *counted.lock().unwrap() += 1;
-        });
+        })
+        .expect("worker spawns");
         worker.retune(Spread { first: 1, second: None });
 
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -590,7 +628,7 @@ mod tests {
         dir.write("bad.png", b"not a png at all");
         dir.write("ok.png", &tiny_png(2, 2, [0, 255, 0, 255]));
         let source = Arc::new(Source::open(dir.path()).expect("temp source opens"));
-        let worker = Worker::spawn(source, || {});
+        let worker = Worker::spawn(source, || {}).expect("worker spawns");
         let wanted = Spread { first: 0, second: None };
         worker.retune(wanted);
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -665,7 +703,7 @@ mod tests {
     #[test]
     fn rapid_retunes_decode_every_trail_page() {
         let (_dir, source) = tiny_source("worker-skim", 50);
-        let worker = Worker::spawn(source, || {});
+        let worker = Worker::spawn(source, || {}).expect("worker spawns");
         for page in 0..50 {
             worker.retune(Spread { first: page, second: None });
         }
@@ -675,7 +713,7 @@ mod tests {
     #[test]
     fn retuned_spread_decodes_both_pages() {
         let (_dir, source) = tiny_source("worker-double", 6);
-        let worker = Worker::spawn(source, || {});
+        let worker = Worker::spawn(source, || {}).expect("worker spawns");
         worker.retune(Spread { first: 3, second: Some(4) });
         wait_ready(&worker, &[3, 4]);
         // The last-wanted records are what keep a wanted spread in
@@ -690,7 +728,7 @@ mod tests {
         let (_dir, source) = tiny_source("worker-bound", 140);
         let gate = Gate::new();
         let parked = gate.clone();
-        let worker = Worker::spawn(source, move || parked.hold());
+        let worker = Worker::spawn(source, move || parked.hold()).expect("worker spawns");
         worker.retune(Spread { first: 0, second: None });
         wait_ready(&worker, &[0]);
         // All 139 retunes queue while the worker is parked on page 0.
@@ -715,7 +753,7 @@ mod tests {
         let (_dir, source) = tiny_source("worker-prio", 70);
         let gate = Gate::new();
         let parked = gate.clone();
-        let worker = Worker::spawn(source, move || parked.hold());
+        let worker = Worker::spawn(source, move || parked.hold()).expect("worker spawns");
         worker.retune(Spread { first: 0, second: None });
         wait_ready(&worker, &[0]);
         worker.retune(Spread { first: 60, second: None });

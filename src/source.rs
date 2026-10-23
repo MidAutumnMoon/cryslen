@@ -13,19 +13,10 @@ use std::io::Error as IoError;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::thread::JoinHandle;
 
 use zip::result::ZipError;
 
 use crate::decode::format_from_name;
-
-/// Where pages come from, decided by `Source::open` from one path argument.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum SourceKind {
-    Directory(PathBuf),
-    Zip(PathBuf),
-    SevenZip(PathBuf),
-}
 
 #[derive(Debug)]
 pub enum SourceError {
@@ -111,6 +102,10 @@ impl ByteTier {
 
     /// A member larger than the whole budget is not retained. A repeated
     /// index keeps its incumbent, so the byte count stays exact.
+    #[expect(
+        clippy::expect_used,
+        reason = "every map key has exactly one order entry (paired insert/evict removal), and live_bytes > budget with an empty map is impossible; pinned by the ByteTier tests"
+    )]
     fn insert(&mut self, index: usize, data: Arc<[u8]>) {
         if data.len() > self.budget || self.map.contains_key(&index) {
             return;
@@ -134,17 +129,28 @@ fn lock_recovered<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
     }
 }
 
-pub struct Source {
-    kind: SourceKind,
-    names: Vec<String>,
-    zip: Option<Mutex<zip::ZipArchive<BufReader<File>>>>,
-    sevenzip: Option<Mutex<sevenz_rust2::ArchiveReader<File>>>,
+/// The state a 7z source's read path needs.
+struct SevenZipState {
+    archive: Mutex<sevenz_rust2::ArchiveReader<File>>,
     /// Decompressed 7z members, shared with the harvest thread.
-    tier: Option<Arc<Mutex<ByteTier>>>,
-    /// Dropping detaches the harvest thread so quitting does not wait out
-    /// a pass. The thread owns only its reader and the tier `Arc` and
-    /// finishes alone.
-    harvest: Option<JoinHandle<()>>,
+    tier: Arc<Mutex<ByteTier>>,
+}
+
+/// Where pages come from, decided by `Source::open` from one path argument.
+/// Each variant carries the state its read path needs.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "one Source behind an Arc, so the enum size is never multiplied"
+)]
+enum Backend {
+    Directory(PathBuf),
+    Zip(Mutex<zip::ZipArchive<BufReader<File>>>),
+    SevenZip(SevenZipState),
+}
+
+pub struct Source {
+    names: Vec<String>,
+    backend: Backend,
 }
 
 impl Source {
@@ -169,7 +175,7 @@ impl Source {
             .filter(|name| format_from_name(name).is_some())
             .collect();
         sort_pages(&mut names);
-        Self::from_names(SourceKind::Directory(dir.to_path_buf()), names)
+        Self::from_names(Backend::Directory(dir.to_path_buf()), names)
     }
 
     fn open_zip(path: &Path) -> Result<Self, SourceError> {
@@ -183,10 +189,7 @@ impl Source {
             .map(|name| name.into_owned())
             .collect();
         sort_pages(&mut names);
-        let mut source =
-            Self::from_names(SourceKind::Zip(path.to_path_buf()), names)?;
-        source.zip = Some(Mutex::new(zip));
-        Ok(source)
+        Self::from_names(Backend::Zip(Mutex::new(zip)), names)
     }
 
     fn open_sevenzip(path: &Path) -> Result<Self, SourceError> {
@@ -200,32 +203,30 @@ impl Source {
             .map(|entry| entry.name.clone())
             .collect();
         sort_pages(&mut names);
-        let mut source = Self::from_names(SourceKind::SevenZip(path.to_path_buf()), names)?;
-        let pages: HashMap<String, usize> = source
-            .names
+        // The empty check runs before the spawn, so a pageless archive
+        // starts no harvest thread.
+        if names.is_empty() {
+            return Err(SourceError::Empty);
+        }
+        let pages: HashMap<String, usize> = names
             .iter()
             .enumerate()
             .map(|(index, name)| (name.clone(), index))
             .collect();
         let tier = Arc::new(Mutex::new(ByteTier::new(TIER_BUDGET_BYTES)));
-        source.sevenzip = Some(Mutex::new(archive));
-        source.tier = Some(Arc::clone(&tier));
-        source.harvest = Some(spawn_harvest(path.to_path_buf(), pages, tier));
-        Ok(source)
+        let backend = Backend::SevenZip(SevenZipState {
+            archive: Mutex::new(archive),
+            tier: Arc::clone(&tier),
+        });
+        spawn_harvest(path.to_path_buf(), pages, tier);
+        Self::from_names(backend, names)
     }
 
-    fn from_names(kind: SourceKind, names: Vec<String>) -> Result<Self, SourceError> {
+    fn from_names(backend: Backend, names: Vec<String>) -> Result<Self, SourceError> {
         if names.is_empty() {
             return Err(SourceError::Empty);
         }
-        Ok(Self {
-            kind,
-            names,
-            zip: None,
-            sevenzip: None,
-            tier: None,
-            harvest: None,
-        })
+        Ok(Self { names, backend })
     }
 
     pub fn len(&self) -> usize {
@@ -246,11 +247,11 @@ impl Source {
         debug_assert!(index < self.names.len());
         let entry = &self.names[index];
         let file = entry.rsplit('/').next().unwrap_or(entry).to_string();
-        let parent = match &self.kind {
-            SourceKind::Directory(dir) => {
+        let parent = match &self.backend {
+            Backend::Directory(dir) => {
                 dir.file_name().map(|name| name.to_string_lossy().into_owned())
             }
-            SourceKind::Zip(_) | SourceKind::SevenZip(_) => entry.rsplit_once('/').map(|(path, _)| {
+            Backend::Zip(_) | Backend::SevenZip(_) => entry.rsplit_once('/').map(|(path, _)| {
                 path.rsplit('/').next().unwrap_or(path).to_string()
             }),
         };
@@ -262,13 +263,12 @@ impl Source {
     pub fn bytes(&self, index: usize) -> Result<Arc<[u8]>, SourceError> {
         debug_assert!(index < self.names.len());
         let name = &self.names[index];
-        match &self.kind {
-            SourceKind::Directory(dir) => fs::read(dir.join(name))
+        match &self.backend {
+            Backend::Directory(dir) => fs::read(dir.join(name))
                 .map(Arc::from)
                 .map_err(SourceError::Io),
-            SourceKind::Zip(_) => {
-                let mut archive =
-                    lock_recovered(self.zip.as_ref().expect("zip handle for zip sources"));
+            Backend::Zip(zip) => {
+                let mut archive = lock_recovered(zip);
                 let mut entry = archive.by_name(name).map_err(SourceError::Zip)?;
                 let mut buf = Vec::new();
                 entry
@@ -276,19 +276,17 @@ impl Source {
                     .map_err(|error| SourceError::Zip(ZipError::Io(error)))?;
                 Ok(buf.into())
             }
-            SourceKind::SevenZip(_) => {
-                let tier = self.tier.as_ref().expect("byte tier for 7z sources");
-                if let Some(cached) = lock_recovered(tier).get(index).cloned() {
+            Backend::SevenZip(backend) => {
+                if let Some(cached) = lock_recovered(&backend.tier).get(index).cloned() {
                     return Ok(cached);
                 }
                 // The reader guard is scoped so the reader and tier locks
                 // are never held together.
                 let data: Arc<[u8]> = {
-                    let mut archive =
-                        lock_recovered(self.sevenzip.as_ref().expect("7z handle for 7z sources"));
+                    let mut archive = lock_recovered(&backend.archive);
                     archive.read_file(name).map_err(SourceError::SevenZip)?.into()
                 };
-                lock_recovered(tier).insert(index, data.clone());
+                lock_recovered(&backend.tier).insert(index, data.clone());
                 Ok(data)
             }
         }
@@ -296,9 +294,9 @@ impl Source {
 
     #[cfg(test)]
     fn tier_has(&self, index: usize) -> bool {
-        match &self.tier {
-            Some(tier) => lock_recovered(tier).get(index).is_some(),
-            None => false,
+        match &self.backend {
+            Backend::SevenZip(backend) => lock_recovered(&backend.tier).get(index).is_some(),
+            Backend::Directory(_) | Backend::Zip(_) => false,
         }
     }
 }
@@ -309,14 +307,13 @@ impl Source {
 /// when it is not a page, because a solid block's later members decode
 /// only after the earlier ones are consumed. A read error ends the pass.
 /// Pages then still come from `bytes` through the retained reader.
-fn spawn_harvest(
-    path: PathBuf,
-    pages: HashMap<String, usize>,
-    tier: Arc<Mutex<ByteTier>>,
-) -> JoinHandle<()> {
+fn spawn_harvest(path: PathBuf, pages: HashMap<String, usize>, tier: Arc<Mutex<ByteTier>>) {
     use std::thread::Builder;
 
-    Builder::new()
+    // Dropping the handle detaches the thread, so quitting never waits
+    // on it. A spawn error only skips the prefetch; pages still load
+    // through `bytes`.
+    drop(Builder::new()
         .name("cy-harvest".into())
         .spawn(move || {
             let Ok(mut reader) =
@@ -333,8 +330,7 @@ fn spawn_harvest(
                 }
                 Ok(true)
             });
-        })
-        .expect("spawn harvest thread")
+        }));
 }
 
 /// Pages read in filename order for humans: c2 before c10.
@@ -343,6 +339,7 @@ fn sort_pages(names: &mut [String]) {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, reason = "test code fails fast by design")]
 mod tests {
     use super::*;
     use crate::decode;

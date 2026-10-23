@@ -5,10 +5,9 @@
 //! color conversion. JXL uses jxl-rs with a scoped-thread parallel runner.
 //!
 //! All functions here are panics-clean for corrupt input: they return
-//! `DecodeError`, never panic. Decoder panics are caught with catch_unwind
-//! where a crate documents them. The worker adds its own boundary as
-//! belt-and-braces. The FFI `unsafe` for AVIF is confined to the `avif`
-//! submodule.
+//! `DecodeError`, never panic. Any panic that still escapes is contained by
+//! the worker's `catch_unwind` in `decode_page`. The FFI `unsafe` for AVIF
+//! is confined to the `avif` submodule.
 
 use std::error::Error;
 use std::fmt;
@@ -637,6 +636,7 @@ mod jxl {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, reason = "test code fails fast by design")]
 mod tests {
     use super::*;
     use crate::testkit;
