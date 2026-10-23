@@ -5,10 +5,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Solid-color PNG straight from the image encoder.
-pub fn tiny_png(w: u32, h: u32, rgba: [u8; 4]) -> Vec<u8> {
+pub fn tiny_png(width: u32, height: u32, rgba: [u8; 4]) -> Vec<u8> {
     use std::io::Cursor;
 
-    let img = image::RgbaImage::from_pixel(w, h, image::Rgba(rgba));
+    let img = image::RgbaImage::from_pixel(width, height, image::Rgba(rgba));
     let mut buf = Vec::new();
     image::DynamicImage::ImageRgba8(img)
         .write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)
@@ -21,7 +21,7 @@ pub struct TempDir(PathBuf);
 static DIRS: AtomicU64 = AtomicU64::new(0);
 
 impl TempDir {
-    pub fn new(tag: &str) -> TempDir {
+    pub fn new(tag: &str) -> Self {
         use std::env;
         use std::process;
 
@@ -32,7 +32,7 @@ impl TempDir {
             DIRS.fetch_add(1, Ordering::Relaxed),
         ));
         fs::create_dir_all(&path).expect("create temp dir");
-        TempDir(path)
+        Self(path)
     }
 
     pub fn path(&self) -> &Path {

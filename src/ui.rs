@@ -55,12 +55,12 @@ pub fn show(ui: &mut egui::Ui, status: &StatusLine) {
 /// side lays out right-to-left, so the display order iterates in
 /// reverse.
 fn right_end(ui: &mut egui::Ui, status: &StatusLine) {
-    for (i, &mode) in ViewMode::ALL.iter().enumerate().rev() {
+    for (mode_index, &mode) in ViewMode::ALL.iter().enumerate().rev() {
         let text = egui::RichText::new(group_label(mode)).monospace();
         let text =
             if mode == status.mode { text.color(mode_color(mode)).strong() } else { text.weak() };
         ui.label(text);
-        if i > 0 {
+        if mode_index > 0 {
             ui.label(egui::RichText::new("·").weak().monospace());
         }
     }
@@ -118,11 +118,11 @@ fn line(style: &egui::Style, status: &StatusLine) -> LayoutJob {
     if let Some(facts) = &status.page {
         section(&mut job, " · ".into(), plain);
         // A format label shows only when the filename's extension lies.
-        let (w, h) = facts.dims;
+        let (width, height) = facts.dims;
         let dims_text = if facts.claimed != Some(facts.decoded) {
-            format!("{} {w}x{h}", facts.decoded.label())
+            format!("{} {width}x{height}", facts.decoded.label())
         } else {
-            format!("{w}x{h}")
+            format!("{width}x{height}")
         };
         section(&mut job, dims_text, plain);
     }
@@ -163,7 +163,7 @@ mod tests {
     /// Section colors in append order. Sections carry no text slices
     /// here; the text and the deterministic append order pin the mapping.
     fn section_colors(job: &LayoutJob) -> Vec<egui::Color32> {
-        job.sections.iter().map(|s| s.format.color).collect()
+        job.sections.iter().map(|section| section.format.color).collect()
     }
 
     #[test]
@@ -182,11 +182,11 @@ mod tests {
 
     #[test]
     fn matching_extension_hides_the_format() {
-        let mut s = status();
-        if let Some(page) = &mut s.page {
+        let mut status_line = status();
+        if let Some(page) = &mut status_line.page {
             page.claimed = Some(Format::Jxl);
         }
-        let job = line(&egui::Style::default(), &s);
+        let job = line(&egui::Style::default(), &status_line);
         assert_eq!(job.text, "12-13/214 · b/010.png · 6000x4000 · 87%");
     }
 
@@ -194,11 +194,11 @@ mod tests {
     fn single_page_head_and_uncolored_parent() {
         let style = egui::Style::default();
         let plain = style.visuals.text_color();
-        let mut s = status();
-        s.spread = Spread { first: 4, second: None };
-        s.page = None;
-        s.zoom = 1.0;
-        let job = line(&style, &s);
+        let mut status_line = status();
+        status_line.spread = Spread { first: 4, second: None };
+        status_line.page = None;
+        status_line.zoom = 1.0;
+        let job = line(&style, &status_line);
         assert_eq!(job.text, "5/214 · b/010.png · 100%");
         assert_eq!(section_colors(&job), vec![HEAD_COLOR, plain, NAME_COLOR, plain]);
     }
@@ -206,19 +206,19 @@ mod tests {
     #[test]
     fn head_leads_with_the_spread_range() {
         let style = egui::Style::default();
-        let mut s = status();
-        s.spread = Spread { first: 49, second: Some(50) };
-        s.total = 2146;
-        let job = line(&style, &s);
+        let mut status_line = status();
+        status_line.spread = Spread { first: 49, second: Some(50) };
+        status_line.total = 2146;
+        let job = line(&style, &status_line);
         assert!(job.text.starts_with("50-51/2146 · "));
     }
 
     #[test]
     fn waiting_and_error_append() {
-        let mut s = status();
-        s.waiting = true;
-        s.error = Some("boom".into());
-        let job = line(&egui::Style::default(), &s);
+        let mut status_line = status();
+        status_line.waiting = true;
+        status_line.error = Some("boom".into());
+        let job = line(&egui::Style::default(), &status_line);
         assert!(job.text.ends_with("· decoding… · boom"));
     }
 
@@ -237,12 +237,21 @@ mod tests {
 
     fn walk(shape: &egui::Shape, out: &mut Vec<TextItem>) {
         match shape {
-            egui::Shape::Text(t) => out.push(TextItem {
-                text: t.galley.rows.iter().map(|r| r.text()).collect::<String>(),
-                rect: t.galley.rect.translate(t.pos.to_vec2()),
-                elided: t.galley.elided,
+            egui::Shape::Text(text_shape) => out.push(TextItem {
+                text: text_shape
+                    .galley
+                    .rows
+                    .iter()
+                    .map(|row| row.text())
+                    .collect::<String>(),
+                rect: text_shape.galley.rect.translate(text_shape.pos.to_vec2()),
+                elided: text_shape.galley.elided,
             }),
-            egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+            egui::Shape::Vec(shapes) => {
+                for child_shape in shapes {
+                    walk(child_shape, out);
+                }
+            }
             _ => {}
         }
     }
@@ -271,7 +280,7 @@ mod tests {
     }
 
     fn find<'a>(items: &'a [TextItem], prefix: &str) -> &'a TextItem {
-        items.iter().find(|t| t.text.starts_with(prefix)).expect(prefix)
+        items.iter().find(|item| item.text.starts_with(prefix)).expect(prefix)
     }
 
     /// The panel frame's inner margin is the flush-left and
@@ -304,7 +313,8 @@ mod tests {
         let toast = render(WIDE, &with_toast);
         for items in [&plain, &toast] {
             let comic = find(items, "Comic (c)");
-            let rightmost = items.iter().map(|t| t.rect.right()).fold(f32::MIN, f32::max);
+            let rightmost =
+                items.iter().map(|item| item.rect.right()).fold(f32::MIN, f32::max);
             assert!((rightmost - comic.rect.right()).abs() < ROUND, "group must be rightmost");
             assert!(
                 (comic.rect.right() - (WIDE - PANEL_MARGIN)).abs() < ROUND,
@@ -325,7 +335,7 @@ mod tests {
         let toast = render(WIDE, &with_toast);
         assert!(find(&toast, "right to left").rect.right() < find(&toast, "Comic (c)").rect.left());
         let plain = render(WIDE, &status());
-        assert!(plain.iter().all(|i| !i.text.contains(status().mode.effect())));
+        assert!(plain.iter().all(|item| !item.text.contains(status().mode.effect())));
     }
 
     #[test]

@@ -26,7 +26,7 @@ pub struct Window {
 }
 
 impl Window {
-    pub fn new(event_loop: &ActiveEventLoop) -> eros::Result<Window> {
+    pub fn new(event_loop: &ActiveEventLoop) -> eros::Result<Self> {
         unsafe { Self::create(event_loop) }
     }
 
@@ -36,7 +36,7 @@ impl Window {
     ///
     /// `event_loop` must be the loop this window runs on, because the raw
     /// display handle taken from it backs the GL display.
-    unsafe fn create(event_loop: &ActiveEventLoop) -> eros::Result<Window> {
+    unsafe fn create(event_loop: &ActiveEventLoop) -> eros::Result<Self> {
         use glutin::config::ConfigTemplateBuilder;
         use glutin::context::ContextApi;
         use glutin::context::ContextAttributesBuilder;
@@ -93,13 +93,13 @@ impl Window {
                 })?,
         };
 
-        let (w, h): (u32, u32) = window.inner_size().into();
+        let (width, height): (u32, u32) = window.inner_size().into();
         let surface_attrs =
             SurfaceAttributesBuilder::<WindowSurface>::new()
                 .build(
                     raw_window,
-                    NonZeroU32::new(w).expect("nonzero window width"),
-                    NonZeroU32::new(h).expect("nonzero window height"),
+                    NonZeroU32::new(width).expect("nonzero window width"),
+                    NonZeroU32::new(height).expect("nonzero window height"),
                 );
         let surface = gl_display.create_window_surface(&gl_config, &surface_attrs)?;
         let context = not_current.make_current(&surface)?;
@@ -109,11 +109,11 @@ impl Window {
         surface
             .set_swap_interval(&context, SwapInterval::DontWait)?;
 
-        let gl = Arc::new(glow::Context::from_loader_function(|s| {
-            let s = CString::new(s).expect("GL proc name without interior NUL");
-            gl_display.get_proc_address(&s)
+        let gl = Arc::new(glow::Context::from_loader_function(|symbol| {
+            let symbol = CString::new(symbol).expect("GL proc name without interior NUL");
+            gl_display.get_proc_address(&symbol)
         }));
-        Ok(Window { winit: window, gl, surface, context, resized_to: (w, h) })
+        Ok(Self { winit: window, gl, surface, context, resized_to: (width, height) })
     }
 
     pub fn glow(&self) -> Arc<glow::Context> {

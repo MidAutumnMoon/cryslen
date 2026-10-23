@@ -53,7 +53,7 @@ const FS_CORE: &str = r#"
     uniform float u_norm;  // depth normalize (1.0 for 8-bit storage)
     uniform vec3 u_yuv_off;
     uniform mat3 u_mat;
-    uniform sampler2D u_tex0; // RGBA or Y
+    uniform sampler2D u_tex0; // RGBA or luma
     uniform sampler2D u_tex1; // Cb (1x1 midpoint for mono)
     uniform sampler2D u_tex2; // Cr
     void main() {
@@ -137,9 +137,9 @@ struct Entry {
 enum Textures {
     /// Single RGBA texture.
     Rgba(<glow::Context as glow::HasContext>::Texture),
-    /// Y + Cb + Cr plane textures (Cb/Cr empty for mono, bound to a 1x1).
+    /// Luma + Cb + Cr plane textures (Cb/Cr empty for mono, bound to a 1x1).
     Yuv {
-        y: <glow::Context as glow::HasContext>::Texture,
+        luma: <glow::Context as glow::HasContext>::Texture,
         cb: <glow::Context as glow::HasContext>::Texture,
         cr: <glow::Context as glow::HasContext>::Texture,
     },
@@ -161,7 +161,7 @@ const RGBA_UNIFORMS: PageUniforms = PageUniforms {
 };
 
 impl PageTextures {
-    pub fn new(gl: Arc<glow::Context>) -> PageTextures {
+    pub fn new(gl: Arc<glow::Context>) -> Self {
         let (vs, fs) = if gl.version().is_embedded { (VS_ES, FS_ES) } else { (VS_CORE, FS_CORE) };
         let compile = |kind, src| unsafe {
             let shader = gl.create_shader(kind).expect("GL shader object");
@@ -204,7 +204,7 @@ impl PageTextures {
             }
         }
         let max_tex = unsafe { gl.get_parameter_i32(glow::MAX_TEXTURE_SIZE) } as u32;
-        PageTextures { gl, program, vao, seats: [None, None], textures: HashMap::new(), vbo, max_tex }
+        Self { gl, program, vao, seats: [None, None], textures: HashMap::new(), vbo, max_tex }
     }
 
     /// Record that `seat` draws `page`, uploading its textures only on a
@@ -326,8 +326,8 @@ impl PageTextures {
                     Textures::Rgba(rgba_texture) => {
                         gl.bind_texture(glow::TEXTURE_2D, Some(*rgba_texture))
                     }
-                    Textures::Yuv { y, cb, cr } => {
-                        gl.bind_texture(glow::TEXTURE_2D, Some(*y));
+                    Textures::Yuv { luma, cb, cr } => {
+                        gl.bind_texture(glow::TEXTURE_2D, Some(*luma));
                         gl.active_texture(glow::TEXTURE1);
                         gl.bind_texture(glow::TEXTURE_2D, Some(*cb));
                         gl.active_texture(glow::TEXTURE2);
@@ -359,8 +359,8 @@ fn delete_textures(gl: &glow::Context, textures: &Textures) {
     unsafe {
         match textures {
             Textures::Rgba(rgba_texture) => gl.delete_texture(*rgba_texture),
-            Textures::Yuv { y, cb, cr } => {
-                gl.delete_texture(*y);
+            Textures::Yuv { luma, cb, cr } => {
+                gl.delete_texture(*luma);
                 gl.delete_texture(*cb);
                 gl.delete_texture(*cr);
             }
@@ -444,7 +444,7 @@ fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> Entry {
         Pixels::Yuv(yuv) => {
             let ((luma_w, luma_h), (chroma_w, chroma_h)) =
                 plane_dims((width, height), yuv.subsampling);
-            let wide = matches!(yuv.y, Plane::U16(_));
+            let wide = matches!(yuv.luma, Plane::U16(_));
             // GL_R16 is not filterable in GLES: LINEAR makes the texture
             // incomplete (samples black); NEAREST without mips is the
             // safe fallback on an ES context.
@@ -453,9 +453,9 @@ fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> Entry {
                 let want_bytes = want_samples * if wide { 2 } else { 1 };
                 assert_eq!(plane_bytes(plane).len(), want_bytes, "{what} plane bytes");
             };
-            expect(&yuv.y, luma_w as usize * luma_h as usize, "y");
+            expect(&yuv.luma, luma_w as usize * luma_h as usize, "luma");
             let luma_texture =
-                upload_plane(gl, plane_bytes(&yuv.y), (luma_w, luma_h), wide, filterable);
+                upload_plane(gl, plane_bytes(&yuv.luma), (luma_w, luma_h), wide, filterable);
             let (cb_texture, cr_texture) = if yuv.subsampling == Subsampling::Mono {
                 // 1x1 chroma at the range midpoint; the matrix cancels it
                 // to neutral gray. LE pairs match plane_bytes' U16 layout.
@@ -474,7 +474,7 @@ fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> Entry {
                 (upload_plane(gl, plane_bytes(&yuv.cb), (chroma_w, chroma_h), wide, filterable),
                  upload_plane(gl, plane_bytes(&yuv.cr), (chroma_w, chroma_h), wide, filterable))
             };
-            (Textures::Yuv { y: luma_texture, cb: cb_texture, cr: cr_texture },
+            (Textures::Yuv { luma: luma_texture, cb: cb_texture, cr: cr_texture },
              depth_norm(yuv.depth, wide),
              filterable)
         }
@@ -497,13 +497,13 @@ fn entry_cost_bytes(decoded: &Decoded, mips: bool) -> usize {
     let base = match &decoded.pixels {
         Pixels::Rgba8(rgba) => rgba.len(),
         Pixels::Yuv(yuv) => {
-            let per_sample = if matches!(yuv.y, Plane::U16(_)) { 2 } else { 1 };
+            let per_sample = if matches!(yuv.luma, Plane::U16(_)) { 2 } else { 1 };
             let chroma = match yuv.subsampling {
                 // Mono uploads a 1x1 midpoint texture per chroma channel.
                 Subsampling::Mono => 2 * per_sample,
                 _ => plane_bytes(&yuv.cb).len() + plane_bytes(&yuv.cr).len(),
             };
-            plane_bytes(&yuv.y).len() + chroma
+            plane_bytes(&yuv.luma).len() + chroma
         }
     };
     if mips { base * 4 / 3 } else { base }
@@ -525,7 +525,12 @@ fn eviction_victims(
         .filter(|page| !bound.contains(&Some(*page)))
         .collect();
     let distance = |page: usize| {
-        bound.iter().flatten().map(|b| page.abs_diff(*b)).min().unwrap_or(usize::MAX)
+        bound
+            .iter()
+            .flatten()
+            .map(|bound_page| page.abs_diff(*bound_page))
+            .min()
+            .unwrap_or(usize::MAX)
     };
     candidates.sort_unstable_by_key(|page| Reverse((distance(*page), *page)));
     let mut victims = Vec::new();
@@ -557,10 +562,10 @@ struct PageUniforms {
 }
 
 impl From<&Pixels> for PageUniforms {
-    fn from(p: &Pixels) -> Self {
-        match p {
+    fn from(pixels: &Pixels) -> Self {
+        match pixels {
             Pixels::Rgba8(_) => RGBA_UNIFORMS,
-            Pixels::Yuv(yuv) => PageUniforms {
+            Pixels::Yuv(yuv) => Self {
                 mode: Mode::Yuv,
                 subsampling: yuv.subsampling,
                 depth: yuv.depth,
@@ -580,8 +585,8 @@ fn mode_id(mode: Mode) -> u32 {
 }
 
 /// Shader subsampling id: 0 mono, 1 = 420, 2 = 422, 3 = 444.
-fn chroma_id(s: Subsampling) -> u32 {
-    match s {
+fn chroma_id(subsampling: Subsampling) -> u32 {
+    match subsampling {
         Subsampling::Mono => 0,
         Subsampling::Yuv420 => 1,
         Subsampling::Yuv422 => 2,
@@ -753,7 +758,7 @@ mod tests {
             subsampling: Subsampling::Yuv420,
             full_range: false,
             matrix: Matrix::Bt2020,
-            y: Plane::U8(Box::default()), cb: Plane::U8(Box::default()), cr: Plane::U8(Box::default()),
+            luma: Plane::U8(Box::default()), cb: Plane::U8(Box::default()), cr: Plane::U8(Box::default()),
         });
         let uniforms = PageUniforms::from(&yuv_pixels);
         assert_eq!(
@@ -776,7 +781,7 @@ mod tests {
             subsampling: Subsampling::Yuv420,
             full_range: true,
             matrix: Matrix::Bt709,
-            y: Plane::U8(vec![0u8; 4 * 4].into_boxed_slice()),
+            luma: Plane::U8(vec![0u8; 4 * 4].into_boxed_slice()),
             cb: Plane::U8(vec![0u8; 2 * 2].into_boxed_slice()),
             cr: Plane::U8(vec![0u8; 2 * 2].into_boxed_slice()),
         };
@@ -791,7 +796,7 @@ mod tests {
             subsampling: Subsampling::Mono,
             full_range: true,
             matrix: Matrix::Identity,
-            y: Plane::U16(vec![0u16; 4].into_boxed_slice()),
+            luma: Plane::U16(vec![0u16; 4].into_boxed_slice()),
             cb: Plane::U8(Box::default()),
             cr: Plane::U8(Box::default()),
         };

@@ -40,8 +40,8 @@ fn main() -> ExitCode {
 
     let open = match classify(path) {
         Ok(open) => open,
-        Err(e) => {
-            eprintln!("cy: {e}");
+        Err(error) => {
+            eprintln!("cy: {error}");
             return ExitCode::FAILURE;
         }
     };
@@ -52,8 +52,8 @@ fn main() -> ExitCode {
 
     match run(open_path, land_on) {
         Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("cy: {e}");
+        Err(error) => {
+            eprintln!("cy: {error}");
             ExitCode::FAILURE
         }
     }
@@ -76,7 +76,7 @@ fn classify(path: &Path) -> eros::Result<Arg> {
     // Path::parent() yields Some("") for bare relative names ("pic.jpg").
     let dir = path
         .parent()
-        .filter(|p| !p.as_os_str().is_empty())
+        .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     Ok(Arg::Image { dir: dir.to_path_buf(), name })
 }
@@ -88,7 +88,7 @@ fn run(open_path: &Path, land_on: Option<&str>) -> eros::Result<()> {
 
     // Page to land on: the named file if given, else the first page.
     let index = land_on
-        .and_then(|name| (0..source.len()).find(|&i| source.name(i).eq_ignore_ascii_case(name)))
+        .and_then(|name| (0..source.len()).find(|&page_index| source.name(page_index).eq_ignore_ascii_case(name)))
         .unwrap_or(0);
 
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
@@ -100,8 +100,8 @@ fn run(open_path: &Path, land_on: Option<&str>) -> eros::Result<()> {
 
     let mut app = App::new(source, worker, index, event_loop.create_proxy());
     event_loop.run_app(&mut app)?;
-    if let Some(e) = app.start_error.take() {
-        return Err(e);
+    if let Some(error) = app.start_error.take() {
+        return Err(error);
     }
     Ok(())
 }
@@ -136,9 +136,9 @@ mod tests {
     fn other_file_arguments_error() {
         let dir = TempDir::new("main-arg-bad");
         dir.write("notes.txt", b"not a page");
-        let Err(e) = classify(&dir.path().join("notes.txt")) else {
+        let Err(error) = classify(&dir.path().join("notes.txt")) else {
             panic!("txt file accepted as an image or source");
         };
-        assert!(e.to_string().contains("unsupported"), "{e}");
+        assert!(error.to_string().contains("unsupported"), "{error}");
     }
 }

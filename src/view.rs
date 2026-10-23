@@ -15,24 +15,24 @@ pub enum ViewMode {
 
 impl ViewMode {
     /// The modes in status-bar display order.
-    pub const ALL: [ViewMode; 3] = [ViewMode::Normal, ViewMode::Manga, ViewMode::Comic];
+    pub const ALL: [Self; 3] = [Self::Normal, Self::Manga, Self::Comic];
 
     /// Whether pages pair into spreads.
     pub fn pairs(self) -> bool {
-        matches!(self, ViewMode::Manga | ViewMode::Comic)
+        matches!(self, Self::Manga | Self::Comic)
     }
 
     /// Whether reading runs right to left.
     pub fn rtl(self) -> bool {
-        self == ViewMode::Manga
+        self == Self::Manga
     }
 
     /// Name shown in the status-bar group.
     pub fn label(self) -> &'static str {
         match self {
-            ViewMode::Normal => "Normal",
-            ViewMode::Manga => "Manga",
-            ViewMode::Comic => "Comic",
+            Self::Normal => "Normal",
+            Self::Manga => "Manga",
+            Self::Comic => "Comic",
         }
     }
 
@@ -40,18 +40,18 @@ impl ViewMode {
     /// match the binding in `crate::keys::from_key`.
     pub fn shortcut(self) -> &'static str {
         match self {
-            ViewMode::Normal => "n",
-            ViewMode::Manga => "m",
-            ViewMode::Comic => "c",
+            Self::Normal => "n",
+            Self::Manga => "m",
+            Self::Comic => "c",
         }
     }
 
     /// One line stating the mode's effect, shown on switch.
     pub fn effect(self) -> &'static str {
         match self {
-            ViewMode::Normal => "left to right, single page",
-            ViewMode::Manga => "right to left, double page",
-            ViewMode::Comic => "left to right, double page",
+            Self::Normal => "left to right, single page",
+            Self::Manga => "right to left, double page",
+            Self::Comic => "left to right, double page",
         }
     }
 }
@@ -177,9 +177,9 @@ impl SpreadLayout {
     pub fn total(&self) -> (f32, f32) {
         let mut total_width: f32 = 0.0;
         let mut total_height: f32 = 0.0;
-        for r in self.rects.iter().flatten() {
-            total_width += r.size.0;
-            total_height = total_height.max(r.size.1);
+        for page_rect in self.rects.iter().flatten() {
+            total_width += page_rect.size.0;
+            total_height = total_height.max(page_rect.size.1);
         }
         (total_width, total_height)
     }
@@ -289,71 +289,71 @@ mod tests {
 
     #[test]
     fn layout_places_seats_left_to_right() {
-        let l = layout([Some((100, 200)), Some((100, 200))]);
-        assert_eq!(l.rects[0], Some(PageRect { pos: (0.0, 0.0), size: (100.0, 200.0) }));
-        assert_eq!(l.rects[1], Some(PageRect { pos: (100.0, 0.0), size: (100.0, 200.0) }));
-        assert_eq!(l.total(), (200.0, 200.0));
+        let spread_layout = layout([Some((100, 200)), Some((100, 200))]);
+        assert_eq!(spread_layout.rects[0], Some(PageRect { pos: (0.0, 0.0), size: (100.0, 200.0) }));
+        assert_eq!(spread_layout.rects[1], Some(PageRect { pos: (100.0, 0.0), size: (100.0, 200.0) }));
+        assert_eq!(spread_layout.total(), (200.0, 200.0));
     }
 
     #[test]
     fn layout_asymmetric_pair_top_aligned() {
-        let l = layout([Some((100, 300)), Some((200, 150))]);
-        assert_eq!(l.rects[0], Some(PageRect { pos: (0.0, 0.0), size: (100.0, 300.0) }));
-        assert_eq!(l.rects[1], Some(PageRect { pos: (100.0, 0.0), size: (200.0, 150.0) }));
-        assert_eq!(l.total(), (300.0, 300.0));
+        let spread_layout = layout([Some((100, 300)), Some((200, 150))]);
+        assert_eq!(spread_layout.rects[0], Some(PageRect { pos: (0.0, 0.0), size: (100.0, 300.0) }));
+        assert_eq!(spread_layout.rects[1], Some(PageRect { pos: (100.0, 0.0), size: (200.0, 150.0) }));
+        assert_eq!(spread_layout.total(), (300.0, 300.0));
     }
 
     #[test]
     fn layout_skips_undecoded_seats() {
-        let l = layout([Some((100, 200)), None]);
-        assert_eq!(l.rects[1], None);
-        assert_eq!(l.total(), (100.0, 200.0));
+        let spread_layout = layout([Some((100, 200)), None]);
+        assert_eq!(spread_layout.rects[1], None);
+        assert_eq!(spread_layout.total(), (100.0, 200.0));
         // an undecoded left seat leaves the right page starting at x=0
-        let l = layout([None, Some((100, 200))]);
-        assert_eq!(l.rects[0], None);
-        assert_eq!(l.rects[1], Some(PageRect { pos: (0.0, 0.0), size: (100.0, 200.0) }));
+        let spread_layout = layout([None, Some((100, 200))]);
+        assert_eq!(spread_layout.rects[0], None);
+        assert_eq!(spread_layout.rects[1], Some(PageRect { pos: (0.0, 0.0), size: (100.0, 200.0) }));
     }
 
     #[test]
     fn fit_scales_to_min_axis_and_centers() {
-        let v = fit((1000.0, 2000.0), (500.0, 500.0));
-        assert!((v.scale - 0.25).abs() < 1e-6);
-        assert!((v.offset.0 - 125.0).abs() < 1e-6);
-        assert!((v.offset.1 - 0.0).abs() < 1e-6);
+        let placement = fit((1000.0, 2000.0), (500.0, 500.0));
+        assert!((placement.scale - 0.25).abs() < 1e-6);
+        assert!((placement.offset.0 - 125.0).abs() < 1e-6);
+        assert!((placement.offset.1 - 0.0).abs() < 1e-6);
     }
 
     #[test]
     fn fit_degenerate_inputs_are_inert() {
-        let v = fit((0.0, 0.0), (500.0, 500.0));
-        assert_eq!(v, Placement { scale: 1.0, offset: (0.0, 0.0) });
-        let v = fit((100.0, 100.0), (0.0, 0.0));
-        assert_eq!(v, Placement { scale: 1.0, offset: (0.0, 0.0) });
+        let placement = fit((0.0, 0.0), (500.0, 500.0));
+        assert_eq!(placement, Placement { scale: 1.0, offset: (0.0, 0.0) });
+        let placement = fit((100.0, 100.0), (0.0, 0.0));
+        assert_eq!(placement, Placement { scale: 1.0, offset: (0.0, 0.0) });
     }
 
     #[test]
     fn zoom_keeps_cursor_anchored() {
-        let v = Placement { scale: 2.0, offset: (100.0, 50.0) };
-        let v = zoom_at(v, (300.0, 200.0), 2.0);
+        let placement = Placement { scale: 2.0, offset: (100.0, 50.0) };
+        let placement = zoom_at(placement, (300.0, 200.0), 2.0);
         // image pixel under the cursor before: (300-100)/2 = 100; after: (300-offset)/4
-        assert!((300.0 - v.offset.0) / v.scale - 100.0 < 0.01);
+        assert!((300.0 - placement.offset.0) / placement.scale - 100.0 < 0.01);
     }
 
     #[test]
     fn zoom_clamps_scale() {
-        let v = zoom_at(Placement { scale: 30.0, offset: (0.0, 0.0) }, (0.0, 0.0), 100.0);
-        assert_eq!(v.scale, MAX_SCALE);
-        let v = zoom_at(Placement { scale: 0.1, offset: (0.0, 0.0) }, (0.0, 0.0), 0.001);
-        assert_eq!(v.scale, MIN_SCALE);
+        let placement = zoom_at(Placement { scale: 30.0, offset: (0.0, 0.0) }, (0.0, 0.0), 100.0);
+        assert_eq!(placement.scale, MAX_SCALE);
+        let placement = zoom_at(Placement { scale: 0.1, offset: (0.0, 0.0) }, (0.0, 0.0), 0.001);
+        assert_eq!(placement.scale, MIN_SCALE);
     }
 
     #[test]
     fn clamp_oversized_keeps_edge_reachable() {
         // 2000 content px at scale 1 in a 500 px window
-        let v = clamp(Placement { scale: 1.0, offset: (-5000.0, 0.0) }, (2000.0, 400.0), (500.0, 500.0));
-        assert!(v.offset.0 >= 500.0 - 2000.0 - EDGE_KEEP_PX - 1e-4, "{}", v.offset.0);
-        assert!(v.offset.0 <= EDGE_KEEP_PX + 1e-4);
+        let placement = clamp(Placement { scale: 1.0, offset: (-5000.0, 0.0) }, (2000.0, 400.0), (500.0, 500.0));
+        assert!(placement.offset.0 >= 500.0 - 2000.0 - EDGE_KEEP_PX - 1e-4, "{}", placement.offset.0);
+        assert!(placement.offset.0 <= EDGE_KEEP_PX + 1e-4);
         // y fits (400 < 500) so it is centered
-        assert!((v.offset.1 - 50.0).abs() < 1e-4);
+        assert!((placement.offset.1 - 50.0).abs() < 1e-4);
     }
 
     #[test]
@@ -362,15 +362,15 @@ mod tests {
         let win = (1000.0, 800.0);
         let fitted = fit(total, win);
         let dragged = pan(fitted, (300.0, -200.0));
-        let c = clamp(dragged, total, win);
-        assert!((c.offset.0 - fitted.offset.0).abs() < 1e-4);
-        assert!((c.offset.1 - fitted.offset.1).abs() < 1e-4);
+        let placement = clamp(dragged, total, win);
+        assert!((placement.offset.0 - fitted.offset.0).abs() < 1e-4);
+        assert!((placement.offset.1 - fitted.offset.1).abs() < 1e-4);
     }
 
     #[test]
     fn clamp_never_changes_scale() {
-        let v = clamp(Placement { scale: 7.0, offset: (1e9, -1e9) }, (100.0, 100.0), (50.0, 50.0));
-        assert_eq!(v.scale, 7.0);
+        let placement = clamp(Placement { scale: 7.0, offset: (1e9, -1e9) }, (100.0, 100.0), (50.0, 50.0));
+        assert_eq!(placement.scale, 7.0);
     }
 
     #[test]
@@ -457,25 +457,25 @@ mod tests {
             ModeSwitch { index: 1, pairing_changed: true }
         );
         // The cover stays the cover.
-        let s = switch_mode(ViewMode::Normal, ViewMode::Comic, 0, 10);
-        assert_eq!(s.index, 0);
-        assert!(s.pairing_changed);
+        let mode_switch = switch_mode(ViewMode::Normal, ViewMode::Comic, 0, 10);
+        assert_eq!(mode_switch.index, 0);
+        assert!(mode_switch.pairing_changed);
         assert_eq!(
             switch_mode(ViewMode::Manga, ViewMode::Comic, 5, 10),
             ModeSwitch { index: 5, pairing_changed: false }
         );
         // So does re-selecting the mode.
-        let s = switch_mode(ViewMode::Manga, ViewMode::Manga, 5, 10);
-        assert_eq!(s.index, 5);
-        assert!(!s.pairing_changed);
+        let mode_switch = switch_mode(ViewMode::Manga, ViewMode::Manga, 5, 10);
+        assert_eq!(mode_switch.index, 5);
+        assert!(!mode_switch.pairing_changed);
     }
 
     #[test]
     fn seats_follow_reading_direction() {
-        let s = Spread { first: 1, second: Some(2) };
-        assert_eq!(s.seats(ViewMode::Normal), [Some(1), Some(2)]);
-        assert_eq!(s.seats(ViewMode::Comic), [Some(1), Some(2)]);
-        assert_eq!(s.seats(ViewMode::Manga), [Some(2), Some(1)]);
+        let spread = Spread { first: 1, second: Some(2) };
+        assert_eq!(spread.seats(ViewMode::Normal), [Some(1), Some(2)]);
+        assert_eq!(spread.seats(ViewMode::Comic), [Some(1), Some(2)]);
+        assert_eq!(spread.seats(ViewMode::Manga), [Some(2), Some(1)]);
         let lone = Spread { first: 5, second: None };
         assert_eq!(lone.seats(ViewMode::Normal), [Some(5), None]);
         assert_eq!(lone.seats(ViewMode::Manga), [None, Some(5)]);

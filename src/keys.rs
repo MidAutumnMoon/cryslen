@@ -23,7 +23,7 @@ pub(crate) enum Action {
 impl Action {
     /// Key map, baked in. Arrows page by screen direction. Space and
     /// the Page keys page by reading order.
-    pub(crate) fn from_key(code: KeyCode) -> Option<Action> {
+    pub(crate) fn from_key(code: KeyCode) -> Option<Self> {
         use Action::*;
         match code {
             KeyCode::Escape | KeyCode::KeyQ => Some(Quit),
@@ -42,7 +42,7 @@ impl Action {
 
     /// Whether a held key keeps firing this action.
     pub(crate) fn repeats(self) -> bool {
-        matches!(self, Action::Right | Action::Left | Action::Forward | Action::Back)
+        matches!(self, Self::Right | Self::Left | Self::Forward | Self::Back)
     }
 
     /// Whether this action advances reading order in `mode`. The
@@ -50,10 +50,10 @@ impl Action {
     /// not.
     pub(crate) fn is_forward(self, mode: ViewMode) -> bool {
         match self {
-            Action::Forward => true,
-            Action::Back => false,
-            Action::Right => !mode.rtl(),
-            Action::Left => mode.rtl(),
+            Self::Forward => true,
+            Self::Back => false,
+            Self::Right => !mode.rtl(),
+            Self::Left => mode.rtl(),
             _ => false,
         }
     }

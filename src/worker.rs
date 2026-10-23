@@ -45,9 +45,9 @@ pub enum SeatView {
 impl SeatView {
     fn resident_bytes(&self) -> usize {
         match self {
-            SeatView::Ready(decoded) => decoded.resident_bytes(),
-            SeatView::Failed(message) => message.len(),
-            SeatView::Pending => 0,
+            Self::Ready(decoded) => decoded.resident_bytes(),
+            Self::Failed(message) => message.len(),
+            Self::Pending => 0,
         }
     }
 }
@@ -84,8 +84,8 @@ struct Book {
 const NEVER_WANTED_RANK: u64 = 0;
 
 impl Book {
-    fn new() -> Book {
-        Book {
+    fn new() -> Self {
+        Self {
             wanted: Spread { first: 0, second: None },
             decided: HashMap::new(),
             pending: BTreeSet::new(),
@@ -206,7 +206,7 @@ impl Worker {
     /// Spawn the worker for `source`. `notify` fires after every decided
     /// page and should send the winit user event. The worker itself
     /// knows nothing about winit.
-    pub fn spawn(source: Arc<Source>, notify: impl Fn() + Send + Sync + 'static) -> Worker {
+    pub fn spawn(source: Arc<Source>, notify: impl Fn() + Send + Sync + 'static) -> Self {
         use std::thread::Builder;
 
         let (tx, rx) = mpsc::channel::<ToWorker>();
@@ -218,7 +218,7 @@ impl Worker {
                 move || run(&source, rx, &book, &notify)
             })
             .expect("spawn decode worker");
-        Worker { tx, book, handle: Some(handle) }
+        Self { tx, book, handle: Some(handle) }
     }
 
     /// Tell the worker which spread the app is now showing.
@@ -312,7 +312,7 @@ fn decode_page(source: &Source, page_index: usize) -> Result<Arc<Decoded>, Strin
     ));
     match result {
         Ok(Ok(page)) => Ok(Arc::new(page)),
-        Ok(Err(e)) => Err(format!("page {}: {e}", page_index + 1)),
+        Ok(Err(error)) => Err(format!("page {}: {error}", page_index + 1)),
         Err(panic) => Err(format!("page {}: {}", page_index + 1, panic_message(panic))),
     }
 }
@@ -554,8 +554,8 @@ mod tests {
     #[test]
     fn retune_decodes_and_notifies() {
         let dir = TempDir::new("worker");
-        for i in 0..3 {
-            dir.write(&format!("p{i}.png"), &tiny_png(3, 2, [i as u8, 0, 0, 255]));
+        for page in 0..3 {
+            dir.write(&format!("p{page}.png"), &tiny_png(3, 2, [page as u8, 0, 0, 255]));
         }
         let source = Arc::new(Source::open(dir.path()).expect("temp source opens"));
         let updates = Arc::new(Mutex::new(0usize));
@@ -622,20 +622,20 @@ mod tests {
     struct Gate(Arc<(Mutex<(u64, u64)>, Condvar)>);
 
     impl Gate {
-        fn new() -> Gate {
-            Gate(Arc::new((Mutex::new((0, 0)), Condvar::new())))
+        fn new() -> Self {
+            Self(Arc::new((Mutex::new((0, 0)), Condvar::new())))
         }
 
         fn hold(&self) {
             let (state, cv) = &*self.0;
-            let mut g = state.lock().unwrap();
-            g.0 += 1;
-            let ticket = g.0;
+            let mut state = state.lock().unwrap();
+            state.0 += 1;
+            let ticket = state.0;
             // Times out so a failed assertion cannot hang Drop's join.
             let deadline = Instant::now() + Duration::from_secs(5);
-            while g.1 < ticket && Instant::now() < deadline {
-                let (guard, _) = cv.wait_timeout(g, Duration::from_millis(50)).unwrap();
-                g = guard;
+            while state.1 < ticket && Instant::now() < deadline {
+                let (guard, _) = cv.wait_timeout(state, Duration::from_millis(50)).unwrap();
+                state = guard;
             }
         }
 

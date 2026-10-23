@@ -193,11 +193,11 @@ impl App {
         worker: Worker,
         index: usize,
         proxy: EventLoopProxy<UserEvent>,
-    ) -> App {
+    ) -> Self {
         let state = State { index, ..DEFAULT_STATE };
         let spread = view::spread_for(state.index, state.mode, source.len());
         worker.retune(spread);
-        App {
+        Self {
             source,
             worker,
             state,
@@ -318,7 +318,7 @@ impl App {
             name: self.source.page_name(spread.first),
             page,
             zoom: self.state.placement.scale,
-            waiting: self.waiting_since.is_some_and(|t| t.elapsed() >= WAIT_GRACE),
+            waiting: self.waiting_since.is_some_and(|since| since.elapsed() >= WAIT_GRACE),
             error: folded.error,
         };
 
@@ -419,8 +419,8 @@ impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let window = match Window::new(event_loop) {
             Ok(window) => window,
-            Err(e) => {
-                self.start_error = Some(e);
+            Err(error) => {
+                self.start_error = Some(error);
                 event_loop.exit();
                 return;
             }
@@ -579,13 +579,13 @@ const PIXELS_PER_WHEEL_LINE: f32 = 40.0;
 mod tests {
     use super::*;
 
-    fn ready(w: u32, h: u32) -> SeatView {
+    fn ready(width: u32, height: u32) -> SeatView {
         SeatView::Ready(Arc::new(
             Decoded::rgba(
-                w,
-                h,
+                width,
+                height,
                 Format::Png,
-                vec![0u8; w as usize * h as usize * 4].into_boxed_slice(),
+                vec![0u8; width as usize * height as usize * 4].into_boxed_slice(),
             )
             .expect("valid rgba page"),
         ))

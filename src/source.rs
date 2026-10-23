@@ -40,12 +40,12 @@ pub enum SourceError {
 impl fmt::Display for SourceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            SourceError::NotFound(p) => write!(f, "not found: {}", p.display()),
-            SourceError::Empty => write!(f, "no image pages found"),
-            SourceError::Unsupported(p) => write!(f, "unsupported source: {}", p.display()),
-            SourceError::Zip(e) => write!(f, "zip: {e}"),
-            SourceError::SevenZip(e) => write!(f, "7z: {e}"),
-            SourceError::Io(e) => write!(f, "io: {e}"),
+            Self::NotFound(path) => write!(f, "not found: {}", path.display()),
+            Self::Empty => write!(f, "no image pages found"),
+            Self::Unsupported(path) => write!(f, "unsupported source: {}", path.display()),
+            Self::Zip(error) => write!(f, "zip: {error}"),
+            Self::SevenZip(error) => write!(f, "7z: {error}"),
+            Self::Io(error) => write!(f, "io: {error}"),
         }
     }
 }
@@ -72,7 +72,7 @@ enum ArchiveKind {
 fn archive_kind(path: &Path) -> Option<ArchiveKind> {
     let ext = path
         .extension()
-        .and_then(|e| e.to_str())
+        .and_then(|extension| extension.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
     match ext.as_str() {
@@ -102,7 +102,7 @@ struct ByteTier {
 
 impl ByteTier {
     fn new(budget: usize) -> Self {
-        ByteTier { budget, live_bytes: 0, order: VecDeque::new(), map: HashMap::new() }
+        Self { budget, live_bytes: 0, order: VecDeque::new(), map: HashMap::new() }
     }
 
     fn get(&self, index: usize) -> Option<&Arc<[u8]>> {
@@ -149,30 +149,30 @@ pub struct Source {
 
 impl Source {
     /// Listing is filtered to image extensions and natural-sorted.
-    pub fn open(path: &Path) -> Result<Source, SourceError> {
+    pub fn open(path: &Path) -> Result<Self, SourceError> {
         if fs::metadata(path).map_err(|_| SourceError::NotFound(path.to_path_buf()))?.is_dir() {
-            return Source::open_dir(path);
+            return Self::open_dir(path);
         }
         match archive_kind(path) {
-            Some(ArchiveKind::Zip) => Source::open_zip(path),
-            Some(ArchiveKind::SevenZip) => Source::open_sevenzip(path),
+            Some(ArchiveKind::Zip) => Self::open_zip(path),
+            Some(ArchiveKind::SevenZip) => Self::open_sevenzip(path),
             None => Err(SourceError::Unsupported(path.to_path_buf())),
         }
     }
 
-    fn open_dir(dir: &Path) -> Result<Source, SourceError> {
+    fn open_dir(dir: &Path) -> Result<Self, SourceError> {
         let mut names: Vec<String> = fs::read_dir(dir)
             .map_err(SourceError::Io)?
             .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.file_type().is_ok_and(|t| t.is_file()))
+            .filter(|entry| entry.file_type().is_ok_and(|file_type| file_type.is_file()))
             .filter_map(|entry| entry.file_name().into_string().ok())
             .filter(|name| format_from_name(name).is_some())
             .collect();
         sort_pages(&mut names);
-        Source::from_names(SourceKind::Directory(dir.to_path_buf()), names)
+        Self::from_names(SourceKind::Directory(dir.to_path_buf()), names)
     }
 
-    fn open_zip(path: &Path) -> Result<Source, SourceError> {
+    fn open_zip(path: &Path) -> Result<Self, SourceError> {
         let file = File::open(path).map_err(SourceError::Io)?;
         let zip = zip::ZipArchive::new(BufReader::new(file)).map_err(SourceError::Zip)?;
         // Non-UTF-8 entry names are skipped (zip 9 reports them as errors).
@@ -184,12 +184,12 @@ impl Source {
             .collect();
         sort_pages(&mut names);
         let mut source =
-            Source::from_names(SourceKind::Zip(path.to_path_buf()), names)?;
+            Self::from_names(SourceKind::Zip(path.to_path_buf()), names)?;
         source.zip = Some(Mutex::new(zip));
         Ok(source)
     }
 
-    fn open_sevenzip(path: &Path) -> Result<Source, SourceError> {
+    fn open_sevenzip(path: &Path) -> Result<Self, SourceError> {
         let archive = sevenz_rust2::ArchiveReader::open(path, sevenz_rust2::Password::empty())
             .map_err(SourceError::SevenZip)?;
         let mut names: Vec<String> = archive
@@ -200,7 +200,7 @@ impl Source {
             .map(|entry| entry.name.clone())
             .collect();
         sort_pages(&mut names);
-        let mut source = Source::from_names(SourceKind::SevenZip(path.to_path_buf()), names)?;
+        let mut source = Self::from_names(SourceKind::SevenZip(path.to_path_buf()), names)?;
         let pages: HashMap<String, usize> = source
             .names
             .iter()
@@ -214,11 +214,11 @@ impl Source {
         Ok(source)
     }
 
-    fn from_names(kind: SourceKind, names: Vec<String>) -> Result<Source, SourceError> {
+    fn from_names(kind: SourceKind, names: Vec<String>) -> Result<Self, SourceError> {
         if names.is_empty() {
             return Err(SourceError::Empty);
         }
-        Ok(Source {
+        Ok(Self {
             kind,
             names,
             zip: None,
@@ -273,7 +273,7 @@ impl Source {
                 let mut buf = Vec::new();
                 entry
                     .read_to_end(&mut buf)
-                    .map_err(|e| SourceError::Zip(ZipError::Io(e)))?;
+                    .map_err(|error| SourceError::Zip(ZipError::Io(error)))?;
                 Ok(buf.into())
             }
             SourceKind::SevenZip(_) => {
@@ -339,7 +339,7 @@ fn spawn_harvest(
 
 /// Pages read in filename order for humans: c2 before c10.
 fn sort_pages(names: &mut [String]) {
-    names.sort_by(|a, b| natord::compare(a, b));
+    names.sort_by(|left, right| natord::compare(left, right));
 }
 
 #[cfg(test)]
@@ -433,7 +433,7 @@ mod tests {
         let mut tier = ByteTier::new(100);
         tier.insert(0, Arc::from(vec![1u8]));
         tier.insert(0, Arc::from(vec![2u8, 2]));
-        assert_eq!(tier.get(0).map(|d| d.to_vec()), Some(vec![1u8]));
+        assert_eq!(tier.get(0).map(|member| member.to_vec()), Some(vec![1u8]));
         assert_eq!(tier.live_bytes, 1);
     }
 
