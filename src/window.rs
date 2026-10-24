@@ -25,17 +25,13 @@ pub struct Window {
 }
 
 impl Window {
-    pub fn new(event_loop: &ActiveEventLoop) -> eros::Result<Self> {
-        unsafe { Self::create(event_loop) }
-    }
-
     /// Prefer desktop GL, fall back to GLES. The swap is non-blocking.
     ///
     /// # Safety
     ///
-    /// `event_loop` must be the loop this window runs on, because the raw
-    /// display handle taken from it backs the GL display.
-    unsafe fn create(event_loop: &ActiveEventLoop) -> eros::Result<Self> {
+    /// The event loop must outlive the returned window: the platform
+    /// display behind its raw handle backs every GL object created here.
+    pub unsafe fn new(event_loop: &ActiveEventLoop) -> eros::Result<Self> {
         use glutin::config::ConfigTemplateBuilder;
         use glutin::context::ContextApi;
         use glutin::context::ContextAttributesBuilder;

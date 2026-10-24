@@ -349,6 +349,8 @@ fn decode_image(bytes: &[u8], format: Format) -> Result<Decoded, DecodeError> {
 /// directly. avifImageYUVToRGB would do the RGB conversion on the CPU.
 /// The GPU does it at draw time.
 mod avif {
+    use std::marker::PhantomData;
+
     use libavif_sys::*;
 
     use super::{DecodeError, Decoded, Format, Matrix, Plane, Subsampling, YuvImage};
@@ -358,101 +360,81 @@ mod avif {
     const MAX_THREADS: usize = 8;
 
     pub fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
-        // SAFETY: the decoder is a private per-call object; every libavif call
-        // receives either it or pointers read from it. The guard destroys it
-        // on every exit path; `bytes` outlives the decoder (destroyed first).
-        unsafe {
-            let decoder_guard = DecoderGuard(avifDecoderCreate());
-            if decoder_guard.0.is_null() {
-                return Err(DecodeError::Unsupported("avif: decoder create"));
-            }
-            (*decoder_guard.0).maxThreads = threads();
-            avifDecoderSetIOMemory(decoder_guard.0, bytes.as_ptr(), bytes.len());
-            check(avifDecoderParse(decoder_guard.0), "avif parse")?;
-            check(avifDecoderNextImage(decoder_guard.0), "avif image")?;
+        // SAFETY: the guard performs the unchecked libavif calls and keeps
+        // `bytes` alive for the decoder's whole life through its lifetime.
+        let decoder = unsafe { DecoderGuard::new(bytes)? };
+        // SAFETY: the decoder is untouched since `new`, so the frame
+        // reference stays valid while the guard lives.
+        let frame = unsafe { decoder.image()? };
 
-            let avif_image_ptr = (*decoder_guard.0).image;
-            if avif_image_ptr.is_null() {
-                return Err(DecodeError::Corrupt("avif: no image"));
-            }
-            let (width, height) = ((*avif_image_ptr).width, (*avif_image_ptr).height);
-            let depth = match (*avif_image_ptr).depth {
-                8 => 8_u8,
-                10 => 10,
-                12 => 12,
-                16 => 16,
-                _ => return Err(DecodeError::Corrupt("avif: bad depth")),
-            };
-            super::checked_pixels(width, height, "avif: bad dimensions")?;
-            super::check_dims(width, height)?;
-            let subsampling = match (*avif_image_ptr).yuvFormat {
-                AVIF_PIXEL_FORMAT_YUV444 => Subsampling::Yuv444,
-                AVIF_PIXEL_FORMAT_YUV422 => Subsampling::Yuv422,
-                AVIF_PIXEL_FORMAT_YUV420 => Subsampling::Yuv420,
-                AVIF_PIXEL_FORMAT_YUV400 => Subsampling::Mono,
-                _ => return Err(DecodeError::Unsupported("avif: pixel format")),
-            };
-            let full_range = (*avif_image_ptr).yuvRange == AVIF_RANGE_FULL;
-            let matrix = match u32::from((*avif_image_ptr).matrixCoefficients) {
-                AVIF_MATRIX_COEFFICIENTS_IDENTITY => Matrix::Identity,
-                AVIF_MATRIX_COEFFICIENTS_BT709 => Matrix::Bt709,
-                AVIF_MATRIX_COEFFICIENTS_BT2020_NCL => Matrix::Bt2020,
-                // avifCalcYUVCoefficients treats unspecified/BG/601 as BT.601.
-                AVIF_MATRIX_COEFFICIENTS_UNSPECIFIED
-                | AVIF_MATRIX_COEFFICIENTS_BT470BG
-                | AVIF_MATRIX_COEFFICIENTS_BT601 => Matrix::Bt601,
-                _ => return Err(DecodeError::Unsupported("avif: matrix coefficients")),
-            };
+        let (width, height) = (frame.width, frame.height);
+        let depth = match frame.depth {
+            8 => 8_u8,
+            10 => 10,
+            12 => 12,
+            16 => 16,
+            _ => return Err(DecodeError::Corrupt("avif: bad depth")),
+        };
+        super::checked_pixels(width, height, "avif: bad dimensions")?;
+        super::check_dims(width, height)?;
+        let subsampling = match frame.yuvFormat {
+            AVIF_PIXEL_FORMAT_YUV444 => Subsampling::Yuv444,
+            AVIF_PIXEL_FORMAT_YUV422 => Subsampling::Yuv422,
+            AVIF_PIXEL_FORMAT_YUV420 => Subsampling::Yuv420,
+            AVIF_PIXEL_FORMAT_YUV400 => Subsampling::Mono,
+            _ => return Err(DecodeError::Unsupported("avif: pixel format")),
+        };
+        let full_range = frame.yuvRange == AVIF_RANGE_FULL;
+        let matrix = match u32::from(frame.matrixCoefficients) {
+            AVIF_MATRIX_COEFFICIENTS_IDENTITY => Matrix::Identity,
+            AVIF_MATRIX_COEFFICIENTS_BT709 => Matrix::Bt709,
+            AVIF_MATRIX_COEFFICIENTS_BT2020_NCL => Matrix::Bt2020,
+            // avifCalcYUVCoefficients treats unspecified/BG/601 as BT.601.
+            AVIF_MATRIX_COEFFICIENTS_UNSPECIFIED
+            | AVIF_MATRIX_COEFFICIENTS_BT470BG
+            | AVIF_MATRIX_COEFFICIENTS_BT601 => Matrix::Bt601,
+            _ => return Err(DecodeError::Unsupported("avif: matrix coefficients")),
+        };
 
-            let (chroma_width, chroma_height) = match subsampling {
-                Subsampling::Mono => (0, 0),
-                Subsampling::Yuv420 => (width.div_ceil(2), height.div_ceil(2)),
-                Subsampling::Yuv422 => (width.div_ceil(2), height),
-                Subsampling::Yuv444 => (width, height),
-            };
-            let luma_plane = copy_plane(
-                (*avif_image_ptr).yuvPlanes[0],
-                (*avif_image_ptr).yuvRowBytes[0],
-                width,
-                height,
-                u32::from(depth),
-            )?;
-            let (blue_plane, red_plane) = if subsampling == Subsampling::Mono {
-                (Plane::U8(Box::new([])), Plane::U8(Box::new([])))
-            } else {
-                (
-                    copy_plane(
-                        (*avif_image_ptr).yuvPlanes[1],
-                        (*avif_image_ptr).yuvRowBytes[1],
-                        chroma_width,
-                        chroma_height,
-                        u32::from(depth),
-                    )?,
-                    copy_plane(
-                        (*avif_image_ptr).yuvPlanes[2],
-                        (*avif_image_ptr).yuvRowBytes[2],
-                        chroma_width,
-                        chroma_height,
-                        u32::from(depth),
-                    )?,
-                )
-            };
-
-            super::Decoded::yuv(
-                width,
-                height,
-                Format::Avif,
-                YuvImage {
-                    depth,
-                    subsampling,
-                    full_range,
-                    matrix,
-                    luma: luma_plane,
-                    cb: blue_plane,
-                    cr: red_plane,
-                },
+        let (chroma_width, chroma_height) = match subsampling {
+            Subsampling::Mono => (0, 0),
+            Subsampling::Yuv420 => (width.div_ceil(2), height.div_ceil(2)),
+            Subsampling::Yuv422 => (width.div_ceil(2), height),
+            Subsampling::Yuv444 => (width, height),
+        };
+        // SAFETY: the guard still owns the frame, so the luma plane is live;
+        // `copy_plane` rejects null planes and short strides.
+        let luma_plane =
+            unsafe { copy_plane(frame.yuvPlanes[0], frame.yuvRowBytes[0], width, height, u32::from(depth)) }?;
+        let (blue_plane, red_plane) = if subsampling == Subsampling::Mono {
+            (Plane::U8(Box::new([])), Plane::U8(Box::new([])))
+        } else {
+            (
+                // SAFETY: same contract as the luma plane, on the Cb plane.
+                unsafe {
+                    copy_plane(frame.yuvPlanes[1], frame.yuvRowBytes[1], chroma_width, chroma_height, u32::from(depth))
+                }?,
+                // SAFETY: same contract as the luma plane, on the Cr plane.
+                unsafe {
+                    copy_plane(frame.yuvPlanes[2], frame.yuvRowBytes[2], chroma_width, chroma_height, u32::from(depth))
+                }?,
             )
-        }
+        };
+
+        super::Decoded::yuv(
+            width,
+            height,
+            Format::Avif,
+            YuvImage {
+                depth,
+                subsampling,
+                full_range,
+                matrix,
+                luma: luma_plane,
+                cb: blue_plane,
+                cr: red_plane,
+            },
+        )
     }
 
     #[expect(
@@ -480,6 +462,11 @@ mod avif {
 
     /// Copy one plane row by row (libavif rows are padded to `stride`).
     /// Depth > 8 planes are native-endian `u16` arrays on the C side.
+    ///
+    /// # Safety
+    ///
+    /// `plane_ptr` must be a live plane's pointer paired with `row_stride`
+    /// as that plane's stride, holding `height` rows of samples.
     unsafe fn copy_plane(
         plane_ptr: *const u8,
         row_stride: u32,
@@ -524,12 +511,58 @@ mod avif {
         }
     }
 
-    struct DecoderGuard(*mut avifDecoder);
-    impl Drop for DecoderGuard {
-        fn drop(&mut self) {
-            if !self.0.is_null() {
-                unsafe { avifDecoderDestroy(self.0) };
+    /// Owns the C decoder for one decode call. The `'bytes` lifetime pins
+    /// the input: the decoder reads it through a raw pointer until it is
+    /// destroyed.
+    struct DecoderGuard<'bytes> {
+        ptr: *mut avifDecoder,
+        _bytes: PhantomData<&'bytes [u8]>,
+    }
+
+    impl<'bytes> DecoderGuard<'bytes> {
+        /// Create the decoder, feed it `bytes`, parse, decode the first
+        /// image.
+        ///
+        /// # Safety
+        ///
+        /// The marker exists because the body performs unchecked libavif
+        /// calls. Input retention is carried by the `'bytes` lifetime, so
+        /// callers owe nothing beyond it.
+        unsafe fn new(bytes: &'bytes [u8]) -> Result<Self, DecodeError> {
+            let ptr = avifDecoderCreate();
+            if ptr.is_null() {
+                return Err(DecodeError::Unsupported("avif: decoder create"));
             }
+            let guard = Self { ptr, _bytes: PhantomData };
+            (*guard.ptr).maxThreads = threads();
+            avifDecoderSetIOMemory(guard.ptr, bytes.as_ptr(), bytes.len());
+            check(avifDecoderParse(guard.ptr), "avif parse")?;
+            check(avifDecoderNextImage(guard.ptr), "avif image")?;
+            Ok(guard)
+        }
+
+        /// The decoded frame. The decoder owns it, so copy from it before
+        /// the guard drops.
+        ///
+        /// # Safety
+        ///
+        /// The marker exists because the body dereferences the decoder
+        /// pointer. The decoder must be untouched since `new`, which module
+        /// privacy enforces: no other decoder call exists between the two.
+        unsafe fn image(&self) -> Result<&avifImage, DecodeError> {
+            let frame = (*self.ptr).image;
+            if frame.is_null() {
+                return Err(DecodeError::Corrupt("avif: no image"));
+            }
+            Ok(&*frame)
+        }
+    }
+
+    impl Drop for DecoderGuard<'_> {
+        fn drop(&mut self) {
+            // SAFETY: the guard solely owns the decoder from
+            // `avifDecoderCreate`, and drop runs exactly once.
+            unsafe { avifDecoderDestroy(self.ptr); }
         }
     }
 }

@@ -419,7 +419,9 @@ impl App {
 
 impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        let window = match Window::new(event_loop) {
+        // SAFETY: the app owns this window and is dropped before the event
+        // loop is, so the loop's display outlives every GL object in it.
+        let window = match unsafe { Window::new(event_loop) } {
             Ok(window) => window,
             Err(error) => {
                 self.fatal_error = Some(error);
