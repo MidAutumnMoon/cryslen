@@ -744,10 +744,10 @@ mod tests {
                 "luma scale row {row}"
             );
         }
-        assert!((element(&matrix, 0, 2) - 1.596027).abs() < 1e-3);
-        assert!((element(&matrix, 1, 1) - -0.391762).abs() < 1e-3);
-        assert!((element(&matrix, 1, 2) - -0.812968).abs() < 1e-3);
-        assert!((element(&matrix, 2, 1) - 2.017232).abs() < 1e-3);
+        assert!((element(&matrix, 0, 2) - 1.596_027).abs() < 1e-3);
+        assert!((element(&matrix, 1, 1) - -0.391_762).abs() < 1e-3);
+        assert!((element(&matrix, 1, 2) - -0.812_968).abs() < 1e-3);
+        assert!((element(&matrix, 2, 1) - 2.017_232).abs() < 1e-3);
         assert_eq!(element(&matrix, 0, 1), 0.0);
         assert_eq!(element(&matrix, 2, 2), 0.0);
     }
@@ -755,10 +755,10 @@ mod tests {
     #[test]
     fn bt709_limited_matches_documented_constants() {
         let matrix = yuv_to_rgb_matrix(Matrix::Bt709, false);
-        assert!((element(&matrix, 0, 2) - 1.792741).abs() < 1e-3);
-        assert!((element(&matrix, 1, 1) - -0.212899).abs() < 1e-3);
-        assert!((element(&matrix, 1, 2) - -0.532909).abs() < 1e-3);
-        assert!((element(&matrix, 2, 1) - 2.112402).abs() < 1e-3);
+        assert!((element(&matrix, 0, 2) - 1.792_741).abs() < 1e-3);
+        assert!((element(&matrix, 1, 1) - -0.212_899).abs() < 1e-3);
+        assert!((element(&matrix, 1, 2) - -0.532_909).abs() < 1e-3);
+        assert!((element(&matrix, 2, 1) - 2.112_402).abs() < 1e-3);
     }
 
     #[test]
@@ -821,7 +821,7 @@ mod tests {
 
     #[test]
     fn rgba_entry_cost_counts_the_mip_chain() {
-        let bytes = vec![0u8; 4 * 4 * 4].into_boxed_slice();
+        let bytes = vec![0_u8; 4 * 4 * 4].into_boxed_slice();
         let decoded = Decoded::rgba(4, 4, Format::Png, bytes).expect("rgba page");
         assert_eq!(entry_cost_bytes(&decoded, true), 64 * 4 / 3);
     }
@@ -833,9 +833,9 @@ mod tests {
             subsampling: Subsampling::Yuv420,
             full_range: true,
             matrix: Matrix::Bt709,
-            luma: Plane::U8(vec![0u8; 4 * 4].into_boxed_slice()),
-            cb: Plane::U8(vec![0u8; 2 * 2].into_boxed_slice()),
-            cr: Plane::U8(vec![0u8; 2 * 2].into_boxed_slice()),
+            luma: Plane::U8(vec![0_u8; 4 * 4].into_boxed_slice()),
+            cb: Plane::U8(vec![0_u8; 2 * 2].into_boxed_slice()),
+            cr: Plane::U8(vec![0_u8; 2 * 2].into_boxed_slice()),
         };
         let decoded = Decoded::yuv(4, 4, Format::Avif, yuv).expect("yuv page");
         assert_eq!(entry_cost_bytes(&decoded, true), (16 + 4 + 4) * 4 / 3);
@@ -848,7 +848,7 @@ mod tests {
             subsampling: Subsampling::Mono,
             full_range: true,
             matrix: Matrix::Identity,
-            luma: Plane::U16(vec![0u16; 4].into_boxed_slice()),
+            luma: Plane::U16(vec![0_u16; 4].into_boxed_slice()),
             cb: Plane::U8(Box::default()),
             cr: Plane::U8(Box::default()),
         };
@@ -858,7 +858,7 @@ mod tests {
 
     #[test]
     fn eviction_drops_unbound_pages_farthest_first() {
-        let costs = [(3usize, 10usize), (19, 10), (10, 10), (20, 10)];
+        let costs = [(3_usize, 10_usize), (19, 10), (10, 10), (20, 10)];
         // 19 sits one page from seat 1's anchor, so 3 is the farther victim.
         assert_eq!(eviction_victims(costs, [Some(10), Some(20)], 35), vec![3]);
         assert_eq!(eviction_victims(costs, [Some(10), Some(20)], 25), vec![3, 19]);
@@ -866,14 +866,14 @@ mod tests {
 
     #[test]
     fn bound_pages_are_never_evicted() {
-        let costs = [(10usize, 10usize), (11, 10), (12, 10)];
+        let costs = [(10_usize, 10_usize), (11, 10), (12, 10)];
         assert_eq!(eviction_victims(costs, [Some(10), Some(11)], 0), vec![12]);
         assert_eq!(eviction_victims(costs, [Some(10), Some(11)], 30), vec![]);
     }
 
     #[test]
     fn eviction_ties_break_to_the_higher_page() {
-        let costs = [(8usize, 10usize), (12, 10), (10, 10)];
+        let costs = [(8_usize, 10_usize), (12, 10), (10, 10)];
         assert_eq!(eviction_victims(costs, [Some(10), None], 25), vec![12]);
     }
 }

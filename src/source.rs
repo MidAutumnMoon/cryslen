@@ -410,7 +410,7 @@ mod tests {
     }
 
     fn member(len: usize) -> Arc<[u8]> {
-        Arc::from(vec![0u8; len])
+        Arc::from(vec![0_u8; len])
     }
 
     #[test]
@@ -441,9 +441,9 @@ mod tests {
     #[test]
     fn tier_keeps_incumbent_on_repeat_insert() {
         let mut tier = ByteTier::new(100);
-        tier.insert(0, Arc::from(vec![1u8]));
-        tier.insert(0, Arc::from(vec![2u8, 2]));
-        assert_eq!(tier.get(0).map(|member| member.to_vec()), Some(vec![1u8]));
+        tier.insert(0, Arc::from(vec![1_u8]));
+        tier.insert(0, Arc::from(vec![2_u8, 2]));
+        assert_eq!(tier.get(0).map(|member| member.to_vec()), Some(vec![1_u8]));
         assert_eq!(tier.live_bytes, 1);
     }
 
@@ -489,7 +489,7 @@ mod tests {
             let options = SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
             for (name, color) in
-                [("b/010.png", 1u8), ("b/002.png", 2), ("b/020.png", 3), ("b/deep/005.png", 4)]
+                [("b/010.png", 1_u8), ("b/002.png", 2), ("b/020.png", 3), ("b/deep/005.png", 4)]
             {
                 zip.start_file(name, options).unwrap();
                 zip.write_all(&tiny_png(2, 2, [color, 0, 0, 255])).unwrap();

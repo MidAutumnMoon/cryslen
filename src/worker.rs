@@ -416,7 +416,7 @@ mod tests {
     fn prefetch_window_covers_double_mode_turns() {
         use crate::view;
 
-        for page_count in [2usize, 9, 13] {
+        for page_count in [2_usize, 9, 13] {
             let spreads = 1 + (page_count - 1).div_ceil(2);
             let mut focus = 0;
             for turn in 0..spreads {
@@ -586,11 +586,11 @@ mod tests {
     #[test]
     fn retune_decodes_and_notifies() {
         let dir = TempDir::new("worker");
-        for page in 0u8..3 {
+        for page in 0_u8..3 {
             dir.write(&format!("p{page}.png"), &tiny_png(3, 2, [page, 0, 0, 255]));
         }
         let source = Arc::new(Source::open(dir.path()).expect("temp source opens"));
-        let updates = Arc::new(Mutex::new(0usize));
+        let updates = Arc::new(Mutex::new(0_usize));
         let counted = Arc::clone(&updates);
         let worker = Worker::spawn(source, move || {
             *counted.lock().unwrap() += 1;

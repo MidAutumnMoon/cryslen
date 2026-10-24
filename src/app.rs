@@ -604,7 +604,7 @@ mod tests {
                 width,
                 height,
                 Format::Png,
-                vec![0u8; width as usize * height as usize * 4].into_boxed_slice(),
+                vec![0_u8; width as usize * height as usize * 4].into_boxed_slice(),
             )
             .expect("valid rgba page"),
         ))

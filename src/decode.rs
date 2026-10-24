@@ -98,7 +98,7 @@ fn checked_extent(width: u32, height: u32, bytes_per_pixel: usize) -> Result<usi
 const MAX_PIXELS: u32 = 512 << 18;
 
 /// Largest page edge accepted as one GL texture (the common desktop limit).
-const MAX_TEXTURE_EDGE: u32 = 16384;
+const MAX_TEXTURE_EDGE: u32 = 0x4000;
 
 fn check_dims(width: u32, height: u32) -> Result<(), DecodeError> {
     if width > MAX_TEXTURE_EDGE || height > MAX_TEXTURE_EDGE {
@@ -378,7 +378,7 @@ mod avif {
             }
             let (width, height) = ((*avif_image_ptr).width, (*avif_image_ptr).height);
             let depth = match (*avif_image_ptr).depth {
-                8 => 8u8,
+                8 => 8_u8,
                 10 => 10,
                 12 => 12,
                 16 => 16,
@@ -711,10 +711,19 @@ mod tests {
 
     #[test]
     fn edge_cap_at_gpu_texture_limit() {
-        let over = Decoded::rgba(16385, 1, Format::Png, vec![0u8; 4 * 16385].into_boxed_slice());
+        let over = Decoded::rgba(
+            MAX_TEXTURE_EDGE + 1,
+            1,
+            Format::Png,
+            vec![0_u8; 4 * (MAX_TEXTURE_EDGE + 1) as usize].into_boxed_slice(),
+        );
         assert!(matches!(over, Err(DecodeError::Unsupported(_))));
-        let at_limit =
-            Decoded::rgba(16384, 1, Format::Png, vec![0u8; 4 * 16384].into_boxed_slice());
+        let at_limit = Decoded::rgba(
+            MAX_TEXTURE_EDGE,
+            1,
+            Format::Png,
+            vec![0_u8; 4 * MAX_TEXTURE_EDGE as usize].into_boxed_slice(),
+        );
         assert!(at_limit.is_ok());
     }
 
