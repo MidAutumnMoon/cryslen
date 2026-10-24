@@ -67,3 +67,10 @@ After making changes (scope to the relevant app/crate):
 3. Dedup, collect and report all triggered clippy warning to the user and require them to review. Ensure tests pass before considering the change complete.
 
 Do not pipe command output through `head` or `tail`, especially `cargo test`.
+
+## VCS
+
+Use `jj` vcs exclusively. For example, `jj status`, `jj new`.
+
+`difftastic` is configured as diff tool. Use `jj diff --git` and `jj show --git` for traditional git style diff output.
+
