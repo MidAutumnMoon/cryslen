@@ -33,6 +33,16 @@ pub enum UserEvent {
     PagesUpdated,
 }
 
+/// Post `event` to the event loop. A failed send means the loop is
+/// gone, so the event has no consumer left and quitting already won.
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "pub(crate) is the crate's visibility style for crate-wide items, even inside private modules"
+)]
+pub(crate) fn post(proxy: &EventLoopProxy<UserEvent>, event: UserEvent) {
+    let Ok(()) = proxy.send_event(event) else { return; };
+}
+
 /// Everything mode-ish about the viewing session. Plain data.
 struct State {
     /// Index of the spread's first page (a spread start).
@@ -301,7 +311,7 @@ impl App {
         if let Some(since) = self.waiting_since {
             let elapsed = since.elapsed();
             if elapsed < WAIT_GRACE {
-                let _ = self.proxy.send_event(UserEvent::Repaint(WAIT_GRACE.saturating_sub(elapsed)));
+                post(&self.proxy, UserEvent::Repaint(WAIT_GRACE.saturating_sub(elapsed)));
             }
         }
 
@@ -311,7 +321,7 @@ impl App {
             self.mode_toast_since.filter(|&since| since.elapsed() < MODE_TOAST);
         if let Some(since) = self.mode_toast_since {
             let remaining = MODE_TOAST.saturating_sub(since.elapsed());
-            let _ = self.proxy.send_event(UserEvent::Repaint(remaining));
+            post(&self.proxy, UserEvent::Repaint(remaining));
         }
 
         let claimed = self.source.name(spread.first).and_then(decode::format_from_name);
@@ -454,7 +464,7 @@ impl ApplicationHandler<UserEvent> for App {
 
             let proxy = Mutex::new(self.proxy.clone());
             egui.egui_ctx.set_request_repaint_callback(move |info| {
-                let _ = proxy.lock().send_event(UserEvent::Repaint(info.delay));
+                post(&proxy.lock(), UserEvent::Repaint(info.delay));
             });
         }
         window.winit.request_redraw();

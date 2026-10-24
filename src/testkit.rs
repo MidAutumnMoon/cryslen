@@ -46,6 +46,7 @@ impl TempDir {
 
 impl Drop for TempDir {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        // A failed removal is a leaked scratch dir, never a test failure.
+        let Ok(()) = fs::remove_dir_all(&self.0) else { return; };
     }
 }

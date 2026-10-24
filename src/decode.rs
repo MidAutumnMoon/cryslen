@@ -690,30 +690,50 @@ mod jxl {
         thread::available_parallelism().map_or(1, NonZeroUsize::get).min(MAX_THREADS)
     }
 
-    /// Scoped-thread runner. Per-task errors inside the threads are
-    /// swallowed. A broken codestream fails the sequential `process`
-    /// call right after.
-    struct Pool(usize);
+    /// Scoped-thread runner. The first failing task fails the whole
+    /// run, which is how the crate's driver expects a runner to
+    /// report a broken codestream. The driver calls this only with
+    /// two or more threads, so no sequential path exists here.
+    pub(super) struct Pool(usize);
+
+    impl Pool {
+        #[cfg(test)]
+        pub(super) fn new(threads: usize) -> Self {
+            Self(threads)
+        }
+    }
+
     impl JxlParallelRunner for Pool {
         fn run(&mut self, num: usize, fun: &JxlParallelRunnerFun<'_>) -> error::Result<()> {
+            use std::sync::Mutex;
+            use std::sync::PoisonError;
+
             let thread_count = self.0.min(num);
-            if thread_count < 2 {
-                return (0..num).try_for_each(fun);
-            }
             let chunk = num.div_ceil(thread_count);
+            let failure: Mutex<Option<error::Error>> = Mutex::new(None);
             thread::scope(|scope| {
                 for thread_index in 0..thread_count {
                     let fun: &JxlParallelRunnerFun = fun;
+                    let failure = &failure;
                     scope.spawn(move || {
                         for task_index in thread_index * chunk
                             ..((thread_index + 1) * chunk).min(num)
                         {
-                            let _ = fun(task_index);
+                            if let Err(task_error) = fun(task_index) {
+                                failure
+                                    .lock()
+                                    .unwrap_or_else(PoisonError::into_inner)
+                                    .get_or_insert(task_error);
+                                break;
+                            }
                         }
                     });
                 }
             });
-            Ok(())
+            failure
+                .into_inner()
+                .unwrap_or_else(PoisonError::into_inner)
+                .map_or(Ok(()), Err)
         }
         fn num_threads(&self) -> usize {
             self.0
@@ -901,5 +921,42 @@ mod tests {
             }
             Pixels::Yuv(_) => panic!("jxl must decode to rgba"),
         }
+    }
+
+    // The fixtures are single-group, so only this test drives the runner's
+    // parallel path at all.
+    #[test]
+    fn jxl_pool_reports_the_first_task_error() {
+        use ::jxl::api::JxlParallelRunner as _;
+
+        use super::jxl::Pool;
+
+        let mut pool = Pool::new(4);
+        let failing = |task: usize| {
+            if task == 1 {
+                Err(JxlError::InvalidSignature)
+            } else {
+                Ok(())
+            }
+        };
+        assert!(matches!(pool.run(4, &failing), Err(JxlError::InvalidSignature)));
+
+        let passing = |_: usize| Ok(());
+        pool.run(4, &passing).expect("every passing task succeeds");
+
+        // Two threads over four tasks pin the chunk partition. A range
+        // that drops the last task would leave the failure unreported.
+        let mut two_threads = Pool::new(2);
+        let failing_last = |task: usize| {
+            if task == 3 {
+                Err(JxlError::InvalidSignature)
+            } else {
+                Ok(())
+            }
+        };
+        assert!(matches!(
+            two_threads.run(4, &failing_last),
+            Err(JxlError::InvalidSignature)
+        ));
     }
 }

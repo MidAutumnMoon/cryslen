@@ -230,9 +230,15 @@ impl Worker {
         Ok(Self { tx, book, handle: Some(handle) })
     }
 
+    /// Tell the worker thread `message`. A failed send means the
+    /// thread already exited, so the message has no reader left.
+    fn tell(&self, message: ToWorker) {
+        let Ok(()) = self.tx.send(message) else { return; };
+    }
+
     /// Tell the worker which spread the app is now showing.
     pub fn retune(&self, wanted: Spread) {
-        let _ = self.tx.send(ToWorker::Retune(wanted));
+        self.tell(ToWorker::Retune(wanted));
     }
 
     /// The current view for both seats of `wanted`, read under one lock.
@@ -253,9 +259,13 @@ impl Worker {
 impl Drop for Worker {
     fn drop(&mut self) {
         // Stop wakes a parked loop so the join returns.
-        let _ = self.tx.send(ToWorker::Stop);
+        self.tell(ToWorker::Stop);
         if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+            // Join Err means the thread died of a panic. Nothing can act
+            // on the payload at teardown, so debug builds surface the
+            // breach and release reaps regardless.
+            let joined = handle.join();
+            debug_assert!(joined.is_ok(), "worker thread panicked");
         }
     }
 }

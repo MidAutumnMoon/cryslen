@@ -99,7 +99,7 @@ fn run(open_path: &Path, land_on: Option<&str>) -> eros::Result<()> {
     let proxy = event_loop.create_proxy();
 
     let worker = Worker::spawn(Arc::clone(&source), move || {
-        let _ = proxy.send_event(UserEvent::PagesUpdated);
+        app::post(&proxy, UserEvent::PagesUpdated);
     })?;
 
     let mut app = App::new(source, worker, index, event_loop.create_proxy());

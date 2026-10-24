@@ -339,14 +339,14 @@ fn spawn_harvest(path: PathBuf, pages: HashMap<String, usize>, tier: Arc<Mutex<B
                 return;
             };
             let mut member = Vec::new();
-            let _ = reader.for_each_entries(|entry, data| {
+            let Ok(()) = reader.for_each_entries(|entry, data| {
                 member.clear();
                 data.read_to_end(&mut member)?;
                 if let Some(&index) = pages.get(&entry.name) {
                     lock_recovered(&tier).insert(index, Arc::from(member.as_slice()));
                 }
                 Ok(true)
-            });
+            }) else { return; };
         }));
 }
 
