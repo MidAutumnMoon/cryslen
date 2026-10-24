@@ -346,7 +346,7 @@ fn sort_pages(names: &mut [String]) {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, reason = "a panic in test code is inconsequential")]
+#[expect(clippy::expect_used, clippy::unwrap_used, reason = "a panic in test code is inconsequential")]
 mod tests {
     use super::*;
     use crate::decode;

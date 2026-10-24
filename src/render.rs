@@ -806,7 +806,7 @@ fn yuv_to_rgb_matrix(matrix: Matrix, full_range: bool) -> [f32; 9] {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, reason = "a panic in test code is inconsequential")]
+#[expect(clippy::expect_used, reason = "a panic in test code is inconsequential")]
 mod tests {
     use super::*;
     use crate::decode::Format;

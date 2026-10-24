@@ -8,7 +8,7 @@ mod keys;
 mod render;
 mod source;
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, reason = "a panic in test code is inconsequential")]
+#[expect(clippy::expect_used, reason = "a panic in test code is inconsequential")]
 pub(crate) mod testkit;
 mod ui;
 mod view;
@@ -111,7 +111,7 @@ fn run(open_path: &Path, land_on: Option<&str>) -> eros::Result<()> {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, reason = "a panic in test code is inconsequential")]
+#[expect(clippy::expect_used, clippy::panic, reason = "a panic in test code is inconsequential")]
 mod tests {
     use super::*;
     use crate::testkit::{tiny_png, TempDir};

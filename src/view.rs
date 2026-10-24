@@ -285,7 +285,6 @@ fn clamp_axis(offset: f32, content: f32, window: f32) -> f32 {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, reason = "a panic in test code is inconsequential")]
 mod tests {
     use super::*;
 

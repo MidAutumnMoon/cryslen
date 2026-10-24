@@ -596,7 +596,7 @@ fn wheel_lines(dy: f64, scale_factor: f64) -> f32 {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic, reason = "a panic in test code is inconsequential")]
+#[expect(clippy::expect_used, reason = "a panic in test code is inconsequential")]
 mod tests {
     use super::*;
 
