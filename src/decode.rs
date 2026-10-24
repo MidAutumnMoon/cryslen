@@ -228,19 +228,27 @@ impl Error for DecodeError {}
 /// Decode one page. `name` is the page filename (extension fallback).
 /// Static: animated images show their first frame.
 pub fn decode(bytes: &[u8], name: &str) -> Result<Decoded, DecodeError> {
-    let format = match sniff(bytes).or_else(|| format_from_name(name)) {
-        Some(format) => format,
-        None => return Err(DecodeError::NotAnImage),
+    let Some(format) = sniff(bytes).or_else(|| format_from_name(name)) else {
+        return Err(DecodeError::NotAnImage);
     };
     match format {
         Format::Avif => avif::decode(bytes),
         Format::Jxl => jxl::decode(bytes),
-        format => decode_image(bytes, format),
+        Format::Jpeg
+        | Format::Png
+        | Format::Gif
+        | Format::Webp
+        | Format::Bmp
+        | Format::Tiff => decode_image(bytes, format),
     }
 }
 
 /// Extension -> format table. The same table decides what can decode and
 /// what gets listed as a page.
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "pub(crate) is the crate's visibility style for crate-wide items, even inside private modules"
+)]
 pub(crate) fn format_from_name(name: &str) -> Option<Format> {
     use std::path::Path;
 
@@ -303,6 +311,10 @@ fn sniff_ftyp_avif(bytes: &[u8]) -> bool {
 /// Brand region of the leading `ftyp` box. A box length under 12 still
 /// yields the 4-byte major brand region.
 fn ftyp_brands(bytes: &[u8]) -> Option<&[u8]> {
+    #[expect(
+        clippy::big_endian_bytes,
+        reason = "the ISOBMFF box length is big-endian by specification"
+    )]
     let box_len = u32::from_be_bytes(bytes.get(..4)?.try_into().ok()?) as usize;
     let kind: [u8; 4] = bytes.get(4..8)?.try_into().ok()?;
     if kind != *b"ftyp" {
@@ -345,9 +357,28 @@ fn decode_image(bytes: &[u8], format: Format) -> Result<Decoded, DecodeError> {
 /// directly. avifImageYUVToRGB would do the RGB conversion on the CPU.
 /// The GPU does it at draw time.
 mod avif {
+    use libavif_sys::avifDecoder;
+    use libavif_sys::avifDecoderCreate;
+    use libavif_sys::avifDecoderDestroy;
+    use libavif_sys::avifDecoderNextImage;
+    use libavif_sys::avifDecoderParse;
+    use libavif_sys::avifDecoderSetIOMemory;
+    use libavif_sys::avifImage;
+    use libavif_sys::avifResult;
+    use libavif_sys::avifResultToString;
+    use libavif_sys::AVIF_MATRIX_COEFFICIENTS_BT2020_NCL;
+    use libavif_sys::AVIF_MATRIX_COEFFICIENTS_BT470BG;
+    use libavif_sys::AVIF_MATRIX_COEFFICIENTS_BT601;
+    use libavif_sys::AVIF_MATRIX_COEFFICIENTS_BT709;
+    use libavif_sys::AVIF_MATRIX_COEFFICIENTS_IDENTITY;
+    use libavif_sys::AVIF_MATRIX_COEFFICIENTS_UNSPECIFIED;
+    use libavif_sys::AVIF_PIXEL_FORMAT_YUV400;
+    use libavif_sys::AVIF_PIXEL_FORMAT_YUV420;
+    use libavif_sys::AVIF_PIXEL_FORMAT_YUV422;
+    use libavif_sys::AVIF_PIXEL_FORMAT_YUV444;
+    use libavif_sys::AVIF_RANGE_FULL;
+    use libavif_sys::AVIF_RESULT_OK;
     use std::marker::PhantomData;
-
-    use libavif_sys::*;
 
     use super::{DecodeError, Decoded, Format, Matrix, Plane, Subsampling, YuvImage};
 
@@ -439,11 +470,10 @@ mod avif {
         reason = "the thread count is min(available, MAX_THREADS) before the C-int maxThreads field, so the narrowing cannot occur"
     )]
     fn threads() -> i32 {
+        use std::num::NonZeroUsize;
         use std::thread;
 
-        thread::available_parallelism()
-            .map_or(1, |parallelism| parallelism.get())
-            .min(MAX_THREADS) as i32
+        thread::available_parallelism().map_or(1, NonZeroUsize::get).min(MAX_THREADS) as i32
     }
 
     unsafe fn check(code: avifResult, what: &'static str) -> Result<(), DecodeError> {
@@ -497,6 +527,10 @@ mod avif {
                 let src = slice::from_raw_parts(plane_ptr.add(row * row_stride), bytes);
                 raw.extend_from_slice(src);
             }
+            #[expect(
+                clippy::host_endian_bytes,
+                reason = "libavif's u16 plane samples are native-endian C arrays"
+            )]
             let samples = raw
                 .as_chunks::<2>()
                 .0
@@ -651,7 +685,9 @@ mod jxl {
     }
 
     fn threads() -> usize {
-        thread::available_parallelism().map_or(1, |parallelism| parallelism.get()).min(MAX_THREADS)
+        use std::num::NonZeroUsize;
+
+        thread::available_parallelism().map_or(1, NonZeroUsize::get).min(MAX_THREADS)
     }
 
     /// Scoped-thread runner. Per-task errors inside the threads are
@@ -746,13 +782,13 @@ mod tests {
             vec![0_u8; 4 * (MAX_TEXTURE_EDGE + 1) as usize].into_boxed_slice(),
         );
         assert!(matches!(over, Err(DecodeError::Unsupported(_))));
-        let at_limit = Decoded::rgba(
+        Decoded::rgba(
             MAX_TEXTURE_EDGE,
             1,
             Format::Png,
             vec![0_u8; 4 * MAX_TEXTURE_EDGE as usize].into_boxed_slice(),
-        );
-        assert!(at_limit.is_ok());
+        )
+        .expect("page at the edge cap constructs");
     }
 
     #[test]
@@ -831,7 +867,7 @@ mod tests {
             cr: Plane::U8(Box::new([])),
         };
         let real = mono(Plane::U16(vec![0; 32 * 16].into_boxed_slice()));
-        assert!(Decoded::yuv(32, 16, Format::Avif, real).is_ok());
+        Decoded::yuv(32, 16, Format::Avif, real).expect("mono yuv page constructs");
         let empty = mono(Plane::U16(Box::new([])));
         assert!(matches!(
             Decoded::yuv(32, 16, Format::Avif, empty),

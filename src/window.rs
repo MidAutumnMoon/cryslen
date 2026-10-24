@@ -12,7 +12,7 @@ use winit::event_loop::ActiveEventLoop;
 use winit::raw_window_handle::HasWindowHandle as _;
 use winit::window::Window as WinitWindow;
 
-/// Window + EGL context + surface. vsync is DontWait, so the app must call
+/// Window + EGL context + surface. vsync is `DontWait`, so the app must call
 /// `pre_present_and_swap()` to present.
 pub struct Window {
     pub winit: WinitWindow,
@@ -121,6 +121,8 @@ impl Window {
     /// Resize the surface when the window size changed since the last
     /// call. A zero size (minimized) and an unchanged size are no-ops.
     pub fn resize(&mut self, size: PhysicalSize<u32>) {
+        use glutin::prelude::GlSurface as _;
+
         let (Some(width), Some(height)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
         else {
             return;
@@ -128,7 +130,6 @@ impl Window {
         if (size.width, size.height) == self.resized_to {
             return;
         }
-        use glutin::prelude::GlSurface as _;
         self.surface.resize(&self.context, width, height);
         self.resized_to = (size.width, size.height);
     }

@@ -5,6 +5,10 @@ use winit::keyboard::KeyCode;
 
 /// Input actions, derived from physical keys (layout-independent).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "pub(crate) is the crate's visibility style for crate-wide items, even inside private modules"
+)]
 pub(crate) enum Action {
     Quit,
     SelectMode(ViewMode),
@@ -23,19 +27,22 @@ pub(crate) enum Action {
 impl Action {
     /// Key map, baked in. Arrows page by screen direction. Space and
     /// the Page keys page by reading order.
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "winit's unmapped KeyCode variants map to no action"
+    )]
     pub(crate) fn from_key(code: KeyCode) -> Option<Self> {
-        use Action::*;
         match code {
-            KeyCode::Escape | KeyCode::KeyQ => Some(Quit),
-            KeyCode::KeyN => Some(SelectMode(ViewMode::Normal)),
-            KeyCode::KeyM => Some(SelectMode(ViewMode::Manga)),
-            KeyCode::KeyC => Some(SelectMode(ViewMode::Comic)),
-            KeyCode::KeyF => Some(ToggleFullscreen),
-            KeyCode::KeyR => Some(ResetView),
-            KeyCode::ArrowRight => Some(Right),
-            KeyCode::ArrowLeft => Some(Left),
-            KeyCode::Space | KeyCode::PageDown => Some(Forward),
-            KeyCode::PageUp => Some(Back),
+            KeyCode::Escape | KeyCode::KeyQ => Some(Self::Quit),
+            KeyCode::KeyN => Some(Self::SelectMode(ViewMode::Normal)),
+            KeyCode::KeyM => Some(Self::SelectMode(ViewMode::Manga)),
+            KeyCode::KeyC => Some(Self::SelectMode(ViewMode::Comic)),
+            KeyCode::KeyF => Some(Self::ToggleFullscreen),
+            KeyCode::KeyR => Some(Self::ResetView),
+            KeyCode::ArrowRight => Some(Self::Right),
+            KeyCode::ArrowLeft => Some(Self::Left),
+            KeyCode::Space | KeyCode::PageDown => Some(Self::Forward),
+            KeyCode::PageUp => Some(Self::Back),
             _ => None,
         }
     }
@@ -51,10 +58,13 @@ impl Action {
     pub(crate) fn is_forward(self, mode: ViewMode) -> bool {
         match self {
             Self::Forward => true,
-            Self::Back => false,
             Self::Right => !mode.rtl(),
             Self::Left => mode.rtl(),
-            _ => false,
+            Self::Back
+            | Self::Quit
+            | Self::SelectMode(_)
+            | Self::ToggleFullscreen
+            | Self::ResetView => false,
         }
     }
 }

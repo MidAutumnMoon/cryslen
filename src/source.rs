@@ -10,7 +10,7 @@ use std::fs;
 use std::fs::File;
 use std::io::BufReader;
 use std::io::Error as IoError;
-use std::io::Read;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -73,6 +73,10 @@ fn archive_kind(path: &Path) -> Option<ArchiveKind> {
     }
 }
 
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "pub(crate) is the crate's visibility style for crate-wide items, even inside private modules"
+)]
 pub(crate) fn is_archive(path: &Path) -> bool {
     archive_kind(path).is_some()
 }
@@ -167,9 +171,13 @@ impl Source {
     }
 
     fn open_dir(dir: &Path) -> Result<Self, SourceError> {
+        #[expect(
+            clippy::filetype_is_file,
+            reason = "directory pages are regular files, so symlinks are skipped"
+        )]
         let mut names: Vec<String> = fs::read_dir(dir)
             .map_err(SourceError::Io)?
-            .filter_map(|entry| entry.ok())
+            .filter_map(Result::ok)
             .filter(|entry| entry.file_type().is_ok_and(|file_type| file_type.is_file()))
             .filter_map(|entry| entry.file_name().into_string().ok())
             .filter(|name| format_from_name(name).is_some())
@@ -179,14 +187,16 @@ impl Source {
     }
 
     fn open_zip(path: &Path) -> Result<Self, SourceError> {
+        use std::borrow::Cow;
+
         let file = File::open(path).map_err(SourceError::Io)?;
         let zip = zip::ZipArchive::new(BufReader::new(file)).map_err(SourceError::Zip)?;
         // Non-UTF-8 entry names are skipped (zip 9 reports them as errors).
         let mut names: Vec<String> = zip
             .file_names()
-            .filter_map(|name| name.ok())
+            .filter_map(Result::ok)
             .filter(|name| format_from_name(name).is_some())
-            .map(|name| name.into_owned())
+            .map(Cow::into_owned)
             .collect();
         sort_pages(&mut names);
         Self::from_names(Backend::Zip(Mutex::new(zip)), names)
@@ -247,15 +257,15 @@ impl Source {
         reason = "the page list is non-empty and immutable, and every page index is clamped to its length before reaching here"
     )]
     pub fn page_name(&self, index: usize) -> PageName {
-        debug_assert!(index < self.names.len());
+        debug_assert!(index < self.names.len(), "caller clamps the page index");
         let entry = &self.names[index];
-        let file = entry.rsplit('/').next().unwrap_or(entry).to_string();
+        let file = entry.rsplit('/').next().unwrap_or(entry).to_owned();
         let parent = match &self.backend {
             Backend::Directory(dir) => {
                 dir.file_name().map(|name| name.to_string_lossy().into_owned())
             }
             Backend::Zip(_) | Backend::SevenZip(_) => entry.rsplit_once('/').map(|(path, _)| {
-                path.rsplit('/').next().unwrap_or(path).to_string()
+                path.rsplit('/').next().unwrap_or(path).to_owned()
             }),
         };
         PageName { parent, file }
@@ -268,7 +278,7 @@ impl Source {
         reason = "the page list is non-empty and immutable, and every page index is clamped to its length before reaching here"
     )]
     pub fn bytes(&self, index: usize) -> Result<Arc<[u8]>, SourceError> {
-        debug_assert!(index < self.names.len());
+        debug_assert!(index < self.names.len(), "caller clamps the page index");
         let name = &self.names[index];
         match &self.backend {
             Backend::Directory(dir) => fs::read(dir.join(name))
@@ -293,7 +303,7 @@ impl Source {
                     let mut archive = lock_recovered(&backend.archive);
                     archive.read_file(name).map_err(SourceError::SevenZip)?.into()
                 };
-                lock_recovered(&backend.tier).insert(index, data.clone());
+                lock_recovered(&backend.tier).insert(index, Arc::clone(&data));
                 Ok(data)
             }
         }
@@ -373,6 +383,10 @@ mod tests {
         assert_eq!(source.names, ["p1.png", "p2.png"]);
         let bytes = source.bytes(0).expect("first page reads");
         assert_eq!(bytes.get(..8), Some(&b"\x89PNG\r\n\x1a\n"[..]));
+        #[expect(
+            clippy::big_endian_bytes,
+            reason = "PNG chunk fields are big-endian by specification"
+        )]
         let be_u32 = |at: usize| {
             bytes
                 .get(at..at + 4)

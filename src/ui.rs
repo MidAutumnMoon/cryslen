@@ -101,10 +101,10 @@ fn line(style: &egui::Style, status: &StatusLine) -> LayoutJob {
     };
     let mut job = LayoutJob::default();
 
-    let mut head = format!("{}", status.spread.first + 1);
-    if let Some(second) = status.spread.second {
-        head.push_str(&format!("-{}", second + 1));
-    }
+    let head = status.spread.second.map_or_else(
+        || format!("{}", status.spread.first + 1),
+        |second| format!("{}-{}", status.spread.first + 1, second + 1),
+    );
     section(&mut job, head, HEAD_COLOR);
     section(&mut job, format!("/{}", status.total), plain);
 
@@ -119,10 +119,10 @@ fn line(style: &egui::Style, status: &StatusLine) -> LayoutJob {
         section(&mut job, " · ".into(), plain);
         // A format label shows only when the filename's extension lies.
         let (width, height) = facts.dims;
-        let dims_text = if facts.claimed != Some(facts.decoded) {
-            format!("{} {width}x{height}", facts.decoded.label())
-        } else {
+        let dims_text = if facts.claimed == Some(facts.decoded) {
             format!("{width}x{height}")
+        } else {
+            format!("{} {width}x{height}", facts.decoded.label())
         };
         section(&mut job, dims_text, plain);
     }
@@ -236,6 +236,10 @@ mod tests {
         elided: bool,
     }
 
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "egui's non-text shape variants carry no text items"
+    )]
     fn walk(shape: &egui::Shape, out: &mut Vec<TextItem>) {
         match shape {
             egui::Shape::Text(text_shape) => out.push(TextItem {
@@ -276,11 +280,13 @@ mod tests {
         let shapes = mem::take(&mut out.shapes);
         out.drop_without_applying_deltas();
         let mut items = Vec::new();
-        shapes.iter().for_each(|cs| walk(&cs.shape, &mut items));
+        for shape in &shapes {
+            walk(&shape.shape, &mut items);
+        }
         items
     }
 
-    fn find<'a>(items: &'a [TextItem], prefix: &str) -> &'a TextItem {
+    fn find<'items>(items: &'items [TextItem], prefix: &str) -> &'items TextItem {
         items.iter().find(|item| item.text.starts_with(prefix)).expect(prefix)
     }
 

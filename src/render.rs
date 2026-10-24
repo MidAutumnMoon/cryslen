@@ -26,7 +26,7 @@ use crate::view::{Placement, Seat, SpreadLayout};
 /// uniforms, so pan/zoom never touch vertex data. Top-origin math lives in
 /// the VS, because GL clip space is bottom-origin while winit coords are
 /// top-origin.
-const VS_CORE: &str = r#"
+const VS_CORE: &str = "
     #version 330 core
     in vec2 pos;
     uniform vec2 u_win;    // window size, px
@@ -37,12 +37,12 @@ const VS_CORE: &str = r#"
         vec2 px = u_offset + (pos * 0.5 + 0.5) * u_size;
         v_px = px;
         gl_Position = vec4(px.x / u_win.x * 2.0 - 1.0, 1.0 - px.y / u_win.y * 2.0, 0.0, 1.0);
-    }"#;
+    }";
 
 /// One shader, both pixel layouts: mode/subsampling/depth/range/matrix arrive
 /// as uniforms, so there are no per-variant programs. Chroma is sampled
 /// bilinearly at cosited scaled coordinates, exact for 444.
-const FS_CORE: &str = r#"
+const FS_CORE: &str = "
     #version 330 core
     in vec2 v_px;
     out vec4 color;
@@ -69,9 +69,9 @@ const FS_CORE: &str = r#"
         vec2 cuv = ip * ratio / u_csize;
         vec3 yuv = vec3(y, texture(u_tex1, cuv).r, texture(u_tex2, cuv).r);
         color = vec4(u_mat * (yuv * u_norm - u_yuv_off), 1.0);
-    }"#;
+    }";
 
-const VS_ES: &str = r#"
+const VS_ES: &str = "
     #version 300 es
     in vec2 pos;
     uniform vec2 u_win;
@@ -82,11 +82,11 @@ const VS_ES: &str = r#"
         vec2 px = u_offset + (pos * 0.5 + 0.5) * u_size;
         v_px = px;
         gl_Position = vec4(px.x / u_win.x * 2.0 - 1.0, 1.0 - px.y / u_win.y * 2.0, 0.0, 1.0);
-    }"#;
+    }";
 
 // highp is required: mediump may be fp16, where the ulp at 16k image px is
 // 8.0 and wrecks the coordinate math. ES3 mandates highp support.
-const FS_ES: &str = r#"
+const FS_ES: &str = "
     #version 300 es
     precision highp float;
     in vec2 v_px;
@@ -111,7 +111,7 @@ const FS_ES: &str = r#"
         vec2 cuv = ip * ratio / u_csize;
         vec3 yuv = vec3(y, texture(u_tex1, cuv).r, texture(u_tex2, cuv).r);
         color = vec4(u_mat * (yuv * u_norm - u_yuv_off), 1.0);
-    }"#;
+    }";
 
 /// Page-keyed texture cache plus the spread draw. Each entry is an RGBA
 /// texture or a YUV plane triple.
@@ -184,7 +184,7 @@ impl PageTextures {
     ///
     /// # Panics
     ///
-    /// Panics if the page exceeds this context's MAX_TEXTURE_SIZE. Decode
+    /// Panics if the page exceeds this context's `MAX_TEXTURE_SIZE`. Decode
     /// rejects edges over its own cap first, so only a GPU advertising a
     /// smaller limit can trip this.
     pub fn bind(&mut self, seat: Seat, page: usize, decoded: &Decoded) {
@@ -437,7 +437,7 @@ unsafe fn draw_page(
     gl.active_texture(glow::TEXTURE0);
     match &entry.textures {
         Textures::Rgba(rgba_texture) => {
-            gl.bind_texture(glow::TEXTURE_2D, Some(*rgba_texture))
+            gl.bind_texture(glow::TEXTURE_2D, Some(*rgba_texture));
         }
         Textures::Yuv { luma, cb, cr } => {
             gl.bind_texture(glow::TEXTURE_2D, Some(*luma));
@@ -577,6 +577,10 @@ unsafe fn upload_plane(
 ///
 /// The context must be current. The asserts inside enforce the plane
 /// byte-length precondition of the uploads.
+#[expect(
+    clippy::similar_names,
+    reason = "Cb and Cr are the YUV plane names the two textures hold"
+)]
 unsafe fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> Entry {
     let (width, height) = (decoded.width, decoded.height);
     let (textures, norm, mips) = match &decoded.pixels {
@@ -600,13 +604,17 @@ unsafe fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> Entry {
                 upload_plane(gl, plane_bytes(&yuv.luma), (luma_w, luma_h), wide, filterable);
             let (cb_texture, cr_texture) = if yuv.subsampling == Subsampling::Mono {
                 // 1x1 chroma at the range midpoint; the matrix cancels it
-                // to neutral gray. LE pairs match plane_bytes' U16 layout.
+                // to neutral gray. Native pairs match plane_bytes' U16 layout.
+                #[expect(
+                    clippy::host_endian_bytes,
+                    reason = "the midpoint pairs with plane_bytes' native-endian U16 layout"
+                )]
                 let midpoint_bytes: Vec<u8> = if wide {
                     (1_u32 << (yuv.depth.clamp(MIN_PLANE_DEPTH, MAX_PLANE_DEPTH) - 1))
-                        .to_le_bytes()
+                        .to_ne_bytes()
                         .to_vec()
                 } else {
-                    MONO_CHROMA_MIDPOINT_8.to_le_bytes().to_vec()
+                    MONO_CHROMA_MIDPOINT_8.to_ne_bytes().to_vec()
                 };
                 (upload_plane(gl, &midpoint_bytes, (1, 1), wide, filterable),
                  upload_plane(gl, &midpoint_bytes, (1, 1), wide, filterable))
@@ -643,11 +651,17 @@ fn entry_cost_bytes(decoded: &Decoded, mips: bool) -> usize {
             let chroma = match yuv.subsampling {
                 // Mono uploads a 1x1 midpoint texture per chroma channel.
                 Subsampling::Mono => 2 * per_sample,
-                _ => plane_bytes(&yuv.cb).len() + plane_bytes(&yuv.cr).len(),
+                Subsampling::Yuv420 | Subsampling::Yuv422 | Subsampling::Yuv444 => {
+                    plane_bytes(&yuv.cb).len() + plane_bytes(&yuv.cr).len()
+                }
             };
             plane_bytes(&yuv.luma).len() + chroma
         }
     };
+    #[expect(
+        clippy::integer_division,
+        reason = "the mip chain costs 4/3 of the base levels, rounded down for budgeting"
+    )]
     if mips { base * 4 / 3 } else { base }
 }
 
@@ -780,6 +794,10 @@ const BT2020_KR_KB: (f32, f32) = (0.2627, 0.0593);
 /// ([`LIMITED_LUMA_SCALE`], [`LIMITED_CHROMA_SCALE`]) so the anchors stay
 /// the plain offsets from [`range_offsets`]. `Identity` passes planes
 /// through as RGB.
+#[expect(
+    clippy::similar_names,
+    reason = "the green coefficients are the Cb and Cr terms of the BT matrix derivation"
+)]
 fn yuv_to_rgb_matrix(matrix: Matrix, full_range: bool) -> [f32; 9] {
     let (k_red, k_blue) = match matrix {
         Matrix::Bt601 => BT601_KR_KB,
@@ -913,6 +931,10 @@ mod tests {
         );
     }
 
+    #[expect(
+        clippy::integer_division,
+        reason = "mirrors entry_cost_bytes' truncated mip-chain cost"
+    )]
     #[test]
     fn rgba_entry_cost_counts_the_mip_chain() {
         let bytes = vec![0_u8; 4 * 4 * 4].into_boxed_slice();
@@ -920,6 +942,10 @@ mod tests {
         assert_eq!(entry_cost_bytes(&decoded, true), 64 * 4 / 3);
     }
 
+    #[expect(
+        clippy::integer_division,
+        reason = "mirrors entry_cost_bytes' truncated mip-chain cost"
+    )]
     #[test]
     fn yuv420_entry_cost_counts_the_mip_chain() {
         let yuv = YuvImage {

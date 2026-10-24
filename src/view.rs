@@ -355,6 +355,10 @@ mod tests {
         assert!((300.0 - placement.offset.0) / placement.scale - 100.0 < 0.01);
     }
 
+    #[expect(
+        clippy::float_cmp_const,
+        reason = "clamping to the bound yields the bound exactly"
+    )]
     #[test]
     fn zoom_clamps_scale() {
         assert_eq!(zoom_at(Placement { scale: 30.0, offset: (0.0, 0.0) }, (0.0, 0.0), 100.0).scale, MAX_SCALE);

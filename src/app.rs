@@ -163,7 +163,7 @@ pub struct App {
     /// What each seat holds, the last frame included. Worker eviction
     /// can drop the book's entry, never the pixels held here.
     held: [Option<Arc<Decoded>>; 2],
-    /// The spread last sent to the worker. frame() asserts the
+    /// The spread last sent to the worker. `frame()` asserts the
     /// on-screen spread equals this, so every spread change must
     /// retune.
     retuned_spread: Spread,
@@ -221,6 +221,10 @@ impl App {
     /// their last frame, and refresh the layout memo. Returns the
     /// seat-ordered views for the status fold.
     fn display(&mut self, spread: Spread, snapshot: &SpreadView) -> [Option<SeatView>; 2] {
+        #[expect(
+            clippy::redundant_closure_for_method_calls,
+            reason = "map hands the item owned, and the fn path needs it by reference"
+        )]
         let seat_views: [Option<SeatView>; 2] =
             snapshot.seats(self.state.mode).map(|seat| seat.cloned());
         let wanted_pages = spread.seats(self.state.mode);
@@ -229,6 +233,10 @@ impl App {
             .zip(wanted_pages)
             .zip(seat_views.each_ref().into_iter().zip(self.held.each_mut()))
         {
+            #[expect(
+                clippy::match_same_arms,
+                reason = "the hold arms document different seat states, and merging loses the case map"
+            )]
             match (wanted, view) {
                 (None, _) => {
                     *held = None;
@@ -263,9 +271,8 @@ impl App {
         use crate::ui::PageFacts;
         use crate::ui::StatusLine;
 
-        let size = match self.surface_size() {
-            Some(size) => size,
-            None => return Ok(()),
+        let Some(size) = self.surface_size() else {
+            return Ok(());
         };
         let win = view::px_f32((size.width, size.height));
 
@@ -285,18 +292,16 @@ impl App {
         }
 
         let folded = fold_status(spread, self.state.mode, &seat_views);
-        self.waiting_since = if folded.waiting {
-            Some(self.waiting_since.unwrap_or_else(Instant::now))
-        } else {
-            None
-        };
+        self.waiting_since = folded
+            .waiting
+            .then(|| self.waiting_since.unwrap_or_else(Instant::now));
         // While waiting on a decode, wake up once when the status grace
         // expires so "decoding…" appears. Without this the loop stays
         // parked and the flag never shows.
         if let Some(since) = self.waiting_since {
             let elapsed = since.elapsed();
             if elapsed < WAIT_GRACE {
-                let _ = self.proxy.send_event(UserEvent::Repaint(WAIT_GRACE - elapsed));
+                let _ = self.proxy.send_event(UserEvent::Repaint(WAIT_GRACE.saturating_sub(elapsed)));
             }
         }
 
@@ -483,6 +488,10 @@ impl ApplicationHandler<UserEvent> for App {
         self.gl = None;
     }
 
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "winit's unhandled WindowEvent variants need no work"
+    )]
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
         use winit::event::MouseButton;

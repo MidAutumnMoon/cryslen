@@ -188,9 +188,9 @@ impl Book {
     fn assert_wanted_covered(&self) {
         let covered =
             |page: usize| self.decided.contains_key(&page) || self.pending.contains(&page);
-        debug_assert!(covered(self.wanted.first));
+        debug_assert!(covered(self.wanted.first), "first wanted page is decided or pending");
         if let Some(second) = self.wanted.second {
-            debug_assert!(covered(second));
+            debug_assert!(covered(second), "second wanted page is decided or pending");
         }
     }
 
@@ -225,7 +225,7 @@ impl Worker {
             .name("cy-decode".into())
             .spawn({
                 let book = Arc::clone(&book);
-                move || run(&source, rx, &book, &notify)
+                move || run(&source, &rx, &book, &notify)
             })?;
         Ok(Self { tx, book, handle: Some(handle) })
     }
@@ -265,7 +265,7 @@ impl Drop for Worker {
 /// completion.
 fn run(
     source: &Source,
-    rx: mpsc::Receiver<ToWorker>,
+    rx: &mpsc::Receiver<ToWorker>,
     book: &Mutex<Book>,
     notify: &dyn Fn(),
 ) {
@@ -347,18 +347,18 @@ fn decode_page(source: &Source, page_index: usize) -> Result<Arc<Decoded>, Strin
     match result {
         Ok(Ok(page)) => Ok(Arc::new(page)),
         Ok(Err(error)) => Err(format!("page {}: {error}", page_index + 1)),
-        Err(panic) => Err(format!("page {}: {}", page_index + 1, panic_message(panic))),
+        Err(panic) => Err(format!("page {}: {}", page_index + 1, panic_message(panic.as_ref()))),
     }
 }
 
-fn panic_message(panic: Box<dyn Any + Send>) -> String {
+fn panic_message(panic: &(dyn Any + Send)) -> String {
     if let Some(text) = panic.downcast_ref::<&str>() {
-        format!("decoder panicked: {text}")
-    } else if let Some(text) = panic.downcast_ref::<String>() {
-        format!("decoder panicked: {text}")
-    } else {
-        "decoder panicked".to_string()
+        return format!("decoder panicked: {text}");
     }
+    if let Some(text) = panic.downcast_ref::<String>() {
+        return format!("decoder panicked: {text}");
+    }
+    String::from("decoder panicked")
 }
 
 /// How many pages on each side of the wanted spread's first page to
