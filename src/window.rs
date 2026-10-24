@@ -25,7 +25,7 @@ pub struct Window {
 }
 
 impl Window {
-    /// Prefer desktop GL, fall back to GLES. The swap is non-blocking.
+    /// Prefer desktop GL, fall back to GLES.
     ///
     /// # Safety
     ///

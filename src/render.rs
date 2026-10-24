@@ -8,9 +8,7 @@
 //! anyway, so recovery could not be total. The failure is also rare on
 //! target hardware.
 //!
-//! A page-keyed texture cache plus the two-seat spread draw, YUV plane
-//! textures with shader-side conversion. Chroma siting
-//! (avifChromaSamplePosition) is not applied: the default
+//! Chroma siting (avifChromaSamplePosition) is not applied: the default
 //! co-sited/midway assumption biases chroma by at most half a texel,
 //! invisible in practice.
 
@@ -116,7 +114,7 @@ const FS_ES: &str = r#"
     }"#;
 
 /// Page-keyed texture cache plus the spread draw. Each entry is an RGBA
-/// texture or a YUV plane triple. Uploads run on the GL thread.
+/// texture or a YUV plane triple.
 pub struct PageTextures {
     gl: Arc<glow::Context>,
     program: <glow::Context as glow::HasContext>::Program,
@@ -141,7 +139,7 @@ struct Entry {
 enum Textures {
     /// Single RGBA texture.
     Rgba(<glow::Context as glow::HasContext>::Texture),
-    /// Luma + Cb + Cr plane textures (Cb/Cr empty for mono, bound to a 1x1).
+    /// Luma + Cb + Cr plane textures. Mono binds 1x1 midpoint chroma.
     Yuv {
         luma: <glow::Context as glow::HasContext>::Texture,
         cb: <glow::Context as glow::HasContext>::Texture,
@@ -167,8 +165,9 @@ const RGBA_UNIFORMS: PageUniforms = PageUniforms {
 impl PageTextures {
     pub fn new(gl: Arc<glow::Context>) -> eros::Result<Self> {
         let (vs, fs) = if gl.version().is_embedded { (VS_ES, FS_ES) } else { (VS_CORE, FS_CORE) };
-        // SAFETY: the returned names land in Self, whose Drop deletes them.
-        let (program, vbo, vao) = unsafe { create_pipeline(&gl, vs, fs) }?;
+        // SAFETY: the returned names land in Self, whose Drop deletes them;
+        // the error path below leaks them into the process-fatal exit.
+        let (program, vao, vbo) = unsafe { create_pipeline(&gl, vs, fs) }?;
         #[expect(
             clippy::map_err_ignore,
             reason = "the dropped conversion error says only that the value is out of range, which the message states"
@@ -290,8 +289,7 @@ impl Drop for PageTextures {
 ///
 /// # Safety
 ///
-/// The context must be current. The returned shader name is live until
-/// it is attached to a program or deleted.
+/// The context must be current. The caller must delete the returned name.
 unsafe fn compile_shader(
     gl: &glow::Context,
     kind: u32,
@@ -324,8 +322,8 @@ unsafe fn create_pipeline(
     fs: &str,
 ) -> eros::Result<(
     <glow::Context as HasContext>::Program,
-    <glow::Context as HasContext>::Buffer,
     <glow::Context as HasContext>::VertexArray,
+    <glow::Context as HasContext>::Buffer,
 )> {
     let program = gl
         .create_program()
@@ -373,7 +371,7 @@ unsafe fn create_pipeline(
         gl.uniform_1_i32(gl.get_uniform_location(program, name).as_ref(), unit);
     }
 
-    Ok((program, vbo, vao))
+    Ok((program, vao, vbo))
 }
 
 /// Own the frame state the page draws depend on. egui's paint leaves BLEND
@@ -406,8 +404,8 @@ unsafe fn draw_page(
     gl: &glow::Context,
     program: <glow::Context as HasContext>::Program,
     entry: &Entry,
-    origin: (f32, f32),
-    size: (f32, f32),
+    screen_origin: (f32, f32),
+    screen_size: (f32, f32),
     scale: f32,
 ) {
     let uniform_location = |name: &str| gl.get_uniform_location(program, name);
@@ -415,8 +413,8 @@ unsafe fn draw_page(
     let (_, (chroma_width, chroma_height)) =
         plane_dims(entry.size, page_uniforms.subsampling);
     let (luma_anchor, chroma_anchor) = range_offsets(page_uniforms.full_range);
-    gl.uniform_2_f32(uniform_location("u_offset").as_ref(), origin.0, origin.1);
-    gl.uniform_2_f32(uniform_location("u_size").as_ref(), size.0, size.1);
+    gl.uniform_2_f32(uniform_location("u_offset").as_ref(), screen_origin.0, screen_origin.1);
+    gl.uniform_2_f32(uniform_location("u_size").as_ref(), screen_size.0, screen_size.1);
     gl.uniform_2_f32(uniform_location("u_scale").as_ref(), scale, scale);
     let img = view::px_f32(entry.size);
     gl.uniform_2_f32(uniform_location("u_img").as_ref(), img.0, img.1);
@@ -497,8 +495,7 @@ fn gl_int(value: u32) -> i32 {
 ///
 /// # Safety
 ///
-/// The context must be current. The returned name is live until deleted,
-/// and the texture is left bound to `TEXTURE_2D`.
+/// The context must be current. The returned name is live until deleted.
 unsafe fn new_texture(gl: &glow::Context, filterable: bool) -> <glow::Context as HasContext>::Texture {
     #[expect(
         clippy::expect_used,
@@ -592,8 +589,7 @@ unsafe fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> Entry {
                 plane_dims((width, height), yuv.subsampling);
             let wide = matches!(yuv.luma, Plane::U16(_));
             // GL_R16 is not filterable in GLES: LINEAR makes the texture
-            // incomplete (samples black); NEAREST without mips is the
-            // safe fallback on an ES context.
+            // incomplete (samples black).
             let filterable = !(gl.version().is_embedded && wide);
             let expect = |plane: &Plane, want_samples: usize, what: &str| {
                 let want_bytes = want_samples * if wide { 2 } else { 1 };

@@ -41,8 +41,7 @@ impl Decoded {
         Ok(Self { width, height, pixels: Pixels::Rgba8(bytes), format })
     }
 
-    /// Planar YUV sized per [`plane_dims`] for these dimensions. Called only
-    /// by the `avif` decoder.
+    /// Planar YUV sized per [`plane_dims`] for these dimensions.
     pub(crate) fn yuv(
         width: u32,
         height: u32,
@@ -143,9 +142,9 @@ impl Format {
 }
 
 /// Planar YUV image. 8-bit planes are one byte per sample. 10/12-bit planes
-/// are `u16` samples with `depth` significant bits (normalize by
-/// `(1<<depth)-1`). Dimensions ride on [`Decoded`]. Plane sizes derive from
-/// them. Mono carries luma only, so its chroma planes stay empty.
+/// are `u16` samples with `depth` significant bits. Dimensions ride on
+/// [`Decoded`]. Plane sizes derive from them. Mono carries luma only, so
+/// its chroma planes stay empty.
 #[derive(Clone)]
 pub struct YuvImage {
     pub depth: u8,
@@ -159,7 +158,6 @@ pub struct YuvImage {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-// Yuv420/Yuv422 arrive only from the `avif` decoder.
 pub enum Subsampling {
     Mono,
     Yuv420,
@@ -168,7 +166,6 @@ pub enum Subsampling {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-// The BT matrices arrive only from the `avif` decoder.
 pub enum Matrix {
     Bt601,
     Bt709,
@@ -177,7 +174,6 @@ pub enum Matrix {
 }
 
 #[derive(Clone)]
-// Plane data arrives only from the `avif` decoder.
 pub enum Plane {
     U8(Box<[u8]>),
     U16(Box<[u16]>),
@@ -195,7 +191,7 @@ pub fn plane_dims(size: (u32, u32), subsampling: Subsampling) -> ((u32, u32), (u
     }
 }
 
-/// Byte view of a plane (u16 planes are little-endian native pairs).
+/// Byte view of a plane (u16 planes are native-endian byte pairs).
 pub fn plane_bytes(plane: &Plane) -> &[u8] {
     match plane {
         Plane::U8(bytes) => bytes,
