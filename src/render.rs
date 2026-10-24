@@ -763,14 +763,14 @@ mod tests {
 
     #[test]
     fn full_range_matrices() {
-        let matrix = yuv_to_rgb_matrix(Matrix::Bt601, true);
-        assert_eq!(element(&matrix, 0, 0), 1.0);
+        let bt601 = yuv_to_rgb_matrix(Matrix::Bt601, true);
+        assert_eq!(element(&bt601, 0, 0), 1.0);
         // 2(1 - KR), exact per the standard's coefficients.
-        assert!((element(&matrix, 0, 2) - 2.0 * (1.0 - BT601_KR_KB.0)).abs() < 1e-6);
-        assert!((element(&matrix, 2, 1) - 2.0 * (1.0 - BT601_KR_KB.1)).abs() < 1e-6);
-        let matrix = yuv_to_rgb_matrix(Matrix::Bt709, true);
-        assert!((element(&matrix, 0, 2) - 2.0 * (1.0 - BT709_KR_KB.0)).abs() < 1e-6);
-        assert!((element(&matrix, 2, 1) - 2.0 * (1.0 - BT709_KR_KB.1)).abs() < 1e-6);
+        assert!((element(&bt601, 0, 2) - 2.0 * (1.0 - BT601_KR_KB.0)).abs() < 1e-6);
+        assert!((element(&bt601, 2, 1) - 2.0 * (1.0 - BT601_KR_KB.1)).abs() < 1e-6);
+        let bt709 = yuv_to_rgb_matrix(Matrix::Bt709, true);
+        assert!((element(&bt709, 0, 2) - 2.0 * (1.0 - BT709_KR_KB.0)).abs() < 1e-6);
+        assert!((element(&bt709, 2, 1) - 2.0 * (1.0 - BT709_KR_KB.1)).abs() < 1e-6);
         assert_eq!(
             yuv_to_rgb_matrix(Matrix::Identity, false),
             [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]

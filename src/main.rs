@@ -38,9 +38,7 @@ fn main() -> ExitCode {
         eprintln!("usage: cy <dir | archive | image-file>");
         return ExitCode::from(2);
     };
-    let path = Path::new(&arg_os);
-
-    let open = match classify(path) {
+    let open = match classify(Path::new(&arg_os)) {
         Ok(open) => open,
         Err(error) => {
             eprintln!("cy: {error}");

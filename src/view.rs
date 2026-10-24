@@ -266,20 +266,21 @@ const EDGE_KEEP_PX: f32 = 64.0;
 /// stays inside the window. An axis where the scaled spread fits the window
 /// is pinned to the centered position.
 pub fn clamp(placement: Placement, total: (f32, f32), window: (f32, f32)) -> Placement {
-    let axis = |offset: f32, content: f32, window: f32| -> f32 {
-        if content <= window {
-            (window - content) / 2.0
-        } else {
-            offset.clamp(window - content - EDGE_KEEP_PX, EDGE_KEEP_PX)
-        }
-    };
     let scaled = (total.0 * placement.scale, total.1 * placement.scale);
     Placement {
         scale: placement.scale,
         offset: (
-            axis(placement.offset.0, scaled.0, window.0),
-            axis(placement.offset.1, scaled.1, window.1),
+            clamp_axis(placement.offset.0, scaled.0, window.0),
+            clamp_axis(placement.offset.1, scaled.1, window.1),
         ),
+    }
+}
+
+fn clamp_axis(offset: f32, content: f32, window: f32) -> f32 {
+    if content <= window {
+        (window - content) / 2.0
+    } else {
+        offset.clamp(window - content - EDGE_KEEP_PX, EDGE_KEEP_PX)
     }
 }
 
@@ -324,13 +325,13 @@ mod tests {
 
     #[test]
     fn layout_skips_undecoded_seats() {
-        let spread_layout = layout([Some((100, 200)), None]);
-        assert_eq!(spread_layout.rects[1], None);
-        assert_eq!(spread_layout.total(), (100.0, 200.0));
+        let missing_right = layout([Some((100, 200)), None]);
+        assert_eq!(missing_right.rects[1], None);
+        assert_eq!(missing_right.total(), (100.0, 200.0));
         // an undecoded left seat leaves the right page starting at x=0
-        let spread_layout = layout([None, Some((100, 200))]);
-        assert_eq!(spread_layout.rects[0], None);
-        assert_eq!(spread_layout.rects[1], Some(PageRect { pos: (0.0, 0.0), size: (100.0, 200.0) }));
+        let missing_left = layout([None, Some((100, 200))]);
+        assert_eq!(missing_left.rects[0], None);
+        assert_eq!(missing_left.rects[1], Some(PageRect { pos: (0.0, 0.0), size: (100.0, 200.0) }));
     }
 
     #[test]
@@ -343,10 +344,8 @@ mod tests {
 
     #[test]
     fn fit_degenerate_inputs_are_inert() {
-        let placement = fit((0.0, 0.0), (500.0, 500.0));
-        assert_eq!(placement, Placement { scale: 1.0, offset: (0.0, 0.0) });
-        let placement = fit((100.0, 100.0), (0.0, 0.0));
-        assert_eq!(placement, Placement { scale: 1.0, offset: (0.0, 0.0) });
+        assert_eq!(fit((0.0, 0.0), (500.0, 500.0)), Placement { scale: 1.0, offset: (0.0, 0.0) });
+        assert_eq!(fit((100.0, 100.0), (0.0, 0.0)), Placement { scale: 1.0, offset: (0.0, 0.0) });
     }
 
     #[test]
@@ -359,10 +358,8 @@ mod tests {
 
     #[test]
     fn zoom_clamps_scale() {
-        let placement = zoom_at(Placement { scale: 30.0, offset: (0.0, 0.0) }, (0.0, 0.0), 100.0);
-        assert_eq!(placement.scale, MAX_SCALE);
-        let placement = zoom_at(Placement { scale: 0.1, offset: (0.0, 0.0) }, (0.0, 0.0), 0.001);
-        assert_eq!(placement.scale, MIN_SCALE);
+        assert_eq!(zoom_at(Placement { scale: 30.0, offset: (0.0, 0.0) }, (0.0, 0.0), 100.0).scale, MAX_SCALE);
+        assert_eq!(zoom_at(Placement { scale: 0.1, offset: (0.0, 0.0) }, (0.0, 0.0), 0.001).scale, MIN_SCALE);
     }
 
     #[test]
@@ -476,17 +473,19 @@ mod tests {
             ModeSwitch { index: 1, pairing_changed: true }
         );
         // The cover stays the cover.
-        let mode_switch = switch_mode(ViewMode::Normal, ViewMode::Comic, 0, 10);
-        assert_eq!(mode_switch.index, 0);
-        assert!(mode_switch.pairing_changed);
+        assert_eq!(
+            switch_mode(ViewMode::Normal, ViewMode::Comic, 0, 10),
+            ModeSwitch { index: 0, pairing_changed: true }
+        );
         assert_eq!(
             switch_mode(ViewMode::Manga, ViewMode::Comic, 5, 10),
             ModeSwitch { index: 5, pairing_changed: false }
         );
         // So does re-selecting the mode.
-        let mode_switch = switch_mode(ViewMode::Manga, ViewMode::Manga, 5, 10);
-        assert_eq!(mode_switch.index, 5);
-        assert!(!mode_switch.pairing_changed);
+        assert_eq!(
+            switch_mode(ViewMode::Manga, ViewMode::Manga, 5, 10),
+            ModeSwitch { index: 5, pairing_changed: false }
+        );
     }
 
     #[test]

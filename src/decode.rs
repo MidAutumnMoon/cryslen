@@ -338,12 +338,11 @@ fn decode_image(bytes: &[u8], format: Format) -> Result<Decoded, DecodeError> {
     let (width, height) = decoder.dimensions();
     check_dims(width, height)?;
     let orientation = decoder.orientation().map_err(|error| DecodeError::Image(format, error))?;
-        let mut oriented = image::DynamicImage::from_decoder(decoder)
-            .map_err(|error| DecodeError::Image(format, error))?;
+    let mut oriented = image::DynamicImage::from_decoder(decoder)
+        .map_err(|error| DecodeError::Image(format, error))?;
     oriented.apply_orientation(orientation);
     let rgba = oriented.into_rgba8();
-    let (width, height) = (rgba.width(), rgba.height());
-    Decoded::rgba(width, height, format, rgba.into_raw().into_boxed_slice())
+    Decoded::rgba(rgba.width(), rgba.height(), format, rgba.into_raw().into_boxed_slice())
 }
 
 /// libavif FFI: decoder over the in-memory file, YUV planes copied out
@@ -815,10 +814,10 @@ mod tests {
     // grayscale. alpha.jxl carries an alpha extra channel.
     #[test]
     fn jxl_fixtures_decode_to_rgba() {
-        let page = decode(include_bytes!("testdata/gray.jxl"), "a.jxl").expect("gray jxl decodes");
-        assert_eq!((page.width, page.height), (8, 8));
-        assert_eq!(page.format, Format::Jxl);
-        match page.pixels {
+        let gray_page = decode(include_bytes!("testdata/gray.jxl"), "a.jxl").expect("gray jxl decodes");
+        assert_eq!((gray_page.width, gray_page.height), (8, 8));
+        assert_eq!(gray_page.format, Format::Jxl);
+        match gray_page.pixels {
             // gray replicates to r=g=b
             Pixels::Rgba8(bytes) => {
                 assert_eq!(bytes.get(..4), Some(&[0x20, 0x20, 0x20, 0xFF][..]));
@@ -827,9 +826,9 @@ mod tests {
             Pixels::Yuv(_) => panic!("jxl must decode to rgba"),
         }
 
-        let page =
+        let alpha_page =
             decode(include_bytes!("testdata/alpha.jxl"), "a.jxl").expect("alpha jxl decodes");
-        match page.pixels {
+        match alpha_page.pixels {
             // the file's own alpha rides in the fourth byte
             Pixels::Rgba8(bytes) => {
                 assert_eq!(bytes.get(..4), Some(&[0x40, 0x80, 0xC0, 0xFF][..]));

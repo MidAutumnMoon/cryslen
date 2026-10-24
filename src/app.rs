@@ -691,28 +691,22 @@ mod tests {
         let spread = Spread { first: 0, second: Some(1) };
         // In Manga the lead page sits in the right seat.
         let both = [Some(ready(800, 600)), Some(ready(640, 480))];
-        let folded = fold_status(spread, ViewMode::Manga, &both);
-        assert_eq!(folded.page, Some((Format::Png, (640, 480))));
-        let folded = fold_status(spread, ViewMode::Comic, &both);
-        assert_eq!(folded.page, Some((Format::Png, (800, 600))));
+        assert_eq!(fold_status(spread, ViewMode::Manga, &both).page, Some((Format::Png, (640, 480))));
+        assert_eq!(fold_status(spread, ViewMode::Comic, &both).page, Some((Format::Png, (800, 600))));
         // A still-deciding lead seat yields its place to the other page.
         let lead_pending = [Some(ready(800, 600)), Some(SeatView::Pending)];
-        let folded = fold_status(spread, ViewMode::Manga, &lead_pending);
-        assert_eq!(folded.page, Some((Format::Png, (800, 600))));
-        assert!(folded.waiting);
+        assert_eq!(fold_status(spread, ViewMode::Manga, &lead_pending).page, Some((Format::Png, (800, 600))));
+        assert!(fold_status(spread, ViewMode::Manga, &lead_pending).waiting);
         // A failed lead stops the fold.
         let lead_failed = [Some(ready(800, 600)), Some(SeatView::Failed("seat1".into()))];
-        let folded = fold_status(spread, ViewMode::Manga, &lead_failed);
-        assert_eq!(folded.page, None);
-        assert_eq!(folded.error.as_deref(), Some("seat1"));
+        assert_eq!(fold_status(spread, ViewMode::Manga, &lead_failed).page, None);
+        assert_eq!(fold_status(spread, ViewMode::Manga, &lead_failed).error.as_deref(), Some("seat1"));
         // The partner's decode still counts as waiting even then.
         let failed_and_pending = [Some(SeatView::Pending), Some(SeatView::Failed("x".into()))];
-        let folded = fold_status(spread, ViewMode::Manga, &failed_and_pending);
-        assert!(folded.waiting);
-        assert_eq!(folded.page, None);
+        assert!(fold_status(spread, ViewMode::Manga, &failed_and_pending).waiting);
+        assert_eq!(fold_status(spread, ViewMode::Manga, &failed_and_pending).page, None);
         // An empty seat never speaks.
         let only_right = [None, Some(ready(800, 600))];
-        let folded = fold_status(spread, ViewMode::Manga, &only_right);
-        assert_eq!(folded.page, Some((Format::Png, (800, 600))));
+        assert_eq!(fold_status(spread, ViewMode::Manga, &only_right).page, Some((Format::Png, (800, 600))));
     }
 }
