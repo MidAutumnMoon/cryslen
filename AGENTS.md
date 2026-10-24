@@ -13,7 +13,7 @@ cryslen is an image viewer, authored by MidAutumnMoon and licensed under GPL-3.0
 - Don't meaninglessly repeat what the user already knows or owns.
 - Don't pad with disclaimers, summaries, or "hope that helps" type closings.
 - If something is wrong, say what's wrong and how to fix it. Don't hedge.
-- Write reports in concise and non-repetitive manner. Don't repeat what user already knows.
+- Write user-facing messages in concise and non-repetitive manner. Don't repeat what user already knows.
 
 ## Make changes
 
