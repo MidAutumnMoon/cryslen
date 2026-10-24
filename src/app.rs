@@ -169,7 +169,7 @@ pub struct App {
     state: State,
     /// GL exists only after `resumed` (winit requirement).
     gl: Option<Gl>,
-    pub fatal_error: Option<eros::ErrorUnion>,
+    fatal_error: Option<eros::ErrorUnion>,
     /// What each seat holds, the last frame included. Worker eviction
     /// can drop the book's entry, never the pixels held here.
     held: [Option<Arc<Decoded>>; 2],
@@ -220,6 +220,17 @@ impl App {
             fit: Fit::default(),
             proxy,
         }
+    }
+
+    /// Record `error` and leave the event loop. The stored error outlives
+    /// the loop so `main` can report it.
+    fn fail(&mut self, error: eros::ErrorUnion, event_loop: &ActiveEventLoop) {
+        self.fatal_error = Some(error);
+        event_loop.exit();
+    }
+
+    pub fn take_fatal_error(&mut self) -> Option<eros::ErrorUnion> {
+        self.fatal_error.take()
     }
 
     /// Spread for the current index/mode, clamped to the book.
@@ -341,12 +352,12 @@ impl App {
         let Some(gl) = self.gl.as_mut() else { return Ok(()) };
         gl.egui.painter.clear([size.width, size.height], [0.08, 0.08, 0.09, 1.0]);
         gl.pages.draw((size.width, size.height), &self.last_layout, &self.state.placement);
-        gl.egui.run(&gl.window.winit, |ui| ui::show(ui, &status));
-        gl.egui.paint(&gl.window.winit);
+        gl.egui.run(gl.window.winit(), |ui| ui::show(ui, &status));
+        gl.egui.paint(gl.window.winit());
         gl.window.pre_present_and_swap()?;
         // Reveal only after the first frame is presented, so the window
         // never maps empty.
-        gl.window.winit.set_visible(true);
+        gl.window.winit().set_visible(true);
         Ok(())
     }
 
@@ -354,7 +365,7 @@ impl App {
     /// None when there is no window yet or it is minimized.
     fn surface_size(&mut self) -> Option<PhysicalSize<u32>> {
         let gl = self.gl.as_mut()?;
-        let size = gl.window.winit.inner_size();
+        let size = gl.window.winit().inner_size();
         if size.width == 0 || size.height == 0 {
             return None;
         }
@@ -364,7 +375,7 @@ impl App {
 
     fn request_redraw(&self) {
         if let Some(gl) = self.gl.as_ref() {
-            gl.window.winit.request_redraw();
+            gl.window.winit().request_redraw();
         }
     }
 
@@ -372,7 +383,7 @@ impl App {
     /// pan and zoom work in.
     fn geometry(&self) -> ((f32, f32), (f32, f32)) {
         let window = self.gl.as_ref().map(|gl| {
-            let window_size = gl.window.winit.inner_size();
+            let window_size = gl.window.winit().inner_size();
             view::px_f32((window_size.width, window_size.height))
         });
         (self.last_layout.total(), window.unwrap_or((0.0, 0.0)))
@@ -401,9 +412,9 @@ impl App {
                 use winit::window::Fullscreen;
 
                 if let Some(gl) = self.gl.as_ref() {
-                    let entering = gl.window.winit.fullscreen().is_none();
+                    let entering = gl.window.winit().fullscreen().is_none();
                     let fullscreen_request = entering.then_some(Fullscreen::Borderless(None));
-                    gl.window.winit.set_fullscreen(fullscreen_request);
+                    gl.window.winit().set_fullscreen(fullscreen_request);
                 }
             }
             Action::ResetView => {
@@ -432,6 +443,10 @@ impl App {
     }
 }
 
+#[expect(
+    clippy::rest_pattern_accessible_field,
+    reason = "the matched fields are unused here, so naming them would trip unneeded_field_pattern"
+)]
 impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         // SAFETY: the app owns this window and is dropped before the event
@@ -439,8 +454,7 @@ impl ApplicationHandler<UserEvent> for App {
         let window = match unsafe { Window::new(event_loop) } {
             Ok(window) => window,
             Err(error) => {
-                self.fatal_error = Some(error);
-                event_loop.exit();
+                self.fail(error, event_loop);
                 return;
             }
         };
@@ -448,8 +462,7 @@ impl ApplicationHandler<UserEvent> for App {
         let pages = match PageTextures::new(Arc::clone(&gl)) {
             Ok(pages) => pages,
             Err(error) => {
-                self.fatal_error = Some(error);
-                event_loop.exit();
+                self.fail(error, event_loop);
                 return;
             }
         };
@@ -467,7 +480,7 @@ impl ApplicationHandler<UserEvent> for App {
                 post(&proxy.lock(), UserEvent::Repaint(info.delay));
             });
         }
-        window.winit.request_redraw();
+        window.winit().request_redraw();
         self.gl = Some(Gl { pages, egui, window });
     }
 
@@ -515,11 +528,10 @@ impl ApplicationHandler<UserEvent> for App {
         // Give egui the event first. If it wants the pointer, we don't
         // pan or zoom.
         let egui_wants = {
-            let Gl { egui, window, .. } = gl;
-            let response = egui.on_window_event(&window.winit, &event);
-            let wants = egui.egui_ctx.egui_wants_pointer_input();
+            let response = gl.egui.on_window_event(gl.window.winit(), &event);
+            let wants = gl.egui.egui_ctx.egui_wants_pointer_input();
             if response.repaint {
-                window.winit.request_redraw();
+                gl.window.winit().request_redraw();
             }
             wants
         };
@@ -545,7 +557,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let wheel_delta_y = match delta {
                     MouseScrollDelta::LineDelta(_, lines) => *lines,
                     MouseScrollDelta::PixelDelta(pixels) => {
-                        wheel_lines(pixels.y, gl.window.winit.scale_factor())
+                        wheel_lines(pixels.y, gl.window.winit().scale_factor())
                     }
                 };
                 let (total, window) = self.geometry();
@@ -578,8 +590,7 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::RedrawRequested => {
                 if let Err(error) = self.frame() {
-                    self.fatal_error = Some(error);
-                    event_loop.exit();
+                    self.fail(error, event_loop);
                     return;
                 }
                 // Park until the next input, so idle costs nothing.

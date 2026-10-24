@@ -15,7 +15,7 @@ use winit::window::Window as WinitWindow;
 /// Window + EGL context + surface. vsync is `DontWait`, so the app must call
 /// `pre_present_and_swap()` to present.
 pub struct Window {
-    pub winit: WinitWindow,
+    winit: WinitWindow,
     gl: Arc<glow::Context>,
     surface: Surface<WindowSurface>,
     context: PossiblyCurrentContext,
@@ -116,6 +116,10 @@ impl Window {
 
     pub fn glow(&self) -> Arc<glow::Context> {
         Arc::clone(&self.gl)
+    }
+
+    pub(crate) fn winit(&self) -> &WinitWindow {
+        &self.winit
     }
 
     /// Resize the surface when the window size changed since the last

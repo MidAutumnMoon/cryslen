@@ -14,6 +14,7 @@
 
 use std::cmp::Reverse;
 use std::collections::HashMap;
+use std::mem;
 use std::sync::Arc;
 
 use glow::HasContext;
@@ -257,8 +258,8 @@ impl PageTextures {
             // Whole-pixel rect origin: LINEAR samples shimmer at 1:1 zoom
             // on fractional offsets otherwise.
             let screen_origin = (
-                (placement.offset.0 + rect.pos.0 * placement.scale).round(),
-                (placement.offset.1 + rect.pos.1 * placement.scale).round(),
+                rect.pos.0.mul_add(placement.scale, placement.offset.0).round(),
+                rect.pos.1.mul_add(placement.scale, placement.offset.1).round(),
             );
             let screen_size = (rect.size.0 * placement.scale, rect.size.1 * placement.scale);
             if screen_size.0 <= 0.0 || screen_size.1 <= 0.0 {
@@ -276,8 +277,9 @@ impl Drop for PageTextures {
     fn drop(&mut self) {
         // GL objects must be deleted while their context is alive. The
         // window that owns the context is dropped after this struct.
-        for (_, entry) in self.textures.drain() {
-            // SAFETY: the drain makes this the entry's only deletion.
+        for entry in mem::take(&mut self.textures).into_values() {
+            // SAFETY: the take empties the map, so this loop holds the
+            // only reference to each entry.
             unsafe { delete_textures(&self.gl, &entry.textures); }
         }
         // SAFETY: the context outlives this drop; these names are deleted once, here.
@@ -877,12 +879,14 @@ mod tests {
     fn full_range_matrices() {
         let bt601 = yuv_to_rgb_matrix(Matrix::Bt601, true);
         assert_eq!(element(&bt601, 0, 0), 1.0);
-        // 2(1 - KR), exact per the standard's coefficients.
-        assert!((element(&bt601, 0, 2) - 2.0 * (1.0 - BT601_KR_KB.0)).abs() < 1e-6);
-        assert!((element(&bt601, 2, 1) - 2.0 * (1.0 - BT601_KR_KB.1)).abs() < 1e-6);
+        // (0, 2) is 2(1 - KR) and (2, 1) is 2(1 - KB). Full range leaves
+        // the chroma scale at 1, so BT.601 gives exactly 1.402 and 1.772.
+        assert!((element(&bt601, 0, 2) - 1.402).abs() < 1e-6);
+        assert!((element(&bt601, 2, 1) - 1.772).abs() < 1e-6);
         let bt709 = yuv_to_rgb_matrix(Matrix::Bt709, true);
-        assert!((element(&bt709, 0, 2) - 2.0 * (1.0 - BT709_KR_KB.0)).abs() < 1e-6);
-        assert!((element(&bt709, 2, 1) - 2.0 * (1.0 - BT709_KR_KB.1)).abs() < 1e-6);
+        // The same two entries with BT.709's coefficients.
+        assert!((element(&bt709, 0, 2) - 1.5748).abs() < 1e-6);
+        assert!((element(&bt709, 2, 1) - 1.8556).abs() < 1e-6);
         assert_eq!(
             yuv_to_rgb_matrix(Matrix::Identity, false),
             [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]

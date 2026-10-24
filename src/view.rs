@@ -227,7 +227,7 @@ pub fn fit(total: (f32, f32), win: (f32, f32)) -> Placement {
     let scale = (win.0 / total.0).min(win.1 / total.1);
     Placement {
         scale,
-        offset: ((win.0 - total.0 * scale) / 2.0, (win.1 - total.1 * scale) / 2.0),
+        offset: (total.0.mul_add(-scale, win.0) / 2.0, total.1.mul_add(-scale, win.1) / 2.0),
     }
 }
 
@@ -245,8 +245,10 @@ pub fn zoom_at(mut placement: Placement, cursor: (f32, f32), factor: f32) -> Pla
     placement.scale = (old * factor).clamp(MIN_SCALE, MAX_SCALE);
     let applied = placement.scale / old;
     // keep the image pixel under the cursor fixed: off' = cursor - (cursor-off)*applied
-    placement.offset = (cursor.0 - (cursor.0 - placement.offset.0) * applied,
-                        cursor.1 - (cursor.1 - placement.offset.1) * applied);
+    placement.offset = (
+        (cursor.0 - placement.offset.0).mul_add(-applied, cursor.0),
+        (cursor.1 - placement.offset.1).mul_add(-applied, cursor.1),
+    );
     placement
 }
 
@@ -352,7 +354,7 @@ mod tests {
         let placement = Placement { scale: 2.0, offset: (100.0, 50.0) };
         let placement = zoom_at(placement, (300.0, 200.0), 2.0);
         // image pixel under the cursor before: (300-100)/2 = 100; after: (300-offset)/4
-        assert!((300.0 - placement.offset.0) / placement.scale - 100.0 < 0.01);
+        assert!(((300.0 - placement.offset.0) / placement.scale - 100.0).abs() < 0.01);
     }
 
     #[expect(

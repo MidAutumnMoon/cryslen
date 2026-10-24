@@ -7,6 +7,7 @@ use std::any::Any;
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap};
 use std::io;
+use std::mem;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -295,10 +296,9 @@ fn run(
                 reason = "a poisoned book lock means drifted state, so crash rather than recover"
             )]
             let mut book = book.lock().expect("decode book lock");
-            for &spread in &retunes {
+            for spread in mem::take(&mut retunes) {
                 book.retune(spread, page_count);
             }
-            retunes.clear();
         }
         // The scrutinee's MutexGuard drops before the else block runs,
         // so the lock is not held across the blocking recv below.
@@ -676,10 +676,13 @@ mod tests {
             let ticket = state.0;
             // Times out so a failed assertion cannot hang Drop's join.
             let deadline = Instant::now() + Duration::from_secs(5);
-            while state.1 < ticket && Instant::now() < deadline {
-                let (guard, _) = cv.wait_timeout(state, Duration::from_millis(50)).unwrap();
-                state = guard;
-            }
+            let (_state, _timeout) = cv
+                .wait_timeout_while(
+                    state,
+                    deadline.saturating_duration_since(Instant::now()),
+                    |state| state.1 < ticket,
+                )
+                .unwrap();
         }
 
         fn release(&self, through: u64) {
@@ -705,6 +708,10 @@ mod tests {
         }
     }
 
+    fn was_wanted(worker: &Worker, page: usize) -> bool {
+        worker.book.lock().expect("decode book lock").last_wanted.contains_key(&page)
+    }
+
     #[test]
     fn rapid_retunes_decode_every_trail_page() {
         let (_dir, source) = tiny_source("worker-skim", 50);
@@ -723,9 +730,8 @@ mod tests {
         wait_ready(&worker, &[3, 4]);
         // The last-wanted records are what keep a wanted spread in
         // the book, so the wiring is pinned on them.
-        let book = worker.book.lock().expect("decode book lock");
-        assert!(book.last_wanted.contains_key(&3));
-        assert!(book.last_wanted.contains_key(&4));
+        assert!(was_wanted(&worker, 3));
+        assert!(was_wanted(&worker, 4));
     }
 
     #[test]

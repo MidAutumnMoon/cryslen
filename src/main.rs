@@ -104,7 +104,7 @@ fn run(open_path: &Path, land_on: Option<&str>) -> eros::Result<()> {
 
     let mut app = App::new(source, worker, index, event_loop.create_proxy());
     event_loop.run_app(&mut app)?;
-    if let Some(error) = app.fatal_error.take() {
+    if let Some(error) = app.take_fatal_error() {
         return Err(error);
     }
     Ok(())

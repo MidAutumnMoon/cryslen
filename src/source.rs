@@ -10,6 +10,7 @@ use std::fs;
 use std::fs::File;
 use std::io::BufReader;
 use std::io::Error as IoError;
+use std::io::ErrorKind;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -160,7 +161,14 @@ pub struct Source {
 impl Source {
     /// Listing is filtered to image extensions and natural-sorted.
     pub fn open(path: &Path) -> Result<Self, SourceError> {
-        if fs::metadata(path).map_err(|_| SourceError::NotFound(path.to_path_buf()))?.is_dir() {
+        let metadata = fs::metadata(path).map_err(|error| {
+            if error.kind() == ErrorKind::NotFound {
+                SourceError::NotFound(path.to_path_buf())
+            } else {
+                SourceError::Io(error)
+            }
+        })?;
+        if metadata.is_dir() {
             return Self::open_dir(path);
         }
         match archive_kind(path) {
@@ -291,10 +299,13 @@ impl Source {
                 entry
                     .read_to_end(&mut buf)
                     .map_err(|error| SourceError::Zip(ZipError::Io(error)))?;
+                drop(entry);
+                drop(archive);
                 Ok(buf.into())
             }
             Backend::SevenZip(backend) => {
-                if let Some(cached) = lock_recovered(&backend.tier).get(index).cloned() {
+                let cached = lock_recovered(&backend.tier).get(index).cloned();
+                if let Some(cached) = cached {
                     return Ok(cached);
                 }
                 // The reader guard is scoped so the reader and tier locks
@@ -538,6 +549,16 @@ mod tests {
         assert!(matches!(
             Source::open(&dir.path().join("book.rar")),
             Err(SourceError::Unsupported(_))
+        ));
+    }
+
+    #[test]
+    fn open_under_regular_file_reports_io() {
+        let dir = TempDir::new("pageenotdir");
+        dir.write("plain.txt", b"not a directory");
+        assert!(matches!(
+            Source::open(&dir.path().join("plain.txt").join("page.png")),
+            Err(SourceError::Io(_))
         ));
     }
 }

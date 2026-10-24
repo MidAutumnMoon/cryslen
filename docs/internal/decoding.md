@@ -37,7 +37,7 @@ on the target machine before quoting numbers externally.
 ## jxl-rs integration essentials
 
 The type-state API needs three `process()` passes (headers, frame info,
-pixels). Two non-obvious points:
+pixels). Three non-obvious points:
 
 1. **You must supply a `JxlParallelRunner`** or you get the slow
    single-thread path, several times over. The trait is "run
@@ -53,6 +53,10 @@ pixels). Two non-obvious points:
    that alpha intact. Supply one `extra_channel_format` slot per extra
    channel. `None` means no separate buffer for it. Request higher bit
    depths through `JxlDataFormat` (`U16`, `F16`, `F32`).
+3. **`NeedsMoreInput` with no bytes left is terminal.** The decoder
+   returns it when it wants more of the input. The whole file is
+   already in the buffer, so zero remaining bytes means none can
+   arrive. Return a corrupt page instead of retrying the same call.
 
 Guard against hostile headers: `width.checked_mul(height)` against a
 pixel cap (the image crate's own 512 MiB allocation ceiling) before

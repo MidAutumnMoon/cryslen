@@ -602,8 +602,9 @@ mod jxl {
     use std::thread;
 
     use jxl::api::{
-        states, JxlColorType, JxlDataFormat, JxlDecoder, JxlDecoderOptions, JxlOutputBuffer,
-        JxlParallelRunner, JxlParallelRunnerFun, JxlPixelFormat, ProcessingResult,
+        states, JxlBitstreamInput as _, JxlColorType, JxlDataFormat, JxlDecoder,
+        JxlDecoderOptions, JxlOutputBuffer, JxlParallelRunner, JxlParallelRunnerFun, JxlPixelFormat,
+        ProcessingResult,
     };
     use jxl::error;
 
@@ -614,6 +615,10 @@ mod jxl {
     /// Buffered read chunk for the codestream input.
     const READ_CHUNK_BYTES: usize = 1 << 20;
 
+    #[expect(
+        clippy::rest_pattern_accessible_field,
+        reason = "the matched fields are unused here, so naming them would trip unneeded_field_pattern"
+    )]
     pub fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
         use std::io::BufReader;
         use std::io::Cursor;
@@ -657,7 +662,14 @@ mod jxl {
         let mut decoder = loop {
             match decoder.process(&mut input, Some(&mut runner)) {
                 Ok(ProcessingResult::Complete { result }) => break result,
-                Ok(ProcessingResult::NeedsMoreInput { fallback, .. }) => decoder = fallback,
+                Ok(ProcessingResult::NeedsMoreInput { fallback, .. }) => {
+                    // The whole file is already in memory, so zero bytes
+                    // left means none can arrive.
+                    if input.available_bytes().unwrap_or(0) == 0 {
+                        return Err(DecodeError::Corrupt("jxl: truncated image"));
+                    }
+                    decoder = fallback;
+                }
                 Err(error) => return Err(DecodeError::Jxl(error)),
             }
         };
@@ -671,7 +683,12 @@ mod jxl {
                 .process(&mut input, slice::from_mut(&mut output), Some(&mut runner))
             {
                 Ok(ProcessingResult::Complete { .. }) => break,
-                Ok(ProcessingResult::NeedsMoreInput { fallback, .. }) => decoder = fallback,
+                Ok(ProcessingResult::NeedsMoreInput { fallback, .. }) => {
+                    if input.available_bytes().unwrap_or(0) == 0 {
+                        return Err(DecodeError::Corrupt("jxl: truncated image"));
+                    }
+                    decoder = fallback;
+                }
                 Err(error) => return Err(DecodeError::Jxl(error)),
             }
         }
@@ -920,6 +937,32 @@ mod tests {
                 assert_eq!(bytes.get(128..132), Some(&[0x40, 0x80, 0xC0, 0x80][..]));
             }
             Pixels::Yuv(_) => panic!("jxl must decode to rgba"),
+        }
+    }
+
+    // A cut inside the frame info or pixel pass leaves the decoder with no
+    // bytes to request, so the decode must end rather than wait forever.
+    #[test]
+    fn truncated_jxl_ends_the_decode() {
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let fixture = include_bytes!("testdata/gray.jxl");
+        // 8 lands in pass 2, 35 in pass 3.
+        for cut in [8, 35] {
+            let truncated = fixture.get(..cut).expect("cut inside the fixture").to_vec();
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let Ok(()) = tx.send(decode(&truncated, "a.jxl")) else { return; };
+            });
+            let result = rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("truncated jxl decode finishes");
+            assert!(
+                matches!(result, Err(DecodeError::Corrupt("jxl: truncated image"))),
+                "cut {cut} did not report truncation"
+            );
         }
     }
 
