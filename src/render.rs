@@ -259,23 +259,22 @@ impl PageTextures {
         }
         // SAFETY: program and vao are Self's fields, live until Drop.
         unsafe { begin_frame(&self.gl, self.program, self.vao, size); }
-        // Pages stop at the chrome edge. GL scissor is bottom-origin,
-        // window coordinates are top-origin.
-        let (viewport_origin, content) = (viewport.origin(), viewport.size());
+        // Pages stop at the chrome edge. GL scissor is bottom-origin and
+        // the viewport hugs the window's top-left, so only the height
+        // converts.
         #[expect(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
-            reason = "viewport origin and size are whole physical px carried as f32"
+            reason = "viewport size is whole physical px carried as f32"
         )]
-        let (left, top, width, height) =
-            (viewport_origin.0 as u32, viewport_origin.1 as u32, content.0 as u32, content.1 as u32);
+        let (width, height) = (viewport.size().0 as u32, viewport.size().1 as u32);
         // SAFETY: the context is current; this only toggles scissor state.
         unsafe { self.gl.enable(glow::SCISSOR_TEST); }
         // SAFETY: same contract, setting the scissor box.
         unsafe {
             self.gl.scissor(
-                gl_int(left),
-                gl_int(size.1.saturating_sub(top + height)),
+                0,
+                gl_int(size.1.saturating_sub(height)),
                 gl_int(width),
                 gl_int(height),
             );
@@ -284,11 +283,11 @@ impl PageTextures {
             let Some(rect) = rect else { continue };
             let Some(page) = page else { continue };
             let Some(entry) = self.textures.get(page) else { continue };
-            // Whole-pixel window-px origin: LINEAR samples shimmer at 1:1
-            // zoom on fractional offsets otherwise.
+            // Whole-pixel rect origin: LINEAR samples shimmer at 1:1 zoom
+            // on fractional offsets otherwise.
             let screen_origin = (
-                viewport_origin.0 + rect.pos.0.mul_add(placement.scale, placement.offset.0).round(),
-                viewport_origin.1 + rect.pos.1.mul_add(placement.scale, placement.offset.1).round(),
+                rect.pos.0.mul_add(placement.scale, placement.offset.0).round(),
+                rect.pos.1.mul_add(placement.scale, placement.offset.1).round(),
             );
             let screen_size = (rect.size.0 * placement.scale, rect.size.1 * placement.scale);
             if screen_size.0 <= 0.0 || screen_size.1 <= 0.0 {

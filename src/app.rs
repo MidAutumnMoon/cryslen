@@ -20,7 +20,7 @@ use crate::keys::Action;
 use crate::render::PageTextures;
 use crate::source::Source;
 use crate::view;
-use crate::view::{ContentPos, Placement, Seat, Spread, SpreadLayout, ViewMode, Viewport};
+use crate::view::{Placement, Seat, Spread, SpreadLayout, ViewMode, Viewport};
 use crate::window::Window;
 use crate::worker::{SeatView, SpreadView, Worker};
 
@@ -125,8 +125,9 @@ impl Fit {
         self.refit();
     }
 
-    /// Fit afresh, discarding user placement.
-    fn resized(&mut self) {
+    /// Fit afresh when the viewport changed: window resize, egui zoom, or
+    /// a late font settling. User placement does not survive.
+    fn viewport_changed(&mut self) {
         self.refit();
     }
 
@@ -172,7 +173,9 @@ pub struct App {
     /// on-screen spread equals this, so every spread change must
     /// retune.
     retuned_spread: Spread,
-    cursor: ContentPos,
+    /// Cursor position in viewport px, which is window px while the
+    /// viewport hugs the window's top-left.
+    cursor: (f32, f32),
     dragging: bool,
     /// Set while any wanted seat is undecided. There is no spinner
     /// animation because it would force repaints of the parked loop.
@@ -209,7 +212,7 @@ impl App {
             fatal_error: None,
             held: [None, None],
             retuned_spread: spread,
-            cursor: ContentPos::default(),
+            cursor: (0.0, 0.0),
             dragging: false,
             waiting_since: None,
             mode_toast_since: None,
@@ -234,6 +237,17 @@ impl App {
     /// Spread for the current index/mode, clamped to the book.
     fn spread(&self) -> Spread {
         view::spread_for(self.state.index, self.state.mode, self.source.len())
+    }
+
+    /// Fit `total` into `viewport` when a refit is due. A user zoom or
+    /// pan wins over the shape-triggered refit.
+    fn refit_into(&mut self, total: (f32, f32), viewport: Viewport) {
+        if self.fit.should_refit(total) {
+            if !self.fit.user_moved {
+                self.state.placement = view::fit(total, viewport);
+            }
+            self.fit.settle(total);
+        }
     }
 
     fn display(&mut self, spread: Spread, snapshot: &SpreadView) -> [Option<SeatView>; 2] {
@@ -295,6 +309,11 @@ impl App {
         let snapshot = self.worker.snapshot(&spread);
         let seat_views = self.display(spread, &snapshot);
 
+        // Refit with the memo before the status line reads the scale, so
+        // the bar does not show a superseded zoom.
+        let total = self.last_layout.total();
+        self.refit_into(total, self.last_viewport);
+
         let folded = fold_status(spread, self.state.mode, &seat_views);
         self.waiting_since = folded
             .waiting
@@ -330,30 +349,27 @@ impl App {
             error: folded.error,
         };
 
-        let Some(gl) = self.gl.as_mut() else { return Ok(()) };
-
         // egui lays out first: `EguiGlow::run` only records shapes, so
         // the chrome rect is settled before pages are placed, and paint
         // still draws the bar after the pages.
-        let mut content = egui::Rect::NOTHING;
-        gl.egui.run(gl.window.winit(), |ui| content = ui::show(ui, &status));
-        let viewport =
-            content_viewport(size, content, gl.egui.egui_ctx.pixels_per_point());
-        // A viewport change gets the resize treatment. The bar's height
+        let viewport = {
+            let Some(gl) = self.gl.as_mut() else { return Ok(()) };
+            let mut content = egui::Rect::NOTHING;
+            gl.egui.run(gl.window.winit(), |ui| content = ui::show(ui, &status));
+            content_viewport(size, content, gl.egui.egui_ctx.pixels_per_point())
+        };
+        // A viewport change gets the resize treatment: the bar's height
         // moves with fonts and egui zoom without any winit resize event.
+        // The status line above was built at the old scale, so redraw
+        // once to correct it.
         if viewport != self.last_viewport {
-            self.fit.resized();
+            self.fit.viewport_changed();
             self.last_viewport = viewport;
+            self.request_redraw();
         }
+        self.refit_into(total, viewport);
 
-        // A user zoom or pan wins over the shape-triggered refit.
-        let total = self.last_layout.total();
-        if self.fit.should_refit(total) {
-            if !self.fit.user_moved {
-                self.state.placement = view::fit(total, viewport);
-            }
-            self.fit.settle(total);
-        }
+        let Some(gl) = self.gl.as_mut() else { return Ok(()) };
 
         gl.egui.painter.clear([size.width, size.height], clear_color(gl.window.translucent()));
         gl.pages.draw((size.width, size.height), viewport, &self.last_layout, &self.state.placement);
@@ -579,18 +595,17 @@ impl ApplicationHandler<UserEvent> for App {
                     clippy::cast_possible_truncation,
                     reason = "cursor positions are window-scale px, exact in f32"
                 )]
-                let window_pos = (position.x as f32, position.y as f32);
-                let cursor = ContentPos::from_window(window_pos, self.last_viewport);
+                let cursor_pos = (position.x as f32, position.y as f32);
                 if self.dragging && !egui_wants {
                     let (total, viewport) = self.geometry();
                     let pan_delta =
-                        (cursor.x() - self.cursor.x(), cursor.y() - self.cursor.y());
+                        (cursor_pos.0 - self.cursor.0, cursor_pos.1 - self.cursor.1);
                     let panned = view::pan(self.state.placement, pan_delta);
                     self.state.placement = view::clamp(panned, total, viewport);
                     self.fit.note_user_move();
                     self.request_redraw();
                 }
-                self.cursor = cursor;
+                self.cursor = cursor_pos;
             }
             WindowEvent::RedrawRequested => {
                 if let Err(error) = self.frame() {
@@ -628,16 +643,16 @@ fn clear_color(translucent: bool) -> [f32; 4] {
     }
 }
 
-/// The page viewport: the window minus the chrome egui just laid out, in
-/// physical px. The scale is egui's own (`pixels_per_point` = egui zoom x
-/// output scale), the only correct one here, because egui zoom resizes
-/// the bar without any window event.
+/// The page viewport from the chrome egui just laid out: the window
+/// above the status bar's top edge, in physical px, full width. The
+/// scale is egui's own (`pixels_per_point` = egui zoom x output scale),
+/// never the window's scale factor.
 fn content_viewport(window: PhysicalSize<u32>, content: egui::Rect, ppp: f32) -> Viewport {
     let win = view::px_f32((window.width, window.height));
     // The bar's top edge rounds to a whole physical px, matching the
     // rounding of egui's own clip rects.
     let bar_top = (content.max.y * ppp).round();
-    Viewport::above_bottom_bar(win, win.1 - bar_top)
+    Viewport::above_bottom_bar(win, bar_top)
 }
 
 #[expect(
@@ -769,11 +784,11 @@ mod tests {
     }
 
     #[test]
-    fn resize_discards_user_placement() {
+    fn viewport_change_discards_user_placement() {
         let mut fit = Fit::default();
         fit.settle((100.0, 200.0));
         fit.note_user_move();
-        fit.resized();
+        fit.viewport_changed();
         assert!(fit.should_refit((100.0, 200.0)));
         assert!(!fit.user_moved);
     }

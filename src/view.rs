@@ -160,57 +160,26 @@ impl Spread {
     }
 }
 
-/// Where pages live: the window rect left after egui chrome, in physical
-/// px. Placement offsets are relative to the viewport's top-left, never
-/// the window's.
+/// Where pages live: the window area left after egui chrome, in physical
+/// px, anchored at the window's top-left. Placement offsets are relative
+/// to the viewport's top-left, which is the window's, never below it.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Viewport {
-    origin: (f32, f32),
     size: (f32, f32),
 }
 
 impl Viewport {
-    /// A viewport filling the window above a bottom chrome strip
-    /// `bar_height` px tall. The only constructor, so a viewport is
-    /// always chrome-aware: a whole-window viewport is the visible,
-    /// greppable `above_bottom_bar(win, 0.0)`.
-    pub fn above_bottom_bar(window: (f32, f32), bar_height: f32) -> Self {
-        Self {
-            origin: (0.0, 0.0),
-            size: (window.0.max(0.0), (window.1 - bar_height).max(0.0)),
-        }
-    }
-
-    /// The viewport's top-left corner, in window px.
-    pub fn origin(self) -> (f32, f32) {
-        self.origin
+    /// A viewport filling the window above a bottom chrome strip whose
+    /// top edge sits `bar_top` physical px from the window top. The only
+    /// constructor, so a viewport is always chrome-aware: a whole-window
+    /// viewport is the visible, greppable `above_bottom_bar(win, win.1)`.
+    pub fn above_bottom_bar(window: (f32, f32), bar_top: f32) -> Self {
+        Self { size: (window.0.max(0.0), bar_top.clamp(0.0, window.1.max(0.0))) }
     }
 
     /// The viewport's size.
     pub fn size(self) -> (f32, f32) {
         self.size
-    }
-}
-
-/// A cursor position in viewport space. Constructible only by mapping a
-/// window-px position through a [`Viewport`], so the chrome offset is
-/// subtracted exactly once.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct ContentPos(f32, f32);
-
-impl ContentPos {
-    /// Map a window-px cursor position into viewport space.
-    pub fn from_window(pos: (f32, f32), viewport: Viewport) -> Self {
-        let origin = viewport.origin();
-        Self(pos.0 - origin.0, pos.1 - origin.1)
-    }
-
-    pub fn x(self) -> f32 {
-        self.0
-    }
-
-    pub fn y(self) -> f32 {
-        self.1
     }
 }
 
@@ -292,17 +261,18 @@ pub fn fit(total: (f32, f32), viewport: Viewport) -> Placement {
 const MIN_SCALE: f32 = 0.05;
 const MAX_SCALE: f32 = 40.0;
 
-/// Zoom by `factor`, keeping the image point under `cursor` anchored.
-/// Clamps scale to [`MIN_SCALE`]..=[`MAX_SCALE`]. The anchor uses the
-/// *actual* factor applied so hitting the clamp does not shift the image.
-pub fn zoom_at(mut placement: Placement, cursor: ContentPos, factor: f32) -> Placement {
+/// Zoom by `factor`, keeping the image point under `cursor` (viewport px)
+/// anchored. Clamps scale to [`MIN_SCALE`]..=[`MAX_SCALE`]. The anchor
+/// uses the *actual* factor applied so hitting the clamp does not shift
+/// the image.
+pub fn zoom_at(mut placement: Placement, cursor: (f32, f32), factor: f32) -> Placement {
     let old = placement.scale;
     placement.scale = (old * factor).clamp(MIN_SCALE, MAX_SCALE);
     let applied = placement.scale / old;
     // keep the image pixel under the cursor fixed: off' = cursor - (cursor-off)*applied
     placement.offset = (
-        (cursor.x() - placement.offset.0).mul_add(-applied, cursor.x()),
-        (cursor.y() - placement.offset.1).mul_add(-applied, cursor.y()),
+        (cursor.0 - placement.offset.0).mul_add(-applied, cursor.0),
+        (cursor.1 - placement.offset.1).mul_add(-applied, cursor.1),
     );
     placement
 }
@@ -316,7 +286,7 @@ pub fn pan(placement: Placement, delta: (f32, f32)) -> Placement {
 }
 
 /// Reachability margin for [`clamp`]: at most this many px of the spread may
-/// hang off any window edge (and a fully-visible spread stays centered).
+/// hang off any viewport edge (and a fully-visible spread stays centered).
 const EDGE_KEEP_PX: f32 = 64.0;
 
 /// Clamp pan so the spread cannot be lost: at least `EDGE_KEEP_PX` px of it
@@ -393,27 +363,19 @@ mod tests {
 
     /// The whole window as a viewport, for tests that predate chrome.
     fn full_window(win: (f32, f32)) -> Viewport {
-        Viewport::above_bottom_bar(win, 0.0)
+        Viewport::above_bottom_bar(win, win.1)
     }
 
     #[test]
     fn above_bottom_bar_sizes_and_clamps() {
-        let viewport = Viewport::above_bottom_bar((1000.0, 800.0), 60.0);
-        assert_eq!(viewport.origin(), (0.0, 0.0));
+        let viewport = Viewport::above_bottom_bar((1000.0, 800.0), 740.0);
         assert_eq!(viewport.size(), (1000.0, 740.0));
-        // A bar taller than the window degenerates to nothing, not negatives.
-        let degenerate = Viewport::above_bottom_bar((100.0, 50.0), 80.0);
-        assert_eq!(degenerate.size(), (100.0, 0.0));
-    }
-
-    #[test]
-    fn content_pos_subtracts_the_viewport_origin() {
-        let viewport = Viewport::above_bottom_bar((1000.0, 800.0), 60.0);
-        let pos = ContentPos::from_window((100.0, 700.0), viewport);
-        assert_eq!((pos.x(), pos.y()), (100.0, 700.0));
-        // A window-px position inside the bar maps below the viewport.
-        let in_bar = ContentPos::from_window((100.0, 790.0), viewport);
-        assert!(in_bar.y() >= 740.0);
+        // A bar top past the window bottom degenerates to the window; a
+        // negative one to nothing.
+        let past = Viewport::above_bottom_bar((100.0, 50.0), 80.0);
+        assert_eq!(past.size(), (100.0, 50.0));
+        let negative = Viewport::above_bottom_bar((100.0, 50.0), -10.0);
+        assert_eq!(negative.size(), (100.0, 0.0));
     }
 
     #[test]
@@ -428,7 +390,7 @@ mod tests {
     fn fit_centers_within_the_viewport_not_the_window() {
         // Height-fitting image: the viewport is 600 px tall in an 800 px
         // window, so centering lands at 0, not at the window's 100.
-        let viewport = Viewport::above_bottom_bar((1000.0, 800.0), 200.0);
+        let viewport = Viewport::above_bottom_bar((1000.0, 800.0), 600.0);
         let placement = fit((500.0, 400.0), viewport);
         assert!((placement.scale - 1.5).abs() < 1e-6);
         assert!((placement.offset.1 - 0.0).abs() < 1e-6, "{}", placement.offset.1);
@@ -450,8 +412,7 @@ mod tests {
     #[test]
     fn zoom_keeps_cursor_anchored() {
         let placement = Placement { scale: 2.0, offset: (100.0, 50.0) };
-        let cursor = ContentPos::from_window((300.0, 200.0), full_window((500.0, 500.0)));
-        let placement = zoom_at(placement, cursor, 2.0);
+        let placement = zoom_at(placement, (300.0, 200.0), 2.0);
         // image pixel under the cursor before: (300-100)/2 = 100; after: (300-offset)/4
         assert!(((300.0 - placement.offset.0) / placement.scale - 100.0).abs() < 0.01);
     }
@@ -462,13 +423,12 @@ mod tests {
     )]
     #[test]
     fn zoom_clamps_scale() {
-        let origin = ContentPos::from_window((0.0, 0.0), Viewport::default());
         assert_eq!(
-            zoom_at(Placement { scale: 30.0, offset: (0.0, 0.0) }, origin, 100.0).scale,
+            zoom_at(Placement { scale: 30.0, offset: (0.0, 0.0) }, (0.0, 0.0), 100.0).scale,
             MAX_SCALE
         );
         assert_eq!(
-            zoom_at(Placement { scale: 0.1, offset: (0.0, 0.0) }, origin, 0.001).scale,
+            zoom_at(Placement { scale: 0.1, offset: (0.0, 0.0) }, (0.0, 0.0), 0.001).scale,
             MIN_SCALE
         );
     }
