@@ -62,9 +62,9 @@ Do not pipe any command output through `head` or `tail`, tools will properly han
 
 After making changes (scope to the relevant app/crate):
 
-1. **Lint**: `cargo clippy --all-features --all-targets --package <crate>`
+1. **Lint**: `cargo clippy --all-features --all-targets --package <crate>` Don't act immediately on clippy suggestions. Don't suppress warnings.
 2. **Test**: `cargo test --all-features --package <crate>`
-3. Collect, dedup and report all triggered clippy warning to the user and require them to review. Because new warnings are symptom of deeper architecural problems, don't silence or workaround them without user's review. Ensure tests pass before considering the change complete.
+3. Collect, dedup and report all triggered clippy warning to the user and require user review. Because new warnings are symptom of deeper architecural problems, don't suppress or workaround them without user's review. But ensure tests pass before considering the change complete.
 
 Do not pipe command output through `head` or `tail`, especially `cargo test`.
 
@@ -72,5 +72,7 @@ Do not pipe command output through `head` or `tail`, especially `cargo test`.
 
 Use `jj` vcs exclusively. For example, `jj status`, `jj new`.
 
-`difftastic` is configured as diff tool. Use `jj diff --git` and `jj show --git` for traditional git style diff output.
+External pager is configured. Use `jj diff --git` and `jj show --git` for traditional git style diff output.
+
+Don't commit on behalf of the user. Don't write commit message
 
