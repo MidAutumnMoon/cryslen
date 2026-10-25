@@ -19,6 +19,11 @@ pub struct Window {
     gl: Arc<glow::Context>,
     surface: Surface<WindowSurface>,
     context: PossiblyCurrentContext,
+    /// Whether the background renders translucent (glass mode): the
+    /// alpha-demanding EGL query matched. False runs fully opaque; the
+    /// fallback config may still carry alpha bits, but the opaque hint
+    /// and clear make that invisible.
+    translucent: bool,
     /// Size the surface was last resized to (physical px). Creation
     /// counts as the first resize.
     resized_to: (u32, u32),
@@ -49,14 +54,6 @@ impl Window {
         use winit::platform::wayland::WindowAttributesExtWayland as _;
         use winit::window::WindowAttributes;
 
-        let attrs = WindowAttributes::default()
-            .with_name("cryslen", "cryslen")
-            .with_resizable(true)
-            .with_inner_size(LogicalSize { width: INITIAL_WINDOW_WIDTH, height: INITIAL_WINDOW_HEIGHT })
-            .with_title("cryslen")
-            // Hidden at creation, revealed after the first presented frame.
-            .with_visible(false);
-
         // glutin-winit's DisplayBuilder picks a config through a closure
         // that cannot fail, so using it would force a panic on an empty
         // config list.
@@ -65,11 +62,38 @@ impl Window {
             raw_display,
             DisplayApiPreference::Egl,
         )?;
-        let template = ConfigTemplateBuilder::new().build();
-        let gl_config = gl_display
-            .find_configs(template)?
-            .next()
-            .ok_or_else(|| eros::error!("no GL config matched the template"))?;
+        // Prefer a config that renders alpha, so the window background can
+        // show the desktop through it. A machine with no such config falls
+        // back to any config and runs fully opaque: a mode, not an error.
+        let translucent_template = ConfigTemplateBuilder::new()
+            .with_alpha_size(8)
+            .build();
+        let (gl_config, translucent) =
+            if let Some(config) = gl_display.find_configs(translucent_template)?.next() {
+                (config, true)
+            } else {
+                // Alpha-agnostic second pass: the default template also
+                // demands alpha, which would repeat the same empty query.
+                let plain = ConfigTemplateBuilder::new().with_alpha_size(0).build();
+                let config = gl_display
+                    .find_configs(plain)?
+                    .next()
+                    .ok_or_else(|| eros::error!("no GL config matched the template"))?;
+                (config, false)
+            };
+
+        let attrs = WindowAttributes::default()
+            .with_name("cryslen", "cryslen")
+            .with_resizable(true)
+            .with_inner_size(LogicalSize { width: INITIAL_WINDOW_WIDTH, height: INITIAL_WINDOW_HEIGHT })
+            .with_title("cryslen")
+            // Without the transparent hint winit marks the whole surface
+            // opaque, and compositors may then skip blending (and their
+            // background effects) behind it even though the buffer has an
+            // alpha channel.
+            .with_transparent(translucent)
+            // Hidden at creation, revealed after the first presented frame.
+            .with_visible(false);
 
         let window = glutin_winit::finalize_window(event_loop, attrs, &gl_config)?;
         let raw_window = window.window_handle()?.as_raw();
@@ -111,11 +135,18 @@ impl Window {
             let symbol = CString::new(symbol).expect("GL proc name without interior NUL");
             gl_display.get_proc_address(&symbol)
         }));
-        Ok(Self { winit: window, gl, surface, context, resized_to: (width, height) })
+        Ok(Self { winit: window, gl, surface, context, translucent, resized_to: (width, height) })
     }
 
     pub fn glow(&self) -> Arc<glow::Context> {
         Arc::clone(&self.gl)
+    }
+
+    /// Whether the window background renders translucent, letting a
+    /// compositor that blurs translucent surfaces show the desktop
+    /// through it.
+    pub fn translucent(&self) -> bool {
+        self.translucent
     }
 
     pub(crate) fn winit(&self) -> &WinitWindow {

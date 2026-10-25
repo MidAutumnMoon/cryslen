@@ -350,7 +350,9 @@ impl App {
         };
 
         let Some(gl) = self.gl.as_mut() else { return Ok(()) };
-        gl.egui.painter.clear([size.width, size.height], [0.08, 0.08, 0.09, 1.0]);
+        gl.egui
+            .painter
+            .clear([size.width, size.height], clear_color(gl.window.translucent()));
         gl.pages.draw((size.width, size.height), &self.last_layout, &self.state.placement);
         gl.egui.run(gl.window.winit(), |ui| ui::show(ui, &status));
         gl.egui.paint(gl.window.winit());
@@ -480,6 +482,13 @@ impl ApplicationHandler<UserEvent> for App {
                 post(&proxy.lock(), UserEvent::Repaint(info.delay));
             });
         }
+        // Opaque mode deliberately keeps egui's default panel fill over
+        // the background — the pre-glass look. Glass mode applies the
+        // fill once here; a future runtime glass toggle must re-apply
+        // it, while frame()'s clear follows the mode on its own.
+        if window.translucent() {
+            egui.egui_ctx.all_styles_mut(|style| style.visuals.panel_fill = glass_fill());
+        }
         window.winit().request_redraw();
         self.gl = Some(Gl { pages, egui, window });
     }
@@ -607,6 +616,42 @@ const WAIT_GRACE: Duration = Duration::from_millis(150);
 /// How long a mode switch's toast stays on screen.
 const MODE_TOAST: Duration = Duration::from_millis(1500);
 
+/// Window background color, straight (un-multiplied) channels.
+const BACKGROUND: [f32; 3] = [0.08, 0.08, 0.09];
+
+/// Background opacity when the window is translucent. Baked-in default
+/// (no config file, ever).
+const GLASS_ALPHA: f32 = 0.85;
+
+/// Framebuffer clear color. Wayland composites ARGB buffers as
+/// premultiplied alpha, so the translucent variant scales the color
+/// channels by alpha; stored straight, the compositor would treat
+/// them as already premultiplied, and the composite would come out
+/// brighter than intended.
+fn clear_color(translucent: bool) -> [f32; 4] {
+    let [red, green, blue] = BACKGROUND;
+    if translucent {
+        [red * GLASS_ALPHA, green * GLASS_ALPHA, blue * GLASS_ALPHA, GLASS_ALPHA]
+    } else {
+        [red, green, blue, 1.0]
+    }
+}
+
+/// The glass color as egui's premultiplied u8 color: [`clear_color`]'s
+/// translucent channels, quantized. The premultiplied glass lives in one
+/// place ([`clear_color`]); this is only its u8 conversion, so the bar
+/// repeating the background holds structurally.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the clear color's channels are clamped 0..=1 values scaled into u8"
+)]
+fn glass_fill() -> egui::Color32 {
+    let [red, green, blue, alpha] = clear_color(true);
+    let channel = |value: f32| value.mul_add(255.0, 0.5) as u8;
+    egui::Color32::from_rgba_premultiplied(channel(red), channel(green), channel(blue), channel(alpha))
+}
+
 /// Wheel zoom sensitivity: e^(`WHEEL_ZOOM_SENSITIVITY` * lines) per event,
 /// so one notch is ~×1.16 and three notches ~×1.6.
 const WHEEL_ZOOM_SENSITIVITY: f32 = 0.15;
@@ -640,6 +685,34 @@ mod tests {
             )
             .expect("valid rgba page"),
         ))
+    }
+
+    #[test]
+    fn clear_color_is_premultiplied() {
+        let [red, green, blue, alpha] = clear_color(true);
+        assert!((alpha - GLASS_ALPHA).abs() < 1e-6);
+        // Each channel stores its straight value times alpha.
+        for (channel, straight) in [red, green, blue].into_iter().zip(BACKGROUND) {
+            assert!((straight.mul_add(GLASS_ALPHA, -channel)).abs() < 1e-6);
+        }
+        // The premultiplied invariant: no channel exceeds alpha.
+        assert!(red <= alpha && green <= alpha && blue <= alpha);
+    }
+
+    #[expect(
+        clippy::float_cmp_const,
+        reason = "the opaque variant returns the same constants untouched, so equality is exact"
+    )]
+    #[test]
+    fn opaque_clear_color_is_the_plain_background() {
+        assert_eq!(clear_color(false), [BACKGROUND[0], BACKGROUND[1], BACKGROUND[2], 1.0]);
+    }
+
+    #[test]
+    fn glass_fill_pins_the_background_glass() {
+        // Exact bytes: the bar must repeat the background glass, and no
+        // formula or constructor change may drift them apart silently.
+        assert_eq!(glass_fill(), egui::Color32::from_rgba_premultiplied(17, 17, 20, 217));
     }
 
     #[test]
