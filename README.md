@@ -3,7 +3,7 @@
 <div align="center">
   <img src="assets/icon-raw.avif" alt="cryslen" width="350">
 
-### `cy`: a minimal Wayland image and comic pager.
+### `cy`: a minimal Wayland image viewer with manga mode.
 </div>
 
 - Pages from directories, `.zip`/`.cbz`, and `.7z`/`.cb7` archives

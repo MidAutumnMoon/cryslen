@@ -1,4 +1,3 @@
-//! cryslen (`cy`): a minimal wayland image/comic pager.
 //! Usage: cy <dir | file.zip | file.7z | image-file>
 //! A bare image file opens its parent directory at that page.
 

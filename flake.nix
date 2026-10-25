@@ -1,5 +1,5 @@
 {
-  description = "cryslen (cy): minimal wayland image/comic pager";
+  description = "cryslen (cy): minimal wayland image viewer with manga mode";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable-small";
 

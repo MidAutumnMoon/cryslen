@@ -3,7 +3,6 @@ Version=1.0
 Type=Application
 Name=cryslen
 GenericName=Image Viewer
-Comment=Minimal Wayland image and comic pager
 Exec=cy %f
 Icon=cryslen
 Terminal=false

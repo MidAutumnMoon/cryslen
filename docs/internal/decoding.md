@@ -101,7 +101,7 @@ write orientation tags, so fixtures for it must come from real files.
   AVIF files are absent in the wild.
 - **Hardware AV1 for stills**: decode blocks exist on newer GPUs but
   are video-shaped (mostly 4:2:0 8-bit, no film-grain synthesis,
-  per-session setup). The wrong tool for a pager. Older iGPUs expose no
+  per-session setup). The wrong tool for an image viewer. Older iGPUs expose no
   AV1 VA-API profile at all.
 - **Hardware JPEG XL**: nothing ships in consumer silicon.
 - **Pure-Rust AV1 bitstream decode**: does not exist. Container parsing

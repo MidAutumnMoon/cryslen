@@ -2,7 +2,7 @@
 name = "cryslen"
 version = "0.1.0"
 edition = "2021"
-description = "minimal wayland image/comic pager"
+description = "minimal wayland image viewer with manga mode"
 
 [[bin]]
 name = "cy"
