@@ -19,10 +19,9 @@ pub struct Window {
     gl: Arc<glow::Context>,
     surface: Surface<WindowSurface>,
     context: PossiblyCurrentContext,
-    /// Whether the background renders translucent (glass mode): the
-    /// alpha-demanding EGL query matched. False runs fully opaque; the
-    /// fallback config may still carry alpha bits, but the opaque hint
-    /// and clear make that invisible.
+    /// True when the alpha-demanding EGL query matched. False runs
+    /// fully opaque. The fallback config may still carry alpha bits,
+    /// but the opaque hint and clear make that invisible.
     translucent: bool,
     /// Size the surface was last resized to (physical px). Creation
     /// counts as the first resize.
@@ -62,12 +61,10 @@ impl Window {
             raw_display,
             DisplayApiPreference::Egl,
         )?;
-        // Prefer a config that renders alpha, so the window background can
-        // show the desktop through it. A machine with no such config falls
-        // back to any config and runs fully opaque: a mode, not an error.
-        let translucent_template = ConfigTemplateBuilder::new()
-            .with_alpha_size(8)
-            .build();
+        // Prefer a config with alpha so the background can show the
+        // desktop through it. A machine with none runs fully opaque,
+        // a mode, not an error.
+        let translucent_template = ConfigTemplateBuilder::new().with_alpha_size(8).build();
         let (gl_config, translucent) =
             if let Some(config) = gl_display.find_configs(translucent_template)?.next() {
                 (config, true)
@@ -88,9 +85,8 @@ impl Window {
             .with_inner_size(LogicalSize { width: INITIAL_WINDOW_WIDTH, height: INITIAL_WINDOW_HEIGHT })
             .with_title("cryslen")
             // Without the transparent hint winit marks the whole surface
-            // opaque, and compositors may then skip blending (and their
-            // background effects) behind it even though the buffer has an
-            // alpha channel.
+            // opaque, so compositors may skip blending and background
+            // effects behind it even though the buffer has alpha.
             .with_transparent(translucent)
             // Hidden at creation, revealed after the first presented frame.
             .with_visible(false);
@@ -142,9 +138,8 @@ impl Window {
         Arc::clone(&self.gl)
     }
 
-    /// Whether the window background renders translucent, letting a
-    /// compositor that blurs translucent surfaces show the desktop
-    /// through it.
+    /// Lets a compositor that blurs translucent surfaces show the
+    /// desktop through the window.
     pub fn translucent(&self) -> bool {
         self.translucent
     }

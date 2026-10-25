@@ -1,7 +1,7 @@
 //! App: winit event handling, state transitions, frame composition.
 //!
-//! State is a single plain struct. Every event maps to an `Action` first
-//! (pure, testable), then mutates state.
+//! State is a single plain struct. Key commands map to an `Action` first
+//! (pure, testable), then mutate state.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -33,8 +33,8 @@ pub enum UserEvent {
     PagesUpdated,
 }
 
-/// Post `event` to the event loop. A failed send means the loop is
-/// gone, so the event has no consumer left and quitting already won.
+/// A failed send means the loop is gone, so the event has no consumer
+/// left and quitting already won.
 #[expect(
     clippy::redundant_pub_crate,
     reason = "pub(crate) is the crate's visibility style for crate-wide items, even inside private modules"
@@ -43,7 +43,7 @@ pub(crate) fn post(proxy: &EventLoopProxy<UserEvent>, event: UserEvent) {
     let Ok(()) = proxy.send_event(event) else { return; };
 }
 
-/// Everything mode-ish about the viewing session. Plain data.
+/// Everything mode-ish about the viewing session.
 struct State {
     /// Index of the spread's first page (a spread start).
     index: usize,
@@ -118,7 +118,7 @@ impl Fit {
         self.settled = Some(total);
     }
 
-    /// User zoom or pan. Their placement wins over later fit triggers.
+    /// User zoom or pan.
     fn note_user_move(&mut self) {
         self.user_moved = true;
     }
@@ -145,9 +145,9 @@ impl Fit {
     }
 }
 
-/// The GL bundle: everything that exists only between `resumed` and exit.
-/// Field order is drop order: pages and egui are dropped while the window
-/// (which owns the GL context) is still alive.
+/// The GL bundle: everything that exists only between `resumed` and exit
+/// (winit requirement). Field order is drop order: pages and egui are
+/// dropped while the window (which owns the GL context) is still alive.
 struct Gl {
     pages: PageTextures,
     egui: egui_glow::EguiGlow,
@@ -167,7 +167,6 @@ pub struct App {
     source: Arc<Source>,
     worker: Worker,
     state: State,
-    /// GL exists only after `resumed` (winit requirement).
     gl: Option<Gl>,
     fatal_error: Option<eros::ErrorUnion>,
     /// What each seat holds, the last frame included. Worker eviction
@@ -302,8 +301,7 @@ impl App {
         let snapshot = self.worker.snapshot(&spread);
         let seat_views = self.display(spread, &snapshot);
 
-        // Refit when the composed spread changes shape, unless the user
-        // has zoomed or panned: their placement wins over geometry.
+        // A user zoom or pan wins over the shape-triggered refit.
         let total = self.last_layout.total();
         if self.fit.should_refit(total) {
             if !self.fit.user_moved {
@@ -316,9 +314,8 @@ impl App {
         self.waiting_since = folded
             .waiting
             .then(|| self.waiting_since.unwrap_or_else(Instant::now));
-        // While waiting on a decode, wake up once when the status grace
-        // expires so "decoding…" appears. Without this the loop stays
-        // parked and the flag never shows.
+        // Arm a wake at grace expiry. The parked loop otherwise never
+        // shows the "decoding…" flag.
         if let Some(since) = self.waiting_since {
             let elapsed = since.elapsed();
             if elapsed < WAIT_GRACE {
@@ -350,9 +347,7 @@ impl App {
         };
 
         let Some(gl) = self.gl.as_mut() else { return Ok(()) };
-        gl.egui
-            .painter
-            .clear([size.width, size.height], clear_color(gl.window.translucent()));
+        gl.egui.painter.clear([size.width, size.height], clear_color(gl.window.translucent()));
         gl.pages.draw((size.width, size.height), &self.last_layout, &self.state.placement);
         gl.egui.run(gl.window.winit(), |ui| ui::show(ui, &status));
         gl.egui.paint(gl.window.winit());
@@ -483,9 +478,9 @@ impl ApplicationHandler<UserEvent> for App {
             });
         }
         // Opaque mode deliberately keeps egui's default panel fill over
-        // the background — the pre-glass look. Glass mode applies the
-        // fill once here; a future runtime glass toggle must re-apply
-        // it, while frame()'s clear follows the mode on its own.
+        // the background. Glass mode applies the fill once here; a
+        // future runtime glass toggle must re-apply it, while frame()'s
+        // clear follows the mode on its own.
         if window.translucent() {
             egui.egui_ctx.all_styles_mut(|style| style.visuals.panel_fill = glass_fill());
         }
@@ -619,15 +614,12 @@ const MODE_TOAST: Duration = Duration::from_millis(1500);
 /// Window background color, straight (un-multiplied) channels.
 const BACKGROUND: [f32; 3] = [0.08, 0.08, 0.09];
 
-/// Background opacity when the window is translucent. Baked-in default
-/// (no config file, ever).
+/// Background opacity when the window is translucent.
 const GLASS_ALPHA: f32 = 0.85;
 
-/// Framebuffer clear color. Wayland composites ARGB buffers as
-/// premultiplied alpha, so the translucent variant scales the color
-/// channels by alpha; stored straight, the compositor would treat
-/// them as already premultiplied, and the composite would come out
-/// brighter than intended.
+/// Wayland composites ARGB buffers as premultiplied alpha, so the
+/// translucent variant scales the color channels by alpha. Stored
+/// straight, the composite would come out brighter than intended.
 fn clear_color(translucent: bool) -> [f32; 4] {
     let [red, green, blue] = BACKGROUND;
     if translucent {
@@ -637,9 +629,8 @@ fn clear_color(translucent: bool) -> [f32; 4] {
     }
 }
 
-/// The glass color as egui's premultiplied u8 color: [`clear_color`]'s
-/// translucent channels, quantized. The premultiplied glass lives in one
-/// place ([`clear_color`]); this is only its u8 conversion, so the bar
+/// [`clear_color`]'s translucent channels as egui's premultiplied u8
+/// color. The premultiplied glass lives in one place, so the bar
 /// repeating the background holds structurally.
 #[expect(
     clippy::cast_possible_truncation,
@@ -652,16 +643,15 @@ fn glass_fill() -> egui::Color32 {
     egui::Color32::from_rgba_premultiplied(channel(red), channel(green), channel(blue), channel(alpha))
 }
 
-/// Wheel zoom sensitivity: e^(`WHEEL_ZOOM_SENSITIVITY` * lines) per event,
-/// so one notch is ~×1.16 and three notches ~×1.6.
+/// Wheel zoom sensitivity: one notch is ~×1.16, three notches ~×1.6.
 const WHEEL_ZOOM_SENSITIVITY: f32 = 0.15;
 
-/// Assumed wheel resolution for high-resolution (pixel-mode) wheels: how
-/// many physical px of scroll equal one "line", normalized by scale factor
-/// so zoom speed does not vary with output scaling.
+/// Assumed wheel resolution for pixel-mode wheels: how many physical
+/// px of scroll equal one "line".
 const PIXELS_PER_WHEEL_LINE: f32 = 40.0;
 
-/// Pixel-mode wheel motion as zoom lines.
+/// Pixel-mode wheel motion as zoom lines, divided by scale factor so
+/// zoom speed does not vary with output scaling.
 #[expect(
     clippy::cast_possible_truncation,
     reason = "wheel lines feed an exponential zoom sensitivity, so one f64-to-f32 rounding is immaterial"
