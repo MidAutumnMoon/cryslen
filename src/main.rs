@@ -32,6 +32,10 @@ enum Arg {
 fn main() -> ExitCode {
     use std::env;
 
+    // Keep the guard alive for the whole process: dropping it stops the
+    // non-blocking log writer.
+    let _log_guard = ino_tracing::init_tracing_subscriber();
+
     // env::args panics on non-UTF-8 argv, which file managers pass.
     let Some(arg_os) = env::args_os().nth(1) else {
         eprintln!("usage: cy <dir | archive | image-file>");

@@ -611,10 +611,6 @@ mod jxl {
 
     const MAX_THREADS: usize = 16;
 
-    #[expect(
-        clippy::rest_pattern_accessible_field,
-        reason = "the matched fields are unused here, so naming them would trip unneeded_field_pattern"
-    )]
     pub fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
         use std::slice;
 
@@ -633,7 +629,8 @@ mod jxl {
             if event == Event::BasicInfo {
                 break;
             }
-            if matches!(event, Event::NeedMoreInput { .. }) {
+            if let Event::NeedMoreInput { size_hint } = event {
+                tracing::debug!(size_hint, "truncated jxl header");
                 return Err(DecodeError::Corrupt("jxl: truncated header"));
             }
             // A fresh decoder emits BasicInfo or NeedMoreInput before all else.
@@ -670,8 +667,14 @@ mod jxl {
                 .process(&mut input, Some(slice::from_mut(&mut output)), Some(&mut runner))
                 .map_err(DecodeError::Jxl)?
             {
-                Event::FrameComplete { .. } => break,
-                Event::NeedMoreInput { .. } => {
+                Event::FrameComplete { has_more_frames } => {
+                    if has_more_frames {
+                        tracing::debug!("jxl animation: later frames not decoded");
+                    }
+                    break;
+                }
+                Event::NeedMoreInput { size_hint } => {
+                    tracing::debug!(size_hint, "truncated jxl image");
                     return Err(DecodeError::Corrupt("jxl: truncated image"));
                 }
                 Event::BasicInfo | Event::FrameHeader | Event::Complete => {}

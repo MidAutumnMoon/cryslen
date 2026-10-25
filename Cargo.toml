@@ -30,6 +30,10 @@ libavif-sys = { version = "0.17", default-features = false, features = ["codec-d
 # JPEG XL via jxl-rs (pure Rust)
 jxl = "0.8"
 
+# Logging
+tracing = "0.1"
+ino_tracing = "1"
+
 [profile.release]
 lto = "thin"
 
