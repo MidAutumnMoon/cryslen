@@ -25,9 +25,10 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 natord = "1"
 zip = { version = "9", default-features = false, features = ["deflate"] }
 sevenz-rust2 = { version = "0.24", default-features = false, features = ["bzip2"] }
-# AVIF via libavif + dav1d (built from source; needs the flake devShell toolchain)
+# AVIF via libavif + dav1d, built from source. Building it needs the
+# flake devShell toolchain.
 libavif-sys = { version = "0.17", default-features = false, features = ["codec-dav1d"] }
-# JPEG XL via jxl-rs (pure Rust)
+# JPEG XL via jxl-rs, pure Rust
 jxl = "0.8"
 
 # Logging
@@ -41,8 +42,7 @@ lto = "thin"
 # Lints
 #
 
-# This serves dual purposes as both lint config and reminder for
-# when to use what lints.
+# Doubles as lint config and a reminder of when to use what lints.
 [lints.clippy]
 
 # Broad groups: lowest priority
@@ -67,8 +67,8 @@ missing_errors_doc = "allow"
 # Noah allows
 struct_excessive_bools = "allow"
 
-# Allow quite few lints from correctness group, these can be useful
-# in some specific cases but generally they are dumb.
+# Allow quite a few restriction lints. They can be useful in specific
+# cases, but generally they are dumb.
 implicit_return = "allow"
 default_numeric_fallback = "allow"
 question_mark_used = "allow"
@@ -85,20 +85,20 @@ integer_division_remainder_used = "allow"
 as_conversions = "allow"
 mod_module_files = "allow"
 
-# Shadow is useful, clippy's lints on shadow_same and shadow_reuse
-# are unreasonable, though shadow_unrelated can be useful.
+# Shadowing is useful. clippy's shadow_same and shadow_reuse are
+# unreasonable, though shadow_unrelated can be useful.
 shadow_same = "allow"
 shadow_reuse = "allow"
 shadow_unrelated = "warn"
 
-# Useful when writting no_std codes, but annoying in general codes.
+# Useful when writing no_std code, but annoying in general code.
 std_instead_of_alloc = "allow"
 std_instead_of_core = "allow"
 
 # I prefer 1_u64 style
 separated_literal_suffix = "allow"
 
-# Useful in embedded environments, but annoying in general codes.
+# Useful in embedded environments, but annoying in general code.
 float_arithmetic = "allow"
 
 # I prefer semicolon inside block style,
@@ -111,8 +111,8 @@ semicolon_outside_block = "allow"
 # I like it
 impl_trait_in_params = "allow"
 
-# Too annoying for normal Rust apps, seletively enable for specific module,
-# see tomato.rs for an example.
+# Too annoying for normal Rust apps. Selectively enable it for specific
+# modules.
 arithmetic_side_effects = "allow"
 
 # Prefer match ergonomics or explicit ownership like as_ref().

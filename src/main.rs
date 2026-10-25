@@ -1,5 +1,4 @@
-//! Usage: cy <dir | file.zip | file.7z | image-file>
-//! A bare image file opens its parent directory at that page.
+//! Usage: cy <dir | file.zip | file.7z | image-file>.
 
 mod app;
 mod decode;
@@ -22,8 +21,8 @@ use app::{App, UserEvent};
 use source::Source;
 use worker::Worker;
 
-/// Parsed path argument. An image file opens its parent directory at that
-/// image. A directory or archive opens as itself.
+/// An image file opens its parent directory at that image. A directory or
+/// archive opens as itself.
 enum Arg {
     Open(PathBuf),
     Image { dir: PathBuf, name: String },
@@ -32,8 +31,8 @@ enum Arg {
 fn main() -> ExitCode {
     use std::env;
 
-    // Keep the guard alive for the whole process: dropping it stops the
-    // non-blocking log writer.
+    // Dropping the guard stops the non-blocking log writer, so it must
+    // live for the whole process.
     let _log_guard = ino_tracing::init_tracing_subscriber();
 
     // env::args panics on non-UTF-8 argv, which file managers pass.
@@ -62,8 +61,8 @@ fn main() -> ExitCode {
     }
 }
 
-/// Directories and archives open as sources. A file argument must be an
-/// image by extension, or it is a startup error.
+/// A file argument must be an image by extension, or it is a startup
+/// error.
 fn classify(path: &Path) -> eros::Result<Arg> {
     // A path with no file-name component cannot be a file argument,
     // so it opens as a source.

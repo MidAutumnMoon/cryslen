@@ -1,22 +1,20 @@
 //! Decoding: raw page bytes -> `Decoded` (RGBA or YUV planes).
 //!
-//! Dispatch is by magic bytes where possible, then extension. JPEG/PNG get
-//! EXIF orientation applied. AVIF decodes to YUV planes for shader-side
-//! color conversion. JXL uses jxl-rs with a scoped-thread parallel runner.
+//! Dispatch is by magic bytes where possible, then extension. AVIF decodes
+//! to YUV planes and the rest to RGBA.
 //!
-//! All functions here are panics-clean for corrupt input: they return
-//! `DecodeError`, never panic. The FFI `unsafe` for AVIF is confined to
-//! the `avif` submodule.
+//! All functions here return `DecodeError` for corrupt input instead of
+//! panicking. The FFI `unsafe` for AVIF is confined to the `avif`
+//! submodule.
 
 use std::error::Error;
 use std::fmt;
 
 use ::jxl::error::Error as JxlError;
 
-/// Decoded page: dimensions plus pixels in one of two layouts. Construct via
-/// [`Decoded::rgba`] / [`Decoded::yuv`], which validate that pixel extents
-/// match the dimensions. Extent bugs surface as construction errors, not
-/// display-time panics.
+/// Decoded page. Construct via [`Decoded::rgba`] / [`Decoded::yuv`], which
+/// validate the pixel extents against the dimensions. A wrong extent then
+/// surfaces as a construction error, not a display-time panic.
 #[derive(Clone)]
 pub struct Decoded {
     pub width: u32,
@@ -26,7 +24,6 @@ pub struct Decoded {
 }
 
 impl Decoded {
-    /// Interleaved RGBA, `4 * w * h` bytes, row-major, top-first.
     pub(crate) fn rgba(
         width: u32,
         height: u32,
@@ -41,7 +38,6 @@ impl Decoded {
         Ok(Self { width, height, pixels: Pixels::Rgba8(bytes), format })
     }
 
-    /// Planar YUV sized per [`plane_dims`] for these dimensions.
     pub(crate) fn yuv(
         width: u32,
         height: u32,
@@ -79,8 +75,8 @@ impl Decoded {
     }
 }
 
-/// Pixel count with a hostile-header cap (matches the image crate's 512 MiB
-/// allocation ceiling).
+/// Pixel count with a hostile-header cap. The cap matches the image crate's
+/// 512 MiB allocation ceiling.
 fn checked_pixels(width: u32, height: u32, what: &'static str) -> Result<u32, DecodeError> {
     width
         .checked_mul(height)
@@ -88,15 +84,14 @@ fn checked_pixels(width: u32, height: u32, what: &'static str) -> Result<u32, De
         .ok_or(DecodeError::Corrupt(what))
 }
 
-/// Byte extent: [`checked_pixels`] times `bytes_per_pixel`.
 fn checked_extent(width: u32, height: u32, bytes_per_pixel: usize) -> Result<usize, DecodeError> {
     Ok(checked_pixels(width, height, "bad dimensions")? as usize * bytes_per_pixel)
 }
 
-/// Hostile-header cap shared by all decoders, in pixels.
 const MAX_PIXELS: u32 = 512 << 18;
 
-/// Largest page edge accepted as one GL texture (the common desktop limit).
+/// Largest page edge accepted as one GL texture. 0x4000 is the common
+/// desktop limit.
 const MAX_TEXTURE_EDGE: u32 = 0x4000;
 
 fn check_dims(width: u32, height: u32) -> Result<(), DecodeError> {
@@ -141,10 +136,10 @@ impl Format {
     }
 }
 
-/// Planar YUV image. 8-bit planes are one byte per sample. 10/12-bit planes
-/// are `u16` samples with `depth` significant bits. Dimensions ride on
-/// [`Decoded`]. Plane sizes derive from them. Mono carries luma only, so
-/// its chroma planes stay empty.
+/// 8-bit planes are one byte per sample. Deeper planes are `u16` samples
+/// with `depth` significant bits. Dimensions ride on [`Decoded`]. Plane
+/// sizes follow [`plane_dims`]. Mono carries luma only, so its chroma
+/// planes stay empty.
 #[derive(Clone)]
 pub struct YuvImage {
     pub depth: u8,
@@ -179,8 +174,8 @@ pub enum Plane {
     U16(Box<[u16]>),
 }
 
-/// Plane dims (luma, chroma) for an image size and subsampling. Mono has no
-/// chroma (renderers substitute a 1x1 midpoint).
+/// Plane dims (luma, chroma) for an image size and subsampling. Mono chroma
+/// is 1x1 so renderers can bind a midpoint texture.
 pub fn plane_dims(size: (u32, u32), subsampling: Subsampling) -> ((u32, u32), (u32, u32)) {
     let (width, height) = size;
     match subsampling {
@@ -191,7 +186,7 @@ pub fn plane_dims(size: (u32, u32), subsampling: Subsampling) -> ((u32, u32), (u
     }
 }
 
-/// Byte view of a plane (u16 planes are native-endian byte pairs).
+/// Byte view of a plane. `u16` planes become native-endian byte pairs.
 pub fn plane_bytes(plane: &Plane) -> &[u8] {
     match plane {
         Plane::U8(bytes) => bytes,
@@ -225,8 +220,8 @@ impl fmt::Display for DecodeError {
 
 impl Error for DecodeError {}
 
-/// Decode one page. `name` is the page filename (extension fallback).
-/// Static: animated images show their first frame.
+/// Decode one page. `name` is the page filename, used as the extension
+/// fallback. Animated images show their first frame.
 pub fn decode(bytes: &[u8], name: &str) -> Result<Decoded, DecodeError> {
     let Some(format) = sniff(bytes).or_else(|| format_from_name(name)) else {
         return Err(DecodeError::NotAnImage);
@@ -243,8 +238,8 @@ pub fn decode(bytes: &[u8], name: &str) -> Result<Decoded, DecodeError> {
     }
 }
 
-/// Extension -> format table. The same table decides what can decode and
-/// what gets listed as a page.
+/// Format for a page filename's extension. The same table decides what can
+/// decode and what gets listed as a page.
 #[expect(
     clippy::redundant_pub_crate,
     reason = "pub(crate) is the crate's visibility style for crate-wide items, even inside private modules"
@@ -269,7 +264,7 @@ pub(crate) fn format_from_name(name: &str) -> Option<Format> {
     })
 }
 
-/// Magic-byte sniffing. `None` only means no known signature.
+/// `None` only means no known signature.
 fn sniff(bytes: &[u8]) -> Option<Format> {
     if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
         return Some(Format::Jpeg);
@@ -289,7 +284,7 @@ fn sniff(bytes: &[u8]) -> Option<Format> {
     if bytes.starts_with(&[0x49, 0x49, 0x2A, 0x00]) || bytes.starts_with(&[0x4D, 0x4D, 0x00, 0x2A]) {
         return Some(Format::Tiff);
     }
-    // JXL: raw codestream or ISOBMFF container signature.
+    // Raw codestream or ISOBMFF container signature.
     if bytes.starts_with(&[0xFF, 0x0A])
         || bytes.starts_with(&[0x00, 0x00, 0x00, 0x0C, b'J', b'X', b'L', b' ', 0x0D, 0x0A, 0x87, 0x0A])
     {
@@ -301,7 +296,6 @@ fn sniff(bytes: &[u8]) -> Option<Format> {
     None
 }
 
-/// AVIF files start with an ISOBMFF `ftyp` box.
 fn sniff_ftyp_avif(bytes: &[u8]) -> bool {
     ftyp_brands(bytes).is_some_and(|brands| {
         brands.as_chunks::<4>().0.iter().any(|brand| brand == b"avif" || brand == b"avis")
@@ -309,7 +303,7 @@ fn sniff_ftyp_avif(bytes: &[u8]) -> bool {
 }
 
 /// Brand region of the leading `ftyp` box. A box length under 12 still
-/// yields the 4-byte major brand region.
+/// yields the 4-byte major brand.
 fn ftyp_brands(bytes: &[u8]) -> Option<&[u8]> {
     #[expect(
         clippy::big_endian_bytes,
@@ -354,8 +348,7 @@ fn decode_image(bytes: &[u8], format: Format) -> Result<Decoded, DecodeError> {
 }
 
 /// libavif FFI: decoder over the in-memory file, YUV planes copied out
-/// directly. avifImageYUVToRGB would do the RGB conversion on the CPU.
-/// The GPU does it at draw time.
+/// directly.
 mod avif {
     use libavif_sys::avifDecoder;
     use libavif_sys::avifDecoderCreate;
@@ -383,15 +376,14 @@ mod avif {
     use super::{DecodeError, Decoded, Format, Matrix, Plane, Subsampling, YuvImage};
 
     /// dav1d parallelism saturates quickly on stills, so the thread count
-    /// is capped (knob baked in).
+    /// is capped.
     const MAX_THREADS: usize = 8;
 
     pub fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
-        // SAFETY: the guard performs the unchecked libavif calls and keeps
-        // `bytes` alive for the decoder's whole life through its lifetime.
+        // SAFETY: `DecoderGuard::new`'s contract leaves callers the `'bytes`
+        // borrow, which the signature enforces.
         let decoder = unsafe { DecoderGuard::new(bytes)? };
-        // SAFETY: the decoder is untouched since `new`, so the frame
-        // reference stays valid while the guard lives.
+        // SAFETY: the decoder is untouched since `new`.
         let frame = unsafe { decoder.image()? };
 
         let (width, height) = (frame.width, frame.height);
@@ -429,7 +421,7 @@ mod avif {
             Subsampling::Yuv422 => (width.div_ceil(2), height),
             Subsampling::Yuv444 => (width, height),
         };
-        // SAFETY: the guard still owns the frame, so the luma plane is live;
+        // SAFETY: the guard still owns the frame, so the luma plane is live.
         // `copy_plane` rejects null planes and short strides.
         let luma_plane =
             unsafe { copy_plane(frame.yuvPlanes[0], frame.yuvRowBytes[0], width, height, u32::from(depth)) }?;
@@ -437,11 +429,11 @@ mod avif {
             (Plane::U8(Box::new([])), Plane::U8(Box::new([])))
         } else {
             (
-                // SAFETY: same contract as the luma plane, on the Cb plane.
+                // SAFETY: same contract as the luma plane.
                 unsafe {
                     copy_plane(frame.yuvPlanes[1], frame.yuvRowBytes[1], chroma_width, chroma_height, u32::from(depth))
                 }?,
-                // SAFETY: same contract as the luma plane, on the Cr plane.
+                // SAFETY: same contract as the luma plane.
                 unsafe {
                     copy_plane(frame.yuvPlanes[2], frame.yuvRowBytes[2], chroma_width, chroma_height, u32::from(depth))
                 }?,
@@ -486,8 +478,7 @@ mod avif {
         Err(DecodeError::Avif(what, detail.into_owned()))
     }
 
-    /// Copy one plane row by row (libavif rows are padded to `stride`).
-    /// Depth > 8 planes are native-endian `u16` arrays on the C side.
+    /// Copies one plane row by row. libavif pads rows to `stride`.
     ///
     /// # Safety
     ///
@@ -542,7 +533,7 @@ mod avif {
     }
 
     /// Owns the C decoder for one decode call. The `'bytes` lifetime pins
-    /// the input: the decoder reads it through a raw pointer until it is
+    /// the input, which the decoder reads through a raw pointer until
     /// destroyed.
     struct DecoderGuard<'bytes> {
         ptr: *mut avifDecoder,
@@ -550,8 +541,7 @@ mod avif {
     }
 
     impl<'bytes> DecoderGuard<'bytes> {
-        /// Create the decoder, feed it `bytes`, parse, decode the first
-        /// image.
+        /// Creates the decoder and decodes the first image.
         ///
         /// # Safety
         ///
@@ -577,8 +567,8 @@ mod avif {
         /// # Safety
         ///
         /// The marker exists because the body dereferences the decoder
-        /// pointer. The decoder must be untouched since `new`, which module
-        /// privacy enforces: no other decoder call exists between the two.
+        /// pointer. The decoder must be untouched since `new`, and module
+        /// privacy ensures no other decoder call happens between the two.
         unsafe fn image(&self) -> Result<&avifImage, DecodeError> {
             let frame = (*self.ptr).image;
             if frame.is_null() {
@@ -597,15 +587,16 @@ mod avif {
     }
 }
 
-/// The decoder fills opaque alpha when the file has none.
 mod jxl {
-    use std::thread;
-
-    use jxl::api::{
-        Event, JxlDecoder, JxlDecoderOptions, JxlOutputBuffer, JxlParallelRunner,
-        JxlParallelRunnerFun, JxlPixelFormat,
-    };
-    use jxl::error;
+    use jxl::api::Event;
+    use jxl::api::JxlDecoder;
+    use jxl::api::JxlDecoderOptions;
+    use jxl::api::JxlOutputBuffer;
+    use jxl::api::JxlParallelRunner;
+    use jxl::api::JxlParallelRunnerFun;
+    use jxl::api::JxlPixelFormat;
+    use jxl::error::Error as JxlError;
+    use jxl::error::Result as JxlResult;
 
     use super::{DecodeError, Decoded, Format};
 
@@ -615,13 +606,11 @@ mod jxl {
         use std::slice;
 
         let mut runner = Pool(threads());
-        // The whole file is in memory, so the slice doubles as the
-        // truncation probe: `NeedMoreInput` means it ran dry.
+        // The whole file is in memory, so `NeedMoreInput` means the file is
+        // truncated.
         let mut input: &[u8] = bytes;
         let mut decoder = JxlDecoder::new(JxlDecoderOptions::default());
 
-        // Header phase: run to the basic info, the first event of a fresh
-        // decoder, and fix the output format before any frame is parsed.
         loop {
             let event = decoder
                 .process(&mut input, None, Some(&mut runner))
@@ -641,7 +630,7 @@ mod jxl {
             .ok_or(DecodeError::Corrupt("jxl: missing basic info"))?;
         #[expect(
             clippy::map_err_ignore,
-            reason = "the dropped conversion error says only that the value does not fit, which the message states"
+            reason = "the conversion error only says the value does not fit, which the message already states"
         )]
         let (width, height) = (
             u32::try_from(info.size.0).map_err(|_| DecodeError::Corrupt("jxl: bad dimensions"))?,
@@ -650,18 +639,15 @@ mod jxl {
         let pixel_count = super::checked_pixels(width, height, "jxl: bad dimensions")?;
         super::check_dims(width, height)?;
 
-        // One slot per extra channel; `None` gives that channel no separate
-        // buffer.
+        // Files without their own alpha still get opaque alpha from the
+        // decoder.
         let extra_channels = info.extra_channels.len();
         decoder
             .set_pixel_format(JxlPixelFormat::rgba8(extra_channels))
             .map_err(DecodeError::Jxl)?;
 
-        // Frame phase: decode the first frame into the pixels. The first
-        // frame is the page; later frames are animations.
         let mut rgba = vec![0_u8; pixel_count as usize * 4];
         loop {
-            // `JxlOutputBuffer` borrows the pixels, so rebuild it per pass.
             let mut output = JxlOutputBuffer::new(&mut rgba, height as usize, width as usize * 4);
             match decoder
                 .process(&mut input, Some(slice::from_mut(&mut output)), Some(&mut runner))
@@ -686,14 +672,15 @@ mod jxl {
 
     fn threads() -> usize {
         use std::num::NonZeroUsize;
+        use std::thread;
 
         thread::available_parallelism().map_or(1, NonZeroUsize::get).min(MAX_THREADS)
     }
 
-    /// Scoped-thread runner. The first failing task fails the whole
-    /// run, which is how the crate's driver expects a runner to
-    /// report a broken codestream. The driver calls this only with
-    /// two or more threads, so no sequential path exists here.
+    /// Scoped-thread runner. A failing task fails the whole run, which is
+    /// how the crate's driver expects a broken codestream to be reported.
+    /// The driver invokes this only with two or more threads, so no
+    /// sequential path is needed.
     pub(super) struct Pool(usize);
 
     impl Pool {
@@ -704,13 +691,14 @@ mod jxl {
     }
 
     impl JxlParallelRunner for Pool {
-        fn run(&mut self, num: usize, fun: &JxlParallelRunnerFun<'_>) -> error::Result<()> {
+        fn run(&mut self, num: usize, fun: &JxlParallelRunnerFun<'_>) -> JxlResult<()> {
             use std::sync::Mutex;
             use std::sync::PoisonError;
+            use std::thread;
 
             let thread_count = self.0.min(num);
             let chunk = num.div_ceil(thread_count);
-            let failure: Mutex<Option<error::Error>> = Mutex::new(None);
+            let failure: Mutex<Option<JxlError>> = Mutex::new(None);
             thread::scope(|scope| {
                 for thread_index in 0..thread_count {
                     let fun: &JxlParallelRunnerFun = fun;
@@ -762,9 +750,8 @@ mod tests {
         }
     }
 
-    // decoder.orientation + apply_orientation runs in every image-crate
-    // decode above. The in-tree encoder cannot write EXIF orientation tags,
-    // so no transformed fixture can be synthesized here.
+    // The in-tree encoder cannot write EXIF orientation tags, so
+    // orientation handling has no testable fixture.
 
     #[test]
     fn jpeg_roundtrip() {
@@ -831,7 +818,7 @@ mod tests {
         let mut avif = vec![0, 0, 0, 0x14];
         avif.extend_from_slice(b"ftypavif");
         assert_eq!(sniff(&avif), Some(Format::Avif));
-        // Non-avif brands (e.g. HEIC's mif1) do not sniff as avif.
+        // Non-avif brands like HEIC's mif1 do not sniff as avif.
         let mut heic = vec![0, 0, 0, 0x14];
         heic.extend_from_slice(b"ftypmif1");
         assert_eq!(sniff(&heic), None);
@@ -895,8 +882,7 @@ mod tests {
         ));
     }
 
-    // 8x8 lossless cjxl fixtures with solid top and bottom halves. gray.jxl is
-    // grayscale. alpha.jxl carries an alpha extra channel.
+    // 8x8 lossless cjxl fixtures with solid top and bottom halves.
     #[test]
     fn jxl_fixtures_decode_to_rgba() {
         let gray_page = decode(include_bytes!("testdata/gray.jxl"), "a.jxl").expect("gray jxl decodes");
@@ -923,9 +909,9 @@ mod tests {
         }
     }
 
-    // A cut anywhere leaves the decoder with no bytes to request, so the
-    // decode must end rather than wait forever. Cuts 1 and 2 land in the
-    // header phase, 8 in the frame header, 35 in the pixels.
+    // A truncation bug would hang the decode instead of failing it, hence
+    // the watchdog thread. The cuts cover the header, the frame header, and
+    // the pixels.
     #[test]
     fn truncated_jxl_ends_the_decode() {
         use std::sync::mpsc;
@@ -956,10 +942,10 @@ mod tests {
 
     // The other fixtures are 8x8 squares, so a rows/stride swap in the
     // output buffer keeps the byte total and stays invisible. A 256x128
-    // page pins the order; opaque alpha on every pixel proves the decoder
+    // page pins the order. Opaque alpha on every pixel proves the decoder
     // wrote all rows of the zero-initialised buffer.
-    // wide.jxl and animated.jxl come verbatim from jxl 0.8.0's
-    // tests/testdata (exif.jxl, 5_frames_numbered_jxli.jxl).
+    // wide.jxl and animated.jxl are verbatim copies of exif.jxl and
+    // 5_frames_numbered_jxli.jxl from jxl 0.8.0's tests/testdata.
     #[test]
     fn wide_jxl_pins_the_row_stride_order() {
         let page = decode(include_bytes!("testdata/wide.jxl"), "a.jxl").expect("wide jxl decodes");
@@ -970,8 +956,6 @@ mod tests {
         assert!(rgba.as_chunks::<4>().0.iter().all(|px| px[3] == 0xFF));
     }
 
-    // The viewer is static: an animated container yields its first frame,
-    // not all five.
     #[test]
     fn animated_jxl_decodes_its_first_frame() {
         let page =
@@ -985,8 +969,8 @@ mod tests {
         assert!(rgba.as_chunks::<4>().0.iter().any(|px| px[0] != 0 || px[1] != 0 || px[2] != 0));
     }
 
-    // The fixtures are single-group, so only this test drives the runner's
-    // parallel path at all.
+    // The fixtures are single-group, so only this test exercises the
+    // runner's parallel path.
     #[test]
     fn jxl_pool_reports_the_first_task_error() {
         use ::jxl::api::JxlParallelRunner as _;
