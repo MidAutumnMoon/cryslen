@@ -19,12 +19,12 @@ pub struct Window {
     gl: Arc<glow::Context>,
     surface: Surface<WindowSurface>,
     context: PossiblyCurrentContext,
-    /// True when the alpha-demanding EGL query matched. False runs
-    /// fully opaque. The fallback config may still carry alpha bits,
-    /// but the opaque hint and clear make that invisible.
+    /// True when the alpha-demanding EGL query matched. The fallback
+    /// config may still carry alpha bits, but the opaque hint and clear
+    /// make that invisible.
     translucent: bool,
-    /// Size the surface was last resized to (physical px). Creation
-    /// counts as the first resize.
+    /// Size the surface was last resized to. Creation counts as the
+    /// first resize.
     resized_to: (u32, u32),
 }
 
@@ -33,7 +33,7 @@ impl Window {
     ///
     /// # Safety
     ///
-    /// The event loop must outlive the returned window: the platform
+    /// The event loop must outlive the returned window. The platform
     /// display behind its raw handle backs every GL object created here.
     pub unsafe fn new(event_loop: &ActiveEventLoop) -> eros::Result<Self> {
         use glutin::config::ConfigTemplateBuilder;
@@ -69,8 +69,9 @@ impl Window {
             if let Some(config) = gl_display.find_configs(translucent_template)?.next() {
                 (config, true)
             } else {
-                // Alpha-agnostic second pass: the default template also
-                // demands alpha, which would repeat the same empty query.
+                // The second pass drops the alpha demand. The default
+                // template also demands alpha, which would repeat the
+                // same empty query.
                 let plain = ConfigTemplateBuilder::new().with_alpha_size(0).build();
                 let config = gl_display
                     .find_configs(plain)?
@@ -138,8 +139,6 @@ impl Window {
         Arc::clone(&self.gl)
     }
 
-    /// Lets a compositor that blurs translucent surfaces show the
-    /// desktop through the window.
     pub fn translucent(&self) -> bool {
         self.translucent
     }

@@ -26,10 +26,10 @@ use crate::worker::{SeatView, SpreadView, Worker};
 
 /// User events that wake the parked loop.
 pub enum UserEvent {
-    /// Wake the loop after this delay. Arming only: `new_events`
-    /// fires the redraw when the deadline is reached.
+    /// Arms a wake only. The redraw fires from `new_events` when the
+    /// deadline is reached.
     Repaint(Duration),
-    /// The decode book changed. Redraw to pick up newly decided pages.
+    /// The decode book changed.
     PagesUpdated,
 }
 
@@ -43,7 +43,6 @@ pub(crate) fn post(proxy: &EventLoopProxy<UserEvent>, event: UserEvent) {
     let Ok(()) = proxy.send_event(event) else { return; };
 }
 
-/// Everything mode-ish about the viewing session.
 struct State {
     /// Index of the spread's first page (a spread start).
     index: usize,
@@ -71,8 +70,8 @@ struct FoldedStatus {
 /// Fold the seats' views into status facts, visiting the seats in reading
 /// order so the spread's lead page speaks. `seat_views[i]` is the worker's
 /// view for `spread.seats(mode)[i]`. A seat still deciding yields its place
-/// to the other one. A failed page stops the fold: its facts do not exist,
-/// and the partner's would describe the wrong page.
+/// to the other one. A failed page stops the fold. Its facts do not
+/// exist, and the partner's would describe the wrong page.
 fn fold_status(spread: Spread, mode: ViewMode, seat_views: &[Option<SeatView>; 2]) -> FoldedStatus {
     use std::iter;
 
@@ -97,8 +96,6 @@ fn fold_status(spread: Spread, mode: ViewMode, seat_views: &[Option<SeatView>; 2
     folded
 }
 
-/// The auto-fit protocol: which spread total the refit decision is
-/// settled for, and whether the user has placed the spread since.
 #[derive(Default)]
 struct Fit {
     /// Spread total the refit decision was settled for. None demands a refit.
@@ -118,23 +115,22 @@ impl Fit {
         self.settled = Some(total);
     }
 
-    /// User zoom or pan.
     fn note_user_move(&mut self) {
         self.user_moved = true;
     }
 
-    /// Page turn: the new spread fits afresh once its dims settle. User
-    /// placement does not carry across pages.
+    /// The new spread fits afresh once its dims settle. User placement
+    /// does not carry across pages.
     fn page_turned(&mut self) {
         self.refit();
     }
 
-    /// Resize: fit afresh, discarding user placement.
+    /// Fit afresh, discarding user placement.
     fn resized(&mut self) {
         self.refit();
     }
 
-    /// Reset view: fit afresh, discarding user placement.
+    /// Fit afresh, discarding user placement.
     fn reset_view(&mut self) {
         self.refit();
     }
@@ -145,9 +141,9 @@ impl Fit {
     }
 }
 
-/// The GL bundle: everything that exists only between `resumed` and exit
-/// (winit requirement). Field order is drop order: pages and egui are
-/// dropped while the window (which owns the GL context) is still alive.
+/// Everything that exists only between `resumed` and exit (winit
+/// requirement). Field order is drop order. Pages and egui are dropped
+/// while the window, which owns the GL context, is still alive.
 struct Gl {
     pages: PageTextures,
     egui: egui_glow::EguiGlow,
@@ -178,9 +174,8 @@ pub struct App {
     retuned_spread: Spread,
     cursor: (f32, f32),
     dragging: bool,
-    /// Set while any wanted seat is undecided. The last frame stays on
-    /// screen (hold-last-frame rule) and the status line flags waiting
-    /// after [`WAIT_GRACE`]. No spinner animation: it would force repaints.
+    /// Set while any wanted seat is undecided. There is no spinner
+    /// animation because it would force repaints of the parked loop.
     waiting_since: Option<Instant>,
     /// Set while the mode-switch toast is showing in the status bar.
     mode_toast_since: Option<Instant>,
@@ -237,9 +232,6 @@ impl App {
         view::spread_for(self.state.index, self.state.mode, self.source.len())
     }
 
-    /// Show each seat's Ready page, hold undecided and failed seats on
-    /// their last frame, and refresh the layout memo. Returns the
-    /// seat-ordered views for the status fold.
     fn display(&mut self, spread: Spread, snapshot: &SpreadView) -> [Option<SeatView>; 2] {
         #[expect(
             clippy::redundant_closure_for_method_calls,
@@ -284,7 +276,6 @@ impl App {
         seat_views
     }
 
-    /// One frame: decide, upload, draw, present.
     fn frame(&mut self) -> eros::Result<()> {
         use crate::decode;
         use crate::ui;
@@ -314,8 +305,7 @@ impl App {
         self.waiting_since = folded
             .waiting
             .then(|| self.waiting_since.unwrap_or_else(Instant::now));
-        // Arm a wake at grace expiry. The parked loop otherwise never
-        // shows the "decoding…" flag.
+        // The parked loop otherwise never shows the "decoding…" flag.
         if let Some(since) = self.waiting_since {
             let elapsed = since.elapsed();
             if elapsed < WAIT_GRACE {
@@ -376,8 +366,8 @@ impl App {
         }
     }
 
-    /// (spread total, window size) in physical px, the coordinate frame that
-    /// pan and zoom work in.
+    /// (spread total, window size), the coordinate frame that pan and
+    /// zoom work in. The total is image px, the window physical px.
     fn geometry(&self) -> ((f32, f32), (f32, f32)) {
         let window = self.gl.as_ref().map(|gl| {
             let window_size = gl.window.winit().inner_size();
@@ -477,10 +467,7 @@ impl ApplicationHandler<UserEvent> for App {
                 post(&proxy.lock(), UserEvent::Repaint(info.delay));
             });
         }
-        // Opaque mode deliberately keeps egui's default panel fill over
-        // the background. Glass mode applies the fill once here; a
-        // future runtime glass toggle must re-apply it, while frame()'s
-        // clear follows the mode on its own.
+        // Opaque mode deliberately keeps egui's default panel fill.
         if window.translucent() {
             egui.egui_ctx.all_styles_mut(|style| style.visuals.panel_fill = glass_fill());
         }
@@ -529,8 +516,6 @@ impl ApplicationHandler<UserEvent> for App {
         }
         let Some(gl) = self.gl.as_mut() else { return };
 
-        // Give egui the event first. If it wants the pointer, we don't
-        // pan or zoom.
         let egui_wants = {
             let response = gl.egui.on_window_event(gl.window.winit(), &event);
             let wants = gl.egui.egui_ctx.egui_wants_pointer_input();
@@ -611,15 +596,14 @@ const WAIT_GRACE: Duration = Duration::from_millis(150);
 /// How long a mode switch's toast stays on screen.
 const MODE_TOAST: Duration = Duration::from_millis(1500);
 
-/// Window background color, straight (un-multiplied) channels.
+/// Window background color, straight channels.
 const BACKGROUND: [f32; 3] = [0.08, 0.08, 0.09];
 
 /// Background opacity when the window is translucent.
 const GLASS_ALPHA: f32 = 0.85;
 
-/// Wayland composites ARGB buffers as premultiplied alpha, so the
-/// translucent variant scales the color channels by alpha. Stored
-/// straight, the composite would come out brighter than intended.
+/// Framebuffer clear color, premultiplied because Wayland composites
+/// ARGB buffers that way.
 fn clear_color(translucent: bool) -> [f32; 4] {
     let [red, green, blue] = BACKGROUND;
     if translucent {
@@ -629,9 +613,6 @@ fn clear_color(translucent: bool) -> [f32; 4] {
     }
 }
 
-/// [`clear_color`]'s translucent channels as egui's premultiplied u8
-/// color. The premultiplied glass lives in one place, so the bar
-/// repeating the background holds structurally.
 #[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -643,11 +624,11 @@ fn glass_fill() -> egui::Color32 {
     egui::Color32::from_rgba_premultiplied(channel(red), channel(green), channel(blue), channel(alpha))
 }
 
-/// Wheel zoom sensitivity: one notch is ~×1.16, three notches ~×1.6.
+/// One wheel notch zooms ~×1.16, three notches ~×1.6.
 const WHEEL_ZOOM_SENSITIVITY: f32 = 0.15;
 
-/// Assumed wheel resolution for pixel-mode wheels: how many physical
-/// px of scroll equal one "line".
+/// Assumed wheel resolution for pixel-mode wheels, in physical px of
+/// scroll per line.
 const PIXELS_PER_WHEEL_LINE: f32 = 40.0;
 
 /// Pixel-mode wheel motion as zoom lines, divided by scale factor so
@@ -685,7 +666,6 @@ mod tests {
         for (channel, straight) in [red, green, blue].into_iter().zip(BACKGROUND) {
             assert!((straight.mul_add(GLASS_ALPHA, -channel)).abs() < 1e-6);
         }
-        // The premultiplied invariant: no channel exceeds alpha.
         assert!(red <= alpha && green <= alpha && blue <= alpha);
     }
 
@@ -700,8 +680,8 @@ mod tests {
 
     #[test]
     fn glass_fill_pins_the_background_glass() {
-        // Exact bytes: the bar must repeat the background glass, and no
-        // formula or constructor change may drift them apart silently.
+        // The bar must repeat the background glass. Exact bytes, so no
+        // formula or constructor change can drift them apart silently.
         assert_eq!(glass_fill(), egui::Color32::from_rgba_premultiplied(17, 17, 20, 217));
     }
 
