@@ -602,9 +602,8 @@ mod jxl {
     use std::thread;
 
     use jxl::api::{
-        states, JxlBitstreamInput as _, JxlColorType, JxlDataFormat, JxlDecoder,
-        JxlDecoderOptions, JxlOutputBuffer, JxlParallelRunner, JxlParallelRunnerFun, JxlPixelFormat,
-        ProcessingResult,
+        Event, JxlDecoder, JxlDecoderOptions, JxlOutputBuffer, JxlParallelRunner,
+        JxlParallelRunnerFun, JxlPixelFormat,
     };
     use jxl::error;
 
@@ -612,93 +611,74 @@ mod jxl {
 
     const MAX_THREADS: usize = 16;
 
-    /// Buffered read chunk for the codestream input.
-    const READ_CHUNK_BYTES: usize = 1 << 20;
-
     #[expect(
         clippy::rest_pattern_accessible_field,
         reason = "the matched fields are unused here, so naming them would trip unneeded_field_pattern"
     )]
     pub fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
-        use std::io::BufReader;
-        use std::io::Cursor;
         use std::slice;
 
         let mut runner = Pool(threads());
-        let mut input = BufReader::with_capacity(READ_CHUNK_BYTES, Cursor::new(bytes));
+        // The whole file is in memory, so the slice doubles as the
+        // truncation probe: `NeedMoreInput` means it ran dry.
+        let mut input: &[u8] = bytes;
+        let mut decoder = JxlDecoder::new(JxlDecoderOptions::default());
 
-        // pass 1: headers -> image size
-        let decoder = JxlDecoder::<states::Initialized>::new(JxlDecoderOptions::default());
-        let mut decoder = match decoder.process(&mut input, Some(&mut runner)) {
-            Ok(ProcessingResult::Complete { result }) => result,
-            Ok(ProcessingResult::NeedsMoreInput { .. }) => {
-                return Err(DecodeError::Corrupt("jxl: truncated header"))
+        // Header phase: run to the basic info, the first event of a fresh
+        // decoder, and fix the output format before any frame is parsed.
+        loop {
+            let event = decoder
+                .process(&mut input, None, Some(&mut runner))
+                .map_err(DecodeError::Jxl)?;
+            if event == Event::BasicInfo {
+                break;
             }
-            Err(error) => return Err(DecodeError::Jxl(error)),
-        };
-        let (width, height) = decoder.basic_info().size;
+            if matches!(event, Event::NeedMoreInput { .. }) {
+                return Err(DecodeError::Corrupt("jxl: truncated header"));
+            }
+            // A fresh decoder emits BasicInfo or NeedMoreInput before all else.
+        }
+
+        let info = decoder
+            .basic_info()
+            .ok_or(DecodeError::Corrupt("jxl: missing basic info"))?;
         #[expect(
             clippy::map_err_ignore,
             reason = "the dropped conversion error says only that the value does not fit, which the message states"
         )]
         let (width, height) = (
-            u32::try_from(width).map_err(|_| DecodeError::Corrupt("jxl: bad dimensions"))?,
-            u32::try_from(height).map_err(|_| DecodeError::Corrupt("jxl: bad dimensions"))?,
+            u32::try_from(info.size.0).map_err(|_| DecodeError::Corrupt("jxl: bad dimensions"))?,
+            u32::try_from(info.size.1).map_err(|_| DecodeError::Corrupt("jxl: bad dimensions"))?,
         );
         let pixel_count = super::checked_pixels(width, height, "jxl: bad dimensions")?;
         super::check_dims(width, height)?;
 
-        let extra_channels = decoder.basic_info().extra_channels.len();
-        decoder.set_pixel_format(JxlPixelFormat {
-            color_type: JxlColorType::Rgba,
-            color_data_format: Some(JxlDataFormat::U8 { bit_depth: 8 }),
-            // The decoder requires one slot per extra channel. None means
-            // that channel gets no separate buffer.
-            extra_channel_format: vec![None; extra_channels],
-        })
-        .map_err(DecodeError::Jxl)?;
+        // One slot per extra channel; `None` gives that channel no separate
+        // buffer.
+        let extra_channels = info.extra_channels.len();
+        decoder
+            .set_pixel_format(JxlPixelFormat::rgba8(extra_channels))
+            .map_err(DecodeError::Jxl)?;
 
-        // pass 2: frame info
-        let mut decoder = loop {
-            match decoder.process(&mut input, Some(&mut runner)) {
-                Ok(ProcessingResult::Complete { result }) => break result,
-                Ok(ProcessingResult::NeedsMoreInput { fallback, .. }) => {
-                    // The whole file is already in memory, so zero bytes
-                    // left means none can arrive.
-                    if input.available_bytes().unwrap_or(0) == 0 {
-                        return Err(DecodeError::Corrupt("jxl: truncated image"));
-                    }
-                    decoder = fallback;
-                }
-                Err(error) => return Err(DecodeError::Jxl(error)),
-            }
-        };
-
-        // pass 3: pixels
-        let mut rgba_buffer = vec![0_u8; pixel_count as usize * 4];
-        let mut output =
-            JxlOutputBuffer::new(&mut rgba_buffer, height as usize, width as usize * 4);
+        // Frame phase: decode the first frame into the pixels. The first
+        // frame is the page; later frames are animations.
+        let mut rgba = vec![0_u8; pixel_count as usize * 4];
         loop {
+            // `JxlOutputBuffer` borrows the pixels, so rebuild it per pass.
+            let mut output = JxlOutputBuffer::new(&mut rgba, height as usize, width as usize * 4);
             match decoder
-                .process(&mut input, slice::from_mut(&mut output), Some(&mut runner))
+                .process(&mut input, Some(slice::from_mut(&mut output)), Some(&mut runner))
+                .map_err(DecodeError::Jxl)?
             {
-                Ok(ProcessingResult::Complete { .. }) => break,
-                Ok(ProcessingResult::NeedsMoreInput { fallback, .. }) => {
-                    if input.available_bytes().unwrap_or(0) == 0 {
-                        return Err(DecodeError::Corrupt("jxl: truncated image"));
-                    }
-                    decoder = fallback;
+                Event::FrameComplete { .. } => break,
+                Event::NeedMoreInput { .. } => {
+                    return Err(DecodeError::Corrupt("jxl: truncated image"));
                 }
-                Err(error) => return Err(DecodeError::Jxl(error)),
+                Event::BasicInfo | Event::FrameHeader | Event::Complete => {}
             }
         }
 
-        Decoded::rgba(
-            width,
-            height,
-            Format::Jxl,
-            rgba_buffer.into_boxed_slice(),
-        )
+        Decoded::rgba(width, height, Format::Jxl, rgba.into_boxed_slice())
     }
 
     fn threads() -> usize {
@@ -940,8 +920,9 @@ mod tests {
         }
     }
 
-    // A cut inside the frame info or pixel pass leaves the decoder with no
-    // bytes to request, so the decode must end rather than wait forever.
+    // A cut anywhere leaves the decoder with no bytes to request, so the
+    // decode must end rather than wait forever. Cuts 1 and 2 land in the
+    // header phase, 8 in the frame header, 35 in the pixels.
     #[test]
     fn truncated_jxl_ends_the_decode() {
         use std::sync::mpsc;
@@ -949,8 +930,12 @@ mod tests {
         use std::time::Duration;
 
         let fixture = include_bytes!("testdata/gray.jxl");
-        // 8 lands in pass 2, 35 in pass 3.
-        for cut in [8, 35] {
+        for (cut, message) in [
+            (1, "jxl: truncated header"),
+            (2, "jxl: truncated header"),
+            (8, "jxl: truncated image"),
+            (35, "jxl: truncated image"),
+        ] {
             let truncated = fixture.get(..cut).expect("cut inside the fixture").to_vec();
             let (tx, rx) = mpsc::channel();
             thread::spawn(move || {
@@ -960,10 +945,41 @@ mod tests {
                 .recv_timeout(Duration::from_secs(5))
                 .expect("truncated jxl decode finishes");
             assert!(
-                matches!(result, Err(DecodeError::Corrupt("jxl: truncated image"))),
-                "cut {cut} did not report truncation"
+                matches!(result, Err(DecodeError::Corrupt(actual)) if actual == message),
+                "cut {cut} reported the wrong truncation"
             );
         }
+    }
+
+    // The other fixtures are 8x8 squares, so a rows/stride swap in the
+    // output buffer keeps the byte total and stays invisible. A 256x128
+    // page pins the order; opaque alpha on every pixel proves the decoder
+    // wrote all rows of the zero-initialised buffer.
+    // wide.jxl and animated.jxl come verbatim from jxl 0.8.0's
+    // tests/testdata (exif.jxl, 5_frames_numbered_jxli.jxl).
+    #[test]
+    fn wide_jxl_pins_the_row_stride_order() {
+        let page = decode(include_bytes!("testdata/wide.jxl"), "a.jxl").expect("wide jxl decodes");
+        assert_eq!((page.width, page.height), (256, 128));
+        let Pixels::Rgba8(rgba) = &page.pixels else {
+            panic!("jxl must decode to rgba")
+        };
+        assert!(rgba.as_chunks::<4>().0.iter().all(|px| px[3] == 0xFF));
+    }
+
+    // The viewer is static: an animated container yields its first frame,
+    // not all five.
+    #[test]
+    fn animated_jxl_decodes_its_first_frame() {
+        let page =
+            decode(include_bytes!("testdata/animated.jxl"), "a.jxl").expect("animated jxl decodes");
+        assert_eq!((page.width, page.height), (256, 256));
+        let Pixels::Rgba8(rgba) = &page.pixels else {
+            panic!("jxl must decode to rgba")
+        };
+        // The numbered frames paint digits, so a decoded frame carries
+        // non-black pixels.
+        assert!(rgba.as_chunks::<4>().0.iter().any(|px| px[0] != 0 || px[1] != 0 || px[2] != 0));
     }
 
     // The fixtures are single-group, so only this test drives the runner's

@@ -28,7 +28,7 @@ sevenz-rust2 = { version = "0.24", default-features = false, features = ["bzip2"
 # AVIF via libavif + dav1d (built from source; needs the flake devShell toolchain)
 libavif-sys = { version = "0.17", default-features = false, features = ["codec-dav1d"] }
 # JPEG XL via jxl-rs (pure Rust)
-jxl = "0.7"
+jxl = "0.8"
 
 [profile.release]
 lto = "thin"
