@@ -33,9 +33,11 @@ pub struct PageFacts {
     pub dims: (u32, u32),
 }
 
-/// Render the status bar into `ui`. egui 0.37 panels show into the
-/// `&mut Ui` that `EguiGlow::run` hands over, not into a context.
-pub fn show(ui: &mut egui::Ui, status: &StatusLine) {
+/// Render the status bar into `ui` and return the content rect: what
+/// the chrome has not consumed, the only legal page viewport. egui 0.37
+/// panels show into the `&mut Ui` that `EguiGlow::run` hands over, not
+/// into a context.
+pub fn show(ui: &mut egui::Ui, status: &StatusLine) -> egui::Rect {
     egui::Panel::bottom("status").show(ui, |ui| {
         // Sides measures the right end from what it renders, so the
         // facts truncate at the group's true edge. Without
@@ -49,6 +51,7 @@ pub fn show(ui: &mut egui::Ui, status: &StatusLine) {
             |ui| right_end(ui, status),
         );
     });
+    ui.available_rect_before_wrap()
 }
 
 /// The mode group plus a showing toast to its left. The Sides right
@@ -275,8 +278,13 @@ mod tests {
             )),
             ..Default::default()
         };
-        ctx.run_ui(input(), |ui| show(ui, status)).drop_without_applying_deltas();
-        let mut out = ctx.run_ui(input(), |ui| show(ui, status));
+        ctx.run_ui(input(), |ui| {
+            show(ui, status);
+        })
+        .drop_without_applying_deltas();
+        let mut out = ctx.run_ui(input(), |ui| {
+            show(ui, status);
+        });
         let shapes = mem::take(&mut out.shapes);
         out.drop_without_applying_deltas();
         let mut items = Vec::new();
@@ -288,6 +296,46 @@ mod tests {
 
     fn find<'items>(items: &'items [TextItem], prefix: &str) -> &'items TextItem {
         items.iter().find(|item| item.text.starts_with(prefix)).expect(prefix)
+    }
+
+    /// Runs the bar twice (egui panel sizing settles one frame late)
+    /// and returns the content rect of the settled run.
+    fn settled_content(width: f32, status: &StatusLine) -> egui::Rect {
+        let ctx = egui::Context::default();
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(width, 600.0),
+            )),
+            ..Default::default()
+        };
+        let mut settled = egui::Rect::NOTHING;
+        ctx.run_ui(input(), |ui| settled = show(ui, status))
+            .drop_without_applying_deltas();
+        let out = ctx.run_ui(input(), |ui| {
+            show(ui, status);
+        });
+        out.drop_without_applying_deltas();
+        settled
+    }
+
+    #[test]
+    fn content_rect_is_the_window_above_the_bar() {
+        let rect = settled_content(WIDE, &status());
+        assert!(rect.min.x.abs() < ROUND, "{}", rect.min.x);
+        assert!((rect.width() - WIDE).abs() < ROUND, "{}", rect.width());
+        assert!(rect.min.y.abs() < ROUND, "{}", rect.min.y);
+        assert!(rect.max.y > 400.0, "content must span most of the window: {}", rect.max.y);
+        assert!(rect.max.y < 600.0, "content must exclude the bar strip: {}", rect.max.y);
+    }
+
+    #[test]
+    fn content_rect_tracks_the_bar_not_the_window_width() {
+        let wide = settled_content(WIDE, &status());
+        let narrow = settled_content(NARROW, &status());
+        assert!((narrow.width() - NARROW).abs() < ROUND);
+        // One truncating line of text, so the bar height barely moves.
+        assert!((narrow.max.y - wide.max.y).abs() < 8.0, "{narrow:?} vs {wide:?}");
     }
 
     /// The panel frame's inner margin is the flush-left and

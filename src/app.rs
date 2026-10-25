@@ -20,7 +20,7 @@ use crate::keys::Action;
 use crate::render::PageTextures;
 use crate::source::Source;
 use crate::view;
-use crate::view::{Placement, Seat, Spread, SpreadLayout, ViewMode};
+use crate::view::{ContentPos, Placement, Seat, Spread, SpreadLayout, ViewMode, Viewport};
 use crate::window::Window;
 use crate::worker::{SeatView, SpreadView, Worker};
 
@@ -172,7 +172,7 @@ pub struct App {
     /// on-screen spread equals this, so every spread change must
     /// retune.
     retuned_spread: Spread,
-    cursor: (f32, f32),
+    cursor: ContentPos,
     dragging: bool,
     /// Set while any wanted seat is undecided. There is no spinner
     /// animation because it would force repaints of the parked loop.
@@ -182,6 +182,9 @@ pub struct App {
     /// Layout of the spread currently on screen. Pan and zoom read this
     /// memo between frames.
     last_layout: SpreadLayout,
+    /// The viewport the last frame painted into. Pan and zoom read this
+    /// memo between frames; `frame()` refreshes it after every egui pass.
+    last_viewport: Viewport,
     fit: Fit,
     /// Proxy for egui's repaint bridge. winit 0.30 cannot create one from
     /// `ActiveEventLoop`.
@@ -206,11 +209,12 @@ impl App {
             fatal_error: None,
             held: [None, None],
             retuned_spread: spread,
-            cursor: (0.0, 0.0),
+            cursor: ContentPos::default(),
             dragging: false,
             waiting_since: None,
             mode_toast_since: None,
             last_layout: SpreadLayout::default(),
+            last_viewport: Viewport::default(),
             fit: Fit::default(),
             proxy,
         }
@@ -285,21 +289,11 @@ impl App {
         let Some(size) = self.surface_size() else {
             return Ok(());
         };
-        let win = view::px_f32((size.width, size.height));
 
         let spread = self.spread();
         debug_assert_eq!(spread, self.retuned_spread, "every spread change must retune the worker");
         let snapshot = self.worker.snapshot(&spread);
         let seat_views = self.display(spread, &snapshot);
-
-        // A user zoom or pan wins over the shape-triggered refit.
-        let total = self.last_layout.total();
-        if self.fit.should_refit(total) {
-            if !self.fit.user_moved {
-                self.state.placement = view::fit(total, win);
-            }
-            self.fit.settle(total);
-        }
 
         let folded = fold_status(spread, self.state.mode, &seat_views);
         self.waiting_since = folded
@@ -337,9 +331,32 @@ impl App {
         };
 
         let Some(gl) = self.gl.as_mut() else { return Ok(()) };
+
+        // egui lays out first: `EguiGlow::run` only records shapes, so
+        // the chrome rect is settled before pages are placed, and paint
+        // still draws the bar after the pages.
+        let mut content = egui::Rect::NOTHING;
+        gl.egui.run(gl.window.winit(), |ui| content = ui::show(ui, &status));
+        let viewport =
+            content_viewport(size, content, gl.egui.egui_ctx.pixels_per_point());
+        // A viewport change gets the resize treatment. The bar's height
+        // moves with fonts and egui zoom without any winit resize event.
+        if viewport != self.last_viewport {
+            self.fit.resized();
+            self.last_viewport = viewport;
+        }
+
+        // A user zoom or pan wins over the shape-triggered refit.
+        let total = self.last_layout.total();
+        if self.fit.should_refit(total) {
+            if !self.fit.user_moved {
+                self.state.placement = view::fit(total, viewport);
+            }
+            self.fit.settle(total);
+        }
+
         gl.egui.painter.clear([size.width, size.height], clear_color(gl.window.translucent()));
-        gl.pages.draw((size.width, size.height), &self.last_layout, &self.state.placement);
-        gl.egui.run(gl.window.winit(), |ui| ui::show(ui, &status));
+        gl.pages.draw((size.width, size.height), viewport, &self.last_layout, &self.state.placement);
         gl.egui.paint(gl.window.winit());
         gl.window.pre_present_and_swap()?;
         // Reveal only after the first frame is presented, so the window
@@ -366,14 +383,10 @@ impl App {
         }
     }
 
-    /// (spread total, window size), the coordinate frame that pan and
-    /// zoom work in. The total is image px, the window physical px.
-    fn geometry(&self) -> ((f32, f32), (f32, f32)) {
-        let window = self.gl.as_ref().map(|gl| {
-            let window_size = gl.window.winit().inner_size();
-            view::px_f32((window_size.width, window_size.height))
-        });
-        (self.last_layout.total(), window.unwrap_or((0.0, 0.0)))
+    /// (spread total, viewport) the pan and zoom math works in, from the
+    /// last frame's memos.
+    fn geometry(&self) -> ((f32, f32), Viewport) {
+        (self.last_layout.total(), self.last_viewport)
     }
 
     fn dispatch(&mut self, act: Action, event_loop: &ActiveEventLoop) {
@@ -527,8 +540,9 @@ impl ApplicationHandler<UserEvent> for App {
 
         match &event {
             WindowEvent::Resized(_) => {
+                // The refit lands in frame(), where the viewport memo
+                // notices the new size.
                 self.surface_size();
-                self.fit.resized();
                 self.request_redraw();
             }
             WindowEvent::KeyboardInput { event: key, .. } => {
@@ -549,11 +563,11 @@ impl ApplicationHandler<UserEvent> for App {
                         wheel_lines(pixels.y, gl.window.winit().scale_factor())
                     }
                 };
-                let (total, window) = self.geometry();
+                let (total, viewport) = self.geometry();
                 // Scroll up (positive dy) zooms in.
                 let zoom_factor = (wheel_delta_y * WHEEL_ZOOM_SENSITIVITY).exp();
                 let zoomed = view::zoom_at(self.state.placement, self.cursor, zoom_factor);
-                self.state.placement = view::clamp(zoomed, total, window);
+                self.state.placement = view::clamp(zoomed, total, viewport);
                 self.fit.note_user_move();
                 self.request_redraw();
             }
@@ -565,17 +579,18 @@ impl ApplicationHandler<UserEvent> for App {
                     clippy::cast_possible_truncation,
                     reason = "cursor positions are window-scale px, exact in f32"
                 )]
-                let cursor_pos = (position.x as f32, position.y as f32);
+                let window_pos = (position.x as f32, position.y as f32);
+                let cursor = ContentPos::from_window(window_pos, self.last_viewport);
                 if self.dragging && !egui_wants {
-                    let (total, window) = self.geometry();
+                    let (total, viewport) = self.geometry();
                     let pan_delta =
-                        (cursor_pos.0 - self.cursor.0, cursor_pos.1 - self.cursor.1);
+                        (cursor.x() - self.cursor.x(), cursor.y() - self.cursor.y());
                     let panned = view::pan(self.state.placement, pan_delta);
-                    self.state.placement = view::clamp(panned, total, window);
+                    self.state.placement = view::clamp(panned, total, viewport);
                     self.fit.note_user_move();
                     self.request_redraw();
                 }
-                self.cursor = cursor_pos;
+                self.cursor = cursor;
             }
             WindowEvent::RedrawRequested => {
                 if let Err(error) = self.frame() {
@@ -600,7 +615,7 @@ const MODE_TOAST: Duration = Duration::from_millis(1500);
 const BACKGROUND: [f32; 3] = [0.08, 0.08, 0.09];
 
 /// Background opacity when the window is translucent.
-const GLASS_ALPHA: f32 = 0.85;
+const GLASS_ALPHA: f32 = 0.8;
 
 /// Framebuffer clear color, premultiplied because Wayland composites
 /// ARGB buffers that way.
@@ -611,6 +626,18 @@ fn clear_color(translucent: bool) -> [f32; 4] {
     } else {
         [red, green, blue, 1.0]
     }
+}
+
+/// The page viewport: the window minus the chrome egui just laid out, in
+/// physical px. The scale is egui's own (`pixels_per_point` = egui zoom x
+/// output scale), the only correct one here, because egui zoom resizes
+/// the bar without any window event.
+fn content_viewport(window: PhysicalSize<u32>, content: egui::Rect, ppp: f32) -> Viewport {
+    let win = view::px_f32((window.width, window.height));
+    // The bar's top edge rounds to a whole physical px, matching the
+    // rounding of egui's own clip rects.
+    let bar_top = (content.max.y * ppp).round();
+    Viewport::above_bottom_bar(win, win.1 - bar_top)
 }
 
 #[expect(
@@ -627,7 +654,7 @@ fn glass_fill() -> egui::Color32 {
 /// One wheel notch zooms ~×1.16, three notches ~×1.6.
 const WHEEL_ZOOM_SENSITIVITY: f32 = 0.15;
 
-/// Assumed wheel resolution for pixel-mode wheels, in physical px of
+/// Assumed wheel resolution for pixel-mode wheels, in logical px of
 /// scroll per line.
 const PIXELS_PER_WHEEL_LINE: f32 = 40.0;
 
@@ -682,7 +709,18 @@ mod tests {
     fn glass_fill_pins_the_background_glass() {
         // The bar must repeat the background glass. Exact bytes, so no
         // formula or constructor change can drift them apart silently.
-        assert_eq!(glass_fill(), egui::Color32::from_rgba_premultiplied(17, 17, 20, 217));
+        assert_eq!(glass_fill(), egui::Color32::from_rgba_premultiplied(16, 16, 18, 204));
+    }
+
+    #[test]
+    fn content_viewport_subtracts_the_bar_in_physical_px() {
+        let content = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1280.0, 772.0));
+        let integer = content_viewport(PhysicalSize::new(1280, 800), content, 1.0);
+        assert_eq!(integer.size(), (1280.0, 772.0));
+        // Fractional output scale: 772 pt at 1.25 ppp leaves 965 physical
+        // px of content in a 1000 px window.
+        let fractional = content_viewport(PhysicalSize::new(1600, 1000), content, 1.25);
+        assert_eq!(fractional.size(), (1600.0, 965.0));
     }
 
     #[test]

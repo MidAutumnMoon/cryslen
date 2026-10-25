@@ -242,24 +242,53 @@ impl PageTextures {
         });
     }
 
-    /// Draw the spread laid out by `layout` with `placement`.
+    /// Draw the spread into `viewport`, laid out by `layout` with
+    /// `placement`. Scissor-clipped to the viewport, so pages never
+    /// render under chrome even when panned past it.
     ///
     /// Does not clear. The app owns the framebuffer clear each frame.
-    pub fn draw(&self, size: (u32, u32), layout: &SpreadLayout, placement: &Placement) {
+    pub fn draw(
+        &self,
+        size: (u32, u32),
+        viewport: view::Viewport,
+        layout: &SpreadLayout,
+        placement: &Placement,
+    ) {
         if size.0 == 0 || size.1 == 0 {
             return;
         }
         // SAFETY: program and vao are Self's fields, live until Drop.
         unsafe { begin_frame(&self.gl, self.program, self.vao, size); }
+        // Pages stop at the chrome edge. GL scissor is bottom-origin,
+        // window coordinates are top-origin.
+        let (viewport_origin, content) = (viewport.origin(), viewport.size());
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "viewport origin and size are whole physical px carried as f32"
+        )]
+        let (left, top, width, height) =
+            (viewport_origin.0 as u32, viewport_origin.1 as u32, content.0 as u32, content.1 as u32);
+        // SAFETY: the context is current; this only toggles scissor state.
+        unsafe { self.gl.enable(glow::SCISSOR_TEST); }
+        // SAFETY: same contract, setting the scissor box.
+        unsafe {
+            self.gl.scissor(
+                gl_int(left),
+                gl_int(size.1.saturating_sub(top + height)),
+                gl_int(width),
+                gl_int(height),
+            );
+        }
         for (rect, page) in layout.rects.iter().zip(self.seats.iter()) {
             let Some(rect) = rect else { continue };
             let Some(page) = page else { continue };
             let Some(entry) = self.textures.get(page) else { continue };
-            // Whole-pixel rect origin: LINEAR samples shimmer at 1:1 zoom
-            // on fractional offsets otherwise.
+            // Whole-pixel window-px origin: LINEAR samples shimmer at 1:1
+            // zoom on fractional offsets otherwise.
             let screen_origin = (
-                rect.pos.0.mul_add(placement.scale, placement.offset.0).round(),
-                rect.pos.1.mul_add(placement.scale, placement.offset.1).round(),
+                viewport_origin.0 + rect.pos.0.mul_add(placement.scale, placement.offset.0).round(),
+                viewport_origin.1 + rect.pos.1.mul_add(placement.scale, placement.offset.1).round(),
             );
             let screen_size = (rect.size.0 * placement.scale, rect.size.1 * placement.scale);
             if screen_size.0 <= 0.0 || screen_size.1 <= 0.0 {
@@ -270,6 +299,8 @@ impl PageTextures {
                 draw_page(&self.gl, self.program, entry, screen_origin, screen_size, placement.scale);
             }
         }
+        // SAFETY: the context is current; restores unclipped raster state.
+        unsafe { self.gl.disable(glow::SCISSOR_TEST); }
     }
 }
 
