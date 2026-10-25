@@ -21,6 +21,11 @@ use app::{App, UserEvent};
 use source::Source;
 use worker::Worker;
 
+use rustfs_mimalloc::MiMalloc;
+
+#[global_allocator]
+static ALLOC: MiMalloc = MiMalloc;
+
 /// An image file opens its parent directory at that image. A directory or
 /// archive opens as itself.
 enum Arg {

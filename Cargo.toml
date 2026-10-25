@@ -13,7 +13,6 @@ bytemuck = "1"
 egui = { version = "0.37", default-features = false, features = ["default_fonts"] }
 egui-winit = { version = "0.37", default-features = false, features = ["wayland"] }
 egui_glow = { version = "0.37", default-features = false, features = ["winit", "wayland"] }
-# System font fallback for non-Latin filenames
 egui_system_font_provider = "0.37"
 glow = "0.17"
 glutin = { version = "0.32", default-features = false, features = ["egl", "wayland"] }
@@ -25,15 +24,12 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 natord = "1"
 zip = { version = "9", default-features = false, features = ["deflate"] }
 sevenz-rust2 = { version = "0.24", default-features = false, features = ["bzip2"] }
-# AVIF via libavif + dav1d, built from source. Building it needs the
-# flake devShell toolchain.
 libavif-sys = { version = "0.17", default-features = false, features = ["codec-dav1d"] }
-# JPEG XL via jxl-rs, pure Rust
 jxl = "0.8"
 
-# Logging
 tracing = "0.1"
 ino_tracing = "1"
+rustfs-mimalloc = { version = "0.7.2", features = ["override", "no_profile"] }
 
 [profile.release]
 lto = "thin"
