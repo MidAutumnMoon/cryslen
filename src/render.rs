@@ -5,10 +5,10 @@
 //!
 //! Runtime texture-creation failure panics. Recovery is deliberately
 //! not built. An upstream `egui_glow` unwrap can panic at runtime
-//! anyway, so recovery could not be total. The failure is also rare on
+//! anyway, so recovery cannot be total. The failure is also rare on
 //! target hardware.
 //!
-//! Chroma siting (avifChromaSamplePosition) is not applied: the default
+//! Chroma siting (avifChromaSamplePosition) is not applied. The default
 //! co-sited/midway assumption biases chroma by at most half a texel,
 //! invisible in practice.
 
@@ -21,7 +21,7 @@ use glow::HasContext;
 
 use crate::decode::{plane_bytes, plane_dims, Decoded, Matrix, Pixels, Plane, Subsampling};
 use crate::view;
-use crate::view::{Placement, Seat, SpreadLayout};
+use crate::view::{Placement, Seat, SpreadLayout, Viewport};
 
 /// Fixed -1..1 strip. The VS places it at the seat's screen rect from
 /// uniforms, so pan/zoom never touch vertex data. Top-origin math lives in
@@ -148,8 +148,8 @@ enum Textures {
     },
 }
 
-/// Neutral gray chroma for mono pages, in 8-bit storage (128 of 255;
-/// the wide-plane equivalent is `1 << (depth - 1)`).
+/// Neutral gray chroma for mono pages in 8-bit storage, 128 of 255.
+/// The wide-plane equivalent is `1 << (depth - 1)`.
 const MONO_CHROMA_MIDPOINT_8: u8 = 128;
 
 const IDENTITY3: [f32; 9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
@@ -166,8 +166,9 @@ const RGBA_UNIFORMS: PageUniforms = PageUniforms {
 impl PageTextures {
     pub fn new(gl: Arc<glow::Context>) -> eros::Result<Self> {
         let (vs, fs) = if gl.version().is_embedded { (VS_ES, FS_ES) } else { (VS_CORE, FS_CORE) };
-        // SAFETY: the returned names land in Self, whose Drop deletes them;
-        // the error path below leaks them into the process-fatal exit.
+        // SAFETY: the returned names land in Self, whose Drop deletes
+        // them. The error path below leaks them into the process-fatal
+        // exit.
         let (program, vao, vbo) = unsafe { create_pipeline(&gl, vs, fs) }?;
         #[expect(
             clippy::map_err_ignore,
@@ -250,7 +251,7 @@ impl PageTextures {
     pub fn draw(
         &self,
         size: (u32, u32),
-        viewport: view::Viewport,
+        viewport: Viewport,
         layout: &SpreadLayout,
         placement: &Placement,
     ) {
@@ -259,18 +260,17 @@ impl PageTextures {
         }
         // SAFETY: program and vao are Self's fields, live until Drop.
         unsafe { begin_frame(&self.gl, self.program, self.vao, size); }
-        // Pages stop at the chrome edge. GL scissor is bottom-origin and
-        // the viewport hugs the window's top-left, so only the height
-        // converts.
+        // GL scissor is bottom-origin and the viewport hugs the window's
+        // top-left, so only the height converts.
         #[expect(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
             reason = "viewport size is whole physical px carried as f32"
         )]
         let (width, height) = (viewport.size().0 as u32, viewport.size().1 as u32);
-        // SAFETY: the context is current; this only toggles scissor state.
+        // SAFETY: the context is current. This only toggles scissor state.
         unsafe { self.gl.enable(glow::SCISSOR_TEST); }
-        // SAFETY: same contract, setting the scissor box.
+        // SAFETY: same contract as above, setting the scissor box.
         unsafe {
             self.gl.scissor(
                 0,
@@ -298,7 +298,8 @@ impl PageTextures {
                 draw_page(&self.gl, self.program, entry, screen_origin, screen_size, placement.scale);
             }
         }
-        // SAFETY: the context is current; restores unclipped raster state.
+        // SAFETY: the context is current. This restores unclipped raster
+        // state.
         unsafe { self.gl.disable(glow::SCISSOR_TEST); }
     }
 }
@@ -312,7 +313,8 @@ impl Drop for PageTextures {
             // only reference to each entry.
             unsafe { delete_textures(&self.gl, &entry.textures); }
         }
-        // SAFETY: the context outlives this drop; these names are deleted once, here.
+        // SAFETY: the context outlives this drop. These names are
+        // deleted once, here.
         unsafe { delete_pipeline(&self.gl, self.program, self.vao, self.vbo); }
     }
 }
@@ -406,7 +408,7 @@ unsafe fn create_pipeline(
     Ok((program, vao, vbo))
 }
 
-/// Own the frame state the page draws depend on. egui's paint leaves BLEND
+/// Set the frame state the page draws depend on. egui's paint leaves BLEND
 /// enabled, and nothing resets the viewport after a resize.
 ///
 /// # Safety
@@ -426,7 +428,7 @@ unsafe fn begin_frame(
     gl.uniform_2_f32(gl.get_uniform_location(program, "u_win").as_ref(), win.0, win.1);
 }
 
-/// Set one seat's uniforms, bind its textures, draw the quad.
+/// Draw one seat's quad.
 ///
 /// # Safety
 ///
@@ -516,7 +518,7 @@ unsafe fn delete_textures(gl: &glow::Context, textures: &Textures) {
 
 #[expect(
     clippy::cast_possible_wrap,
-    reason = "GL enums, 16384-capped texture edges, and window px all sit far below i32; this is the GL ABI's u32-enum to i32-parameter seam"
+    reason = "GL enums, 16384-capped texture edges, and window px all sit far below i32. This is the GL ABI's u32-enum to i32-parameter seam"
 )]
 fn gl_int(value: u32) -> i32 {
     value as i32
@@ -538,8 +540,8 @@ unsafe fn new_texture(gl: &glow::Context, filterable: bool) -> <glow::Context as
     gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, gl_int(glow::CLAMP_TO_EDGE));
     gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, gl_int(glow::CLAMP_TO_EDGE));
     let (min, mag) = if filterable {
-        // Mipmapped minification: fit view of a 50MP page minifies ~8x;
-        // LINEAR-only shimmer.
+        // Mipmapped minification: a fit view of a 50MP page minifies
+        // ~8x. LINEAR-only minification shimmers.
         (glow::LINEAR_MIPMAP_LINEAR, glow::LINEAR)
     } else {
         (glow::NEAREST, glow::NEAREST)
@@ -624,7 +626,7 @@ unsafe fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> Entry {
             let ((luma_w, luma_h), (chroma_w, chroma_h)) =
                 plane_dims((width, height), yuv.subsampling);
             let wide = matches!(yuv.luma, Plane::U16(_));
-            // GL_R16 is not filterable in GLES: LINEAR makes the texture
+            // GL_R16 is not filterable in GLES. LINEAR makes the texture
             // incomplete (samples black).
             let filterable = !(gl.version().is_embedded && wide);
             let expect = |plane: &Plane, want_samples: usize, what: &str| {
@@ -635,8 +637,9 @@ unsafe fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> Entry {
             let luma_texture =
                 upload_plane(gl, plane_bytes(&yuv.luma), (luma_w, luma_h), wide, filterable);
             let (cb_texture, cr_texture) = if yuv.subsampling == Subsampling::Mono {
-                // 1x1 chroma at the range midpoint; the matrix cancels it
-                // to neutral gray. Native pairs match plane_bytes' U16 layout.
+                // 1x1 chroma at the range midpoint, which the matrix
+                // cancels to neutral gray. Native byte pairs match
+                // plane_bytes' U16 layout.
                 #[expect(
                     clippy::host_endian_bytes,
                     reason = "the midpoint pairs with plane_bytes' native-endian U16 layout"

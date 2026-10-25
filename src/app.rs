@@ -69,9 +69,8 @@ struct FoldedStatus {
 
 /// Fold the seats' views into status facts, visiting the seats in reading
 /// order so the spread's lead page speaks. `seat_views[i]` is the worker's
-/// view for `spread.seats(mode)[i]`. A seat still deciding yields its place
-/// to the other one. A failed page stops the fold. Its facts do not
-/// exist, and the partner's would describe the wrong page.
+/// view for `spread.seats(mode)[i]`. A failed page stops the fold, because
+/// its facts do not exist and the partner's would describe the wrong page.
 fn fold_status(spread: Spread, mode: ViewMode, seat_views: &[Option<SeatView>; 2]) -> FoldedStatus {
     use std::iter;
 
@@ -125,8 +124,8 @@ impl Fit {
         self.refit();
     }
 
-    /// Fit afresh when the viewport changed: window resize, egui zoom, or
-    /// a late font settling. User placement does not survive.
+    /// Fit afresh when the viewport changed. User placement does not
+    /// survive.
     fn viewport_changed(&mut self) {
         self.refit();
     }
@@ -143,8 +142,8 @@ impl Fit {
 }
 
 /// Everything that exists only between `resumed` and exit (winit
-/// requirement). Field order is drop order. Pages and egui are dropped
-/// while the window, which owns the GL context, is still alive.
+/// requirement). The window owns the GL context, so it drops last,
+/// after pages and egui.
 struct Gl {
     pages: PageTextures,
     egui: egui_glow::EguiGlow,
@@ -173,7 +172,7 @@ pub struct App {
     /// on-screen spread equals this, so every spread change must
     /// retune.
     retuned_spread: Spread,
-    /// Cursor position in viewport px, which is window px while the
+    /// Cursor position in viewport px, equal to window px because the
     /// viewport hugs the window's top-left.
     cursor: (f32, f32),
     dragging: bool,
@@ -186,7 +185,7 @@ pub struct App {
     /// memo between frames.
     last_layout: SpreadLayout,
     /// The viewport the last frame painted into. Pan and zoom read this
-    /// memo between frames; `frame()` refreshes it after every egui pass.
+    /// memo between frames. `frame()` refreshes it after every egui pass.
     last_viewport: Viewport,
     fit: Fit,
     /// Proxy for egui's repaint bridge. winit 0.30 cannot create one from
@@ -234,7 +233,6 @@ impl App {
         self.fatal_error.take()
     }
 
-    /// Spread for the current index/mode, clamped to the book.
     fn spread(&self) -> Spread {
         view::spread_for(self.state.index, self.state.mode, self.source.len())
     }
@@ -358,10 +356,10 @@ impl App {
             gl.egui.run(gl.window.winit(), |ui| content = ui::show(ui, &status));
             content_viewport(size, content, gl.egui.egui_ctx.pixels_per_point())
         };
-        // A viewport change gets the resize treatment: the bar's height
-        // moves with fonts and egui zoom without any winit resize event.
-        // The status line above was built at the old scale, so redraw
-        // once to correct it.
+        // The bar's height moves with fonts and egui zoom, with no winit
+        // resize event, so the viewport is diffed every frame. The status
+        // line above was built at the old scale, so redraw once to
+        // correct it.
         if viewport != self.last_viewport {
             self.fit.viewport_changed();
             self.last_viewport = viewport;
@@ -399,8 +397,8 @@ impl App {
         }
     }
 
-    /// (spread total, viewport) the pan and zoom math works in, from the
-    /// last frame's memos.
+    /// The (spread total, viewport) pair that pan and zoom work in, from
+    /// the last frame's memos.
     fn geometry(&self) -> ((f32, f32), Viewport) {
         (self.last_layout.total(), self.last_viewport)
     }
@@ -496,7 +494,9 @@ impl ApplicationHandler<UserEvent> for App {
                 post(&proxy.lock(), UserEvent::Repaint(info.delay));
             });
         }
-        // Opaque mode deliberately keeps egui's default panel fill.
+        // Opaque mode deliberately keeps egui's default panel fill. The
+        // fill applies once here; frame()'s clear follows the mode every
+        // frame.
         if window.translucent() {
             egui.egui_ctx.all_styles_mut(|style| style.visuals.panel_fill = glass_fill());
         }
@@ -593,7 +593,7 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CursorMoved { position, .. } => {
                 #[expect(
                     clippy::cast_possible_truncation,
-                    reason = "cursor positions are window-scale px, exact in f32"
+                    reason = "cursor positions are physical px, exact in f32"
                 )]
                 let cursor_pos = (position.x as f32, position.y as f32);
                 if self.dragging && !egui_wants {
@@ -647,14 +647,16 @@ fn clear_color(translucent: bool) -> [f32; 4] {
 /// above the status bar's top edge, in physical px, full width. The
 /// scale is egui's own (`pixels_per_point` = egui zoom x output scale),
 /// never the window's scale factor.
-fn content_viewport(window: PhysicalSize<u32>, content: egui::Rect, ppp: f32) -> Viewport {
+fn content_viewport(window: PhysicalSize<u32>, content: egui::Rect, pixels_per_point: f32) -> Viewport {
     let win = view::px_f32((window.width, window.height));
     // The bar's top edge rounds to a whole physical px, matching the
     // rounding of egui's own clip rects.
-    let bar_top = (content.max.y * ppp).round();
+    let bar_top = (content.max.y * pixels_per_point).round();
     Viewport::above_bottom_bar(win, bar_top)
 }
 
+/// The glass as egui's u8 color: only a conversion of [`clear_color`],
+/// never a second premultiplication.
 #[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -732,8 +734,8 @@ mod tests {
         let content = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1280.0, 772.0));
         let integer = content_viewport(PhysicalSize::new(1280, 800), content, 1.0);
         assert_eq!(integer.size(), (1280.0, 772.0));
-        // Fractional output scale: 772 pt at 1.25 ppp leaves 965 physical
-        // px of content in a 1000 px window.
+        // Fractional output scale: 772 pt at 1.25 pixels per point leaves
+        // 965 physical px of content in a 1000 px window.
         let fractional = content_viewport(PhysicalSize::new(1600, 1000), content, 1.25);
         assert_eq!(fractional.size(), (1600.0, 965.0));
     }

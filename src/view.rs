@@ -1,6 +1,5 @@
-//! View math: the view modes, the spread-pairing model (cover alone,
-//! then pairs), and the placement of a composed spread (1–2 pages) in
-//! the window. Pure data, no GL.
+//! View math: the view modes, the spread-pairing model, and the
+//! placement of a composed spread in the viewport. Pure data, no GL.
 
 /// A way of laying out and reading pages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,12 +16,10 @@ impl ViewMode {
     /// The modes in status-bar display order.
     pub const ALL: [Self; 3] = [Self::Normal, Self::Manga, Self::Comic];
 
-    /// Whether pages pair into spreads.
     pub fn pairs(self) -> bool {
         matches!(self, Self::Manga | Self::Comic)
     }
 
-    /// Whether reading runs right to left.
     pub fn rtl(self) -> bool {
         self == Self::Manga
     }
@@ -36,7 +33,7 @@ impl ViewMode {
         }
     }
 
-    /// The key that selects this mode, shown next to the name.
+    /// The key that selects this mode.
     pub fn shortcut(self) -> &'static str {
         match self {
             Self::Normal => "n",
@@ -55,7 +52,7 @@ impl ViewMode {
     }
 }
 
-/// Which pages one screen shows. The cover is alone, afterwards pairs,
+/// Which pages one screen shows. The cover is alone, then pairs,
 /// 0-based: `0`, `1+2`, `3+4`, ...
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Spread {
@@ -63,8 +60,8 @@ pub struct Spread {
     pub second: Option<usize>,
 }
 
-/// Spread containing `index` under `mode`, clamped to the book: an
-/// odd tail shows one page (`second: None`), never a phantom page.
+/// Spread containing `index` under `mode`, clamped to the book. An
+/// odd tail shows one page (`second: None`).
 pub fn spread_for(index: usize, mode: ViewMode, len: usize) -> Spread {
     let len = len.max(1);
     let index = index.min(len - 1);
@@ -79,8 +76,7 @@ pub fn spread_for(index: usize, mode: ViewMode, len: usize) -> Spread {
 }
 
 /// Next/previous spread start from `current`, wrapping at the ends.
-/// Forward from the last spread lands on the cover, and backward from
-/// the cover on the last spread. Always returns a spread *start*.
+/// Always returns a spread *start*.
 pub fn advance(current: usize, forward: bool, mode: ViewMode, len: usize) -> usize {
     let len = len.max(1);
     let current = current.min(len - 1);
@@ -138,8 +134,7 @@ impl Seat {
 }
 
 /// Seat order as [left, right] under `mode`. Western reads first-left.
-/// Manga reads first-right, so the first page lands in the right seat
-/// and a lone page sits there.
+/// Manga reads first-right, so a lone page sits on the right.
 pub fn seating<T>(first: T, second: Option<T>, mode: ViewMode) -> [Option<T>; 2] {
     if mode.rtl() {
         [second, Some(first)]
@@ -154,15 +149,13 @@ impl Spread {
         seating(self.first, self.second, mode)
     }
 
-    /// Whether `page` is one of this spread's pages.
     pub fn contains(&self, page: usize) -> bool {
         self.first == page || self.second == Some(page)
     }
 }
 
 /// Where pages live: the window area left after egui chrome, in physical
-/// px, anchored at the window's top-left. Placement offsets are relative
-/// to the viewport's top-left, which is the window's, never below it.
+/// px, anchored at the window's top-left.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Viewport {
     size: (f32, f32),
@@ -171,13 +164,13 @@ pub struct Viewport {
 impl Viewport {
     /// A viewport filling the window above a bottom chrome strip whose
     /// top edge sits `bar_top` physical px from the window top. The only
-    /// constructor, so a viewport is always chrome-aware: a whole-window
-    /// viewport is the visible, greppable `above_bottom_bar(win, win.1)`.
+    /// sizing constructor, so every non-empty viewport is chrome-aware.
+    /// A whole-window viewport is the visible, greppable
+    /// `above_bottom_bar(win, win.1)`.
     pub fn above_bottom_bar(window: (f32, f32), bar_top: f32) -> Self {
         Self { size: (window.0.max(0.0), bar_top.clamp(0.0, window.1.max(0.0))) }
     }
 
-    /// The viewport's size.
     pub fn size(self) -> (f32, f32) {
         self.size
     }
@@ -199,8 +192,6 @@ pub struct PageRect {
 }
 
 /// Layout of a spread's visual seats. `rects` is always [left, right].
-/// Seating (which page goes where) is decided before layout by
-/// [`Spread::seats`]. A seat with no decoded page yet is `None`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SpreadLayout {
     pub rects: [Option<PageRect>; 2],
@@ -244,20 +235,18 @@ pub fn layout(dims: [Option<(u32, u32)>; 2]) -> SpreadLayout {
 
 /// Placement that fits `total` into the viewport, centered.
 pub fn fit(total: (f32, f32), viewport: Viewport) -> Placement {
-    let win = viewport.size();
-    if total.0 <= 0.0 || total.1 <= 0.0 || win.0 <= 0.0 || win.1 <= 0.0 {
+    let size = viewport.size();
+    if total.0 <= 0.0 || total.1 <= 0.0 || size.0 <= 0.0 || size.1 <= 0.0 {
         return Placement { scale: 1.0, offset: (0.0, 0.0) };
     }
-    let scale = (win.0 / total.0).min(win.1 / total.1);
+    let scale = (size.0 / total.0).min(size.1 / total.1);
     Placement {
         scale,
-        offset: (total.0.mul_add(-scale, win.0) / 2.0, total.1.mul_add(-scale, win.1) / 2.0),
+        offset: (total.0.mul_add(-scale, size.0) / 2.0, total.1.mul_add(-scale, size.1) / 2.0),
     }
 }
 
-/// Zoom scale bounds: `scale` is screen px per image px, so these cap how
-/// far in (40 px per image px) and out (20 image px per screen px) a
-/// page can be zoomed.
+/// Zoom scale bounds on `scale`, which is screen px per image px.
 const MIN_SCALE: f32 = 0.05;
 const MAX_SCALE: f32 = 40.0;
 
@@ -277,7 +266,7 @@ pub fn zoom_at(mut placement: Placement, cursor: (f32, f32), factor: f32) -> Pla
     placement
 }
 
-/// Pan by `delta` screen px.
+/// Pan by `delta` viewport px.
 pub fn pan(placement: Placement, delta: (f32, f32)) -> Placement {
     Placement {
         scale: placement.scale,
@@ -285,30 +274,29 @@ pub fn pan(placement: Placement, delta: (f32, f32)) -> Placement {
     }
 }
 
-/// Reachability margin for [`clamp`]: at most this many px of the spread may
-/// hang off any viewport edge (and a fully-visible spread stays centered).
+/// Reachability margin for [`clamp`]: at most this many px of the spread
+/// may hang off any viewport edge.
 const EDGE_KEEP_PX: f32 = 64.0;
 
-/// Clamp pan so the spread cannot be lost: at least `EDGE_KEEP_PX` px of it
-/// stays inside the viewport. An axis where the scaled spread fits the
-/// viewport is pinned to the centered position.
+/// Clamp pan so the spread cannot be lost. An axis where the scaled
+/// spread fits the viewport is pinned to the centered position.
 pub fn clamp(placement: Placement, total: (f32, f32), viewport: Viewport) -> Placement {
-    let window = viewport.size();
+    let size = viewport.size();
     let scaled = (total.0 * placement.scale, total.1 * placement.scale);
     Placement {
         scale: placement.scale,
         offset: (
-            clamp_axis(placement.offset.0, scaled.0, window.0),
-            clamp_axis(placement.offset.1, scaled.1, window.1),
+            clamp_axis(placement.offset.0, scaled.0, size.0),
+            clamp_axis(placement.offset.1, scaled.1, size.1),
         ),
     }
 }
 
-fn clamp_axis(offset: f32, content: f32, window: f32) -> f32 {
-    if content <= window {
-        (window - content) / 2.0
+fn clamp_axis(offset: f32, content: f32, size: f32) -> f32 {
+    if content <= size {
+        (size - content) / 2.0
     } else {
-        offset.clamp(window - content - EDGE_KEEP_PX, EDGE_KEEP_PX)
+        offset.clamp(size - content - EDGE_KEEP_PX, EDGE_KEEP_PX)
     }
 }
 
@@ -361,7 +349,7 @@ mod tests {
         assert_eq!(missing_left.rects[1], Some(PageRect { pos: (0.0, 0.0), size: (100.0, 200.0) }));
     }
 
-    /// The whole window as a viewport, for tests that predate chrome.
+    /// The whole window as a viewport, for tests with no bottom bar.
     fn full_window(win: (f32, f32)) -> Viewport {
         Viewport::above_bottom_bar(win, win.1)
     }
@@ -370,8 +358,8 @@ mod tests {
     fn above_bottom_bar_sizes_and_clamps() {
         let viewport = Viewport::above_bottom_bar((1000.0, 800.0), 740.0);
         assert_eq!(viewport.size(), (1000.0, 740.0));
-        // A bar top past the window bottom degenerates to the window; a
-        // negative one to nothing.
+        // A bar top past the window bottom degenerates to the window.
+        // A negative one degenerates to nothing.
         let past = Viewport::above_bottom_bar((100.0, 50.0), 80.0);
         assert_eq!(past.size(), (100.0, 50.0));
         let negative = Viewport::above_bottom_bar((100.0, 50.0), -10.0);
@@ -413,7 +401,8 @@ mod tests {
     fn zoom_keeps_cursor_anchored() {
         let placement = Placement { scale: 2.0, offset: (100.0, 50.0) };
         let placement = zoom_at(placement, (300.0, 200.0), 2.0);
-        // image pixel under the cursor before: (300-100)/2 = 100; after: (300-offset)/4
+        // The image pixel under the cursor before is (300-100)/2 = 100.
+        // After the zoom it is (300 - offset)/scale.
         assert!(((300.0 - placement.offset.0) / placement.scale - 100.0).abs() < 0.01);
     }
 
@@ -476,8 +465,7 @@ mod tests {
     fn odd_tail_clamps_at_source() {
         // 7 pages: index 6 lives in pair (5, 6).
         assert_eq!(spread_for(6, ViewMode::Manga, 7), Spread { first: 5, second: Some(6) });
-        // 6 pages: the would-be pair (5, 6) shows page 5 alone, with no
-        // phantom page.
+        // 6 pages: the would-be pair (5, 6) shows page 5 alone.
         assert_eq!(spread_for(5, ViewMode::Manga, 6), Spread { first: 5, second: None });
         // Out-of-range index clamps to the last page.
         assert_eq!(spread_for(99, ViewMode::Manga, 6).first, 5);

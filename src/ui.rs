@@ -6,8 +6,7 @@ use crate::decode::Format;
 use crate::source::PageName;
 use crate::view::{Spread, ViewMode};
 
-/// Everything the status bar shows. Built by the app each frame. No
-/// logic lives here beyond formatting.
+/// Everything the status bar shows, built by the app each frame.
 pub struct StatusLine {
     pub total: usize,
     pub spread: Spread,
@@ -165,7 +164,7 @@ mod tests {
     }
 
     /// Section colors in append order. Sections carry no text slices
-    /// here; the text and the deterministic append order pin the mapping.
+    /// here. The text and the deterministic append order pin the mapping.
     fn section_colors(job: &LayoutJob) -> Vec<egui::Color32> {
         job.sections.iter().map(|section| section.format.color).collect()
     }
@@ -274,17 +273,12 @@ mod tests {
         let input = || egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
-                egui::vec2(width, 600.0),
+                egui::vec2(width, SCREEN_HEIGHT),
             )),
             ..Default::default()
         };
-        ctx.run_ui(input(), |ui| {
-            show(ui, status);
-        })
-        .drop_without_applying_deltas();
-        let mut out = ctx.run_ui(input(), |ui| {
-            show(ui, status);
-        });
+        ctx.run_ui(input(), |ui| { show(ui, status); }).drop_without_applying_deltas();
+        let mut out = ctx.run_ui(input(), |ui| { show(ui, status); });
         let shapes = mem::take(&mut out.shapes);
         out.drop_without_applying_deltas();
         let mut items = Vec::new();
@@ -305,16 +299,13 @@ mod tests {
         let input = || egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
-                egui::vec2(width, 600.0),
+                egui::vec2(width, SCREEN_HEIGHT),
             )),
             ..Default::default()
         };
         let mut settled = egui::Rect::NOTHING;
-        ctx.run_ui(input(), |ui| settled = show(ui, status))
-            .drop_without_applying_deltas();
-        let out = ctx.run_ui(input(), |ui| {
-            show(ui, status);
-        });
+        ctx.run_ui(input(), |ui| settled = show(ui, status)).drop_without_applying_deltas();
+        let out = ctx.run_ui(input(), |ui| { show(ui, status); });
         out.drop_without_applying_deltas();
         settled
     }
@@ -326,11 +317,11 @@ mod tests {
         assert!((rect.width() - WIDE).abs() < ROUND, "{}", rect.width());
         assert!(rect.min.y.abs() < ROUND, "{}", rect.min.y);
         assert!(rect.max.y > 400.0, "content must span most of the window: {}", rect.max.y);
-        assert!(rect.max.y < 600.0, "content must exclude the bar strip: {}", rect.max.y);
+        assert!(rect.max.y < SCREEN_HEIGHT, "content must exclude the bar strip: {}", rect.max.y);
     }
 
     #[test]
-    fn content_rect_tracks_the_bar_not_the_window_width() {
+    fn content_rect_tracks_the_bar_height_not_the_window_width() {
         let wide = settled_content(WIDE, &status());
         let narrow = settled_content(NARROW, &status());
         assert!((narrow.width() - NARROW).abs() < ROUND);
@@ -342,6 +333,8 @@ mod tests {
     /// flush-right anchor. `ROUND` tolerates pixel rounding.
     const PANEL_MARGIN: f32 = 8.0;
     const ROUND: f32 = 0.51;
+    /// The screen height every helper renders into.
+    const SCREEN_HEIGHT: f32 = 600.0;
     /// Screen widths: wide enough to show everything, narrow enough to
     /// force elision.
     const WIDE: f32 = 1280.0;
