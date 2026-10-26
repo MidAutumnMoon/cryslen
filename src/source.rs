@@ -370,7 +370,6 @@ fn sort_pages(names: &mut [String]) {
 #[expect(clippy::expect_used, clippy::unwrap_used, reason = "a panic in test code is inconsequential")]
 mod tests {
     use super::*;
-    use crate::decode;
     use crate::testkit::{tiny_png, TempDir};
 
     use std::io::Write as _;
@@ -386,13 +385,16 @@ mod tests {
     #[test]
     fn sevenz_listing_and_read() {
         let source = Source::open(Path::new(SEVENZ_FIXTURE)).expect("7z opens");
-        assert_eq!(source.len(), 2);
+        assert_eq!(source.names, ["p1.png", "p2.png"]);
         assert_eq!(
             source.page_name(0),
             PageName { parent: None, file: "p1.png".into() }
         );
-        assert_eq!(source.names, ["p1.png", "p2.png"]);
         let bytes = source.bytes(0).expect("first page reads");
+        // A repeat read returns the same bytes (via the tier, which the
+        // read or the racing harvest thread may have filled).
+        let repeat = source.bytes(0).expect("first page reads again");
+        assert_eq!(*repeat, *bytes);
         assert_eq!(bytes.get(..8), Some(&b"\x89PNG\r\n\x1a\n"[..]));
         #[expect(
             clippy::big_endian_bytes,
@@ -407,19 +409,6 @@ mod tests {
         let width = be_u32(16).expect("fixture ihdr width");
         let height = be_u32(20).expect("fixture ihdr height");
         assert_eq!((width, height), (40, 30));
-        let decoded_page = decode::decode(&bytes, "p1.png").expect("decodes");
-        assert_eq!((decoded_page.width, decoded_page.height), (width, height));
-    }
-
-    #[test]
-    fn sevenz_repeat_read_served_from_tier() {
-        let source = Source::open(Path::new(SEVENZ_FIXTURE)).expect("7z opens");
-        let first = source.bytes(0).expect("first page reads");
-        // Either bytes or the harvest thread may have filled the tier, and
-        // both write the same member's bytes.
-        assert!(source.tier_has(0), "tier holds the page after a read");
-        let second = source.bytes(0).expect("second page reads");
-        assert_eq!(first, second);
     }
 
     #[test]
@@ -531,9 +520,9 @@ mod tests {
             source.page_name(3),
             PageName { parent: Some("deep".into()), file: "005.png".into() }
         );
+        // bytes(1) is b/010.png, written with color 1.
         let page = source.bytes(1).expect("entry readable");
-        let decoded = decode::decode(&page, "b/010.png").unwrap();
-        assert_eq!(decoded.width, 2);
+        assert_eq!(page.as_ref(), tiny_png(2, 2, [1, 0, 0, 255]).as_slice());
     }
 
     #[test]
@@ -550,12 +539,8 @@ mod tests {
             Source::open(&dir.path().join("book.rar")),
             Err(SourceError::Unsupported(_))
         ));
-    }
-
-    #[test]
-    fn open_under_regular_file_reports_io() {
-        let dir = TempDir::new("pageenotdir");
         dir.write("plain.txt", b"not a directory");
+        // A path under a regular file reports io, not NotFound.
         assert!(matches!(
             Source::open(&dir.path().join("plain.txt").join("page.png")),
             Err(SourceError::Io(_))

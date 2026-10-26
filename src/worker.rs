@@ -407,7 +407,7 @@ fn retain_trail(pending: &mut BTreeSet<usize>, anchor: usize, wanted: &Spread) {
 mod tests {
     use super::*;
     use crate::decode::Format;
-    use crate::testkit::{tiny_png, TempDir};
+    use crate::testkit::{ready_seat, tiny_png, TempDir};
     use crate::view::Spread;
 
     use std::sync::Condvar;
@@ -459,20 +459,19 @@ mod tests {
         }
     }
 
+    // Direction semantics are owned by view::seats; these two asserts pin
+    // only the SpreadView::seats delegation.
     #[test]
     fn view_seating_follows_reading_direction() {
         let lone = SpreadView { first: SeatView::Pending, second: None };
+        // A lone page sits on the right under Manga.
         assert!(matches!(lone.seats(ViewMode::Manga), [None, Some(SeatView::Pending)]));
-        assert!(matches!(lone.seats(ViewMode::Normal), [Some(SeatView::Pending), None]));
         let pair =
             SpreadView { first: SeatView::Pending, second: Some(SeatView::Failed("x".into())) };
+        // A pair reverses its order under Manga.
         assert!(
             matches!(pair.seats(ViewMode::Manga), [Some(SeatView::Failed(_)), Some(SeatView::Pending)])
         );
-        assert!(matches!(
-            pair.seats(ViewMode::Normal),
-            [Some(SeatView::Pending), Some(SeatView::Failed(_))]
-        ));
     }
 
     #[test]
@@ -489,7 +488,7 @@ mod tests {
         let mut book = Book::new();
         book.wanted = Spread { first: 10, second: Some(11) };
         book.pending.extend([10, 11]);
-        book.store(10, ready_page(10));
+        book.store(10, ready_seat(2, 1));
         book.pending.extend(8..=12);
         assert_eq!(book.take_next(), Some(11));
         assert!(!book.pending.contains(&10));
@@ -501,26 +500,14 @@ mod tests {
         assert_eq!(order, vec![11, 9, 12, 8]);
     }
 
-    fn ready_page(label: u8) -> SeatView {
-        SeatView::Ready(Arc::new(
-            Decoded::rgba(
-                2,
-                1,
-                Format::Png,
-                vec![label; 8].into_boxed_slice(),
-            )
-            .unwrap(),
-        ))
-    }
-
     #[test]
     fn evicts_unwanted_pages_far_first() {
         let mut book = Book::new();
         book.budget = 8;
         let wanted = Spread { first: 5, second: Some(6) };
         book.retune(wanted, 10);
-        book.store(1, ready_page(1));
-        book.store(3, ready_page(3));
+        book.store(1, ready_seat(2, 1));
+        book.store(3, ready_seat(2, 1));
         assert!(book.decided.contains_key(&3));
         assert!(!book.decided.contains_key(&1));
         assert!(book.live_bytes <= book.budget);
@@ -533,9 +520,9 @@ mod tests {
         let wanted = Spread { first: 5, second: Some(6) };
         book.retune(Spread { first: 1, second: None }, 10);
         book.retune(wanted, 10);
-        book.store(1, ready_page(1));
+        book.store(1, ready_seat(2, 1));
         // Page 3 is nearer the spread but was never wanted, so it goes.
-        book.store(3, ready_page(3));
+        book.store(3, ready_seat(2, 1));
         assert!(book.decided.contains_key(&1));
         assert!(!book.decided.contains_key(&3));
     }
@@ -548,8 +535,8 @@ mod tests {
         book.retune(Spread { first: 1, second: None }, 10);
         book.retune(Spread { first: 2, second: None }, 10);
         book.retune(wanted, 10);
-        book.store(1, ready_page(1));
-        book.store(2, ready_page(2));
+        book.store(1, ready_seat(2, 1));
+        book.store(2, ready_seat(2, 1));
         assert!(book.decided.contains_key(&2));
         assert!(!book.decided.contains_key(&1));
     }
@@ -563,9 +550,9 @@ mod tests {
         let wanted = Spread { first: 7, second: Some(8) };
         book.retune(Spread { first: 1, second: None }, 20);
         book.retune(wanted, 20);
-        book.store(1, ready_page(1));
-        book.store(7, ready_page(7));
-        book.store(8, ready_page(8));
+        book.store(1, ready_seat(2, 1));
+        book.store(7, ready_seat(2, 1));
+        book.store(8, ready_seat(2, 1));
         assert!(book.decided.contains_key(&7));
         assert!(book.decided.contains_key(&8));
         assert!(!book.decided.contains_key(&1));
@@ -642,11 +629,21 @@ mod tests {
         {
             thread::sleep(Duration::from_millis(10));
         }
-        match worker.snapshot(&wanted).first {
-            SeatView::Failed(msg) => assert!(msg.contains("page 1"), "{msg}"),
+        let failed = match worker.snapshot(&wanted).first {
+            SeatView::Failed(msg) => msg,
             SeatView::Ready(_) => panic!("bad.png decoded as Ready?"),
             SeatView::Pending => panic!("page 0 not decided in time"),
-        }
+        };
+        assert!(failed.contains("page 1"), "{failed}");
+        // The entry is sticky across turns: turn to page 1, then back.
+        worker.retune(Spread { first: 1, second: None });
+        wait_ready(&worker, &[1]);
+        worker.retune(wanted);
+        let revisit = worker.snapshot(&wanted).first;
+        assert!(
+            matches!(&revisit, SeatView::Failed(msg) if *msg == failed),
+            "page 0 lost its sticky failure across a turn"
+        );
     }
 
     fn tiny_source(tag: &str, page_count: u8) -> (TempDir, Arc<Source>) {

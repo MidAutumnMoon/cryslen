@@ -730,7 +730,7 @@ mod jxl {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used, clippy::unwrap_used, clippy::panic, reason = "a panic in test code is inconsequential")]
+#[expect(clippy::expect_used, clippy::panic, reason = "a panic in test code is inconsequential")]
 mod tests {
     use super::*;
     use crate::testkit;
@@ -755,13 +755,7 @@ mod tests {
 
     #[test]
     fn jpeg_roundtrip() {
-        use std::io::Cursor;
-
-        let img = image::RgbImage::from_pixel(5, 2, image::Rgb([200, 100, 50]));
-        let mut jpg = Vec::new();
-        image::DynamicImage::ImageRgb8(img)
-            .write_to(&mut Cursor::new(&mut jpg), image::ImageFormat::Jpeg)
-            .expect("encode jpeg");
+        let jpg = testkit::tiny_jpeg(5, 2, [200, 100, 50]);
         let page = decode(&jpg, "p.jpg").expect("jpeg decodes");
         assert_eq!(page.format, Format::Jpeg);
         assert_eq!((page.width, page.height), (5, 2));
@@ -769,15 +763,9 @@ mod tests {
 
     #[test]
     fn truncated_jpeg_is_an_error_not_panic() {
-        use std::io::Cursor;
-
-        let img = image::RgbImage::from_pixel(32, 32, image::Rgb([1, 2, 3]));
-        let mut jpg = Vec::new();
-        image::DynamicImage::ImageRgb8(img)
-            .write_to(&mut Cursor::new(&mut jpg), image::ImageFormat::Jpeg)
-            .unwrap();
-        let truncated: Vec<u8> = jpg.iter().take(20).copied().collect();
-        assert!(matches!(decode(&truncated, "p.jpg"), Err(DecodeError::Image(Format::Jpeg, _))));
+        let jpg = testkit::tiny_jpeg(32, 32, [1, 2, 3]);
+        let truncated = jpg.get(..20).expect("jpeg is longer than the cut");
+        assert!(matches!(decode(truncated, "p.jpg"), Err(DecodeError::Image(Format::Jpeg, _))));
     }
 
     #[test]
@@ -796,6 +784,26 @@ mod tests {
             vec![0_u8; 4 * MAX_TEXTURE_EDGE as usize].into_boxed_slice(),
         )
         .expect("page at the edge cap constructs");
+    }
+
+    // Dims inside the texture-edge cap can still exceed the pixel-count
+    // cap, which must reject the page before any buffer is sized for it.
+    #[test]
+    fn pixel_count_over_the_cap_is_rejected() {
+        assert!(matches!(
+            Decoded::rgba(MAX_TEXTURE_EDGE, MAX_TEXTURE_EDGE, Format::Png, Box::default()),
+            Err(DecodeError::Corrupt("bad dimensions"))
+        ));
+    }
+
+    // Odd edges round chroma up (div_ceil); mono carries a 1x1 stub the
+    // renderer binds as a midpoint texture.
+    #[test]
+    fn plane_dims_on_odd_sizes() {
+        assert_eq!(plane_dims((5, 3), Subsampling::Mono), ((5, 3), (1, 1)));
+        assert_eq!(plane_dims((5, 3), Subsampling::Yuv420), ((5, 3), (3, 2)));
+        assert_eq!(plane_dims((5, 3), Subsampling::Yuv422), ((5, 3), (3, 3)));
+        assert_eq!(plane_dims((5, 3), Subsampling::Yuv444), ((5, 3), (5, 3)));
     }
 
     #[test]
@@ -863,7 +871,7 @@ mod tests {
     }
 
     #[test]
-    fn yuv_mono_boundary() {
+    fn yuv_plane_extent_boundary() {
         let mono = |luma: Plane| YuvImage {
             depth: 10,
             subsampling: Subsampling::Mono,
@@ -878,6 +886,21 @@ mod tests {
         let empty = mono(Plane::U16(Box::new([])));
         assert!(matches!(
             Decoded::yuv(32, 16, Format::Avif, empty),
+            Err(DecodeError::Corrupt("yuv plane extent"))
+        ));
+        // A 420 image whose chroma planes are stubs: a 4x2 image needs
+        // 2x1 chroma samples.
+        let undersized = YuvImage {
+            depth: 8,
+            subsampling: Subsampling::Yuv420,
+            full_range: true,
+            matrix: Matrix::Bt601,
+            luma: Plane::U8(vec![0; 4 * 2].into_boxed_slice()),
+            cb: Plane::U8(Box::new([])),
+            cr: Plane::U8(Box::new([])),
+        };
+        assert!(matches!(
+            Decoded::yuv(4, 2, Format::Avif, undersized),
             Err(DecodeError::Corrupt("yuv plane extent"))
         ));
     }
@@ -911,7 +934,8 @@ mod tests {
 
     // A truncation bug would hang the decode instead of failing it, hence
     // the watchdog thread. The cuts cover the header, the frame header, and
-    // the pixels.
+    // the pixels. A decode panic closes the channel and fails the recv, so
+    // plain asserts on the main thread suffice.
     #[test]
     fn truncated_jxl_ends_the_decode() {
         use std::sync::mpsc;
@@ -919,20 +943,21 @@ mod tests {
         use std::time::Duration;
 
         let fixture = include_bytes!("testdata/gray.jxl");
-        for (cut, message) in [
-            (1, "jxl: truncated header"),
-            (2, "jxl: truncated header"),
-            (8, "jxl: truncated image"),
-            (35, "jxl: truncated image"),
-        ] {
-            let truncated = fixture.get(..cut).expect("cut inside the fixture").to_vec();
-            let (tx, rx) = mpsc::channel();
-            thread::spawn(move || {
-                let Ok(()) = tx.send(decode(&truncated, "a.jxl")) else { return; };
-            });
-            let result = rx
-                .recv_timeout(Duration::from_secs(5))
-                .expect("truncated jxl decode finishes");
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            for (cut, message) in [
+                (1_usize, "jxl: truncated header"),
+                (2, "jxl: truncated header"),
+                (8, "jxl: truncated image"),
+                (35, "jxl: truncated image"),
+            ] {
+                let truncated = fixture.get(..cut).expect("cut inside the fixture");
+                let Ok(()) = tx.send((cut, message, decode(truncated, "a.jxl"))) else { return; };
+            }
+        });
+        for _ in 0..4 {
+            let (cut, message, result) =
+                rx.recv_timeout(Duration::from_secs(5)).expect("truncated jxl decode finishes");
             assert!(
                 matches!(result, Err(DecodeError::Corrupt(actual)) if actual == message),
                 "cut {cut} reported the wrong truncation"

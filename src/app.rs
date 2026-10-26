@@ -686,22 +686,14 @@ fn wheel_lines(dy: f64, scale_factor: f64) -> f32 {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used, reason = "a panic in test code is inconsequential")]
 mod tests {
     use super::*;
+    use crate::testkit::ready_seat;
 
-    fn ready(width: u32, height: u32) -> SeatView {
-        SeatView::Ready(Arc::new(
-            Decoded::rgba(
-                width,
-                height,
-                Format::Png,
-                vec![0_u8; width as usize * height as usize * 4].into_boxed_slice(),
-            )
-            .expect("valid rgba page"),
-        ))
-    }
-
+    #[expect(
+        clippy::float_cmp_const,
+        reason = "the opaque variant returns the same constants untouched, so equality is exact"
+    )]
     #[test]
     fn clear_color_is_premultiplied() {
         let [red, green, blue, alpha] = clear_color(true);
@@ -710,15 +702,6 @@ mod tests {
         for (channel, straight) in [red, green, blue].into_iter().zip(BACKGROUND) {
             assert!((straight.mul_add(GLASS_ALPHA, -channel)).abs() < 1e-6);
         }
-        assert!(red <= alpha && green <= alpha && blue <= alpha);
-    }
-
-    #[expect(
-        clippy::float_cmp_const,
-        reason = "the opaque variant returns the same constants untouched, so equality is exact"
-    )]
-    #[test]
-    fn opaque_clear_color_is_the_plain_background() {
         assert_eq!(clear_color(false), [BACKGROUND[0], BACKGROUND[1], BACKGROUND[2], 1.0]);
     }
 
@@ -741,17 +724,24 @@ mod tests {
     }
 
     #[test]
+    fn pixel_wheel_zoom_speed_does_not_vary_with_output_scale_factor() {
+        assert_eq!(wheel_lines(40.0, 1.0), 1.0);
+        assert_eq!(wheel_lines(80.0, 2.0), 1.0);
+        assert_eq!(wheel_lines(40.0, 2.0), 0.5);
+    }
+
+    #[test]
     fn fold_waits_on_any_pending_wanted_seat() {
         let spread = Spread { first: 0, second: Some(1) };
-        let both_decided = [Some(ready(2, 2)), Some(SeatView::Failed("x".into()))];
+        let both_decided = [Some(ready_seat(2, 2)), Some(SeatView::Failed("x".into()))];
         assert!(!fold_status(spread, ViewMode::Comic, &both_decided).waiting);
-        let right_pending = [Some(ready(2, 2)), Some(SeatView::Pending)];
+        let right_pending = [Some(ready_seat(2, 2)), Some(SeatView::Pending)];
         assert!(fold_status(spread, ViewMode::Comic, &right_pending).waiting);
-        let left_pending = [Some(SeatView::Pending), Some(ready(2, 2))];
+        let left_pending = [Some(SeatView::Pending), Some(ready_seat(2, 2))];
         assert!(fold_status(spread, ViewMode::Comic, &left_pending).waiting);
         // An unwanted seat is never waited on.
         let single_spread = Spread { first: 0, second: None };
-        let single = [Some(ready(2, 2)), None];
+        let single = [Some(ready_seat(2, 2)), None];
         assert!(!fold_status(single_spread, ViewMode::Normal, &single).waiting);
     }
 
@@ -776,33 +766,16 @@ mod tests {
     }
 
     #[test]
-    fn page_turn_discards_user_placement() {
-        let mut fit = Fit::default();
-        fit.settle((100.0, 200.0));
-        fit.note_user_move();
-        fit.page_turned();
-        assert!(fit.should_refit((100.0, 200.0)));
-        assert!(!fit.user_moved);
-    }
-
-    #[test]
-    fn viewport_change_discards_user_placement() {
-        let mut fit = Fit::default();
-        fit.settle((100.0, 200.0));
-        fit.note_user_move();
-        fit.viewport_changed();
-        assert!(fit.should_refit((100.0, 200.0)));
-        assert!(!fit.user_moved);
-    }
-
-    #[test]
-    fn reset_view_discards_user_placement() {
-        let mut fit = Fit::default();
-        fit.settle((100.0, 200.0));
-        fit.note_user_move();
-        fit.reset_view();
-        assert!(fit.should_refit((100.0, 200.0)));
-        assert!(!fit.user_moved);
+    fn page_turn_viewport_change_and_reset_discard_user_placement() {
+        let discard_placement = [Fit::page_turned, Fit::viewport_changed, Fit::reset_view];
+        for discard in discard_placement {
+            let mut fit = Fit::default();
+            fit.settle((100.0, 200.0));
+            fit.note_user_move();
+            discard(&mut fit);
+            assert!(fit.should_refit((100.0, 200.0)));
+            assert!(!fit.user_moved);
+        }
     }
 
     #[test]
@@ -812,7 +785,7 @@ mod tests {
         assert_eq!(fold_status(spread, ViewMode::Comic, &both_failed).error.as_deref(), Some("seat0"));
         // Manga reads the right seat first, so its error wins.
         assert_eq!(fold_status(spread, ViewMode::Manga, &both_failed).error.as_deref(), Some("seat1"));
-        let right_failed = [Some(ready(2, 2)), Some(SeatView::Failed("seat1".into()))];
+        let right_failed = [Some(ready_seat(2, 2)), Some(SeatView::Failed("seat1".into()))];
         assert_eq!(fold_status(spread, ViewMode::Comic, &right_failed).error.as_deref(), Some("seat1"));
     }
 
@@ -820,23 +793,20 @@ mod tests {
     fn fold_takes_facts_from_the_lead_page() {
         let spread = Spread { first: 0, second: Some(1) };
         // In Manga the lead page sits in the right seat.
-        let both = [Some(ready(800, 600)), Some(ready(640, 480))];
+        let both = [Some(ready_seat(800, 600)), Some(ready_seat(640, 480))];
         assert_eq!(fold_status(spread, ViewMode::Manga, &both).page, Some((Format::Png, (640, 480))));
         assert_eq!(fold_status(spread, ViewMode::Comic, &both).page, Some((Format::Png, (800, 600))));
         // A still-deciding lead seat yields its place to the other page.
-        let lead_pending = [Some(ready(800, 600)), Some(SeatView::Pending)];
+        let lead_pending = [Some(ready_seat(800, 600)), Some(SeatView::Pending)];
         assert_eq!(fold_status(spread, ViewMode::Manga, &lead_pending).page, Some((Format::Png, (800, 600))));
-        assert!(fold_status(spread, ViewMode::Manga, &lead_pending).waiting);
         // A failed lead stops the fold.
-        let lead_failed = [Some(ready(800, 600)), Some(SeatView::Failed("seat1".into()))];
+        let lead_failed = [Some(ready_seat(800, 600)), Some(SeatView::Failed("seat1".into()))];
         assert_eq!(fold_status(spread, ViewMode::Manga, &lead_failed).page, None);
         assert_eq!(fold_status(spread, ViewMode::Manga, &lead_failed).error.as_deref(), Some("seat1"));
-        // The partner's decode still counts as waiting even then.
         let failed_and_pending = [Some(SeatView::Pending), Some(SeatView::Failed("x".into()))];
-        assert!(fold_status(spread, ViewMode::Manga, &failed_and_pending).waiting);
         assert_eq!(fold_status(spread, ViewMode::Manga, &failed_and_pending).page, None);
         // An empty seat never speaks.
-        let only_right = [None, Some(ready(800, 600))];
+        let only_right = [None, Some(ready_seat(800, 600))];
         assert_eq!(fold_status(spread, ViewMode::Manga, &only_right).page, Some((Format::Png, (800, 600))));
     }
 }

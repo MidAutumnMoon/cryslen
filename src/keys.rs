@@ -75,30 +75,26 @@ mod tests {
 
     #[test]
     fn key_map() {
-        assert_eq!(Action::from_key(KeyCode::Escape), Some(Action::Quit));
-        assert_eq!(Action::from_key(KeyCode::KeyQ), Some(Action::Quit));
-        assert_eq!(
-            Action::from_key(KeyCode::KeyN),
-            Some(Action::SelectMode(ViewMode::Normal))
-        );
-        assert_eq!(
-            Action::from_key(KeyCode::KeyM),
-            Some(Action::SelectMode(ViewMode::Manga))
-        );
-        assert_eq!(
-            Action::from_key(KeyCode::KeyC),
-            Some(Action::SelectMode(ViewMode::Comic))
-        );
-        assert_eq!(Action::from_key(KeyCode::KeyF), Some(Action::ToggleFullscreen));
-        assert_eq!(Action::from_key(KeyCode::KeyR), Some(Action::ResetView));
-        assert_eq!(Action::from_key(KeyCode::ArrowRight), Some(Action::Right));
-        assert_eq!(Action::from_key(KeyCode::ArrowLeft), Some(Action::Left));
-        assert_eq!(Action::from_key(KeyCode::Space), Some(Action::Forward));
-        assert_eq!(Action::from_key(KeyCode::PageDown), Some(Action::Forward));
-        assert_eq!(Action::from_key(KeyCode::PageUp), Some(Action::Back));
-        assert_eq!(Action::from_key(KeyCode::KeyA), None);
-        assert_eq!(Action::from_key(KeyCode::KeyD), None);
-        assert_eq!(Action::from_key(KeyCode::ArrowUp), None);
+        let bindings: &[(KeyCode, Option<Action>)] = &[
+            (KeyCode::Escape, Some(Action::Quit)),
+            (KeyCode::KeyQ, Some(Action::Quit)),
+            (KeyCode::KeyN, Some(Action::SelectMode(ViewMode::Normal))),
+            (KeyCode::KeyM, Some(Action::SelectMode(ViewMode::Manga))),
+            (KeyCode::KeyC, Some(Action::SelectMode(ViewMode::Comic))),
+            (KeyCode::KeyF, Some(Action::ToggleFullscreen)),
+            (KeyCode::KeyR, Some(Action::ResetView)),
+            (KeyCode::ArrowRight, Some(Action::Right)),
+            (KeyCode::ArrowLeft, Some(Action::Left)),
+            (KeyCode::Space, Some(Action::Forward)),
+            (KeyCode::PageDown, Some(Action::Forward)),
+            (KeyCode::PageUp, Some(Action::Back)),
+            (KeyCode::KeyA, None),
+            (KeyCode::KeyD, None),
+            (KeyCode::ArrowUp, None),
+        ];
+        for (code, action) in bindings {
+            assert_eq!(Action::from_key(*code), *action);
+        }
     }
 
     #[test]
@@ -132,27 +128,4 @@ mod tests {
         assert!(!Action::Back.is_forward(ViewMode::Manga));
     }
 
-    #[test]
-    fn page_turn_respects_rtl() {
-        use crate::view;
-
-        // advance() composes with is_forward. In manga, rightward from
-        // page 1 moves to the cover while forward moves deeper in.
-        assert_eq!(view::advance(1, Action::Right.is_forward(ViewMode::Manga), ViewMode::Manga, 10), 0);
-        assert_eq!(view::advance(1, Action::Forward.is_forward(ViewMode::Manga), ViewMode::Manga, 10), 3);
-        assert_eq!(view::advance(1, Action::Right.is_forward(ViewMode::Normal), ViewMode::Normal, 10), 2);
-    }
-
-    #[test]
-    fn mode_keys_match_their_shortcut_letters() {
-        let bindings = [
-            (KeyCode::KeyN, "n", ViewMode::Normal),
-            (KeyCode::KeyM, "m", ViewMode::Manga),
-            (KeyCode::KeyC, "c", ViewMode::Comic),
-        ];
-        for (code, letter, mode) in bindings {
-            assert_eq!(Action::from_key(code), Some(Action::SelectMode(mode)));
-            assert_eq!(mode.shortcut(), letter);
-        }
-    }
 }

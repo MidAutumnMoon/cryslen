@@ -874,52 +874,82 @@ mod tests {
         matrix[col * 3 + row]
     }
 
+    // The u_mode and u_chroma uniforms the shaders branch on.
     #[test]
-    fn chroma_ids() {
+    fn uniform_id_encodings() {
+        assert_eq!(mode_id(Mode::Rgba), 0);
+        assert_eq!(mode_id(Mode::Yuv), 1);
         assert_eq!(chroma_id(Subsampling::Mono), 0);
         assert_eq!(chroma_id(Subsampling::Yuv420), 1);
         assert_eq!(chroma_id(Subsampling::Yuv422), 2);
         assert_eq!(chroma_id(Subsampling::Yuv444), 3);
     }
 
+    /// Each row: `(matrix, full_range, [(row, col, expected)])`. Expected
+    /// entries derive from each standard's published KR/KB with
+    /// KG = 1 - KR - KB: (0, 2) is `2(1 - KR)` and (2, 1) is `2(1 - KB)`,
+    /// each times the chroma scale, and the green terms are
+    /// `2·K·(1 - K)/KG` likewise. Full range leaves the scales at 1, so
+    /// BT.601 gives exactly 1.402 and 1.772. BT.2020 (KR 0.2627,
+    /// KB 0.0593, KG 0.678) gives 1.4746/1.8814 full range and, under
+    /// the 255/224 chroma scale, 1.678674/2.141772 with green terms
+    /// 0.187326/0.650424.
     #[test]
-    fn bt601_limited_matches_documented_constants() {
-        let matrix = yuv_to_rgb_matrix(Matrix::Bt601, false);
-        for row in 0..3 {
-            assert!(
-                (element(&matrix, row, 0) - LIMITED_LUMA_SCALE).abs() < 1e-4,
-                "luma scale row {row}"
-            );
+    fn yuv_to_rgb_matches_documented_constants() {
+        let cases = [
+            (
+                Matrix::Bt601,
+                false,
+                &[
+                    (0, 0, LIMITED_LUMA_SCALE),
+                    (1, 0, LIMITED_LUMA_SCALE),
+                    (2, 0, LIMITED_LUMA_SCALE),
+                    (0, 2, 1.596_027),
+                    (1, 1, -0.391_762),
+                    (1, 2, -0.812_968),
+                    (2, 1, 2.017_232),
+                    (0, 1, 0.0),
+                    (2, 2, 0.0),
+                ][..],
+            ),
+            (
+                Matrix::Bt709,
+                false,
+                &[
+                    (0, 2, 1.792_741),
+                    (1, 1, -0.212_899),
+                    (1, 2, -0.532_909),
+                    (2, 1, 2.112_402),
+                ][..],
+            ),
+            (
+                Matrix::Bt2020,
+                false,
+                &[
+                    (0, 2, 1.678_674),
+                    (1, 1, -0.187_326),
+                    (1, 2, -0.650_424),
+                    (2, 1, 2.141_772),
+                ][..],
+            ),
+            (Matrix::Bt601, true, &[(0, 0, 1.0), (0, 2, 1.402), (2, 1, 1.772)][..]),
+            (Matrix::Bt709, true, &[(0, 2, 1.5748), (2, 1, 1.8556)][..]),
+            (Matrix::Bt2020, true, &[(0, 2, 1.4746), (2, 1, 1.8814)][..]),
+        ];
+        for (matrix, full_range, expected) in cases {
+            let conversion = yuv_to_rgb_matrix(matrix, full_range);
+            // The limited-range constants are published tables accurate to
+            // about 1e-3; the full-range entries are exact 2(1-K)
+            // derivations, so they pin tighter.
+            let tolerance = if full_range { 1e-6 } else { 1e-3 };
+            for &(row, col, want) in expected {
+                assert!(
+                    (element(&conversion, row, col) - want).abs() < tolerance,
+                    "{matrix:?} full_range={full_range} at ({row}, {col})"
+                );
+            }
         }
-        assert!((element(&matrix, 0, 2) - 1.596_027).abs() < 1e-3);
-        assert!((element(&matrix, 1, 1) - -0.391_762).abs() < 1e-3);
-        assert!((element(&matrix, 1, 2) - -0.812_968).abs() < 1e-3);
-        assert!((element(&matrix, 2, 1) - 2.017_232).abs() < 1e-3);
-        assert_eq!(element(&matrix, 0, 1), 0.0);
-        assert_eq!(element(&matrix, 2, 2), 0.0);
-    }
-
-    #[test]
-    fn bt709_limited_matches_documented_constants() {
-        let matrix = yuv_to_rgb_matrix(Matrix::Bt709, false);
-        assert!((element(&matrix, 0, 2) - 1.792_741).abs() < 1e-3);
-        assert!((element(&matrix, 1, 1) - -0.212_899).abs() < 1e-3);
-        assert!((element(&matrix, 1, 2) - -0.532_909).abs() < 1e-3);
-        assert!((element(&matrix, 2, 1) - 2.112_402).abs() < 1e-3);
-    }
-
-    #[test]
-    fn full_range_matrices() {
-        let bt601 = yuv_to_rgb_matrix(Matrix::Bt601, true);
-        assert_eq!(element(&bt601, 0, 0), 1.0);
-        // (0, 2) is 2(1 - KR) and (2, 1) is 2(1 - KB). Full range leaves
-        // the chroma scale at 1, so BT.601 gives exactly 1.402 and 1.772.
-        assert!((element(&bt601, 0, 2) - 1.402).abs() < 1e-6);
-        assert!((element(&bt601, 2, 1) - 1.772).abs() < 1e-6);
-        let bt709 = yuv_to_rgb_matrix(Matrix::Bt709, true);
-        // The same two entries with BT.709's coefficients.
-        assert!((element(&bt709, 0, 2) - 1.5748).abs() < 1e-6);
-        assert!((element(&bt709, 2, 1) - 1.8556).abs() < 1e-6);
+        // Identity is an early return, independent of range.
         assert_eq!(
             yuv_to_rgb_matrix(Matrix::Identity, false),
             [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
@@ -961,10 +991,15 @@ mod tests {
             matrix: Matrix::Bt2020,
             luma: Plane::U8(Box::default()), cb: Plane::U8(Box::default()), cr: Plane::U8(Box::default()),
         });
-        let uniforms = PageUniforms::from(&yuv_pixels);
         assert_eq!(
-            (uniforms.mode, uniforms.subsampling, uniforms.depth, uniforms.full_range, uniforms.matrix),
-            (Mode::Yuv, Subsampling::Yuv420, 10, false, Matrix::Bt2020)
+            PageUniforms::from(&yuv_pixels),
+            PageUniforms {
+                mode: Mode::Yuv,
+                subsampling: Subsampling::Yuv420,
+                depth: 10,
+                full_range: false,
+                matrix: Matrix::Bt2020,
+            }
         );
     }
 
@@ -973,44 +1008,47 @@ mod tests {
         reason = "mirrors entry_cost_bytes' truncated mip-chain cost"
     )]
     #[test]
-    fn rgba_entry_cost_counts_the_mip_chain() {
-        let bytes = vec![0_u8; 4 * 4 * 4].into_boxed_slice();
-        let decoded = Decoded::rgba(4, 4, Format::Png, bytes).expect("rgba page");
-        assert_eq!(entry_cost_bytes(&decoded, true), 64 * 4 / 3);
-    }
-
-    #[expect(
-        clippy::integer_division,
-        reason = "mirrors entry_cost_bytes' truncated mip-chain cost"
-    )]
-    #[test]
-    fn yuv420_entry_cost_counts_the_mip_chain() {
-        let yuv = YuvImage {
-            depth: 8,
-            subsampling: Subsampling::Yuv420,
-            full_range: true,
-            matrix: Matrix::Bt709,
-            luma: Plane::U8(vec![0_u8; 4 * 4].into_boxed_slice()),
-            cb: Plane::U8(vec![0_u8; 2 * 2].into_boxed_slice()),
-            cr: Plane::U8(vec![0_u8; 2 * 2].into_boxed_slice()),
-        };
-        let decoded = Decoded::yuv(4, 4, Format::Avif, yuv).expect("yuv page");
-        assert_eq!(entry_cost_bytes(&decoded, true), (16 + 4 + 4) * 4 / 3);
-    }
-
-    #[test]
-    fn r16_gles_entry_cost_skips_mips() {
-        let yuv = YuvImage {
-            depth: 10,
-            subsampling: Subsampling::Mono,
-            full_range: true,
-            matrix: Matrix::Identity,
-            luma: Plane::U16(vec![0_u16; 4].into_boxed_slice()),
-            cb: Plane::U8(Box::default()),
-            cr: Plane::U8(Box::default()),
-        };
-        let decoded = Decoded::yuv(2, 2, Format::Avif, yuv).expect("yuv page");
-        assert_eq!(entry_cost_bytes(&decoded, false), 4 * 2 + 2 * 2);
+    fn entry_cost_counts_the_mip_chain_where_present() {
+        let rgba =
+            Decoded::rgba(4, 4, Format::Png, vec![0_u8; 64].into_boxed_slice()).expect("rgba page");
+        let yuv420 = Decoded::yuv(
+            4,
+            4,
+            Format::Avif,
+            YuvImage {
+                depth: 8,
+                subsampling: Subsampling::Yuv420,
+                full_range: true,
+                matrix: Matrix::Bt709,
+                luma: Plane::U8(vec![0_u8; 16].into_boxed_slice()),
+                cb: Plane::U8(vec![0_u8; 4].into_boxed_slice()),
+                cr: Plane::U8(vec![0_u8; 4].into_boxed_slice()),
+            },
+        )
+        .expect("yuv page");
+        // Mono planes here are R16, unfilterable under GLES: no mip chain.
+        let mono = Decoded::yuv(
+            2,
+            2,
+            Format::Avif,
+            YuvImage {
+                depth: 10,
+                subsampling: Subsampling::Mono,
+                full_range: true,
+                matrix: Matrix::Identity,
+                luma: Plane::U16(vec![0_u16; 4].into_boxed_slice()),
+                cb: Plane::U8(Box::default()),
+                cr: Plane::U8(Box::default()),
+            },
+        )
+        .expect("mono page");
+        for (decoded, mips, want) in [
+            (&rgba, true, 64 * 4 / 3),
+            (&yuv420, true, (16 + 4 + 4) * 4 / 3),
+            (&mono, false, 4 * 2 + 2 * 2),
+        ] {
+            assert_eq!(entry_cost_bytes(decoded, mips), want);
+        }
     }
 
     #[test]
@@ -1019,6 +1057,9 @@ mod tests {
         // 19 sits one page from seat 1's anchor, so 3 is the farther victim.
         assert_eq!(eviction_victims(costs, [Some(10), Some(20)], 35), vec![3]);
         assert_eq!(eviction_victims(costs, [Some(10), Some(20)], 25), vec![3, 19]);
+        // An equal distance from the seat breaks the tie to the higher page.
+        let tied = [(8_usize, 10_usize), (12, 10), (10, 10)];
+        assert_eq!(eviction_victims(tied, [Some(10), None], 25), vec![12]);
     }
 
     #[test]
@@ -1028,9 +1069,23 @@ mod tests {
         assert_eq!(eviction_victims(costs, [Some(10), Some(11)], 30), vec![]);
     }
 
+    /// Uniform names one shader source declares, in declaration order.
+    fn uniform_names(shader: &str) -> Vec<&str> {
+        shader
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("uniform "))
+            .filter_map(|decl| decl.split(';').next())
+            .filter_map(|decl| decl.trim().rsplit(' ').next())
+            .collect()
+    }
+
+    // The ES shaders never compile on desktop, so a uniform added to only
+    // one variant silently breaks the other platform. Declared-name parity
+    // between each CORE/ES pair catches that here.
     #[test]
-    fn eviction_ties_break_to_the_higher_page() {
-        let costs = [(8_usize, 10_usize), (12, 10), (10, 10)];
-        assert_eq!(eviction_victims(costs, [Some(10), None], 25), vec![12]);
+    fn core_and_es_shaders_declare_the_same_uniforms() {
+        for (core, es) in [(VS_CORE, VS_ES), (FS_CORE, FS_ES)] {
+            assert_eq!(uniform_names(core), uniform_names(es));
+        }
     }
 }

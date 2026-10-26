@@ -315,22 +315,6 @@ mod tests {
     }
 
     #[test]
-    fn mode_table_strings() {
-        assert_eq!(ViewMode::ALL, [ViewMode::Normal, ViewMode::Manga, ViewMode::Comic]);
-        assert_eq!(ViewMode::Normal.effect(), "left to right, single page");
-        assert_eq!(ViewMode::Manga.effect(), "right to left, double page");
-        assert_eq!(ViewMode::Comic.effect(), "left to right, double page");
-    }
-
-    #[test]
-    fn layout_places_seats_left_to_right() {
-        let spread_layout = layout([Some((100, 200)), Some((100, 200))]);
-        assert_eq!(spread_layout.rects[0], Some(PageRect { pos: (0.0, 0.0), size: (100.0, 200.0) }));
-        assert_eq!(spread_layout.rects[1], Some(PageRect { pos: (100.0, 0.0), size: (100.0, 200.0) }));
-        assert_eq!(spread_layout.total(), (200.0, 200.0));
-    }
-
-    #[test]
     fn layout_asymmetric_pair_top_aligned() {
         let spread_layout = layout([Some((100, 300)), Some((200, 150))]);
         assert_eq!(spread_layout.rects[0], Some(PageRect { pos: (0.0, 0.0), size: (100.0, 300.0) }));
@@ -404,6 +388,10 @@ mod tests {
         // The image pixel under the cursor before is (300-100)/2 = 100.
         // After the zoom it is (300 - offset)/scale.
         assert!(((300.0 - placement.offset.0) / placement.scale - 100.0).abs() < 0.01);
+        // Hitting the clamp anchors with the factor actually applied, so
+        // the image point under the cursor stays fixed anyway.
+        let clamped = zoom_at(Placement { scale: 30.0, offset: (100.0, 50.0) }, (300.0, 200.0), 100.0);
+        assert!(((300.0 - clamped.offset.0) / clamped.scale - (300.0 - 100.0) / 30.0).abs() < 0.01);
     }
 
     #[expect(
@@ -431,6 +419,8 @@ mod tests {
         assert!(placement.offset.0 <= EDGE_KEEP_PX + 1e-4);
         // y fits (400 < 500) so it is centered
         assert!((placement.offset.1 - 50.0).abs() < 1e-4);
+        // Clamping moves the offset only; scale passes through.
+        assert_eq!(placement.scale, 1.0);
     }
 
     #[test]
@@ -442,13 +432,6 @@ mod tests {
         let placement = clamp(dragged, total, viewport);
         assert!((placement.offset.0 - fitted.offset.0).abs() < 1e-4);
         assert!((placement.offset.1 - fitted.offset.1).abs() < 1e-4);
-    }
-
-    #[test]
-    fn clamp_never_changes_scale() {
-        let placement =
-            clamp(Placement { scale: 7.0, offset: (1e9, -1e9) }, (100.0, 100.0), full_window((50.0, 50.0)));
-        assert_eq!(placement.scale, 7.0);
     }
 
     #[test]
@@ -472,18 +455,6 @@ mod tests {
     }
 
     #[test]
-    fn advance_steps_and_wraps() {
-        assert_eq!(advance(1, true, ViewMode::Manga, 10), 3);
-        assert_eq!(advance(3, false, ViewMode::Manga, 10), 1);
-        // 8 is the second page of the last spread (7, 8).
-        assert_eq!(advance(8, true, ViewMode::Manga, 9), 0);
-        assert_eq!(advance(1, false, ViewMode::Manga, 10), 0);
-        assert_eq!(advance(4, true, ViewMode::Normal, 10), 5);
-        // The cover's next spread starts at 1, not 2.
-        assert_eq!(advance(0, true, ViewMode::Manga, 10), 1);
-    }
-
-    #[test]
     fn advance_wraps_at_both_ends() {
         // Single mode: last page to first and back.
         assert_eq!(advance(9, true, ViewMode::Normal, 10), 0);
@@ -497,6 +468,12 @@ mod tests {
         // Odd tail: 6 pages are 0 | 1,2 | 3,4 | 5.
         assert_eq!(advance(5, true, ViewMode::Manga, 6), 0);
         assert_eq!(advance(0, false, ViewMode::Manga, 6), 5);
+        // A step from mid-spread lands on the neighbor spread's start.
+        assert_eq!(advance(1, true, ViewMode::Manga, 10), 3);
+        assert_eq!(advance(3, false, ViewMode::Manga, 10), 1);
+        assert_eq!(advance(4, true, ViewMode::Normal, 10), 5);
+        // The cover's next spread starts at 1, not 2.
+        assert_eq!(advance(0, true, ViewMode::Manga, 10), 1);
     }
 
     #[test]

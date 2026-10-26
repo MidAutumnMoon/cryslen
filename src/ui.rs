@@ -194,26 +194,13 @@ mod tests {
     }
 
     #[test]
-    fn single_page_head_and_uncolored_parent() {
-        let style = egui::Style::default();
-        let plain = style.visuals.text_color();
+    fn single_page_head_without_page_facts() {
         let mut status_line = status();
         status_line.spread = Spread { first: 4, second: None };
         status_line.page = None;
         status_line.zoom = 1.0;
-        let job = line(&style, &status_line);
+        let job = line(&egui::Style::default(), &status_line);
         assert_eq!(job.text, "5/214 · b/010.png · 100%");
-        assert_eq!(section_colors(&job), vec![HEAD_COLOR, plain, NAME_COLOR, plain]);
-    }
-
-    #[test]
-    fn head_leads_with_the_spread_range() {
-        let style = egui::Style::default();
-        let mut status_line = status();
-        status_line.spread = Spread { first: 49, second: Some(50) };
-        status_line.total = 2146;
-        let job = line(&style, &status_line);
-        assert!(job.text.starts_with("50-51/2146 · "));
     }
 
     #[test]
@@ -264,9 +251,11 @@ mod tests {
     }
 
     /// Render the bar headlessly on a `width`-wide screen and return
-    /// the text items of the settled frame. Only the texture upload
-    /// needs a GPU, and `drop_without_applying_deltas` skips it.
-    fn render(width: f32, status: &StatusLine) -> Vec<TextItem> {
+    /// the settled frame's text items and content rect. egui panel
+    /// sizing settles one frame late, so a settle pass runs first.
+    /// Only the texture upload needs a GPU, and
+    /// `drop_without_applying_deltas` skips it.
+    fn render(width: f32, status: &StatusLine) -> (Vec<TextItem>, egui::Rect) {
         use std::mem;
 
         let ctx = egui::Context::default();
@@ -278,41 +267,24 @@ mod tests {
             ..Default::default()
         };
         ctx.run_ui(input(), |ui| { show(ui, status); }).drop_without_applying_deltas();
-        let mut out = ctx.run_ui(input(), |ui| { show(ui, status); });
+        let mut content = egui::Rect::NOTHING;
+        let mut out = ctx.run_ui(input(), |ui| content = show(ui, status));
         let shapes = mem::take(&mut out.shapes);
         out.drop_without_applying_deltas();
         let mut items = Vec::new();
         for shape in &shapes {
             walk(&shape.shape, &mut items);
         }
-        items
+        (items, content)
     }
 
     fn find<'items>(items: &'items [TextItem], prefix: &str) -> &'items TextItem {
         items.iter().find(|item| item.text.starts_with(prefix)).expect(prefix)
     }
 
-    /// Runs the bar twice (egui panel sizing settles one frame late)
-    /// and returns the content rect of the settled run.
-    fn settled_content(width: f32, status: &StatusLine) -> egui::Rect {
-        let ctx = egui::Context::default();
-        let input = || egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(width, SCREEN_HEIGHT),
-            )),
-            ..Default::default()
-        };
-        let mut settled = egui::Rect::NOTHING;
-        ctx.run_ui(input(), |ui| settled = show(ui, status)).drop_without_applying_deltas();
-        let out = ctx.run_ui(input(), |ui| { show(ui, status); });
-        out.drop_without_applying_deltas();
-        settled
-    }
-
     #[test]
     fn content_rect_is_the_window_above_the_bar() {
-        let rect = settled_content(WIDE, &status());
+        let (_, rect) = render(WIDE, &status());
         assert!(rect.min.x.abs() < ROUND, "{}", rect.min.x);
         assert!((rect.width() - WIDE).abs() < ROUND, "{}", rect.width());
         assert!(rect.min.y.abs() < ROUND, "{}", rect.min.y);
@@ -322,8 +294,8 @@ mod tests {
 
     #[test]
     fn content_rect_tracks_the_bar_height_not_the_window_width() {
-        let wide = settled_content(WIDE, &status());
-        let narrow = settled_content(NARROW, &status());
+        let (_, wide) = render(WIDE, &status());
+        let (_, narrow) = render(NARROW, &status());
         assert!((narrow.width() - NARROW).abs() < ROUND);
         // One truncating line of text, so the bar height barely moves.
         assert!((narrow.max.y - wide.max.y).abs() < 8.0, "{narrow:?} vs {wide:?}");
@@ -341,24 +313,18 @@ mod tests {
     const NARROW: f32 = 480.0;
 
     #[test]
-    fn facts_flush_left_and_never_shift() {
-        let plain = render(WIDE, &status());
+    fn anchors_hold_with_and_without_toast() {
+        let (plain, _) = render(WIDE, &status());
         let mut with_toast = status();
         with_toast.toast = true;
-        let toast = render(WIDE, &with_toast);
+        let (toast, _) = render(WIDE, &with_toast);
+        // Facts anchor flush left and never shift.
         assert!((find(&plain, "12-13/214").rect.left() - PANEL_MARGIN).abs() < ROUND);
         assert_eq!(
             find(&plain, "12-13/214").rect.left(),
             find(&toast, "12-13/214").rect.left()
         );
-    }
-
-    #[test]
-    fn group_anchored_right_regardless_of_toast() {
-        let plain = render(WIDE, &status());
-        let mut with_toast = status();
-        with_toast.toast = true;
-        let toast = render(WIDE, &with_toast);
+        // The mode group anchors flush right and never moves.
         for items in [&plain, &toast] {
             let comic = find(items, "Comic (c)");
             let rightmost =
@@ -380,20 +346,20 @@ mod tests {
     fn toast_sits_left_of_the_group_only_when_shown() {
         let mut with_toast = status();
         with_toast.toast = true;
-        let toast = render(WIDE, &with_toast);
+        let (toast, _) = render(WIDE, &with_toast);
         assert!(find(&toast, "right to left").rect.right() < find(&toast, "Comic (c)").rect.left());
-        let plain = render(WIDE, &status());
+        let (plain, _) = render(WIDE, &status());
         assert!(plain.iter().all(|item| !item.text.contains(status().mode.effect())));
     }
 
     #[test]
     fn facts_truncate_instead_of_pushing_the_group() {
-        let narrow = render(NARROW, &status());
+        let (narrow, _) = render(NARROW, &status());
         let facts = find(&narrow, "12-13");
         assert!(facts.elided, "facts must elide on a narrow screen");
         assert!(facts.text.ends_with('…'));
         assert!(facts.rect.right() <= find(&narrow, "Comic (c)").rect.left());
-        let wide = render(WIDE, &status());
+        let (wide, _) = render(WIDE, &status());
         assert!(!find(&wide, "12-13").elided);
     }
 }

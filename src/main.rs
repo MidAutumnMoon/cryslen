@@ -121,12 +121,13 @@ fn run(open_path: &Path, land_on: Option<&str>) -> eros::Result<()> {
 #[expect(clippy::expect_used, clippy::panic, reason = "a panic in test code is inconsequential")]
 mod tests {
     use super::*;
-    use crate::testkit::{tiny_png, TempDir};
+    use crate::testkit::TempDir;
 
     #[test]
     fn image_file_argument_opens_parent_dir() {
         let dir = TempDir::new("main-arg-img");
-        dir.write("page.png", &tiny_png(1, 1, [0, 0, 0, 255]));
+        // classify never reads the content, only the extension.
+        dir.write("page.png", b"x");
         match classify(&dir.path().join("page.png")).expect("image file accepted") {
             Arg::Image { dir: parent, name } => {
                 assert_eq!(parent, dir.path());
