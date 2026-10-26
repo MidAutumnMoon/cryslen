@@ -862,10 +862,9 @@ fn yuv_to_rgb_matrix(matrix: Matrix, full_range: bool) -> [f32; 9] {
 #[expect(clippy::expect_used, reason = "a panic in test code is inconsequential")]
 mod tests {
     use super::*;
-    use crate::decode::Format;
-    use crate::decode::YuvImage;
+    use crate::decode::{Format, YuvImage};
 
-    // The GL draw path itself is out of reach headlessly; these tests pin
+    // The GL draw path itself is out of reach headlessly. These tests pin
     // the CPU-side values it consumes.
 
     /// Row `row`, column `col` of the math matrix (storage is column-major).
@@ -904,7 +903,6 @@ mod tests {
         let matrix = yuv_to_rgb_matrix(Matrix::Bt601, false);
         let (luma_anchor, chroma_anchor) = range_offsets(false);
         assert_eq!((luma_anchor, chroma_anchor), (LIMITED_LUMA_BLACK, LIMITED_CHROMA_NEUTRAL));
-        // Studio-swing black and white map to 0.0 and 1.0.
         let black = LIMITED_LUMA_BLACK;
         let white = 235.0 / 255.0;
         for (raw_luma, expected) in [(black, 0.0), (white, 1.0)] {
@@ -971,7 +969,7 @@ mod tests {
         let tied = [(8_usize, 10_usize), (12, 10), (10, 10)];
         let bound = [(10_usize, 10_usize), (11, 10), (12, 10)];
         for (costs, seats, budget, want) in [
-            // 19 sits one page from seat 10, so 3 is the farther victim
+            // 19 sits one page from seat 20, so 3 is the farther victim
             (&far[..], [Some(10), Some(20)], 35, vec![3_usize]),
             (&far[..], [Some(10), Some(20)], 25, vec![3_usize, 19]),
             // an equal distance from the seat breaks the tie to the higher page

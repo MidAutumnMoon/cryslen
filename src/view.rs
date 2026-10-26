@@ -252,7 +252,7 @@ pub fn fit(total: (f32, f32), viewport: Viewport) -> Placement {
 }
 
 /// Zoom scale bounds on `scale`, which is screen px per image px. The
-/// bounds apply at zoom time only — `fit` does not clamp.
+/// bounds apply at zoom time only. `fit` does not clamp.
 const MIN_SCALE: f32 = 0.05;
 const MAX_SCALE: f32 = 40.0;
 
@@ -313,7 +313,6 @@ mod tests {
     /// `spread_for`: mode flags, the lone cover, odd-start pairs, clamping at the source.
     #[test]
     fn spread_structure() {
-        // (mode, pairs, rtl): the pairing and direction flags per mode
         for (mode, pairs, rtl) in [
             (ViewMode::Normal, false, false),
             (ViewMode::Manga, true, true),
@@ -450,10 +449,10 @@ mod tests {
             [absent, Some(right)],       // right only: right starts at x=0
             [Some(left), Some(right)],   // asymmetric pair
         ] {
-            let spread = layout(dims);
-            // rect present iff input Some; x accumulates over present seats, top-aligned
+            let spread_layout = layout(dims);
+            // A present seat gets a rect at the accumulated x, top-aligned.
             let mut next_seat_x = 0.0_f32;
-            for (rect, seat_dims) in spread.rects.iter().zip(dims.iter()) {
+            for (rect, seat_dims) in spread_layout.rects.iter().zip(dims.iter()) {
                 match seat_dims {
                     Some(seat_dims) => {
                         let (width, height) = px_f32(*seat_dims);
@@ -470,8 +469,8 @@ mod tests {
             // total is the width sum by the height max
             let widths = dims.iter().flatten().map(|&seat| px_f32(seat).0).sum::<f32>();
             let heights = dims.iter().flatten().map(|&seat| px_f32(seat).1).fold(0.0_f32, f32::max);
-            assert!((spread.total().0 - widths).abs() < 1e-4, "seats {dims:?}");
-            assert!((spread.total().1 - heights).abs() < 1e-4, "seats {dims:?}");
+            assert!((spread_layout.total().0 - widths).abs() < 1e-4, "seats {dims:?}");
+            assert!((spread_layout.total().1 - heights).abs() < 1e-4, "seats {dims:?}");
         }
     }
 

@@ -1,19 +1,14 @@
-//! Scratch inputs and waits shared by the unit tests: encoded pages
-//! (source, decode, worker), decided seats (app, worker), temp dirs
-//! (main, source, worker), and the `eventually` poll for tests that
-//! observe another thread (source, worker).
+//! Scratch inputs and waits shared by the unit tests: encoded pages,
+//! decided seats, temp dirs, and the `eventually` poll for tests that
+//! observe another thread.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::thread;
-use std::time::{Duration, Instant};
 
-use crate::decode::Decoded;
-use crate::decode::Format;
+use crate::decode::{Decoded, Format};
 use crate::worker::SeatView;
 
-/// `img` straight from the image encoder, in `format`.
 fn encode(img: &image::DynamicImage, format: image::ImageFormat) -> Vec<u8> {
     use std::io::Cursor;
 
@@ -74,6 +69,9 @@ pub fn ready_seat(width: u32, height: u32) -> SeatView {
 ///
 /// Panics with `what` on timeout.
 pub fn eventually<T>(secs: u64, what: &str, mut probe: impl FnMut() -> Option<T>) -> T {
+    use std::thread;
+    use std::time::{Duration, Instant};
+
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
         if let Some(value) = probe() {

@@ -697,7 +697,6 @@ mod tests {
     #[test]
     fn fit_lifecycle() {
         let mut fit = Fit::default();
-        // Nothing settled yet: any total demands a refit.
         assert!(fit.should_refit((100.0, 200.0)), "default demands a refit");
         fit.settle((100.0, 200.0));
         assert!(!fit.should_refit((100.0, 200.0)), "the settled total needs no refit");
@@ -769,8 +768,8 @@ mod tests {
             (pair, ViewMode::Manga, [None, Some(ready_seat(800, 600))],
                 Expect { waiting: false, error: None, page: Some((Format::Png, (800, 600))) }),
         ];
-        for (i, (spread, mode, seats, want)) in rows.iter().enumerate() {
-            let folded = fold_status(*spread, *mode, seats);
+        for (i, (spread, mode, seat_views, want)) in rows.iter().enumerate() {
+            let folded = fold_status(*spread, *mode, seat_views);
             assert_eq!(folded.waiting, want.waiting, "row {i}: waiting");
             assert_eq!(folded.error.as_deref(), want.error, "row {i}: error");
             assert_eq!(folded.page, want.page, "row {i}: page");

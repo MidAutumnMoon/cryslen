@@ -770,7 +770,9 @@ mod tests {
         assert!(matches!(decode(&[], "x"), Err(DecodeError::NotAnImage)));
     }
 
-    /// The in-tree encoders produce pages `decode()` reads back. (The encoder cannot write EXIF orientation tags, so orientation handling has no testable fixture.)
+    /// The in-tree encoders produce pages `decode()` reads back.
+    // The encoder cannot write EXIF orientation tags, so orientation
+    // handling has no testable fixture.
     #[test]
     fn encoder_roundtrips() {
         // png: format, dims, extent, and the first pixel
@@ -787,8 +789,8 @@ mod tests {
         }
 
         // jpeg: format and dims
-        let jpg = testkit::tiny_jpeg(5, 2, [200, 100, 50]);
-        let jpeg_page = decode(&jpg, "p.jpg").expect("jpeg decodes");
+        let jpeg = testkit::tiny_jpeg(5, 2, [200, 100, 50]);
+        let jpeg_page = decode(&jpeg, "p.jpg").expect("jpeg decodes");
         assert_eq!(jpeg_page.format, Format::Jpeg);
         assert_eq!((jpeg_page.width, jpeg_page.height), (5, 2));
 
@@ -840,8 +842,7 @@ mod tests {
     /// `plane_dims` rounds chroma up on odd edges; `Decoded::yuv` rejects wrong plane extents and counts resident bytes with u16 samples double.
     #[test]
     fn yuv_planes() {
-        // odd edges round chroma up (div_ceil); mono carries a 1x1 stub
-        // the renderer binds as a midpoint texture
+        // odd edges round chroma up. Mono carries a 1x1 chroma stub.
         assert_eq!(plane_dims((5, 3), Subsampling::Mono), ((5, 3), (1, 1)));
         assert_eq!(plane_dims((5, 3), Subsampling::Yuv420), ((5, 3), (3, 2)));
         assert_eq!(plane_dims((5, 3), Subsampling::Yuv422), ((5, 3), (3, 3)));
@@ -930,7 +931,7 @@ mod tests {
             Pixels::Yuv(_) => panic!("jxl must decode to rgba"),
         }
 
-        // wide: 256x128 pins the row/stride order; opaque alpha on every
+        // wide: 256x128 pins the row/stride order. Opaque alpha on every
         // pixel proves the decoder wrote all rows of the zero-initialised
         // buffer
         let wide = decode(include_bytes!("testdata/wide.jxl"), "a.jxl").expect("wide jxl decodes");

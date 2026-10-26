@@ -117,7 +117,7 @@ mod tests {
             assert!(!act.repeats(), "{act:?} is one-shot");
         }
         let forwards: &[(Action, ViewMode, bool)] = &[
-            // Left to right, the rightward arrow advances; the
+            // Left to right, the rightward arrow advances. The
             // reading-order keys never flip.
             (Action::Right, ViewMode::Normal, true),
             (Action::Left, ViewMode::Normal, false),

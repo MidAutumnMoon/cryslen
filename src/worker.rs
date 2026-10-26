@@ -477,7 +477,7 @@ mod tests {
     }
 
     /// Eviction rank under budget pressure: never-wanted pages first, then least-recently-wanted, then farthest.
-    // store()'s debug asserts guard wanted coverage and live_bytes; the
+    // store()'s debug asserts guard wanted coverage and live_bytes. The
     // kept/dropped checks below also protect release builds.
     #[test]
     fn eviction_rank() {
@@ -559,32 +559,39 @@ mod tests {
     /// store's number. Retunes sent while parked are guaranteed queued
     /// behind it, which pins the decode order for assertions.
     #[derive(Clone)]
-    struct Gate(Arc<(Mutex<(u64, u64)>, Condvar)>);
+    struct Gate(Arc<(Mutex<GateTickets>, Condvar)>);
+
+    /// Ticket ledger of a [`Gate`]: the next number to hand out and the
+    /// highest number released so far.
+    struct GateTickets {
+        next: u64,
+        released_through: u64,
+    }
 
     impl Gate {
         fn new() -> Self {
-            Self(Arc::new((Mutex::new((0, 0)), Condvar::new())))
+            Self(Arc::new((Mutex::new(GateTickets { next: 0, released_through: 0 }), Condvar::new())))
         }
 
         fn hold(&self) {
             let (state, cv) = &*self.0;
             let mut state = state.lock().unwrap();
-            state.0 += 1;
-            let ticket = state.0;
+            state.next += 1;
+            let ticket = state.next;
             // Times out so a failed assertion cannot hang Drop's join.
             let deadline = Instant::now() + Duration::from_secs(5);
             let (_state, _timeout) = cv
                 .wait_timeout_while(
                     state,
                     deadline.saturating_duration_since(Instant::now()),
-                    |state| state.1 < ticket,
+                    |state| state.released_through < ticket,
                 )
                 .unwrap();
         }
 
         fn release(&self, through: u64) {
             let (state, cv) = &*self.0;
-            state.lock().unwrap().1 = through;
+            state.lock().unwrap().released_through = through;
             cv.notify_all();
         }
     }
@@ -594,7 +601,7 @@ mod tests {
             eventually(20, &format!("page {page} not decoded in time"), || {
                 match worker.snapshot(&Spread::lone(page)).first {
                     SeatView::Ready(seat) => Some(seat),
-                    SeatView::Failed(msg) => panic!("page {page} failed: {msg}"),
+                    SeatView::Failed(message) => panic!("page {page} failed: {message}"),
                     SeatView::Pending => None,
                 }
             });
@@ -630,7 +637,7 @@ mod tests {
         worker.retune(bad);
         let failed = eventually(20, "page 0 not decided in time", || {
             match worker.snapshot(&bad).first {
-                SeatView::Failed(msg) => Some(msg),
+                SeatView::Failed(message) => Some(message),
                 SeatView::Ready(_) => panic!("bad.png decoded as Ready?"),
                 SeatView::Pending => None,
             }
@@ -642,7 +649,7 @@ mod tests {
         worker.retune(bad);
         let revisit = worker.snapshot(&bad).first;
         assert!(
-            matches!(&revisit, SeatView::Failed(msg) if *msg == failed),
+            matches!(&revisit, SeatView::Failed(message) if *message == failed),
             "page 0 lost its sticky failure across a turn"
         );
         // Drop joins the worker here, so a broken stop path hangs the

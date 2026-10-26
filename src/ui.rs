@@ -150,8 +150,8 @@ mod tests {
             mode: ViewMode::Manga,
             toast: false,
             name: PageName { parent: Some("b".into()), file: "010.png".into() },
-            // The name claims png, the decoded page is jxl: the mismatch
-            // fuses the format into the dims.
+            // The name claims png and the page decodes as jxl, so the
+            // format label prefixes the dims.
             page: Some(PageFacts {
                 decoded: Format::Jxl,
                 claimed: Some(Format::Png),

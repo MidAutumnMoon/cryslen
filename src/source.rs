@@ -370,7 +370,7 @@ fn sort_pages(names: &mut [String]) {
 #[expect(clippy::expect_used, clippy::unwrap_used, reason = "a panic in test code is inconsequential")]
 mod tests {
     use super::*;
-    use crate::decode::decode;
+    use crate::decode;
     use crate::testkit::{eventually, tiny_png, TempDir};
 
     use std::io::Write as _;
@@ -427,14 +427,13 @@ mod tests {
             PageName { parent: None, file: "p1.png".into() }
         );
         let bytes = source.bytes(0).expect("first page reads");
-        // A repeat read returns the same bytes (via the tier, which the
-        // read or the racing harvest thread may have filled).
+        // A repeat read returns the same bytes, whether the read itself or
+        // the racing harvest thread filled the tier.
         let repeat = source.bytes(0).expect("first page reads again");
         assert_eq!(*repeat, *bytes);
         assert_eq!(bytes.get(..8), Some(&b"\x89PNG\r\n\x1a\n"[..]));
-        // The decoder is the oracle: the fixture page decodes at its
-        // written dims.
-        let page = decode(&bytes, "p1.png").expect("fixture page decodes");
+        // The decoder is the oracle for the fixture's dims.
+        let page = decode::decode(&bytes, "p1.png").expect("fixture page decodes");
         assert_eq!((page.width, page.height), (40, 30));
 
         // the harvest pass fills the tier for both pages
