@@ -42,6 +42,10 @@ Do not pipe any command output through `head` or `tail`, tools will properly han
 
 ## Coding Conventions
 
+### nix devShell
+
+Run cargo commands in `nix develop` devShell.
+
 ### Error Handling
 
 - Use [`eros`](https://docs.rs/eros/latest/eros/).
