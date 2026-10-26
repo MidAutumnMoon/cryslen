@@ -791,6 +791,24 @@ mod tests {
         let jpeg_page = decode(&jpg, "p.jpg").expect("jpeg decodes");
         assert_eq!(jpeg_page.format, Format::Jpeg);
         assert_eq!((jpeg_page.width, jpeg_page.height), (5, 2));
+
+        // gif: format and dims
+        let gif = testkit::tiny_gif(3, 2, [200, 100, 50]);
+        let gif_page = decode(&gif, "p.gif").expect("gif decodes");
+        assert_eq!(gif_page.format, Format::Gif);
+        assert_eq!((gif_page.width, gif_page.height), (3, 2));
+
+        // bmp: format and dims
+        let bmp = testkit::tiny_bmp(2, 3, [200, 100, 50]);
+        let bmp_page = decode(&bmp, "p.bmp").expect("bmp decodes");
+        assert_eq!(bmp_page.format, Format::Bmp);
+        assert_eq!((bmp_page.width, bmp_page.height), (2, 3));
+
+        // tiff: format and dims
+        let tiff = testkit::tiny_tiff(3, 1, [200, 100, 50]);
+        let tiff_page = decode(&tiff, "p.tiff").expect("tiff decodes");
+        assert_eq!(tiff_page.format, Format::Tiff);
+        assert_eq!((tiff_page.width, tiff_page.height), (3, 1));
     }
 
     /// Decoded constructors cap page edges at the GPU texture limit and pixel counts at the allocation ceiling.
@@ -819,7 +837,7 @@ mod tests {
         ));
     }
 
-    /// `plane_dims` rounds chroma up on odd edges; `Decoded::yuv` rejects wrong plane extents.
+    /// `plane_dims` rounds chroma up on odd edges; `Decoded::yuv` rejects wrong plane extents and counts resident bytes with u16 samples double.
     #[test]
     fn yuv_planes() {
         // odd edges round chroma up (div_ceil); mono carries a 1x1 stub
@@ -840,7 +858,9 @@ mod tests {
             cr: Plane::U8(Box::new([])),
         };
         let real = mono(Plane::U16(vec![0; 32 * 16].into_boxed_slice()));
-        Decoded::yuv(32, 16, Format::Avif, real).expect("mono yuv page constructs");
+        let page = Decoded::yuv(32, 16, Format::Avif, real).expect("mono yuv page constructs");
+        // The worker's book budget consumes this count.
+        assert_eq!(page.resident_bytes(), 32 * 16 * 2);
         let empty = mono(Plane::U16(Box::new([])));
         assert!(matches!(
             Decoded::yuv(32, 16, Format::Avif, empty),
@@ -863,6 +883,7 @@ mod tests {
         ));
     }
 
+    /// The mono AVIF fixture decodes to a 10-bit u16 luma plane with empty chroma and the gradient intact.
     // 32x16 10-bit 4:0:0 fixture, a black-to-white grayscale gradient.
     #[test]
     fn avif_fixture_decodes() {
@@ -936,6 +957,7 @@ mod tests {
         );
     }
 
+    /// Every truncation point of a jxl page ends the decode with the matching "truncated" error instead of hanging.
     // A truncation bug would hang the decode instead of failing it, hence
     // the watchdog thread. The cuts cover the header, the frame header, and
     // the pixels. A decode panic closes the channel and fails the recv, so
@@ -969,6 +991,7 @@ mod tests {
         }
     }
 
+    /// The pool reports the first failing task, and every task stays reachable under the chunk partition.
     // The fixtures are single-group, so only this test exercises the
     // runner's parallel path.
     #[test]

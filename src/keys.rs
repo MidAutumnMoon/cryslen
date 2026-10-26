@@ -73,6 +73,7 @@ impl Action {
 mod tests {
     use super::*;
 
+    /// The baked key map: every bound physical key maps to its action, nothing else does.
     #[test]
     fn key_map() {
         let bindings: &[(KeyCode, Option<Action>)] = &[
@@ -116,18 +117,25 @@ mod tests {
             assert!(!act.repeats(), "{act:?} is one-shot");
         }
         let forwards: &[(Action, ViewMode, bool)] = &[
-            // Left to right, the rightward arrow advances.
+            // Left to right, the rightward arrow advances; the
+            // reading-order keys never flip.
             (Action::Right, ViewMode::Normal, true),
             (Action::Left, ViewMode::Normal, false),
+            (Action::Forward, ViewMode::Normal, true),
+            (Action::Back, ViewMode::Normal, false),
             // Manga flips the arrows but never the reading-order keys.
             (Action::Right, ViewMode::Manga, false),
             (Action::Left, ViewMode::Manga, true),
             (Action::Forward, ViewMode::Manga, true),
             (Action::Back, ViewMode::Manga, false),
+            // Comic reads like Normal.
+            (Action::Right, ViewMode::Comic, true),
+            (Action::Left, ViewMode::Comic, false),
+            (Action::Forward, ViewMode::Comic, true),
+            (Action::Back, ViewMode::Comic, false),
         ];
         for &(act, mode, want) in forwards {
             assert_eq!(act.is_forward(mode), want, "{act:?} in {mode:?}");
         }
     }
-
 }

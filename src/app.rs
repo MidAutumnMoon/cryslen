@@ -690,42 +690,8 @@ mod tests {
     use super::*;
     use crate::testkit::ready_seat;
 
-    /// The background glass is one premultiplied color, pinned as exact bytes.
-    #[expect(
-        clippy::float_cmp_const,
-        reason = "the opaque variant returns the same constants untouched, so equality is exact"
-    )]
-    #[test]
-    fn background_glass() {
-        let [red, green, blue, alpha] = clear_color(true);
-        assert!((alpha - GLASS_ALPHA).abs() < 1e-6);
-        // Each channel stores its straight value times alpha.
-        for (channel, straight) in [red, green, blue].into_iter().zip(BACKGROUND) {
-            assert!((straight.mul_add(GLASS_ALPHA, -channel)).abs() < 1e-6);
-        }
-        assert_eq!(clear_color(false), [BACKGROUND[0], BACKGROUND[1], BACKGROUND[2], 1.0]);
-        // The bar must repeat the background glass. Exact bytes, so no
-        // formula or constructor change can drift them apart silently.
-        assert_eq!(glass_fill(), egui::Color32::from_rgba_premultiplied(16, 16, 18, 204));
-    }
-
-    #[test]
-    fn content_viewport_subtracts_the_bar_in_physical_px() {
-        let content = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1280.0, 772.0));
-        let integer = content_viewport(PhysicalSize::new(1280, 800), content, 1.0);
-        assert_eq!(integer.size(), (1280.0, 772.0));
-        // Fractional output scale: 772 pt at 1.25 pixels per point leaves
-        // 965 physical px of content in a 1000 px window.
-        let fractional = content_viewport(PhysicalSize::new(1600, 1000), content, 1.25);
-        assert_eq!(fractional.size(), (1600.0, 965.0));
-    }
-
-    #[test]
-    fn pixel_wheel_zoom_speed_does_not_vary_with_output_scale_factor() {
-        assert_eq!(wheel_lines(40.0, 1.0), 1.0);
-        assert_eq!(wheel_lines(80.0, 2.0), 1.0);
-        assert_eq!(wheel_lines(40.0, 2.0), 0.5);
-    }
+    // frame() and dispatch() are GL/winit-bound, so this mod pins the pure
+    // helpers they consume.
 
     /// A fit refits until settled, user moves survive settles, and every discard resets both.
     #[test]
@@ -760,7 +726,7 @@ mod tests {
             page: Option<(Format, (u32, u32))>,
         }
         let pair = Spread { first: 0, second: Some(1) };
-        let single = Spread { first: 0, second: None };
+        let single = Spread::lone(0);
         let rows = [
             // a decided pair never waits; the failure still reports
             (pair, ViewMode::Comic, [Some(ready_seat(2, 2)), Some(SeatView::Failed("x".into()))],
@@ -809,5 +775,44 @@ mod tests {
             assert_eq!(folded.error.as_deref(), want.error, "row {i}: error");
             assert_eq!(folded.page, want.page, "row {i}: page");
         }
+    }
+
+    /// The background glass is one premultiplied color, pinned as exact bytes.
+    #[expect(
+        clippy::float_cmp_const,
+        reason = "the opaque variant returns the same constants untouched, so equality is exact"
+    )]
+    #[test]
+    fn background_glass() {
+        let [red, green, blue, alpha] = clear_color(true);
+        assert!((alpha - GLASS_ALPHA).abs() < 1e-6);
+        // Each channel stores its straight value times alpha.
+        for (channel, straight) in [red, green, blue].into_iter().zip(BACKGROUND) {
+            assert!((straight.mul_add(GLASS_ALPHA, -channel)).abs() < 1e-6);
+        }
+        assert_eq!(clear_color(false), [BACKGROUND[0], BACKGROUND[1], BACKGROUND[2], 1.0]);
+        // The bar must repeat the background glass. Exact bytes, so no
+        // formula or constructor change can drift them apart silently.
+        assert_eq!(glass_fill(), egui::Color32::from_rgba_premultiplied(16, 16, 18, 204));
+    }
+
+    /// The content viewport subtracts the bar in physical px, scaling the egui content rect by egui's own pixels-per-point.
+    #[test]
+    fn content_viewport_subtracts_the_bar_in_physical_px() {
+        let content = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1280.0, 772.0));
+        let integer = content_viewport(PhysicalSize::new(1280, 800), content, 1.0);
+        assert_eq!(integer.size(), (1280.0, 772.0));
+        // Fractional output scale: 772 pt at 1.25 pixels per point leaves
+        // 965 physical px of content in a 1000 px window.
+        let fractional = content_viewport(PhysicalSize::new(1600, 1000), content, 1.25);
+        assert_eq!(fractional.size(), (1600.0, 965.0));
+    }
+
+    /// Pixel-mode wheel motion divides by the output scale factor, so the same physical scroll yields the same zoom lines at any scale.
+    #[test]
+    fn pixel_wheel_zoom_speed_does_not_vary_with_output_scale_factor() {
+        assert_eq!(wheel_lines(40.0, 1.0), 1.0);
+        assert_eq!(wheel_lines(80.0, 2.0), 1.0);
+        assert_eq!(wheel_lines(40.0, 2.0), 0.5);
     }
 }

@@ -1,35 +1,56 @@
-//! Scratch inputs shared by the source/decode/worker unit tests.
+//! Scratch inputs and waits shared by the unit tests: encoded pages
+//! (source, decode, worker), decided seats (app, worker), temp dirs
+//! (main, source, worker), and the `eventually` poll for tests that
+//! observe another thread (source, worker).
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::decode::Decoded;
 use crate::decode::Format;
 use crate::worker::SeatView;
 
-/// Solid-color PNG straight from the image encoder.
-pub fn tiny_png(width: u32, height: u32, rgba: [u8; 4]) -> Vec<u8> {
+/// `img` straight from the image encoder, in `format`.
+fn encode(img: &image::DynamicImage, format: image::ImageFormat) -> Vec<u8> {
     use std::io::Cursor;
 
-    let img = image::RgbaImage::from_pixel(width, height, image::Rgba(rgba));
     let mut buf = Vec::new();
-    image::DynamicImage::ImageRgba8(img)
-        .write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)
-        .expect("encode png");
+    img.write_to(&mut Cursor::new(&mut buf), format)
+        .expect("encode image");
     buf
+}
+
+/// Solid-color PNG straight from the image encoder.
+pub fn tiny_png(width: u32, height: u32, rgba: [u8; 4]) -> Vec<u8> {
+    let img = image::RgbaImage::from_pixel(width, height, image::Rgba(rgba));
+    encode(&image::DynamicImage::ImageRgba8(img), image::ImageFormat::Png)
 }
 
 /// Solid-color JPEG straight from the image encoder.
 pub fn tiny_jpeg(width: u32, height: u32, rgb: [u8; 3]) -> Vec<u8> {
-    use std::io::Cursor;
-
     let img = image::RgbImage::from_pixel(width, height, image::Rgb(rgb));
-    let mut buf = Vec::new();
-    image::DynamicImage::ImageRgb8(img)
-        .write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Jpeg)
-        .expect("encode jpeg");
-    buf
+    encode(&image::DynamicImage::ImageRgb8(img), image::ImageFormat::Jpeg)
+}
+
+/// Solid-color GIF straight from the image encoder.
+pub fn tiny_gif(width: u32, height: u32, rgb: [u8; 3]) -> Vec<u8> {
+    let img = image::RgbImage::from_pixel(width, height, image::Rgb(rgb));
+    encode(&image::DynamicImage::ImageRgb8(img), image::ImageFormat::Gif)
+}
+
+/// Solid-color BMP straight from the image encoder.
+pub fn tiny_bmp(width: u32, height: u32, rgb: [u8; 3]) -> Vec<u8> {
+    let img = image::RgbImage::from_pixel(width, height, image::Rgb(rgb));
+    encode(&image::DynamicImage::ImageRgb8(img), image::ImageFormat::Bmp)
+}
+
+/// Solid-color TIFF straight from the image encoder.
+pub fn tiny_tiff(width: u32, height: u32, rgb: [u8; 3]) -> Vec<u8> {
+    let img = image::RgbImage::from_pixel(width, height, image::Rgb(rgb));
+    encode(&image::DynamicImage::ImageRgb8(img), image::ImageFormat::Tiff)
 }
 
 /// A decided `Ready` seat holding a blank `width`x`height` page.
@@ -45,6 +66,25 @@ pub fn ready_seat(width: u32, height: u32) -> SeatView {
         )
         .expect("valid rgba page"),
     ))
+}
+
+/// Poll `probe` until it returns `Some`, or `secs` seconds pass.
+///
+/// # Panics
+///
+/// Panics with `what` on timeout.
+pub fn eventually<T>(secs: u64, what: &str, mut probe: impl FnMut() -> Option<T>) -> T {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        if let Some(value) = probe() {
+            return value;
+        }
+        if Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+            continue;
+        }
+        panic!("{what}");
+    }
 }
 
 /// Unique temp dir, removed on drop (tests avoid a tempfile dep).

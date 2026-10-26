@@ -865,6 +865,9 @@ mod tests {
     use crate::decode::Format;
     use crate::decode::YuvImage;
 
+    // The GL draw path itself is out of reach headlessly; these tests pin
+    // the CPU-side values it consumes.
+
     /// Row `row`, column `col` of the math matrix (storage is column-major).
     #[expect(
         clippy::indexing_slicing,
@@ -895,6 +898,7 @@ mod tests {
         assert!((depth_norm(12, true) - R16_STORAGE_MAX / 4095.0).abs() < 1e-4);
     }
 
+    /// The limited-range offsets anchor studio-swing black and white at exactly 0.0 and 1.0.
     #[test]
     fn limited_range_anchors_hit_black_and_white() {
         let matrix = yuv_to_rgb_matrix(Matrix::Bt601, false);
@@ -911,6 +915,7 @@ mod tests {
         }
     }
 
+    /// Entry cost sums the plane bytes and counts the mip chain only where one exists.
     #[expect(
         clippy::integer_division,
         reason = "mirrors entry_cost_bytes' truncated mip-chain cost"
@@ -994,6 +999,7 @@ mod tests {
             .collect()
     }
 
+    /// Each CORE/ES shader pair declares the same uniforms, in the same order.
     // The ES shaders never compile on desktop, so a uniform added to only
     // one variant silently breaks the other platform. Declared-name parity
     // between each CORE/ES pair catches that here.

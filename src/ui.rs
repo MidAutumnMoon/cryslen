@@ -176,7 +176,7 @@ mod tests {
         }
         // single page with no decoded facts yet.
         let mut single = status();
-        single.spread = Spread { first: 4, second: None };
+        single.spread = Spread::lone(4);
         single.page = None;
         single.zoom = 1.0;
         // a wait flag and a decode error append after the zoom.
@@ -297,6 +297,8 @@ mod tests {
 
         // Narrow screen: the rect tracks the screen width, the bar stays one truncating line.
         assert!((narrow_rect.width() - NARROW).abs() < ROUND, "{}", narrow_rect.width());
+        // 8.0 tolerates a text line of bar-height difference across widths,
+        // unlike ROUND's sub-pixel rounding.
         assert!((narrow_rect.max.y - wide_rect.max.y).abs() < 8.0, "{narrow_rect:?} vs {wide_rect:?}");
 
         // Facts: flush left, unmoved by the toast.

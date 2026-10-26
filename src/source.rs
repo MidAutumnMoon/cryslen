@@ -370,11 +370,10 @@ fn sort_pages(names: &mut [String]) {
 #[expect(clippy::expect_used, clippy::unwrap_used, reason = "a panic in test code is inconsequential")]
 mod tests {
     use super::*;
-    use crate::testkit::{tiny_png, TempDir};
+    use crate::decode::decode;
+    use crate::testkit::{eventually, tiny_png, TempDir};
 
     use std::io::Write as _;
-    use std::thread;
-    use std::time::{Duration, Instant};
 
     /// LZMA-compressed 7z with two small PNGs, built by 7zz. The crate's
     /// encoder features are trimmed, so the fixture is checked in.
@@ -433,26 +432,15 @@ mod tests {
         let repeat = source.bytes(0).expect("first page reads again");
         assert_eq!(*repeat, *bytes);
         assert_eq!(bytes.get(..8), Some(&b"\x89PNG\r\n\x1a\n"[..]));
-        #[expect(
-            clippy::big_endian_bytes,
-            reason = "PNG chunk fields are big-endian by specification"
-        )]
-        let be_u32 = |at: usize| {
-            bytes
-                .get(at..at + 4)
-                .and_then(|word| word.try_into().ok())
-                .map(u32::from_be_bytes)
-        };
-        let width = be_u32(16).expect("fixture ihdr width");
-        let height = be_u32(20).expect("fixture ihdr height");
-        assert_eq!((width, height), (40, 30));
+        // The decoder is the oracle: the fixture page decodes at its
+        // written dims.
+        let page = decode(&bytes, "p1.png").expect("fixture page decodes");
+        assert_eq!((page.width, page.height), (40, 30));
 
         // the harvest pass fills the tier for both pages
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while !(source.tier_has(0) && source.tier_has(1)) && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(50));
-        }
-        assert!(source.tier_has(0) && source.tier_has(1), "both fixture pages harvested");
+        eventually(20, "both fixture pages harvested", || {
+            (source.tier_has(0) && source.tier_has(1)).then_some(())
+        });
     }
 
     /// Directory sources list pages natural-sorted and image-filtered, and read back written bytes.
@@ -484,6 +472,7 @@ mod tests {
         );
     }
 
+    /// A zip source lists its image entries natural-sorted across inner directories, names pages by the immediate parent, and reads an entry back byte-identical.
     #[test]
     fn zip_listing_and_read() {
         use zip::write::SimpleFileOptions;
@@ -518,6 +507,7 @@ mod tests {
         assert_eq!(page.as_ref(), tiny_png(2, 2, [1, 0, 0, 255]).as_slice());
     }
 
+    /// Every unusable source opens as its matching error: not found, empty, unsupported, io.
     #[test]
     fn open_errors() {
         assert!(matches!(

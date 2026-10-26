@@ -144,6 +144,11 @@ pub fn seating<T>(first: T, second: Option<T>, mode: ViewMode) -> [Option<T>; 2]
 }
 
 impl Spread {
+    /// A lone-page spread.
+    pub const fn lone(first: usize) -> Self {
+        Self { first, second: None }
+    }
+
     /// Visual seating as [left, right] under `mode`.
     pub fn seats(&self, mode: ViewMode) -> [Option<usize>; 2] {
         seating(self.first, self.second, mode)
@@ -246,7 +251,8 @@ pub fn fit(total: (f32, f32), viewport: Viewport) -> Placement {
     }
 }
 
-/// Zoom scale bounds on `scale`, which is screen px per image px.
+/// Zoom scale bounds on `scale`, which is screen px per image px. The
+/// bounds apply at zoom time only — `fit` does not clamp.
 const MIN_SCALE: f32 = 0.05;
 const MAX_SCALE: f32 = 40.0;
 
@@ -306,7 +312,7 @@ mod tests {
 
     /// `spread_for`: mode flags, the lone cover, odd-start pairs, clamping at the source.
     #[test]
-    fn spread_for_structure() {
+    fn spread_structure() {
         // (mode, pairs, rtl): the pairing and direction flags per mode
         for (mode, pairs, rtl) in [
             (ViewMode::Normal, false, false),
@@ -374,8 +380,9 @@ mod tests {
         assert_eq!(advance(0, true, ViewMode::Manga, 0), 0);
     }
 
+    /// A mode switch relands on the new spread's start only when the pairing changes; a direction-only or repeated selection keeps the page.
     #[test]
-    fn mode_switch_reclamps_only_on_pairing_change() {
+    fn mode_switch_relands_only_on_pairing_change() {
         assert_eq!(
             switch_mode(ViewMode::Normal, ViewMode::Manga, 2, 10),
             ModeSwitch { index: 1, pairing_changed: true }
@@ -396,17 +403,21 @@ mod tests {
         );
     }
 
+    /// Seating follows the reading direction: rtl mirrors the seats and parks a lone page on the right, ltr keeps [first, second].
     #[test]
     fn seats_follow_reading_direction() {
         let spread = Spread { first: 1, second: Some(2) };
         assert_eq!(spread.seats(ViewMode::Normal), [Some(1), Some(2)]);
         assert_eq!(spread.seats(ViewMode::Comic), [Some(1), Some(2)]);
         assert_eq!(spread.seats(ViewMode::Manga), [Some(2), Some(1)]);
-        let lone = Spread { first: 5, second: None };
+        let lone = Spread::lone(5);
         assert_eq!(lone.seats(ViewMode::Normal), [Some(5), None]);
+        // A lone Comic page mirrors Normal, not the rtl modes.
+        assert_eq!(lone.seats(ViewMode::Comic), [Some(5), None]);
         assert_eq!(lone.seats(ViewMode::Manga), [None, Some(5)]);
     }
 
+    /// The viewport spans the window above the bar top, degenerating to the whole window or nothing at the bar's extremes.
     #[test]
     fn above_bottom_bar_sizes_and_clamps() {
         let viewport = Viewport::above_bottom_bar((1000.0, 800.0), 740.0);
@@ -419,7 +430,7 @@ mod tests {
         assert_eq!(negative.size(), (100.0, 0.0));
     }
 
-    /// layout composes present seats side by side, top-aligned; undecoded seats join when they arrive.
+    /// layout composes present seats side by side, top-aligned.
     #[test]
     fn layout_places_seats() {
         let left = (100_u32, 300);
@@ -519,6 +530,8 @@ mod tests {
                 };
                 let (want_x, want_y) = under_cursor(before);
                 let (got_x, got_y) = under_cursor(after);
+                // The anchor distance is measured in image pixels, whose
+                // magnitude dwarfs the px tolerances elsewhere in the suite.
                 assert!((got_x - want_x).abs() < 0.01, "scale {scale} factor {factor} cursor {cursor:?}");
                 assert!((got_y - want_y).abs() < 0.01, "scale {scale} factor {factor} cursor {cursor:?}");
             }

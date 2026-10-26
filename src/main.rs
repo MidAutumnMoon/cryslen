@@ -6,7 +6,11 @@ mod keys;
 mod render;
 mod source;
 #[cfg(test)]
-#[expect(clippy::expect_used, reason = "a panic in test code is inconsequential")]
+#[expect(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "a panic in test code is inconsequential"
+)]
 pub(crate) mod testkit;
 mod ui;
 mod view;
@@ -89,18 +93,25 @@ fn classify(path: &Path) -> eros::Result<Arg> {
     Ok(Arg::Image { dir: dir.to_path_buf(), name })
 }
 
+/// Page index to open on: the entry matching `want` case-insensitively,
+/// or the cover on a miss.
+fn landing<'entries>(
+    mut entries: impl Iterator<Item = &'entries str>,
+    want: &str,
+) -> usize {
+    entries.position(|entry| entry.eq_ignore_ascii_case(want)).unwrap_or(0)
+}
+
 fn run(open_path: &Path, land_on: Option<&str>) -> eros::Result<()> {
     use winit::event_loop::EventLoop;
 
     let source = Arc::new(Source::open(open_path)?);
 
-    let index = land_on
-        .and_then(|name| {
-            (0..source.len()).find(|&page_index| {
-                source.name(page_index).is_some_and(|entry| entry.eq_ignore_ascii_case(name))
-            })
-        })
-        .unwrap_or(0);
+    let index = land_on.map_or(0, |name| {
+        // Every page index below `len` has a name, so the indices survive
+        // the filter.
+        landing((0..source.len()).filter_map(|page| source.name(page)), name)
+    });
 
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
@@ -158,5 +169,15 @@ mod tests {
                 (_, want) => panic!("{}: wrong kind, wanted {want:?}", path.display()),
             }
         }
+    }
+
+    /// `landing` resolves the image argument: an exact or case-mismatched name finds its entry, a miss opens the cover.
+    #[test]
+    fn landing_resolves_the_image_argument() {
+        let entries = ["cover.png", "Page2.png", "p3.png"];
+        let names = || entries.iter().copied();
+        assert_eq!(landing(names(), "Page2.png"), 1);
+        assert_eq!(landing(names(), "page2.PNG"), 1);
+        assert_eq!(landing(names(), "missing.png"), 0);
     }
 }

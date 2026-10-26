@@ -86,7 +86,7 @@ const NEVER_WANTED_RANK: u64 = 0;
 impl Book {
     fn new() -> Self {
         Self {
-            wanted: Spread { first: 0, second: None },
+            wanted: Spread::lone(0),
             decided: HashMap::new(),
             pending: BTreeSet::new(),
             last_wanted: HashMap::new(),
@@ -406,14 +406,12 @@ fn retain_trail(pending: &mut BTreeSet<usize>, anchor: usize, wanted: &Spread) {
 #[expect(clippy::expect_used, clippy::unwrap_used, clippy::panic, reason = "a panic in test code is inconsequential")]
 mod tests {
     use super::*;
-    use crate::decode::Format;
-    use crate::testkit::{ready_seat, tiny_png, TempDir};
-    use crate::view::Spread;
+    use crate::testkit::{eventually, ready_seat, tiny_png, TempDir};
 
     use std::sync::Condvar;
-    use std::thread;
     use std::time::{Duration, Instant};
 
+    /// The prefetch window reads the focus, then its neighbors nearest first, never past the book's ends.
     #[test]
     fn neighbors_are_nearest_first() {
         assert_eq!(neighbors(5, 10), vec![5, 4, 6, 3, 7, 2, 8]);
@@ -421,6 +419,7 @@ mod tests {
         assert_eq!(neighbors(9, 10), vec![9, 8, 7, 6]);
     }
 
+    /// The prefetch window covers a double-mode spread and its next turn's pages, except across the wrap.
     // Pins PREFETCH_RADIUS against view's double-mode turn math.
     #[test]
     fn prefetch_window_covers_double_mode_turns() {
@@ -459,6 +458,7 @@ mod tests {
         }
     }
 
+    /// `take_next` picks the nearest undecided page, the page ahead of the spread winning distance ties; decided pages never return.
     #[test]
     fn next_pick_is_nearest_then_ahead() {
         let mut book = Book::new();
@@ -482,14 +482,13 @@ mod tests {
     #[test]
     fn eviction_rank() {
         let wanted = Spread { first: 5, second: Some(6) };
-        let lone = |page: usize| Spread { first: page, second: None };
         for (budget, retunes, stores, kept, dropped) in [
             // page 3 is nearer, but 1 is farther from the spread: farthest evicts first
             (8, vec![wanted], vec![1_usize, 3], vec![3_usize], vec![1_usize]),
             // page 3 is nearer but was never wanted: once-wanted outlives never-wanted
-            (8, vec![lone(1), wanted], vec![1, 3], vec![1], vec![3]),
+            (8, vec![Spread::lone(1), wanted], vec![1, 3], vec![1], vec![3]),
             // both were wanted: the least recently wanted evicts first
-            (8, vec![lone(1), lone(2), wanted], vec![1, 2], vec![2], vec![1]),
+            (8, vec![Spread::lone(1), Spread::lone(2), wanted], vec![1, 2], vec![2], vec![1]),
         ] {
             let mut book = Book::new();
             book.budget = budget;
@@ -515,14 +514,13 @@ mod tests {
         }
     }
 
-    // The endgame pin: a full book must evict the oldest unwanted page,
-    // never a page of the spread the user just turned to.
+    /// A saturating store evicts the oldest unwanted page, never a page of the spread the user just turned to.
     #[test]
     fn saturating_store_never_drops_the_wanted_spread() {
         let mut book = Book::new();
         book.budget = 16;
         let wanted = Spread { first: 7, second: Some(8) };
-        book.retune(Spread { first: 1, second: None }, 20);
+        book.retune(Spread::lone(1), 20);
         book.retune(wanted, 20);
         book.store(1, ready_seat(2, 1));
         book.store(7, ready_seat(2, 1));
@@ -535,22 +533,16 @@ mod tests {
         assert!(matches!(snapshot.second, Some(SeatView::Ready(_))));
     }
 
+    /// A wanted page over the whole budget survives its own store's eviction pass.
+    // 10x10 rgba is 400 bytes against a budget of 10: the store itself
+    // saturates the book.
     #[test]
     fn wanted_spread_survives_its_own_oversize() {
         let mut book = Book::new();
         book.budget = 10;
         let wanted = Spread { first: 3, second: Some(4) };
         book.retune(wanted, 10);
-        let oversize_page = SeatView::Ready(Arc::new(
-            Decoded::rgba(
-                10,
-                10,
-                Format::Png,
-                vec![0; 400].into_boxed_slice(),
-            )
-            .unwrap(),
-        ));
-        book.store(3, oversize_page);
+        book.store(3, ready_seat(10, 10));
         assert!(book.decided.contains_key(&3));
     }
 
@@ -598,18 +590,14 @@ mod tests {
     }
 
     fn wait_ready(worker: &Worker, pages: &[usize]) {
-        let deadline = Instant::now() + Duration::from_secs(20);
         for &page in pages {
-            loop {
-                match worker.snapshot(&Spread { first: page, second: None }).first {
-                    SeatView::Ready(_) => break,
+            eventually(20, &format!("page {page} not decoded in time"), || {
+                match worker.snapshot(&Spread::lone(page)).first {
+                    SeatView::Ready(seat) => Some(seat),
                     SeatView::Failed(msg) => panic!("page {page} failed: {msg}"),
-                    SeatView::Pending if Instant::now() < deadline => {
-                        thread::sleep(Duration::from_millis(1));
-                    }
-                    SeatView::Pending => panic!("page {page} not decoded in time"),
+                    SeatView::Pending => None,
                 }
-            }
+            });
         }
     }
 
@@ -628,7 +616,7 @@ mod tests {
         .expect("worker spawns");
 
         // happy path: the ok page reaches Ready with its dims, and notify fired
-        let ok = Spread { first: 1, second: None };
+        let ok = Spread::lone(1);
         worker.retune(ok);
         wait_ready(&worker, &[1]);
         let SeatView::Ready(page) = worker.snapshot(&ok).first else {
@@ -638,18 +626,15 @@ mod tests {
         assert!(*updates.lock().unwrap() > 0);
 
         // failure path: the bad page fails with the page number
-        let bad = Spread { first: 0, second: None };
+        let bad = Spread::lone(0);
         worker.retune(bad);
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while !matches!(worker.snapshot(&bad).first, SeatView::Failed(_)) && Instant::now() < deadline
-        {
-            thread::sleep(Duration::from_millis(10));
-        }
-        let failed = match worker.snapshot(&bad).first {
-            SeatView::Failed(msg) => msg,
-            SeatView::Ready(_) => panic!("bad.png decoded as Ready?"),
-            SeatView::Pending => panic!("page 0 not decided in time"),
-        };
+        let failed = eventually(20, "page 0 not decided in time", || {
+            match worker.snapshot(&bad).first {
+                SeatView::Failed(msg) => Some(msg),
+                SeatView::Ready(_) => panic!("bad.png decoded as Ready?"),
+                SeatView::Pending => None,
+            }
+        });
         assert!(failed.contains("page 1"), "{failed}");
         // The entry is sticky across turns: turn to the ok page, then back.
         worker.retune(ok);
@@ -671,7 +656,7 @@ mod tests {
         let worker = Worker::spawn(source, || {}).expect("worker spawns");
         // 50 retunes queue faster than pages decode; every page still decodes
         for page in 0..50 {
-            worker.retune(Spread { first: page, second: None });
+            worker.retune(Spread::lone(page));
         }
         wait_ready(&worker, &(0..50).collect::<Vec<_>>());
         // a double-mode retune decides both its pages
@@ -695,20 +680,17 @@ mod tests {
             let gate = Gate::new();
             let parked = gate.clone();
             let worker = Worker::spawn(source, move || parked.hold()).expect("worker spawns");
-            worker.retune(Spread { first: 0, second: None });
+            worker.retune(Spread::lone(0));
             wait_ready(&worker, &[0]);
             // All 139 retunes queue while the worker is parked on page 0.
             for page in 1..140 {
-                worker.retune(Spread { first: page, second: None });
+                worker.retune(Spread::lone(page));
             }
             gate.release(u64::MAX);
             wait_ready(&worker, &(75..140).collect::<Vec<_>>());
             for page in 1..75 {
                 assert!(
-                    matches!(
-                        worker.snapshot(&Spread { first: page, second: None }).first,
-                        SeatView::Pending
-                    ),
+                    matches!(worker.snapshot(&Spread::lone(page)).first, SeatView::Pending),
                     "page {page} decoded past the trail radius"
                 );
             }
@@ -719,19 +701,16 @@ mod tests {
             let gate = Gate::new();
             let parked = gate.clone();
             let worker = Worker::spawn(source, move || parked.hold()).expect("worker spawns");
-            worker.retune(Spread { first: 0, second: None });
+            worker.retune(Spread::lone(0));
             wait_ready(&worker, &[0]);
-            worker.retune(Spread { first: 60, second: None });
+            worker.retune(Spread::lone(60));
             gate.release(1);
             wait_ready(&worker, &[60]);
             // The worker is parked on page 60's store, so the old window
             // pages 1 and 2 cannot have been decoded before it.
             for page in [1, 2] {
                 assert!(
-                    matches!(
-                        worker.snapshot(&Spread { first: page, second: None }).first,
-                        SeatView::Pending
-                    ),
+                    matches!(worker.snapshot(&Spread::lone(page)).first, SeatView::Pending),
                     "page {page} decoded before the wanted page"
                 );
             }
