@@ -163,57 +163,43 @@ mod tests {
         }
     }
 
-    /// Section colors in append order. Sections carry no text slices
-    /// here. The text and the deterministic append order pin the mapping.
-    fn section_colors(job: &LayoutJob) -> Vec<egui::Color32> {
-        job.sections.iter().map(|section| section.format.color).collect()
-    }
-
+    /// The status line's text per variant, with sections colored by meaning.
     #[test]
-    fn facts_text_and_section_colors() {
+    fn status_line_text() {
         let style = egui::Style::default();
         let plain = style.visuals.text_color();
-        let job = line(&style, &status());
-        assert_eq!(job.text, "12-13/214 · b/010.png · jxl 6000x4000 · 87%");
-        assert_eq!(
-            section_colors(&job),
-            // Equal adjacent formats merge: head | range-total, parent |
-            // basename | dims, zoom.
-            vec![HEAD_COLOR, plain, NAME_COLOR, plain]
-        );
-    }
-
-    #[test]
-    fn matching_extension_hides_the_format() {
-        let mut status_line = status();
-        if let Some(page) = &mut status_line.page {
+        let base = status();
+        // matching extension: the format label hides.
+        let mut matching = status();
+        if let Some(page) = &mut matching.page {
             page.claimed = Some(Format::Jxl);
         }
-        let job = line(&egui::Style::default(), &status_line);
-        assert_eq!(job.text, "12-13/214 · b/010.png · 6000x4000 · 87%");
-    }
-
-    #[test]
-    fn single_page_head_without_page_facts() {
-        let mut status_line = status();
-        status_line.spread = Spread { first: 4, second: None };
-        status_line.page = None;
-        status_line.zoom = 1.0;
-        let job = line(&egui::Style::default(), &status_line);
-        assert_eq!(job.text, "5/214 · b/010.png · 100%");
-    }
-
-    #[test]
-    fn waiting_and_error_append() {
-        let mut status_line = status();
-        status_line.waiting = true;
-        status_line.error = Some("boom".into());
-        let job = line(&egui::Style::default(), &status_line);
-        assert!(job.text.ends_with("· decoding… · boom"));
-    }
-
-    #[test]
-    fn group_names_every_mode_with_its_key() {
+        // single page with no decoded facts yet.
+        let mut single = status();
+        single.spread = Spread { first: 4, second: None };
+        single.page = None;
+        single.zoom = 1.0;
+        // a wait flag and a decode error append after the zoom.
+        let mut appending = status();
+        appending.waiting = true;
+        appending.error = Some("boom".into());
+        let rows = [
+            // mismatching extension: the decoded format prefixes the dims
+            (&base, "12-13/214 · b/010.png · jxl 6000x4000 · 87%"),
+            (&matching, "12-13/214 · b/010.png · 6000x4000 · 87%"),
+            (&single, "5/214 · b/010.png · 100%"),
+            (&appending, "12-13/214 · b/010.png · jxl 6000x4000 · 87% · decoding… · boom"),
+        ];
+        for (i, (status_line, want)) in rows.iter().enumerate() {
+            assert_eq!(line(&style, status_line).text, *want, "row {i}");
+        }
+        // Section colors in append order. Equal adjacent formats merge:
+        // head | range-total, parent | basename | dims, zoom.
+        let section_colors = |job: &LayoutJob| -> Vec<egui::Color32> {
+            job.sections.iter().map(|section| section.format.color).collect()
+        };
+        assert_eq!(section_colors(&line(&style, &base)), vec![HEAD_COLOR, plain, NAME_COLOR, plain]);
+        // The mode group names every mode with its key.
         assert_eq!(group_label(ViewMode::Normal), "Normal (n)");
         assert_eq!(group_label(ViewMode::Manga), "Manga (m)");
         assert_eq!(group_label(ViewMode::Comic), "Comic (c)");
@@ -282,25 +268,6 @@ mod tests {
         items.iter().find(|item| item.text.starts_with(prefix)).expect(prefix)
     }
 
-    #[test]
-    fn content_rect_is_the_window_above_the_bar() {
-        let (_, rect) = render(WIDE, &status());
-        assert!(rect.min.x.abs() < ROUND, "{}", rect.min.x);
-        assert!((rect.width() - WIDE).abs() < ROUND, "{}", rect.width());
-        assert!(rect.min.y.abs() < ROUND, "{}", rect.min.y);
-        assert!(rect.max.y > 400.0, "content must span most of the window: {}", rect.max.y);
-        assert!(rect.max.y < SCREEN_HEIGHT, "content must exclude the bar strip: {}", rect.max.y);
-    }
-
-    #[test]
-    fn content_rect_tracks_the_bar_height_not_the_window_width() {
-        let (_, wide) = render(WIDE, &status());
-        let (_, narrow) = render(NARROW, &status());
-        assert!((narrow.width() - NARROW).abs() < ROUND);
-        // One truncating line of text, so the bar height barely moves.
-        assert!((narrow.max.y - wide.max.y).abs() < 8.0, "{narrow:?} vs {wide:?}");
-    }
-
     /// The panel frame's inner margin is the flush-left and
     /// flush-right anchor. `ROUND` tolerates pixel rounding.
     const PANEL_MARGIN: f32 = 8.0;
@@ -312,23 +279,34 @@ mod tests {
     const WIDE: f32 = 1280.0;
     const NARROW: f32 = 480.0;
 
+    /// Bar geometry: content rect, flush anchors, toast placement, elision.
     #[test]
-    fn anchors_hold_with_and_without_toast() {
-        let (plain, _) = render(WIDE, &status());
+    fn bar_geometry() {
+        let (plain, wide_rect) = render(WIDE, &status());
         let mut with_toast = status();
         with_toast.toast = true;
         let (toast, _) = render(WIDE, &with_toast);
-        // Facts anchor flush left and never shift.
+        let (narrow, narrow_rect) = render(NARROW, &status());
+
+        // Content rect: the window above the bar, full width.
+        assert!(wide_rect.min.x.abs() < ROUND, "{}", wide_rect.min.x);
+        assert!(wide_rect.min.y.abs() < ROUND, "{}", wide_rect.min.y);
+        assert!((wide_rect.width() - WIDE).abs() < ROUND, "{}", wide_rect.width());
+        assert!(wide_rect.max.y > 400.0, "content must span most of the window: {}", wide_rect.max.y);
+        assert!(wide_rect.max.y < SCREEN_HEIGHT, "content must exclude the bar strip: {}", wide_rect.max.y);
+
+        // Narrow screen: the rect tracks the screen width, the bar stays one truncating line.
+        assert!((narrow_rect.width() - NARROW).abs() < ROUND, "{}", narrow_rect.width());
+        assert!((narrow_rect.max.y - wide_rect.max.y).abs() < 8.0, "{narrow_rect:?} vs {wide_rect:?}");
+
+        // Facts: flush left, unmoved by the toast.
         assert!((find(&plain, "12-13/214").rect.left() - PANEL_MARGIN).abs() < ROUND);
-        assert_eq!(
-            find(&plain, "12-13/214").rect.left(),
-            find(&toast, "12-13/214").rect.left()
-        );
-        // The mode group anchors flush right and never moves.
+        assert_eq!(find(&plain, "12-13/214").rect.left(), find(&toast, "12-13/214").rect.left());
+
+        // Group: flush right, rightmost, unmoved by the toast.
         for items in [&plain, &toast] {
             let comic = find(items, "Comic (c)");
-            let rightmost =
-                items.iter().map(|item| item.rect.right()).fold(f32::MIN, f32::max);
+            let rightmost = items.iter().map(|item| item.rect.right()).fold(f32::MIN, f32::max);
             assert!((rightmost - comic.rect.right()).abs() < ROUND, "group must be rightmost");
             assert!(
                 (comic.rect.right() - (WIDE - PANEL_MARGIN)).abs() < ROUND,
@@ -340,26 +318,16 @@ mod tests {
             find(&toast, "Comic (c)").rect,
             "the group must not move when the toast appears"
         );
-    }
 
-    #[test]
-    fn toast_sits_left_of_the_group_only_when_shown() {
-        let mut with_toast = status();
-        with_toast.toast = true;
-        let (toast, _) = render(WIDE, &with_toast);
+        // Toast: strictly left of the group when shown, absent when not.
         assert!(find(&toast, "right to left").rect.right() < find(&toast, "Comic (c)").rect.left());
-        let (plain, _) = render(WIDE, &status());
         assert!(plain.iter().all(|item| !item.text.contains(status().mode.effect())));
-    }
 
-    #[test]
-    fn facts_truncate_instead_of_pushing_the_group() {
-        let (narrow, _) = render(NARROW, &status());
+        // Facts truncate instead of pushing the group.
         let facts = find(&narrow, "12-13");
         assert!(facts.elided, "facts must elide on a narrow screen");
         assert!(facts.text.ends_with('…'));
         assert!(facts.rect.right() <= find(&narrow, "Comic (c)").rect.left());
-        let (wide, _) = render(WIDE, &status());
-        assert!(!find(&wide, "12-13").elided);
+        assert!(!find(&plain, "12-13").elided);
     }
 }

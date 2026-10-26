@@ -93,12 +93,13 @@ mod tests {
             (KeyCode::ArrowUp, None),
         ];
         for (code, action) in bindings {
-            assert_eq!(Action::from_key(*code), *action);
+            assert_eq!(Action::from_key(*code), *action, "{code:?}");
         }
     }
 
+    /// Only the paging actions repeat on hold; forward follows the reading direction.
     #[test]
-    fn only_paging_repeats_on_hold() {
+    fn action_semantics() {
         assert!(Action::Right.repeats());
         assert!(Action::Left.repeats());
         assert!(Action::Forward.repeats());
@@ -112,20 +113,21 @@ mod tests {
             Action::ResetView,
         ];
         for act in one_shot {
-            assert!(!act.repeats());
+            assert!(!act.repeats(), "{act:?} is one-shot");
         }
-    }
-
-    #[test]
-    fn forward_follows_reading_direction() {
-        // Left to right, the rightward arrow advances.
-        assert!(Action::Right.is_forward(ViewMode::Normal));
-        assert!(!Action::Left.is_forward(ViewMode::Normal));
-        // Manga flips the arrows but never the reading-order keys.
-        assert!(!Action::Right.is_forward(ViewMode::Manga));
-        assert!(Action::Left.is_forward(ViewMode::Manga));
-        assert!(Action::Forward.is_forward(ViewMode::Manga));
-        assert!(!Action::Back.is_forward(ViewMode::Manga));
+        let forwards: &[(Action, ViewMode, bool)] = &[
+            // Left to right, the rightward arrow advances.
+            (Action::Right, ViewMode::Normal, true),
+            (Action::Left, ViewMode::Normal, false),
+            // Manga flips the arrows but never the reading-order keys.
+            (Action::Right, ViewMode::Manga, false),
+            (Action::Left, ViewMode::Manga, true),
+            (Action::Forward, ViewMode::Manga, true),
+            (Action::Back, ViewMode::Manga, false),
+        ];
+        for &(act, mode, want) in forwards {
+            assert_eq!(act.is_forward(mode), want, "{act:?} in {mode:?}");
+        }
     }
 
 }

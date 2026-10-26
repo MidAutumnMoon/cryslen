@@ -118,40 +118,45 @@ fn run(open_path: &Path, land_on: Option<&str>) -> eros::Result<()> {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used, clippy::panic, reason = "a panic in test code is inconsequential")]
+#[expect(clippy::panic, reason = "a panic in test code is inconsequential")]
 mod tests {
     use super::*;
     use crate::testkit::TempDir;
 
+    /// A path argument classifies to an image in its parent, a source, or an error.
     #[test]
-    fn image_file_argument_opens_parent_dir() {
-        let dir = TempDir::new("main-arg-img");
+    fn classify_argument_kinds() {
         // classify never reads the content, only the extension.
+        let dir = TempDir::new("main-arg");
         dir.write("page.png", b"x");
-        match classify(&dir.path().join("page.png")).expect("image file accepted") {
-            Arg::Image { dir: parent, name } => {
-                assert_eq!(parent, dir.path());
-                assert_eq!(name, "page.png");
-            }
-            Arg::Open(_) => panic!("image file classified as a source path"),
-        }
-    }
-
-    #[test]
-    fn directory_and_archive_arguments_open_as_sources() {
-        let dir = TempDir::new("main-arg-src");
         dir.write("book.cbz", b"not really a zip");
-        assert!(matches!(classify(&dir.path().join("book.cbz")), Ok(Arg::Open(_))));
-        assert!(matches!(classify(dir.path()), Ok(Arg::Open(_))));
-    }
-
-    #[test]
-    fn other_file_arguments_error() {
-        let dir = TempDir::new("main-arg-bad");
         dir.write("notes.txt", b"not a page");
-        let Err(error) = classify(&dir.path().join("notes.txt")) else {
-            panic!("txt file accepted as an image or source");
-        };
-        assert!(error.to_string().contains("unsupported"), "{error}");
+
+        let rows = [
+            // image file: the parent directory opened at that image.
+            (dir.path().join("page.png"), Ok(Some("page.png"))),
+            // archive file: opens as itself.
+            (dir.path().join("book.cbz"), Ok(None)),
+            // the directory itself: opens as itself.
+            (dir.path().to_path_buf(), Ok(None)),
+            // any other file: a startup error.
+            (dir.path().join("notes.txt"), Err("unsupported")),
+        ];
+        for (path, want) in rows {
+            match (classify(&path), want) {
+                (Ok(Arg::Image { dir: parent, name }), Ok(Some(want_name))) => {
+                    assert_eq!(parent, dir.path(), "{}: parent dir", path.display());
+                    assert_eq!(name, want_name, "{}: image name", path.display());
+                }
+                (Ok(Arg::Open(open)), Ok(None)) => {
+                    assert_eq!(open, path, "{}: source path", path.display());
+                }
+                (Err(error), Err(want_text)) => {
+                    let message = error.to_string();
+                    assert!(message.contains(want_text), "{}: {message}", path.display());
+                }
+                (_, want) => panic!("{}: wrong kind, wanted {want:?}", path.display()),
+            }
+        }
     }
 }

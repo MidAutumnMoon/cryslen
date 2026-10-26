@@ -373,6 +373,7 @@ mod tests {
     use crate::testkit::{tiny_png, TempDir};
 
     use std::io::Write as _;
+    use std::thread;
     use std::time::{Duration, Instant};
 
     /// LZMA-compressed 7z with two small PNGs, built by 7zz. The crate's
@@ -382,8 +383,44 @@ mod tests {
         "/tests/fixtures/two_pages.7z"
     );
 
+    /// `ByteTier`: insertion-order eviction, oversized-member rejection, incumbent retention on repeats.
     #[test]
-    fn sevenz_listing_and_read() {
+    fn byte_tier() {
+        let member = |len: usize| Arc::from(vec![0_u8; len]);
+
+        // eviction happens in insertion order, and live_bytes stays exact
+        let mut tier = ByteTier::new(10);
+        tier.insert(0, member(6));
+        tier.insert(1, member(6));
+        assert!(tier.get(0).is_none());
+        assert!(tier.get(1).is_some());
+        assert_eq!(tier.live_bytes, 6);
+        tier.insert(2, member(4));
+        assert!(tier.get(1).is_some());
+        assert!(tier.get(2).is_some());
+        assert_eq!(tier.live_bytes, 10);
+
+        // a member larger than the whole budget is not retained; one
+        // exactly at the budget is
+        tier = ByteTier::new(10);
+        tier.insert(0, member(11));
+        assert!(tier.get(0).is_none());
+        assert_eq!(tier.live_bytes, 0);
+        tier.insert(1, member(10));
+        assert!(tier.get(1).is_some());
+        assert_eq!(tier.live_bytes, 10);
+
+        // a repeated index keeps its incumbent, so the byte count stays exact
+        tier = ByteTier::new(10);
+        tier.insert(0, Arc::from(vec![1_u8]));
+        tier.insert(0, Arc::from(vec![2_u8, 2]));
+        assert_eq!(tier.get(0).map(|kept| kept.to_vec()), Some(vec![1_u8]));
+        assert_eq!(tier.live_bytes, 1);
+    }
+
+    /// 7z sources list pages, read them through the tier, and the background harvest fills the tier.
+    #[test]
+    fn sevenz_source() {
         let source = Source::open(Path::new(SEVENZ_FIXTURE)).expect("7z opens");
         assert_eq!(source.names, ["p1.png", "p2.png"]);
         assert_eq!(
@@ -409,13 +446,8 @@ mod tests {
         let width = be_u32(16).expect("fixture ihdr width");
         let height = be_u32(20).expect("fixture ihdr height");
         assert_eq!((width, height), (40, 30));
-    }
 
-    #[test]
-    fn sevenz_harvest_fills_tier() {
-        use std::thread;
-
-        let source = Source::open(Path::new(SEVENZ_FIXTURE)).expect("7z opens");
+        // the harvest pass fills the tier for both pages
         let deadline = Instant::now() + Duration::from_secs(20);
         while !(source.tier_has(0) && source.tier_has(1)) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(50));
@@ -423,54 +455,21 @@ mod tests {
         assert!(source.tier_has(0) && source.tier_has(1), "both fixture pages harvested");
     }
 
-    fn member(len: usize) -> Arc<[u8]> {
-        Arc::from(vec![0_u8; len])
-    }
-
+    /// Directory sources list pages natural-sorted and image-filtered, and read back written bytes.
     #[test]
-    fn tier_evicts_in_insertion_order() {
-        let mut tier = ByteTier::new(10);
-        tier.insert(0, member(6));
-        tier.insert(1, member(6));
-        assert!(tier.get(0).is_none());
-        assert!(tier.get(1).is_some());
-        assert_eq!(tier.live_bytes, 6);
-        tier.insert(2, member(4));
-        assert!(tier.get(1).is_some());
-        assert!(tier.get(2).is_some());
-        assert_eq!(tier.live_bytes, 10);
-    }
-
-    #[test]
-    fn tier_rejects_oversized_member() {
-        let mut tier = ByteTier::new(10);
-        tier.insert(0, member(11));
-        assert!(tier.get(0).is_none());
-        assert_eq!(tier.live_bytes, 0);
-        tier.insert(1, member(10));
-        assert!(tier.get(1).is_some());
-        assert_eq!(tier.live_bytes, 10);
-    }
-
-    #[test]
-    fn tier_keeps_incumbent_on_repeat_insert() {
-        let mut tier = ByteTier::new(100);
-        tier.insert(0, Arc::from(vec![1_u8]));
-        tier.insert(0, Arc::from(vec![2_u8, 2]));
-        assert_eq!(tier.get(0).map(|member| member.to_vec()), Some(vec![1_u8]));
-        assert_eq!(tier.live_bytes, 1);
-    }
-
-    #[test]
-    fn dir_listing_natural_order_and_filter() {
+    fn dir_source() {
         let dir = TempDir::new("pagedir");
         dir.write("c10.png", &tiny_png(1, 1, [0, 0, 0, 255]));
-        dir.write("c2.png", &tiny_png(1, 1, [0, 0, 0, 255]));
+        dir.write("c2.png", &tiny_png(1, 1, [7, 8, 9, 255]));
         dir.write("c1.png", &tiny_png(1, 1, [0, 0, 0, 255]));
         dir.write("cover.PNG", &tiny_png(1, 1, [0, 0, 0, 255]));
         dir.write("notes.txt", b"not a page");
         let source = Source::open(dir.path()).expect("dir opens");
+        // c2 before c10 (natural order), notes.txt filtered, uppercase
+        // extension kept
+        assert_eq!(source.names, ["c1.png", "c2.png", "c10.png", "cover.PNG"]);
         assert_eq!(source.len(), 4);
+        assert_eq!(source.name(2), Some("c10.png"));
         assert_eq!(
             source.page_name(2),
             PageName {
@@ -478,17 +477,11 @@ mod tests {
                 file: "c10.png".into(),
             }
         );
-        assert_eq!(source.names, ["c1.png", "c2.png", "c10.png", "cover.PNG"]);
-        assert_eq!(source.name(2), Some("c10.png"));
-    }
-
-    #[test]
-    fn dir_bytes_roundtrip() {
-        let dir = TempDir::new("pagebytes");
-        let png = tiny_png(3, 2, [9, 8, 7, 255]);
-        dir.write("p.png", &png);
-        let source = Source::open(dir.path()).unwrap();
-        assert_eq!(source.bytes(0).as_deref().ok(), Some(png.as_slice()));
+        // bytes: a written page reads back byte-identical
+        assert_eq!(
+            source.bytes(1).as_deref().ok(),
+            Some(tiny_png(1, 1, [7, 8, 9, 255]).as_slice())
+        );
     }
 
     #[test]

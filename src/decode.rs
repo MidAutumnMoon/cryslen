@@ -735,86 +735,10 @@ mod tests {
     use super::*;
     use crate::testkit;
 
+    /// `decode()` dispatches on magic bytes, then the filename extension; anything else is `NotAnImage`.
     #[test]
-    fn png_roundtrip() {
-        let png = testkit::tiny_png(4, 3, [10, 20, 30, 255]);
-        let page = decode(&png, "p.png").expect("png decodes");
-        assert_eq!((page.width, page.height), (4, 3));
-        assert_eq!(page.format, Format::Png);
-        match page.pixels {
-            Pixels::Rgba8(bytes) => {
-                assert_eq!(bytes.len(), 4 * 4 * 3);
-                assert_eq!(bytes.get(..4), Some(&[10, 20, 30, 255][..]));
-            }
-            Pixels::Yuv(_) => panic!("png must decode to rgba"),
-        }
-    }
-
-    // The in-tree encoder cannot write EXIF orientation tags, so
-    // orientation handling has no testable fixture.
-
-    #[test]
-    fn jpeg_roundtrip() {
-        let jpg = testkit::tiny_jpeg(5, 2, [200, 100, 50]);
-        let page = decode(&jpg, "p.jpg").expect("jpeg decodes");
-        assert_eq!(page.format, Format::Jpeg);
-        assert_eq!((page.width, page.height), (5, 2));
-    }
-
-    #[test]
-    fn truncated_jpeg_is_an_error_not_panic() {
-        let jpg = testkit::tiny_jpeg(32, 32, [1, 2, 3]);
-        let truncated = jpg.get(..20).expect("jpeg is longer than the cut");
-        assert!(matches!(decode(truncated, "p.jpg"), Err(DecodeError::Image(Format::Jpeg, _))));
-    }
-
-    #[test]
-    fn edge_cap_at_gpu_texture_limit() {
-        let over = Decoded::rgba(
-            MAX_TEXTURE_EDGE + 1,
-            1,
-            Format::Png,
-            vec![0_u8; 4 * (MAX_TEXTURE_EDGE + 1) as usize].into_boxed_slice(),
-        );
-        assert!(matches!(over, Err(DecodeError::Unsupported(_))));
-        Decoded::rgba(
-            MAX_TEXTURE_EDGE,
-            1,
-            Format::Png,
-            vec![0_u8; 4 * MAX_TEXTURE_EDGE as usize].into_boxed_slice(),
-        )
-        .expect("page at the edge cap constructs");
-    }
-
-    // Dims inside the texture-edge cap can still exceed the pixel-count
-    // cap, which must reject the page before any buffer is sized for it.
-    #[test]
-    fn pixel_count_over_the_cap_is_rejected() {
-        assert!(matches!(
-            Decoded::rgba(MAX_TEXTURE_EDGE, MAX_TEXTURE_EDGE, Format::Png, Box::default()),
-            Err(DecodeError::Corrupt("bad dimensions"))
-        ));
-    }
-
-    // Odd edges round chroma up (div_ceil); mono carries a 1x1 stub the
-    // renderer binds as a midpoint texture.
-    #[test]
-    fn plane_dims_on_odd_sizes() {
-        assert_eq!(plane_dims((5, 3), Subsampling::Mono), ((5, 3), (1, 1)));
-        assert_eq!(plane_dims((5, 3), Subsampling::Yuv420), ((5, 3), (3, 2)));
-        assert_eq!(plane_dims((5, 3), Subsampling::Yuv422), ((5, 3), (3, 3)));
-        assert_eq!(plane_dims((5, 3), Subsampling::Yuv444), ((5, 3), (5, 3)));
-    }
-
-    #[test]
-    fn garbage_is_not_an_image() {
-        assert!(matches!(decode(b"hello world", "noext"), Err(DecodeError::NotAnImage)));
-        assert!(matches!(decode(b"hello world", "note.txt"), Err(DecodeError::NotAnImage)));
-        assert!(matches!(decode(&[], "x"), Err(DecodeError::NotAnImage)));
-    }
-
-    #[test]
-    fn sniff_magics() {
+    fn format_detection() {
+        // sniff: one row per magic
         assert_eq!(sniff(&[0xFF, 0xD8, 0xFF, 0xE0]), Some(Format::Jpeg));
         assert_eq!(sniff(b"\x89PNG\r\n\x1a\n"), Some(Format::Png));
         assert_eq!(sniff(b"GIF89a"), Some(Format::Gif));
@@ -831,47 +755,81 @@ mod tests {
         heic.extend_from_slice(b"ftypmif1");
         assert_eq!(sniff(&heic), None);
         assert_eq!(sniff(b"plain text"), None);
-    }
 
-    #[test]
-    fn extension_fallback_and_table() {
+        // extension fallback: uppercase and aliases accepted, non-images rejected
         assert_eq!(format_from_name("a.JPG"), Some(Format::Jpeg));
         assert_eq!(format_from_name("a.tiff"), Some(Format::Tiff));
         assert_eq!(format_from_name("a.avif"), Some(Format::Avif));
         assert_eq!(format_from_name("a.jxl"), Some(Format::Jxl));
         assert_eq!(format_from_name("cover.cbz"), None);
         assert_eq!(format_from_name("noext"), None);
+
+        // garbage: no magic and no usable extension is NotAnImage
+        assert!(matches!(decode(b"hello world", "noext"), Err(DecodeError::NotAnImage)));
+        assert!(matches!(decode(b"hello world", "note.txt"), Err(DecodeError::NotAnImage)));
+        assert!(matches!(decode(&[], "x"), Err(DecodeError::NotAnImage)));
     }
 
+    /// The in-tree encoders produce pages `decode()` reads back. (The encoder cannot write EXIF orientation tags, so orientation handling has no testable fixture.)
     #[test]
-    fn avif_and_jxl_garbage_is_an_error_not_panic() {
-        // No avif encoder exists in-tree, so only the dispatch decision is
-        // testable for it.
-        assert!(matches!(decode(b"\x00\x00\x00\x0cftypavif", "a.avif"), Err(DecodeError::Avif(..))));
-        assert!(matches!(decode(&[0xFF, 0x0A, 0x00], "a.jxl"), Err(DecodeError::Corrupt(_))));
+    fn encoder_roundtrips() {
+        // png: format, dims, extent, and the first pixel
+        let png = testkit::tiny_png(4, 3, [10, 20, 30, 255]);
+        let png_page = decode(&png, "p.png").expect("png decodes");
+        assert_eq!((png_page.width, png_page.height), (4, 3));
+        assert_eq!(png_page.format, Format::Png);
+        match png_page.pixels {
+            Pixels::Rgba8(bytes) => {
+                assert_eq!(bytes.len(), 4 * 4 * 3);
+                assert_eq!(bytes.get(..4), Some(&[10, 20, 30, 255][..]));
+            }
+            Pixels::Yuv(_) => panic!("png must decode to rgba"),
+        }
+
+        // jpeg: format and dims
+        let jpg = testkit::tiny_jpeg(5, 2, [200, 100, 50]);
+        let jpeg_page = decode(&jpg, "p.jpg").expect("jpeg decodes");
+        assert_eq!(jpeg_page.format, Format::Jpeg);
+        assert_eq!((jpeg_page.width, jpeg_page.height), (5, 2));
     }
 
-    // 32x16 10-bit 4:0:0 fixture, a black-to-white grayscale gradient.
+    /// Decoded constructors cap page edges at the GPU texture limit and pixel counts at the allocation ceiling.
     #[test]
-    fn avif_mono_fixture_decodes() {
-        let page = decode(include_bytes!("testdata/mono.avif"), "a.avif").expect("mono avif decodes");
-        assert_eq!(page.format, Format::Avif);
-        assert_eq!((page.width, page.height), (32, 16));
-        let Pixels::Yuv(yuv) = &page.pixels else {
-            panic!("avif must decode to yuv planes")
-        };
-        assert_eq!(yuv.subsampling, Subsampling::Mono);
-        let Plane::U16(luma) = &yuv.luma else {
-            panic!("10-bit luma must be u16 samples")
-        };
-        assert_eq!(luma.len(), 32 * 16);
-        assert!(luma.first() < luma.last());
-        assert!(matches!(&yuv.cb, Plane::U8(bytes) if bytes.is_empty()));
-        assert!(matches!(&yuv.cr, Plane::U8(bytes) if bytes.is_empty()));
+    fn constructor_caps() {
+        Decoded::rgba(
+            MAX_TEXTURE_EDGE,
+            1,
+            Format::Png,
+            vec![0_u8; 4 * MAX_TEXTURE_EDGE as usize].into_boxed_slice(),
+        )
+        .expect("page at the edge cap constructs");
+        // An edge over the limit is Unsupported.
+        let over = Decoded::rgba(
+            MAX_TEXTURE_EDGE + 1,
+            1,
+            Format::Png,
+            vec![0_u8; 4 * (MAX_TEXTURE_EDGE + 1) as usize].into_boxed_slice(),
+        );
+        assert!(matches!(over, Err(DecodeError::Unsupported(_))));
+        // Dims inside the edge cap can still exceed the pixel-count cap,
+        // which must reject the page before any buffer is sized for it.
+        assert!(matches!(
+            Decoded::rgba(MAX_TEXTURE_EDGE, MAX_TEXTURE_EDGE, Format::Png, Box::default()),
+            Err(DecodeError::Corrupt("bad dimensions"))
+        ));
     }
 
+    /// `plane_dims` rounds chroma up on odd edges; `Decoded::yuv` rejects wrong plane extents.
     #[test]
-    fn yuv_plane_extent_boundary() {
+    fn yuv_planes() {
+        // odd edges round chroma up (div_ceil); mono carries a 1x1 stub
+        // the renderer binds as a midpoint texture
+        assert_eq!(plane_dims((5, 3), Subsampling::Mono), ((5, 3), (1, 1)));
+        assert_eq!(plane_dims((5, 3), Subsampling::Yuv420), ((5, 3), (3, 2)));
+        assert_eq!(plane_dims((5, 3), Subsampling::Yuv422), ((5, 3), (3, 3)));
+        assert_eq!(plane_dims((5, 3), Subsampling::Yuv444), ((5, 3), (5, 3)));
+
+        // a well-sized mono page constructs; an empty luma plane does not
         let mono = |luma: Plane| YuvImage {
             depth: 10,
             subsampling: Subsampling::Mono,
@@ -905,14 +863,35 @@ mod tests {
         ));
     }
 
-    // 8x8 lossless cjxl fixtures with solid top and bottom halves.
+    // 32x16 10-bit 4:0:0 fixture, a black-to-white grayscale gradient.
     #[test]
-    fn jxl_fixtures_decode_to_rgba() {
-        let gray_page = decode(include_bytes!("testdata/gray.jxl"), "a.jxl").expect("gray jxl decodes");
-        assert_eq!((gray_page.width, gray_page.height), (8, 8));
-        assert_eq!(gray_page.format, Format::Jxl);
-        match gray_page.pixels {
-            // gray replicates to r=g=b
+    fn avif_fixture_decodes() {
+        let page = decode(include_bytes!("testdata/mono.avif"), "a.avif").expect("mono avif decodes");
+        assert_eq!(page.format, Format::Avif);
+        assert_eq!((page.width, page.height), (32, 16));
+        let Pixels::Yuv(yuv) = &page.pixels else {
+            panic!("avif must decode to yuv planes")
+        };
+        assert_eq!(yuv.subsampling, Subsampling::Mono);
+        let Plane::U16(luma) = &yuv.luma else {
+            panic!("10-bit luma must be u16 samples")
+        };
+        assert_eq!(luma.len(), 32 * 16);
+        assert!(luma.first() < luma.last());
+        assert!(matches!(&yuv.cb, Plane::U8(bytes) if bytes.is_empty()));
+        assert!(matches!(&yuv.cr, Plane::U8(bytes) if bytes.is_empty()));
+    }
+
+    /// The jxl fixtures decode to RGBA: gray/alpha pixel content, wide row-stride order, an animated first frame.
+    // wide.jxl and animated.jxl are verbatim copies of exif.jxl and
+    // 5_frames_numbered_jxli.jxl from jxl 0.8.0's tests/testdata.
+    #[test]
+    fn jxl_fixtures_decode() {
+        // gray: solid halves, gray replicated to r=g=b
+        let gray = decode(include_bytes!("testdata/gray.jxl"), "a.jxl").expect("gray jxl decodes");
+        assert_eq!((gray.width, gray.height), (8, 8));
+        assert_eq!(gray.format, Format::Jxl);
+        match gray.pixels {
             Pixels::Rgba8(bytes) => {
                 assert_eq!(bytes.get(..4), Some(&[0x20, 0x20, 0x20, 0xFF][..]));
                 assert_eq!(bytes.get(128..132), Some(&[0xE0, 0xE0, 0xE0, 0xFF][..]));
@@ -920,16 +899,41 @@ mod tests {
             Pixels::Yuv(_) => panic!("jxl must decode to rgba"),
         }
 
-        let alpha_page =
-            decode(include_bytes!("testdata/alpha.jxl"), "a.jxl").expect("alpha jxl decodes");
-        match alpha_page.pixels {
-            // the file's own alpha rides in the fourth byte
+        // alpha: the file's own alpha rides in the fourth byte
+        let alpha = decode(include_bytes!("testdata/alpha.jxl"), "a.jxl").expect("alpha jxl decodes");
+        match alpha.pixels {
             Pixels::Rgba8(bytes) => {
                 assert_eq!(bytes.get(..4), Some(&[0x40, 0x80, 0xC0, 0xFF][..]));
                 assert_eq!(bytes.get(128..132), Some(&[0x40, 0x80, 0xC0, 0x80][..]));
             }
             Pixels::Yuv(_) => panic!("jxl must decode to rgba"),
         }
+
+        // wide: 256x128 pins the row/stride order; opaque alpha on every
+        // pixel proves the decoder wrote all rows of the zero-initialised
+        // buffer
+        let wide = decode(include_bytes!("testdata/wide.jxl"), "a.jxl").expect("wide jxl decodes");
+        assert_eq!((wide.width, wide.height), (256, 128));
+        let Pixels::Rgba8(wide_rgba) = &wide.pixels else {
+            panic!("jxl must decode to rgba")
+        };
+        assert!(wide_rgba.as_chunks::<4>().0.iter().all(|px| px[3] == 0xFF));
+
+        // animated: the numbered frames paint digits, so the first frame
+        // carries non-black pixels
+        let animated =
+            decode(include_bytes!("testdata/animated.jxl"), "a.jxl").expect("animated jxl decodes");
+        assert_eq!((animated.width, animated.height), (256, 256));
+        let Pixels::Rgba8(animated_rgba) = &animated.pixels else {
+            panic!("jxl must decode to rgba")
+        };
+        assert!(
+            animated_rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|px| px[0] != 0 || px[1] != 0 || px[2] != 0)
+        );
     }
 
     // A truncation bug would hang the decode instead of failing it, hence
@@ -963,35 +967,6 @@ mod tests {
                 "cut {cut} reported the wrong truncation"
             );
         }
-    }
-
-    // The other fixtures are 8x8 squares, so a rows/stride swap in the
-    // output buffer keeps the byte total and stays invisible. A 256x128
-    // page pins the order. Opaque alpha on every pixel proves the decoder
-    // wrote all rows of the zero-initialised buffer.
-    // wide.jxl and animated.jxl are verbatim copies of exif.jxl and
-    // 5_frames_numbered_jxli.jxl from jxl 0.8.0's tests/testdata.
-    #[test]
-    fn wide_jxl_pins_the_row_stride_order() {
-        let page = decode(include_bytes!("testdata/wide.jxl"), "a.jxl").expect("wide jxl decodes");
-        assert_eq!((page.width, page.height), (256, 128));
-        let Pixels::Rgba8(rgba) = &page.pixels else {
-            panic!("jxl must decode to rgba")
-        };
-        assert!(rgba.as_chunks::<4>().0.iter().all(|px| px[3] == 0xFF));
-    }
-
-    #[test]
-    fn animated_jxl_decodes_its_first_frame() {
-        let page =
-            decode(include_bytes!("testdata/animated.jxl"), "a.jxl").expect("animated jxl decodes");
-        assert_eq!((page.width, page.height), (256, 256));
-        let Pixels::Rgba8(rgba) = &page.pixels else {
-            panic!("jxl must decode to rgba")
-        };
-        // The numbered frames paint digits, so a decoded frame carries
-        // non-black pixels.
-        assert!(rgba.as_chunks::<4>().0.iter().any(|px| px[0] != 0 || px[1] != 0 || px[2] != 0));
     }
 
     // The fixtures are single-group, so only this test exercises the

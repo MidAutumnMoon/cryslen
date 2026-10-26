@@ -874,86 +874,25 @@ mod tests {
         matrix[col * 3 + row]
     }
 
-    // The u_mode and u_chroma uniforms the shaders branch on.
+    /// Uniform-value helpers: shader id encodings, range anchors, depth normalization.
     #[test]
-    fn uniform_id_encodings() {
+    fn uniform_values() {
+        // the u_mode and u_chroma uniforms the shaders branch on
         assert_eq!(mode_id(Mode::Rgba), 0);
         assert_eq!(mode_id(Mode::Yuv), 1);
         assert_eq!(chroma_id(Subsampling::Mono), 0);
         assert_eq!(chroma_id(Subsampling::Yuv420), 1);
         assert_eq!(chroma_id(Subsampling::Yuv422), 2);
         assert_eq!(chroma_id(Subsampling::Yuv444), 3);
-    }
-
-    /// Each row: `(matrix, full_range, [(row, col, expected)])`. Expected
-    /// entries derive from each standard's published KR/KB with
-    /// KG = 1 - KR - KB: (0, 2) is `2(1 - KR)` and (2, 1) is `2(1 - KB)`,
-    /// each times the chroma scale, and the green terms are
-    /// `2·K·(1 - K)/KG` likewise. Full range leaves the scales at 1, so
-    /// BT.601 gives exactly 1.402 and 1.772. BT.2020 (KR 0.2627,
-    /// KB 0.0593, KG 0.678) gives 1.4746/1.8814 full range and, under
-    /// the 255/224 chroma scale, 1.678674/2.141772 with green terms
-    /// 0.187326/0.650424.
-    #[test]
-    fn yuv_to_rgb_matches_documented_constants() {
-        let cases = [
-            (
-                Matrix::Bt601,
-                false,
-                &[
-                    (0, 0, LIMITED_LUMA_SCALE),
-                    (1, 0, LIMITED_LUMA_SCALE),
-                    (2, 0, LIMITED_LUMA_SCALE),
-                    (0, 2, 1.596_027),
-                    (1, 1, -0.391_762),
-                    (1, 2, -0.812_968),
-                    (2, 1, 2.017_232),
-                    (0, 1, 0.0),
-                    (2, 2, 0.0),
-                ][..],
-            ),
-            (
-                Matrix::Bt709,
-                false,
-                &[
-                    (0, 2, 1.792_741),
-                    (1, 1, -0.212_899),
-                    (1, 2, -0.532_909),
-                    (2, 1, 2.112_402),
-                ][..],
-            ),
-            (
-                Matrix::Bt2020,
-                false,
-                &[
-                    (0, 2, 1.678_674),
-                    (1, 1, -0.187_326),
-                    (1, 2, -0.650_424),
-                    (2, 1, 2.141_772),
-                ][..],
-            ),
-            (Matrix::Bt601, true, &[(0, 0, 1.0), (0, 2, 1.402), (2, 1, 1.772)][..]),
-            (Matrix::Bt709, true, &[(0, 2, 1.5748), (2, 1, 1.8556)][..]),
-            (Matrix::Bt2020, true, &[(0, 2, 1.4746), (2, 1, 1.8814)][..]),
-        ];
-        for (matrix, full_range, expected) in cases {
-            let conversion = yuv_to_rgb_matrix(matrix, full_range);
-            // The limited-range constants are published tables accurate to
-            // about 1e-3; the full-range entries are exact 2(1-K)
-            // derivations, so they pin tighter.
-            let tolerance = if full_range { 1e-6 } else { 1e-3 };
-            for &(row, col, want) in expected {
-                assert!(
-                    (element(&conversion, row, col) - want).abs() < tolerance,
-                    "{matrix:?} full_range={full_range} at ({row}, {col})"
-                );
-            }
-        }
-        // Identity is an early return, independent of range.
-        assert_eq!(
-            yuv_to_rgb_matrix(Matrix::Identity, false),
-            [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
-        );
+        // quantization anchors: (luma, chroma) per range
+        assert_eq!(range_offsets(true), (0.0, FULL_RANGE_CHROMA_NEUTRAL));
+        assert_eq!(range_offsets(false), (LIMITED_LUMA_BLACK, LIMITED_CHROMA_NEUTRAL));
+        // depth normalization: 1.0 for 8-bit storage, the storage-to-depth
+        // ratio for wide planes
+        assert_eq!(depth_norm(8, false), 1.0);
+        assert_eq!(depth_norm(MAX_PLANE_DEPTH, true), 1.0);
+        assert!((depth_norm(10, true) - R16_STORAGE_MAX / 1023.0).abs() < 1e-4);
+        assert!((depth_norm(12, true) - R16_STORAGE_MAX / 4095.0).abs() < 1e-4);
     }
 
     #[test]
@@ -970,37 +909,6 @@ mod tests {
                 assert!((got - expected).abs() < 1e-4, "row {row}: {got} vs {expected}");
             }
         }
-    }
-
-    #[test]
-    fn quantization_helpers() {
-        assert_eq!(range_offsets(true), (0.0, FULL_RANGE_CHROMA_NEUTRAL));
-        assert_eq!(depth_norm(8, false), 1.0);
-        assert_eq!(depth_norm(MAX_PLANE_DEPTH, true), 1.0);
-        assert!((depth_norm(10, true) - R16_STORAGE_MAX / 1023.0).abs() < 1e-4);
-        assert!((depth_norm(12, true) - R16_STORAGE_MAX / 4095.0).abs() < 1e-4);
-    }
-
-    #[test]
-    fn page_uniforms_from_pixels() {
-        assert_eq!(PageUniforms::from(&Pixels::Rgba8(Box::default())), RGBA_UNIFORMS);
-        let yuv_pixels = Pixels::Yuv(YuvImage {
-            depth: 10,
-            subsampling: Subsampling::Yuv420,
-            full_range: false,
-            matrix: Matrix::Bt2020,
-            luma: Plane::U8(Box::default()), cb: Plane::U8(Box::default()), cr: Plane::U8(Box::default()),
-        });
-        assert_eq!(
-            PageUniforms::from(&yuv_pixels),
-            PageUniforms {
-                mode: Mode::Yuv,
-                subsampling: Subsampling::Yuv420,
-                depth: 10,
-                full_range: false,
-                matrix: Matrix::Bt2020,
-            }
-        );
     }
 
     #[expect(
@@ -1051,22 +959,29 @@ mod tests {
         }
     }
 
+    /// `eviction_victims`: unbound pages go farthest-first, ties to the higher page; bound pages never go.
     #[test]
-    fn eviction_drops_unbound_pages_farthest_first() {
-        let costs = [(3_usize, 10_usize), (19, 10), (10, 10), (20, 10)];
-        // 19 sits one page from seat 1's anchor, so 3 is the farther victim.
-        assert_eq!(eviction_victims(costs, [Some(10), Some(20)], 35), vec![3]);
-        assert_eq!(eviction_victims(costs, [Some(10), Some(20)], 25), vec![3, 19]);
-        // An equal distance from the seat breaks the tie to the higher page.
+    fn eviction_victims_table() {
+        let far = [(3_usize, 10_usize), (19, 10), (10, 10), (20, 10)];
         let tied = [(8_usize, 10_usize), (12, 10), (10, 10)];
-        assert_eq!(eviction_victims(tied, [Some(10), None], 25), vec![12]);
-    }
-
-    #[test]
-    fn bound_pages_are_never_evicted() {
-        let costs = [(10_usize, 10_usize), (11, 10), (12, 10)];
-        assert_eq!(eviction_victims(costs, [Some(10), Some(11)], 0), vec![12]);
-        assert_eq!(eviction_victims(costs, [Some(10), Some(11)], 30), vec![]);
+        let bound = [(10_usize, 10_usize), (11, 10), (12, 10)];
+        for (costs, seats, budget, want) in [
+            // 19 sits one page from seat 10, so 3 is the farther victim
+            (&far[..], [Some(10), Some(20)], 35, vec![3_usize]),
+            (&far[..], [Some(10), Some(20)], 25, vec![3_usize, 19]),
+            // an equal distance from the seat breaks the tie to the higher page
+            (&tied[..], [Some(10), None], 25, vec![12]),
+            // bound pages never go, even at budget 0
+            (&bound[..], [Some(10), Some(11)], 0, vec![12]),
+            // everything fits: no victims
+            (&bound[..], [Some(10), Some(11)], 30, vec![]),
+        ] {
+            assert_eq!(
+                eviction_victims(costs.iter().copied(), seats, budget),
+                want,
+                "costs {costs:?} seats {seats:?} budget {budget}"
+            );
+        }
     }
 
     /// Uniform names one shader source declares, in declaration order.

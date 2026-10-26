@@ -304,202 +304,72 @@ fn clamp_axis(offset: f32, content: f32, size: f32) -> f32 {
 mod tests {
     use super::*;
 
+    /// `spread_for`: mode flags, the lone cover, odd-start pairs, clamping at the source.
     #[test]
-    fn mode_flags() {
-        assert!(!ViewMode::Normal.pairs());
-        assert!(!ViewMode::Normal.rtl());
-        assert!(ViewMode::Manga.pairs());
-        assert!(ViewMode::Manga.rtl());
-        assert!(ViewMode::Comic.pairs());
-        assert!(!ViewMode::Comic.rtl());
-    }
-
-    #[test]
-    fn layout_asymmetric_pair_top_aligned() {
-        let spread_layout = layout([Some((100, 300)), Some((200, 150))]);
-        assert_eq!(spread_layout.rects[0], Some(PageRect { pos: (0.0, 0.0), size: (100.0, 300.0) }));
-        assert_eq!(spread_layout.rects[1], Some(PageRect { pos: (100.0, 0.0), size: (200.0, 150.0) }));
-        assert_eq!(spread_layout.total(), (300.0, 300.0));
-    }
-
-    #[test]
-    fn layout_skips_undecoded_seats() {
-        let missing_right = layout([Some((100, 200)), None]);
-        assert_eq!(missing_right.rects[1], None);
-        assert_eq!(missing_right.total(), (100.0, 200.0));
-        // an undecoded left seat leaves the right page starting at x=0
-        let missing_left = layout([None, Some((100, 200))]);
-        assert_eq!(missing_left.rects[0], None);
-        assert_eq!(missing_left.rects[1], Some(PageRect { pos: (0.0, 0.0), size: (100.0, 200.0) }));
-    }
-
-    /// The whole window as a viewport, for tests with no bottom bar.
-    fn full_window(win: (f32, f32)) -> Viewport {
-        Viewport::above_bottom_bar(win, win.1)
-    }
-
-    #[test]
-    fn above_bottom_bar_sizes_and_clamps() {
-        let viewport = Viewport::above_bottom_bar((1000.0, 800.0), 740.0);
-        assert_eq!(viewport.size(), (1000.0, 740.0));
-        // A bar top past the window bottom degenerates to the window.
-        // A negative one degenerates to nothing.
-        let past = Viewport::above_bottom_bar((100.0, 50.0), 80.0);
-        assert_eq!(past.size(), (100.0, 50.0));
-        let negative = Viewport::above_bottom_bar((100.0, 50.0), -10.0);
-        assert_eq!(negative.size(), (100.0, 0.0));
-    }
-
-    #[test]
-    fn fit_scales_to_min_axis_and_centers() {
-        let placement = fit((1000.0, 2000.0), full_window((500.0, 500.0)));
-        assert!((placement.scale - 0.25).abs() < 1e-6);
-        assert!((placement.offset.0 - 125.0).abs() < 1e-6);
-        assert!((placement.offset.1 - 0.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn fit_centers_within_the_viewport_not_the_window() {
-        // Height-fitting image: the viewport is 600 px tall in an 800 px
-        // window, so centering lands at 0, not at the window's 100.
-        let viewport = Viewport::above_bottom_bar((1000.0, 800.0), 600.0);
-        let placement = fit((500.0, 400.0), viewport);
-        assert!((placement.scale - 1.5).abs() < 1e-6);
-        assert!((placement.offset.1 - 0.0).abs() < 1e-6, "{}", placement.offset.1);
-        assert!((placement.offset.0 - 125.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn fit_degenerate_inputs_are_inert() {
-        assert_eq!(
-            fit((0.0, 0.0), full_window((500.0, 500.0))),
-            Placement { scale: 1.0, offset: (0.0, 0.0) }
-        );
-        assert_eq!(
-            fit((100.0, 100.0), Viewport::default()),
-            Placement { scale: 1.0, offset: (0.0, 0.0) }
-        );
-    }
-
-    #[test]
-    fn zoom_keeps_cursor_anchored() {
-        let placement = Placement { scale: 2.0, offset: (100.0, 50.0) };
-        let placement = zoom_at(placement, (300.0, 200.0), 2.0);
-        // The image pixel under the cursor before is (300-100)/2 = 100.
-        // After the zoom it is (300 - offset)/scale.
-        assert!(((300.0 - placement.offset.0) / placement.scale - 100.0).abs() < 0.01);
-        // Hitting the clamp anchors with the factor actually applied, so
-        // the image point under the cursor stays fixed anyway.
-        let clamped = zoom_at(Placement { scale: 30.0, offset: (100.0, 50.0) }, (300.0, 200.0), 100.0);
-        assert!(((300.0 - clamped.offset.0) / clamped.scale - (300.0 - 100.0) / 30.0).abs() < 0.01);
-    }
-
-    #[expect(
-        clippy::float_cmp_const,
-        reason = "clamping to the bound yields the bound exactly"
-    )]
-    #[test]
-    fn zoom_clamps_scale() {
-        assert_eq!(
-            zoom_at(Placement { scale: 30.0, offset: (0.0, 0.0) }, (0.0, 0.0), 100.0).scale,
-            MAX_SCALE
-        );
-        assert_eq!(
-            zoom_at(Placement { scale: 0.1, offset: (0.0, 0.0) }, (0.0, 0.0), 0.001).scale,
-            MIN_SCALE
-        );
-    }
-
-    #[test]
-    fn clamp_oversized_keeps_edge_reachable() {
-        // 2000 content px at scale 1 in a 500 px viewport
-        let viewport = full_window((500.0, 500.0));
-        let placement = clamp(Placement { scale: 1.0, offset: (-5000.0, 0.0) }, (2000.0, 400.0), viewport);
-        assert!(placement.offset.0 >= 500.0 - 2000.0 - EDGE_KEEP_PX - 1e-4, "{}", placement.offset.0);
-        assert!(placement.offset.0 <= EDGE_KEEP_PX + 1e-4);
-        // y fits (400 < 500) so it is centered
-        assert!((placement.offset.1 - 50.0).abs() < 1e-4);
-        // Clamping moves the offset only; scale passes through.
-        assert_eq!(placement.scale, 1.0);
-    }
-
-    #[test]
-    fn clamp_centers_fitted_axes() {
-        let total = (400.0, 300.0);
-        let viewport = full_window((1000.0, 800.0));
-        let fitted = fit(total, viewport);
-        let dragged = pan(fitted, (300.0, -200.0));
-        let placement = clamp(dragged, total, viewport);
-        assert!((placement.offset.0 - fitted.offset.0).abs() < 1e-4);
-        assert!((placement.offset.1 - fitted.offset.1).abs() < 1e-4);
-    }
-
-    #[test]
-    fn cover_alone_then_pairs() {
-        assert_eq!(spread_for(0, ViewMode::Manga, 10), Spread { first: 0, second: None });
+    fn spread_for_structure() {
+        // (mode, pairs, rtl): the pairing and direction flags per mode
+        for (mode, pairs, rtl) in [
+            (ViewMode::Normal, false, false),
+            (ViewMode::Manga, true, true),
+            (ViewMode::Comic, true, false),
+        ] {
+            assert_eq!(mode.pairs(), pairs, "{mode:?}");
+            assert_eq!(mode.rtl(), rtl, "{mode:?}");
+        }
+        // Anchor: page 1 opens the first pair.
         assert_eq!(spread_for(1, ViewMode::Manga, 10), Spread { first: 1, second: Some(2) });
-        assert_eq!(spread_for(2, ViewMode::Manga, 10), Spread { first: 1, second: Some(2) });
-        assert_eq!(spread_for(3, ViewMode::Manga, 10), Spread { first: 3, second: Some(4) });
-        assert_eq!(spread_for(0, ViewMode::Normal, 10), Spread { first: 0, second: None });
-        assert_eq!(spread_for(5, ViewMode::Normal, 10), Spread { first: 5, second: None });
-    }
-
-    #[test]
-    fn odd_tail_clamps_at_source() {
-        // 7 pages: index 6 lives in pair (5, 6).
-        assert_eq!(spread_for(6, ViewMode::Manga, 7), Spread { first: 5, second: Some(6) });
-        // 6 pages: the would-be pair (5, 6) shows page 5 alone.
-        assert_eq!(spread_for(5, ViewMode::Manga, 6), Spread { first: 5, second: None });
-        // Out-of-range index clamps to the last page.
-        assert_eq!(spread_for(99, ViewMode::Manga, 6).first, 5);
-    }
-
-    #[test]
-    fn advance_wraps_at_both_ends() {
-        // Single mode: last page to first and back.
-        assert_eq!(advance(9, true, ViewMode::Normal, 10), 0);
-        assert_eq!(advance(0, false, ViewMode::Normal, 10), 9);
-        // Double mode with a lone tail page.
-        assert_eq!(advance(9, true, ViewMode::Manga, 10), 0);
-        assert_eq!(advance(0, false, ViewMode::Manga, 10), 9);
-        // Double mode ending on a full pair.
-        assert_eq!(advance(7, true, ViewMode::Manga, 9), 0);
-        assert_eq!(advance(0, false, ViewMode::Manga, 9), 7);
-        // Odd tail: 6 pages are 0 | 1,2 | 3,4 | 5.
-        assert_eq!(advance(5, true, ViewMode::Manga, 6), 0);
-        assert_eq!(advance(0, false, ViewMode::Manga, 6), 5);
-        // A step from mid-spread lands on the neighbor spread's start.
-        assert_eq!(advance(1, true, ViewMode::Manga, 10), 3);
-        assert_eq!(advance(3, false, ViewMode::Manga, 10), 1);
-        assert_eq!(advance(4, true, ViewMode::Normal, 10), 5);
-        // The cover's next spread starts at 1, not 2.
-        assert_eq!(advance(0, true, ViewMode::Manga, 10), 1);
-    }
-
-    #[test]
-    fn advance_round_trips_through_spread_starts() {
-        // A mid-spread page round-trips to its spread start, not to itself.
-        for len in [1, 2, 3, 6, 9, 10] {
-            for &mode in &ViewMode::ALL {
-                for page in 0..len {
-                    for &forward in &[false, true] {
-                        let stepped = advance(page, forward, mode, len);
-                        let back = advance(stepped, !forward, mode, len);
-                        assert_eq!(back, spread_for(page, mode, len).first);
+        for &mode in &ViewMode::ALL {
+            for len in 0_usize..=10 {
+                for page in 0..=(len + 2) {
+                    let clamped = page.min(len.max(1) - 1);
+                    let spread = spread_for(page, mode, len);
+                    assert!(spread.contains(clamped), "mode {mode:?} len {len} page {page}");
+                    if mode.pairs() {
+                        assert!(
+                            spread.first == 0 || spread.first % 2 == 1,
+                            "pairs start at 0 or an odd page: mode {mode:?} len {len} page {page}"
+                        );
+                        assert_eq!(
+                            spread.second.is_none(),
+                            spread.first == 0 || spread.first + 1 >= len,
+                            "the cover is alone and an odd tail ends alone: mode {mode:?} len {len} page {page}"
+                        );
+                    } else {
+                        assert_eq!(spread.first, clamped, "mode {mode:?} len {len} page {page}");
+                        assert_eq!(spread.second, None, "mode {mode:?} len {len} page {page}");
                     }
                 }
             }
         }
     }
 
+    /// advance steps between spread starts and wraps; a step and its inverse return to the spread start.
     #[test]
-    fn advance_tiny_books() {
-        assert_eq!(advance(0, true, ViewMode::Manga, 1), 0);
-        assert_eq!(advance(0, false, ViewMode::Normal, 1), 0);
-        // 2 pages, double mode: cover and one lone page cycle into each
-        // other.
-        assert_eq!(advance(0, true, ViewMode::Manga, 2), 1);
-        assert_eq!(advance(1, true, ViewMode::Manga, 2), 0);
+    fn advance_steps_between_spread_starts() {
+        for len in [0_usize, 1, 2, 3, 6, 9, 10] {
+            for &mode in &ViewMode::ALL {
+                for page in 0..=len {
+                    for &forward in &[false, true] {
+                        let stepped = advance(page, forward, mode, len);
+                        assert_eq!(
+                            spread_for(stepped, mode, len).first,
+                            stepped,
+                            "stepped page must be a spread start: len {len} mode {mode:?} page {page} forward {forward}"
+                        );
+                        assert_eq!(
+                            advance(stepped, !forward, mode, len),
+                            spread_for(page, mode, len).first,
+                            "step then step back must round-trip: len {len} mode {mode:?} page {page} forward {forward}"
+                        );
+                    }
+                }
+            }
+        }
+        // Direction anchors: a mid-spread step lands on the neighbor spread's start.
+        assert_eq!(advance(1, true, ViewMode::Manga, 10), 3);
+        assert_eq!(advance(4, true, ViewMode::Normal, 10), 5);
+        // The cover's next spread starts at 1, not 2.
+        assert_eq!(advance(0, true, ViewMode::Manga, 10), 1);
         // A zero-length book never exists, but the math must tolerate it.
         assert_eq!(advance(0, true, ViewMode::Manga, 0), 0);
     }
@@ -535,5 +405,154 @@ mod tests {
         let lone = Spread { first: 5, second: None };
         assert_eq!(lone.seats(ViewMode::Normal), [Some(5), None]);
         assert_eq!(lone.seats(ViewMode::Manga), [None, Some(5)]);
+    }
+
+    #[test]
+    fn above_bottom_bar_sizes_and_clamps() {
+        let viewport = Viewport::above_bottom_bar((1000.0, 800.0), 740.0);
+        assert_eq!(viewport.size(), (1000.0, 740.0));
+        // A bar top past the window bottom degenerates to the window.
+        // A negative one degenerates to nothing.
+        let past = Viewport::above_bottom_bar((100.0, 50.0), 80.0);
+        assert_eq!(past.size(), (100.0, 50.0));
+        let negative = Viewport::above_bottom_bar((100.0, 50.0), -10.0);
+        assert_eq!(negative.size(), (100.0, 0.0));
+    }
+
+    /// layout composes present seats side by side, top-aligned; undecoded seats join when they arrive.
+    #[test]
+    fn layout_places_seats() {
+        let left = (100_u32, 300);
+        let right = (200, 150);
+        let absent = None::<(u32, u32)>;
+        // Literal anchor, so a swapped u32->f32 mapping cannot pass.
+        assert_eq!(
+            layout([Some(left), Some(right)]).rects,
+            [
+                Some(PageRect { pos: (0.0, 0.0), size: (100.0, 300.0) }),
+                Some(PageRect { pos: (100.0, 0.0), size: (200.0, 150.0) }),
+            ]
+        );
+        for dims in [
+            [absent, absent],            // empty spread
+            [Some(left), absent],        // left only
+            [absent, Some(right)],       // right only: right starts at x=0
+            [Some(left), Some(right)],   // asymmetric pair
+        ] {
+            let spread = layout(dims);
+            // rect present iff input Some; x accumulates over present seats, top-aligned
+            let mut next_seat_x = 0.0_f32;
+            for (rect, seat_dims) in spread.rects.iter().zip(dims.iter()) {
+                match seat_dims {
+                    Some(seat_dims) => {
+                        let (width, height) = px_f32(*seat_dims);
+                        assert_eq!(
+                            *rect,
+                            Some(PageRect { pos: (next_seat_x, 0.0), size: (width, height) }),
+                            "seats {dims:?}"
+                        );
+                        next_seat_x += width;
+                    }
+                    _ => assert_eq!(rect, &None, "seats {dims:?}"),
+                }
+            }
+            // total is the width sum by the height max
+            let widths = dims.iter().flatten().map(|&seat| px_f32(seat).0).sum::<f32>();
+            let heights = dims.iter().flatten().map(|&seat| px_f32(seat).1).fold(0.0_f32, f32::max);
+            assert!((spread.total().0 - widths).abs() < 1e-4, "seats {dims:?}");
+            assert!((spread.total().1 - heights).abs() < 1e-4, "seats {dims:?}");
+        }
+    }
+
+    /// The whole window as a viewport, for tests with no bottom bar.
+    fn full_window(win: (f32, f32)) -> Viewport {
+        Viewport::above_bottom_bar(win, win.1)
+    }
+
+    /// fit scales to the smaller axis ratio and centers each axis in the viewport; degenerate inputs are inert.
+    #[test]
+    fn fit_centers_and_scales() {
+        for (total, viewport) in [
+            ((1000.0_f32, 2000.0), full_window((500.0, 500.0))), // height is the min axis
+            ((2000.0, 1000.0), full_window((500.0, 500.0))),     // width is the min axis
+            // bar-clamped viewport: centering uses the 600-px viewport, not the 800-px window
+            ((500.0, 400.0), Viewport::above_bottom_bar((1000.0, 800.0), 600.0)),
+            ((0.0, 100.0), full_window((500.0, 500.0))),         // degenerate total is inert
+            ((100.0, 100.0), Viewport::default()),               // empty viewport is inert
+        ] {
+            let size = viewport.size();
+            let got = fit(total, viewport);
+            if total.0 <= 0.0 || total.1 <= 0.0 || size.0 <= 0.0 || size.1 <= 0.0 {
+                assert_eq!(got, Placement { scale: 1.0, offset: (0.0, 0.0) }, "total {total:?} size {size:?}");
+                continue;
+            }
+            let want_scale = (size.0 / total.0).min(size.1 / total.1);
+            assert!((got.scale - want_scale).abs() < 1e-6, "total {total:?} size {size:?}");
+            let want_offset = (
+                total.0.mul_add(-want_scale, size.0) / 2.0,
+                total.1.mul_add(-want_scale, size.1) / 2.0,
+            );
+            assert!((got.offset.0 - want_offset.0).abs() < 1e-6, "total {total:?} size {size:?}");
+            assert!((got.offset.1 - want_offset.1).abs() < 1e-6, "total {total:?} size {size:?}");
+        }
+    }
+
+    /// `zoom_at` anchors the image point under the cursor with the factor actually applied, and clamps the scale.
+    #[expect(
+        clippy::float_cmp_const,
+        reason = "clamping to the bound yields the bound exactly"
+    )]
+    #[test]
+    fn zoom_at_anchors_and_clamps() {
+        for (scale, factor) in [
+            (2.0_f32, 2.0),  // plain zoom
+            (1.0, 0.5),      // plain shrink
+            (30.0, 100.0),   // clamps at MAX_SCALE
+            (0.1, 0.001),    // clamps at MIN_SCALE
+        ] {
+            for cursor in [(300.0_f32, 200.0), (0.0, 0.0), (1234.0, 4321.0)] {
+                let before = Placement { scale, offset: (100.0, 50.0) };
+                let after = zoom_at(before, cursor, factor);
+                let under_cursor = |placement: Placement| {
+                    ((cursor.0 - placement.offset.0) / placement.scale,
+                     (cursor.1 - placement.offset.1) / placement.scale)
+                };
+                let (want_x, want_y) = under_cursor(before);
+                let (got_x, got_y) = under_cursor(after);
+                assert!((got_x - want_x).abs() < 0.01, "scale {scale} factor {factor} cursor {cursor:?}");
+                assert!((got_y - want_y).abs() < 0.01, "scale {scale} factor {factor} cursor {cursor:?}");
+            }
+        }
+        // Both clamp bounds land exactly.
+        assert_eq!(zoom_at(Placement { scale: 30.0, offset: (0.0, 0.0) }, (0.0, 0.0), 100.0).scale, MAX_SCALE);
+        assert_eq!(zoom_at(Placement { scale: 0.1, offset: (0.0, 0.0) }, (0.0, 0.0), 0.001).scale, MIN_SCALE);
+    }
+
+    /// clamp pins fitting axes centered and keeps every oversized axis edge-reachable.
+    #[test]
+    fn clamp_keeps_spread_reachable() {
+        let viewport = full_window((500.0, 500.0));
+        // 2000 content px at scale 1 in a 500 px viewport, dragged off both ends.
+        let wide = clamp(Placement { scale: 1.0, offset: (-5000.0, 3000.0) }, (2000.0, 400.0), viewport);
+        // x is oversized: some of the spread stays reachable from both edges
+        assert!(wide.offset.0 >= 500.0 - 2000.0 - EDGE_KEEP_PX - 1e-4, "{}", wide.offset.0);
+        assert!(wide.offset.0 <= EDGE_KEEP_PX + 1e-4);
+        // y fits (400 < 500) so it is pinned centered regardless of the drag
+        assert!((wide.offset.1 - 50.0).abs() < 1e-4);
+        assert_eq!(wide.scale, 1.0, "clamping moves the offset only");
+
+        let tall = clamp(Placement { scale: 1.0, offset: (3000.0, -5000.0) }, (400.0, 2000.0), viewport);
+        assert!((tall.offset.0 - 50.0).abs() < 1e-4);
+        assert!(tall.offset.1 >= 500.0 - 2000.0 - EDGE_KEEP_PX - 1e-4, "{}", tall.offset.1);
+        assert!(tall.offset.1 <= EDGE_KEEP_PX + 1e-4);
+        assert_eq!(tall.scale, 1.0);
+
+        // A fully-fitted spread dragged away returns to its centered placement.
+        let total = (400.0, 300.0);
+        let fitted = fit(total, viewport);
+        let dragged = pan(fitted, (300.0, -200.0));
+        let recentered = clamp(dragged, total, viewport);
+        assert!((recentered.offset.0 - fitted.offset.0).abs() < 1e-4);
+        assert!((recentered.offset.1 - fitted.offset.1).abs() < 1e-4);
     }
 }
