@@ -13,8 +13,9 @@ use std::io::Error as IoError;
 use std::io::ErrorKind;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 
+use parking_lot::Mutex;
 use zip::result::ZipError;
 
 use crate::decode::format_from_name;
@@ -122,15 +123,6 @@ impl ByteTier {
             let evicted = self.order.pop_front().expect("over budget implies an entry");
             self.live_bytes -= self.map.remove(&evicted).expect("order and map agree").len();
         }
-    }
-}
-
-/// A poisoned lock only means a holder panicked mid-flight. The guarded
-/// data is still readable, so recover the guard.
-fn lock_recovered<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
-    match lock.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
     }
 }
 
@@ -293,7 +285,7 @@ impl Source {
                 .map(Arc::from)
                 .map_err(SourceError::Io),
             Backend::Zip(zip) => {
-                let mut archive = lock_recovered(zip);
+                let mut archive = zip.lock();
                 let mut entry = archive.by_name(name).map_err(SourceError::Zip)?;
                 let mut buf = Vec::new();
                 entry
@@ -304,17 +296,17 @@ impl Source {
                 Ok(buf.into())
             }
             Backend::SevenZip(backend) => {
-                let cached = lock_recovered(&backend.tier).get(index).cloned();
+                let cached = backend.tier.lock().get(index).cloned();
                 if let Some(cached) = cached {
                     return Ok(cached);
                 }
                 // The reader guard is scoped so the reader and tier locks
                 // are never held together.
                 let data: Arc<[u8]> = {
-                    let mut archive = lock_recovered(&backend.archive);
+                    let mut archive = backend.archive.lock();
                     archive.read_file(name).map_err(SourceError::SevenZip)?.into()
                 };
-                lock_recovered(&backend.tier).insert(index, Arc::clone(&data));
+                backend.tier.lock().insert(index, Arc::clone(&data));
                 Ok(data)
             }
         }
@@ -323,7 +315,7 @@ impl Source {
     #[cfg(test)]
     fn tier_has(&self, index: usize) -> bool {
         match &self.backend {
-            Backend::SevenZip(backend) => lock_recovered(&backend.tier).get(index).is_some(),
+            Backend::SevenZip(backend) => backend.tier.lock().get(index).is_some(),
             Backend::Directory(_) | Backend::Zip(_) => false,
         }
     }
@@ -354,7 +346,7 @@ fn spawn_harvest(path: PathBuf, pages: HashMap<String, usize>, tier: Arc<Mutex<B
                 member.clear();
                 data.read_to_end(&mut member)?;
                 if let Some(&index) = pages.get(&entry.name) {
-                    lock_recovered(&tier).insert(index, Arc::from(member.as_slice()));
+                    tier.lock().insert(index, Arc::from(member.as_slice()));
                 }
                 Ok(true)
             }) else { return; };

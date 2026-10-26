@@ -22,6 +22,7 @@ winit = { version = "0.30", default-features = false, features = ["rwh_06", "way
 eros = { version = "0.8", default-features = false }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "tiff"] }
 natord = "1"
+parking_lot = "0.12"
 zip = { version = "9", default-features = false, features = ["deflate"] }
 sevenz-rust2 = { version = "0.24", default-features = false, features = ["bzip2"] }
 libavif-sys = { version = "0.17", default-features = false, features = ["codec-dav1d"] }

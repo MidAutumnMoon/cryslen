@@ -391,6 +391,7 @@ dependencies = [
  "jxl",
  "libavif-sys",
  "natord",
+ "parking_lot",
  "rustfs-mimalloc",
  "sevenz-rust2",
  "tracing",

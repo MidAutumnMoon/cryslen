@@ -692,9 +692,9 @@ mod jxl {
 
     impl JxlParallelRunner for Pool {
         fn run(&mut self, num: usize, fun: &JxlParallelRunnerFun<'_>) -> JxlResult<()> {
-            use std::sync::Mutex;
-            use std::sync::PoisonError;
             use std::thread;
+
+            use parking_lot::Mutex;
 
             let thread_count = self.0.min(num);
             let chunk = num.div_ceil(thread_count);
@@ -708,20 +708,14 @@ mod jxl {
                             ..((thread_index + 1) * chunk).min(num)
                         {
                             if let Err(task_error) = fun(task_index) {
-                                failure
-                                    .lock()
-                                    .unwrap_or_else(PoisonError::into_inner)
-                                    .get_or_insert(task_error);
+                                failure.lock().get_or_insert(task_error);
                                 break;
                             }
                         }
                     });
                 }
             });
-            failure
-                .into_inner()
-                .unwrap_or_else(PoisonError::into_inner)
-                .map_or(Ok(()), Err)
+            failure.into_inner().map_or(Ok(()), Err)
         }
         fn num_threads(&self) -> usize {
             self.0

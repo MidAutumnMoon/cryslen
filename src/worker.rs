@@ -8,8 +8,10 @@ use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap};
 use std::io;
 use std::mem;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
+
+use parking_lot::Mutex;
 
 use crate::decode::Decoded;
 use crate::source::Source;
@@ -244,16 +246,7 @@ impl Worker {
 
     /// The current view for both seats of `wanted`, read under one lock.
     pub fn snapshot(&self, wanted: &Spread) -> SpreadView {
-        // A poisoned book lock means a panic struck mid-mutation, so
-        // live_bytes may not match the decided entries. Crash rather than
-        // run on drifted state. Poisoning is unreachable in release
-        // because decode runs outside the lock.
-        #[expect(
-            clippy::expect_used,
-            reason = "a poisoned book lock means drifted state, so crash rather than recover"
-        )]
-        let book = self.book.lock().expect("decode book lock");
-        book.snapshot(wanted)
+        self.book.lock().snapshot(wanted)
     }
 }
 
@@ -291,22 +284,14 @@ fn run(
             retunes.push(spread);
         }
         if !retunes.is_empty() {
-            #[expect(
-                clippy::expect_used,
-                reason = "a poisoned book lock means drifted state, so crash rather than recover"
-            )]
-            let mut book = book.lock().expect("decode book lock");
+            let mut book = book.lock();
             for spread in mem::take(&mut retunes) {
                 book.retune(spread, page_count);
             }
         }
         // The scrutinee's MutexGuard drops before the else block runs,
         // so the lock is not held across the blocking recv below.
-        #[expect(
-            clippy::expect_used,
-            reason = "a poisoned book lock means drifted state, so crash rather than recover"
-        )]
-        let Some(page_index) = book.lock().expect("decode book lock").take_next() else {
+        let Some(page_index) = book.lock().take_next() else {
             let arrived = match rx.recv() {
                 Ok(ToWorker::Retune(spread)) => spread,
                 Ok(ToWorker::Stop) | Err(_) => return,
@@ -316,11 +301,7 @@ fn run(
         };
         let decoded = decode_page(source, page_index);
         {
-            #[expect(
-                clippy::expect_used,
-                reason = "a poisoned book lock means drifted state, so crash rather than recover"
-            )]
-            let mut book = book.lock().expect("decode book lock");
+            let mut book = book.lock();
             let seat_view = match decoded {
                 Ok(page) => SeatView::Ready(page),
                 Err(message) => SeatView::Failed(message),
@@ -403,12 +384,12 @@ fn retain_trail(pending: &mut BTreeSet<usize>, anchor: usize, wanted: &Spread) {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used, clippy::unwrap_used, clippy::panic, reason = "a panic in test code is inconsequential")]
+#[expect(clippy::expect_used, clippy::panic, reason = "a panic in test code is inconsequential")]
 mod tests {
     use super::*;
     use crate::testkit::{eventually, ready_seat, tiny_png, TempDir};
 
-    use std::sync::Condvar;
+    use parking_lot::Condvar;
     use std::time::{Duration, Instant};
 
     /// The prefetch window reads the focus, then its neighbors nearest first, never past the book's ends.
@@ -575,23 +556,22 @@ mod tests {
 
         fn hold(&self) {
             let (state, cv) = &*self.0;
-            let mut state = state.lock().unwrap();
+            let mut state = state.lock();
             state.next += 1;
             let ticket = state.next;
             // Times out so a failed assertion cannot hang Drop's join.
             let deadline = Instant::now() + Duration::from_secs(5);
-            let (_state, _timeout) = cv
-                .wait_timeout_while(
-                    state,
-                    deadline.saturating_duration_since(Instant::now()),
-                    |state| state.released_through < ticket,
-                )
-                .unwrap();
+            cv.wait_while_for(
+                &mut state,
+                |state| state.released_through < ticket,
+                deadline.saturating_duration_since(Instant::now()),
+            );
+            drop(state);
         }
 
         fn release(&self, through: u64) {
             let (state, cv) = &*self.0;
-            state.lock().unwrap().released_through = through;
+            state.lock().released_through = through;
             cv.notify_all();
         }
     }
@@ -618,7 +598,7 @@ mod tests {
         let updates = Arc::new(Mutex::new(0_usize));
         let counted = Arc::clone(&updates);
         let worker = Worker::spawn(source, move || {
-            *counted.lock().unwrap() += 1;
+            *counted.lock() += 1;
         })
         .expect("worker spawns");
 
@@ -630,7 +610,7 @@ mod tests {
             panic!("ok page not Ready");
         };
         assert_eq!((page.width, page.height), (3, 2));
-        assert!(*updates.lock().unwrap() > 0);
+        assert!(*updates.lock() > 0);
 
         // failure path: the bad page fails with the page number
         let bad = Spread::lone(0);
@@ -672,7 +652,7 @@ mod tests {
         // The last-wanted records are what keep a wanted spread in the
         // book, so the wiring is pinned on them.
         let was_wanted = |page: usize| {
-            worker.book.lock().expect("decode book lock").last_wanted.contains_key(&page)
+            worker.book.lock().last_wanted.contains_key(&page)
         };
         assert!(was_wanted(3), "page 3 never recorded as wanted");
         assert!(was_wanted(4), "page 4 never recorded as wanted");

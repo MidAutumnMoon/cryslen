@@ -487,7 +487,7 @@ impl ApplicationHandler<UserEvent> for App {
         egui.egui_ctx
             .add_font_provider(Arc::new(egui_system_font_provider::SystemFontProvider::new()));
         {
-            use egui::mutex::Mutex;
+            use parking_lot::Mutex;
 
             let proxy = Mutex::new(self.proxy.clone());
             egui.egui_ctx.set_request_repaint_callback(move |info| {
