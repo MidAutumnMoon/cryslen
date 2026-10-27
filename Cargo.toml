@@ -34,6 +34,23 @@ rustfs-mimalloc = { version = "0.7.2", features = ["override", "no_profile"] }
 
 [profile.release]
 lto = "thin"
+strip = "debuginfo"
+
+[profile.release.build-override]
+opt-level = 2
+debug = false
+incremental = false
+
+[profile.dev]
+split-debuginfo = "unpacked"
+
+[profile.dev.package."*"]
+opt-level = 1
+
+[profile.dev.build-override]
+opt-level = 2
+debug = false
+incremental = false
 
 #
 # Lints
