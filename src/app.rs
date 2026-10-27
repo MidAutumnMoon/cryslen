@@ -70,7 +70,7 @@ struct FoldedStatus {
 /// order so the spread's lead page speaks. `seat_views[i]` is the worker's
 /// view for `spread.seats(mode)[i]`. A failed page stops the fold, because
 /// its facts do not exist and the partner's would describe the wrong page.
-fn fold_status(spread: Spread, mode: ViewMode, seat_views: &[Option<SeatView>; 2]) -> FoldedStatus {
+fn fold_status(spread: Spread, mode: ViewMode, seat_views: &[Option<&SeatView>; 2]) -> FoldedStatus {
     use std::iter;
 
     let waiting = iter::zip(spread.seats(mode), seat_views)
@@ -95,9 +95,9 @@ fn fold_status(spread: Spread, mode: ViewMode, seat_views: &[Option<SeatView>; 2
 }
 
 /// One seat's instruction for the frame the plan covers.
-enum SeatStep {
+enum SeatStep<'view> {
     /// Bind this decided page.
-    Show { page: usize, decoded: Arc<Decoded> },
+    Show { page: usize, decoded: &'view Arc<Decoded> },
     /// Keep exactly what the seat shows.
     Hold,
     /// Draw background: the seat wants no page, or its page failed.
@@ -106,29 +106,28 @@ enum SeatStep {
 
 /// What one frame does to the screen, plus the spread the screen
 /// belongs to afterwards.
-struct ScreenPlan {
-    steps: [SeatStep; 2],
+struct ScreenPlan<'view> {
+    steps: [SeatStep<'view>; 2],
     /// The spread the on-screen pixels belong to after the frame.
-    shown: Option<Spread>,
-    /// The frame froze a spread change because a wanted seat is
-    /// undecided.
-    holding: bool,
+    shown_after: Option<Spread>,
     /// The frame put a new spread on screen (cold start's first show
     /// included), so the fit decision is due.
     committed: bool,
+    /// A decided wanted page frozen behind its undecided partner:
+    /// upload it now, so the commit frame is a pure rebind. A freeze
+    /// leaves a wanted seat undecided, so at most one decided wanted
+    /// page exists — the Option is that bound.
+    stage: Option<(usize, &'view Arc<Decoded>)>,
 }
 
-/// One seat's step from its wanted page and the worker's view of it.
-fn seat_step(wanted: Option<usize>, view: Option<&SeatView>) -> SeatStep {
-    match (wanted, view) {
+/// One seat's step from its wanted page and the worker's view of it,
+/// paired so an unwanted seat and a missing view are one fact.
+fn seat_step(pair: Option<(usize, &SeatView)>) -> SeatStep<'_> {
+    match pair {
         // An unwanted seat and a decided failure both draw background.
-        (None, _) | (Some(_), Some(SeatView::Failed(_))) => SeatStep::Clear,
-        (Some(page), Some(SeatView::Ready(decoded))) => {
-            SeatStep::Show { page, decoded: Arc::clone(decoded) }
-        }
-        // A still-deciding seat keeps what it shows. A wanted seat
-        // always has a view, so the defensive None keeps the seat too.
-        (Some(_), Some(SeatView::Pending) | None) => SeatStep::Hold,
+        None | Some((_, SeatView::Failed(_))) => SeatStep::Clear,
+        Some((page, SeatView::Ready(decoded))) => SeatStep::Show { page, decoded },
+        Some((_, SeatView::Pending)) => SeatStep::Hold,
     }
 }
 
@@ -140,34 +139,39 @@ fn plan_screen(
     shown: Option<Spread>,
     wanted: Spread,
     mode: ViewMode,
-    seat_views: &[Option<SeatView>; 2],
-) -> ScreenPlan {
+    seat_views: [Option<&SeatView>; 2],
+) -> ScreenPlan<'_> {
     let [wanted_left, wanted_right] = wanted.seats(mode);
     let [view_left, view_right] = seat_views;
-    let undecided = [(wanted_left, view_left), (wanted_right, view_right)]
-        .into_iter()
-        .any(|(page, view)| page.is_some() && matches!(view, Some(SeatView::Pending)));
+    let pairs = [wanted_left.zip(view_left), wanted_right.zip(view_right)];
+    let [pair_left, pair_right] = pairs;
+    let undecided =
+        pairs.into_iter().any(|pair| matches!(pair, Some((_, SeatView::Pending))));
     if undecided && shown.is_some_and(|shown| shown != wanted) {
+        let stage = pairs.into_iter().find_map(|pair| match pair {
+            Some((page, SeatView::Ready(decoded))) => Some((page, decoded)),
+            _ => None,
+        });
         return ScreenPlan {
             steps: [SeatStep::Hold, SeatStep::Hold],
-            shown,
-            holding: true,
+            shown_after: shown,
             committed: false,
+            stage,
         };
     }
-    let steps = [seat_step(wanted_left, view_left.as_ref()), seat_step(wanted_right, view_right.as_ref())];
+    let steps = [seat_step(pair_left), seat_step(pair_right)];
     #[expect(
         clippy::rest_pattern_accessible_field,
         reason = "the matched fields are unused here, so naming them would trip unneeded_field_pattern"
     )]
     let any_shown = steps.iter().any(|step| matches!(step, SeatStep::Show { .. }));
     // An all-failed first spread shows nothing, so cold start outlives it.
-    let new_shown = (shown.is_some() || any_shown).then_some(wanted);
+    let shown_after = (shown.is_some() || any_shown).then_some(wanted);
     ScreenPlan {
         steps,
-        shown: new_shown,
-        holding: false,
-        committed: new_shown != shown,
+        shown_after,
+        committed: shown_after != shown,
+        stage: None,
     }
 }
 
@@ -246,16 +250,15 @@ pub struct App {
     state: State,
     gl: Option<Gl>,
     fatal_error: Option<eros::ErrorUnion>,
-    /// What each seat holds, the last frame included. Worker eviction
-    /// can drop the book's entry, never the pixels held here.
-    held: [Option<Arc<Decoded>>; 2],
+    /// The dims each seat shows, the last frame included. The layout
+    /// derives from these; the pixels live in the GL cache.
+    held: [Option<(u32, u32)>; 2],
     /// The spread the on-screen pixels belong to. None until any seat
-    /// has ever shown a page (cold start). Reset when the GL surface
-    /// dies, because a new surface starts empty.
+    /// has ever shown a page (cold start).
     shown: Option<Spread>,
-    /// The spread last sent to the worker. `frame()` asserts the
-    /// on-screen spread equals this, so every spread change must
-    /// retune.
+    /// The spread last sent to the worker. `frame()` asserts the wanted
+    /// spread equals this, so every spread change must retune. The
+    /// on-screen spread (`shown`) may lag it during a hold.
     retuned_spread: Spread,
     /// Cursor position in viewport px, equal to window px because the
     /// viewport hugs the window's top-left.
@@ -339,16 +342,8 @@ impl App {
         }
     }
 
-    fn display(&mut self, spread: Spread, snapshot: &SpreadView) -> [Option<SeatView>; 2] {
-        use std::iter;
-
-        #[expect(
-            clippy::redundant_closure_for_method_calls,
-            reason = "map hands the item owned, and the fn path needs it by reference"
-        )]
-        let seat_views: [Option<SeatView>; 2] =
-            snapshot.seats(self.state.mode).map(|seat| seat.cloned());
-        let plan = plan_screen(self.shown, spread, self.state.mode, &seat_views);
+    fn display(&mut self, spread: Spread, snapshot: &SpreadView) {
+        let plan = plan_screen(self.shown, spread, self.state.mode, snapshot.seats(self.state.mode));
         for ((seat, held), step) in Seat::ALL
             .into_iter()
             .zip(self.held.each_mut())
@@ -357,9 +352,9 @@ impl App {
             match step {
                 SeatStep::Show { page, decoded } => {
                     if let Some(gl) = self.gl.as_mut() {
-                        gl.pages.bind(seat, page, &decoded);
+                        gl.pages.bind(seat, page, decoded);
                     }
-                    *held = Some(decoded);
+                    *held = Some((decoded.width, decoded.height));
                 }
                 // The freeze: neither seat, nor the GL bindings, nor the
                 // layout below may move while the spread is undecided.
@@ -372,27 +367,16 @@ impl App {
                 }
             }
         }
-        if plan.holding {
-            // A holding spread has an undecided wanted seat, so at most
-            // one decided wanted page exists to stage per frame.
+        if let Some((page, decoded)) = plan.stage {
             if let Some(gl) = self.gl.as_mut() {
-                for (wanted, view) in iter::zip(spread.seats(self.state.mode), &seat_views) {
-                    if let (Some(page), Some(SeatView::Ready(decoded))) = (wanted, view) {
-                        gl.pages.stage(page, decoded);
-                    }
-                }
+                gl.pages.stage(page, decoded);
             }
         }
-        self.shown = plan.shown;
+        self.shown = plan.shown_after;
         if plan.committed {
             self.fit.committed();
         }
-        let held_dims = self
-            .held
-            .each_ref()
-            .map(|seat_held| seat_held.as_ref().map(|decoded| (decoded.width, decoded.height)));
-        self.last_layout = view::layout(held_dims);
-        seat_views
+        self.last_layout = view::layout(self.held);
     }
 
     fn frame(&mut self) -> eros::Result<()> {
@@ -408,14 +392,14 @@ impl App {
         let spread = self.spread();
         debug_assert_eq!(spread, self.retuned_spread, "every spread change must retune the worker");
         let snapshot = self.worker.snapshot(&spread);
-        let seat_views = self.display(spread, &snapshot);
+        self.display(spread, &snapshot);
 
         // Refit with the memo before the status line reads the scale, so
         // the bar does not show a superseded zoom.
         let total = self.last_layout.total();
         self.refit_into(total, self.last_viewport);
 
-        let folded = fold_status(spread, self.state.mode, &seat_views);
+        let folded = fold_status(spread, self.state.mode, &snapshot.seats(self.state.mode));
         self.waiting_since = folded
             .waiting
             .then(|| self.waiting_since.unwrap_or_else(Instant::now));
@@ -556,14 +540,6 @@ impl App {
         self.retuned_spread = spread;
         self.worker.retune(spread);
     }
-
-    /// Reset the screen state after the GL surface is gone: a new
-    /// surface starts empty, so holds have nothing to keep.
-    fn screen_lost(&mut self) {
-        self.shown = None;
-        self.held = [None, None];
-        self.last_layout = SpreadLayout::default();
-    }
 }
 
 #[expect(
@@ -637,7 +613,6 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
-        self.screen_lost();
         self.gl = None;
     }
 
@@ -902,16 +877,18 @@ mod tests {
                 Expect { waiting: false, error: None, page: Some((Format::Png, (800, 600))) }),
         ];
         for (i, (spread, mode, seat_views, want)) in rows.iter().enumerate() {
-            let folded = fold_status(*spread, *mode, seat_views);
+            let views = seat_views.each_ref().map(Option::as_ref);
+            let folded = fold_status(*spread, *mode, &views);
             assert_eq!(folded.waiting, want.waiting, "row {i}: waiting");
             assert_eq!(folded.error.as_deref(), want.error, "row {i}: error");
             assert_eq!(folded.page, want.page, "row {i}: page");
         }
     }
 
-    /// The screen plan, row by row: a hold freezes every seat, a commit
-    /// moves every seat in one frame, cold start shows decided seats as
-    /// they arrive, and a failure is as settled as a ready page.
+    /// The screen plan, row by row: a hold freezes every seat and stages
+    /// its decided partner, a commit moves every seat in one frame, cold
+    /// start shows decided seats as they arrive, and a failure is as
+    /// settled as a ready page.
     #[test]
     fn plan_screen_table() {
         #[derive(Debug, PartialEq)]
@@ -926,7 +903,7 @@ mod tests {
         }
         const HOLD: StepFacts = (StepKind::Hold, None);
         const CLEAR: StepFacts = (StepKind::Clear, None);
-        fn step_facts(step: &SeatStep) -> StepFacts {
+        fn step_facts(step: &SeatStep<'_>) -> StepFacts {
             match step {
                 SeatStep::Show { page, decoded } => {
                     (StepKind::Show, Some((*page, (decoded.width, decoded.height))))
@@ -943,8 +920,8 @@ mod tests {
             views: [Option<SeatView>; 2],
             steps: [StepFacts; 2],
             shown_after: Option<Spread>,
-            holding: bool,
             committed: bool,
+            stage: Option<(usize, (u32, u32))>,
         }
         let old = Spread { first: 3, second: Some(4) };
         let pair = Spread { first: 5, second: Some(6) };
@@ -958,63 +935,63 @@ mod tests {
                 shown: Some(old), wanted: pair, mode: ViewMode::Manga,
                 views: [Some(ready_seat(600, 700)), Some(ready_seat(500, 700))],
                 steps: [show(6, (600, 700)), show(5, (500, 700))],
-                shown_after: Some(pair), holding: false, committed: true,
+                shown_after: Some(pair), committed: true, stage: None,
             },
             Row {
-                name: "an undecided left page holds every seat",
+                name: "an undecided left page holds every seat and stages the partner",
                 shown: Some(old), wanted: pair, mode: ViewMode::Manga,
                 views: [pending(), Some(ready_seat(500, 700))],
                 steps: [HOLD, HOLD],
-                shown_after: Some(old), holding: true, committed: false,
+                shown_after: Some(old), committed: false, stage: Some((5, (500, 700))),
             },
             Row {
-                name: "an undecided right page holds every seat",
+                name: "an undecided right page holds every seat and stages the partner",
                 shown: Some(old), wanted: pair, mode: ViewMode::Manga,
                 views: [Some(ready_seat(600, 700)), pending()],
                 steps: [HOLD, HOLD],
-                shown_after: Some(old), holding: true, committed: false,
+                shown_after: Some(old), committed: false, stage: Some((6, (600, 700))),
             },
             Row {
                 name: "a failed partner commits: the seat clears",
                 shown: Some(old), wanted: pair, mode: ViewMode::Manga,
                 views: [failed(), Some(ready_seat(500, 700))],
                 steps: [CLEAR, show(5, (500, 700))],
-                shown_after: Some(pair), holding: false, committed: true,
+                shown_after: Some(pair), committed: true, stage: None,
             },
             Row {
                 name: "both failed commits to background mid-session",
                 shown: Some(old), wanted: pair, mode: ViewMode::Manga,
                 views: [failed(), failed()],
                 steps: [CLEAR, CLEAR],
-                shown_after: Some(pair), holding: false, committed: true,
+                shown_after: Some(pair), committed: true, stage: None,
             },
             Row {
                 name: "a pending page behind a failure still holds",
                 shown: Some(old), wanted: pair, mode: ViewMode::Manga,
                 views: [failed(), pending()],
                 steps: [HOLD, HOLD],
-                shown_after: Some(old), holding: true, committed: false,
+                shown_after: Some(old), committed: false, stage: None,
             },
             Row {
                 name: "the shown spread re-read as pending holds invisibly",
                 shown: Some(pair), wanted: pair, mode: ViewMode::Manga,
                 views: [pending(), Some(ready_seat(500, 700))],
                 steps: [HOLD, show(5, (500, 700))],
-                shown_after: Some(pair), holding: false, committed: false,
+                shown_after: Some(pair), committed: false, stage: None,
             },
             Row {
                 name: "a lone Manga page parks right and clears left",
                 shown: Some(old), wanted: Spread::lone(7), mode: ViewMode::Manga,
                 views: [None, Some(ready_seat(700, 700))],
                 steps: [CLEAR, show(7, (700, 700))],
-                shown_after: Some(Spread::lone(7)), holding: false, committed: true,
+                shown_after: Some(Spread::lone(7)), committed: true, stage: None,
             },
             Row {
                 name: "ltr seating binds the first page left",
                 shown: Some(old), wanted: pair, mode: ViewMode::Comic,
                 views: [Some(ready_seat(500, 700)), Some(ready_seat(600, 700))],
                 steps: [show(5, (500, 700)), show(6, (600, 700))],
-                shown_after: Some(pair), holding: false, committed: true,
+                shown_after: Some(pair), committed: true, stage: None,
             },
             Row {
                 name: "a Normal turn holds the unwanted seat until commit",
@@ -1022,7 +999,7 @@ mod tests {
                 mode: ViewMode::Normal,
                 views: [pending(), None],
                 steps: [HOLD, HOLD],
-                shown_after: Some(Spread::lone(2)), holding: true, committed: false,
+                shown_after: Some(Spread::lone(2)), committed: false, stage: None,
             },
             Row {
                 name: "a Normal commit clears the unwanted seat in the swap",
@@ -1030,74 +1007,69 @@ mod tests {
                 mode: ViewMode::Normal,
                 views: [Some(ready_seat(300, 400)), None],
                 steps: [show(3, (300, 400)), CLEAR],
-                shown_after: Some(Spread::lone(3)), holding: false, committed: true,
+                shown_after: Some(Spread::lone(3)), committed: true, stage: None,
             },
             Row {
                 name: "cold start with nothing decided keeps nothing",
                 shown: None, wanted: pair, mode: ViewMode::Manga,
                 views: [pending(), pending()],
                 steps: [HOLD, HOLD],
-                shown_after: None, holding: false, committed: false,
+                shown_after: None, committed: false, stage: None,
             },
             Row {
                 name: "cold start shows a decided seat at once",
                 shown: None, wanted: pair, mode: ViewMode::Manga,
                 views: [Some(ready_seat(600, 700)), pending()],
                 steps: [show(6, (600, 700)), HOLD],
-                shown_after: Some(pair), holding: false, committed: true,
+                shown_after: Some(pair), committed: true, stage: None,
             },
             Row {
                 name: "cold start survives an all-failed first spread",
                 shown: None, wanted: pair, mode: ViewMode::Manga,
                 views: [failed(), failed()],
                 steps: [CLEAR, CLEAR],
-                shown_after: None, holding: false, committed: false,
+                shown_after: None, committed: false, stage: None,
             },
             Row {
                 name: "cold start mixes a cleared failure with a shown page",
                 shown: None, wanted: pair, mode: ViewMode::Manga,
                 views: [failed(), Some(ready_seat(500, 700))],
                 steps: [CLEAR, show(5, (500, 700))],
-                shown_after: Some(pair), holding: false, committed: true,
+                shown_after: Some(pair), committed: true, stage: None,
             },
             Row {
                 name: "steady state re-shows the same seats",
                 shown: Some(pair), wanted: pair, mode: ViewMode::Manga,
                 views: [Some(ready_seat(600, 700)), Some(ready_seat(500, 700))],
                 steps: [show(6, (600, 700)), show(5, (500, 700))],
-                shown_after: Some(pair), holding: false, committed: false,
+                shown_after: Some(pair), committed: false, stage: None,
             },
             Row {
                 name: "a direction flip on a decided spread re-mirrors at once",
                 shown: Some(pair), wanted: pair, mode: ViewMode::Comic,
                 views: [Some(ready_seat(500, 700)), Some(ready_seat(600, 700))],
                 steps: [show(5, (500, 700)), show(6, (600, 700))],
-                shown_after: Some(pair), holding: false, committed: false,
+                shown_after: Some(pair), committed: false, stage: None,
             },
             Row {
                 name: "a direction flip mid-hold keeps the old arrangement",
                 shown: Some(old), wanted: pair, mode: ViewMode::Comic,
                 views: [Some(ready_seat(500, 700)), pending()],
                 steps: [HOLD, HOLD],
-                shown_after: Some(old), holding: true, committed: false,
+                shown_after: Some(old), committed: false, stage: Some((5, (500, 700))),
             },
         ];
-        for Row { name, shown, wanted, mode, views, steps, shown_after, holding, committed } in rows {
-            let plan = plan_screen(shown, wanted, mode, &views);
+        for Row { name, shown, wanted, mode, views, steps, shown_after, committed, stage } in rows {
+            let views = views.each_ref().map(Option::as_ref);
+            let plan = plan_screen(shown, wanted, mode, views);
             assert_eq!(plan.steps.each_ref().map(step_facts), steps, "{name}: steps");
-            assert_eq!(plan.shown, shown_after, "{name}: shown");
-            assert_eq!(plan.holding, holding, "{name}: holding");
+            assert_eq!(plan.shown_after, shown_after, "{name}: shown");
             assert_eq!(plan.committed, committed, "{name}: committed");
-            if holding {
-                use std::iter;
-
-                let ready_count = iter::zip(wanted.seats(mode), &views)
-                    .filter(|(wanted, view)| {
-                        wanted.is_some() && matches!(view, Some(SeatView::Ready(_)))
-                    })
-                    .count();
-                assert!(ready_count <= 1, "{name}: a holding frame stages at most one page");
-            }
+            assert_eq!(
+                plan.stage.map(|(page, decoded)| (page, (decoded.width, decoded.height))),
+                stage,
+                "{name}: stage"
+            );
         }
     }
 
