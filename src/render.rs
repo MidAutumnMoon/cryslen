@@ -183,14 +183,29 @@ impl PageTextures {
     /// Record that `seat` draws `page`, uploading its textures only on a
     /// cache miss. Binding an unchanged page is a no-op. A bound page is
     /// never evicted, so a held seat keeps drawing.
+    pub fn bind(&mut self, seat: Seat, page: usize, decoded: &Decoded) {
+        if *self.seat_slot(seat) == Some(page) {
+            return;
+        }
+        *self.seat_slot(seat) = Some(page);
+        self.ensure_cached(page, decoded);
+    }
+
+    /// Ensure `page`'s textures are cached without binding any seat, so
+    /// the frame that later shows the page is a pure rebind.
+    pub fn stage(&mut self, page: usize, decoded: &Decoded) {
+        self.ensure_cached(page, decoded);
+    }
+
+    /// Upload `page` into the cache on a miss.
     ///
     /// # Panics
     ///
     /// Panics if the page exceeds this context's `MAX_TEXTURE_SIZE`. Decode
     /// rejects edges over its own cap first, so only a GPU advertising a
     /// smaller limit can trip this.
-    pub fn bind(&mut self, seat: Seat, page: usize, decoded: &Decoded) {
-        if *self.seat_slot(seat) == Some(page) {
+    fn ensure_cached(&mut self, page: usize, decoded: &Decoded) {
+        if self.textures.contains_key(&page) {
             return;
         }
         let (width, height) = (decoded.width, decoded.height);
@@ -201,10 +216,6 @@ impl PageTextures {
             "image {width}x{height} exceeds GL max texture size {} (tiling not implemented)",
             self.max_tex
         );
-        *self.seat_slot(seat) = Some(page);
-        if self.textures.contains_key(&page) {
-            return;
-        }
         // SAFETY: the edge asserts above keep the page inside this
         // context's texture limit.
         let entry = unsafe { upload_entry(&self.gl, decoded) };
