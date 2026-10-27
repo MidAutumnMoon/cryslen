@@ -13,6 +13,7 @@ use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
 use winit::event_loop::ControlFlow;
 use winit::event_loop::EventLoopProxy;
+use winit::keyboard::ModifiersState;
 use winit::window::WindowId;
 
 use crate::decode::{Decoded, Format};
@@ -50,14 +51,12 @@ struct State {
     placement: Placement,
 }
 
-/// Baked-in defaults (no config file, ever).
 const DEFAULT_STATE: State = State {
     index: 0,
     mode: ViewMode::Normal,
     placement: Placement { scale: 1.0, offset: (0.0, 0.0) },
 };
 
-/// Status facts folded over both seats of a spread.
 struct FoldedStatus {
     /// A wanted seat is still undecided.
     waiting: bool,
@@ -104,7 +103,6 @@ struct Fit {
 }
 
 impl Fit {
-    /// Whether the placement must be fitted to `total` this frame.
     fn should_refit(&self, total: (f32, f32)) -> bool {
         self.settled != Some(total)
     }
@@ -118,23 +116,20 @@ impl Fit {
         self.user_moved = true;
     }
 
-    /// The new spread fits afresh once its dims settle. User placement
-    /// does not carry across pages.
     fn page_turned(&mut self) {
         self.refit();
     }
 
-    /// Fit afresh when the viewport changed. User placement does not
-    /// survive.
     fn viewport_changed(&mut self) {
         self.refit();
     }
 
-    /// Fit afresh, discarding user placement.
     fn reset_view(&mut self) {
         self.refit();
     }
 
+    /// Discard the settle and any user placement, so the next frame
+    /// fits afresh.
     fn refit(&mut self) {
         self.settled = None;
         self.user_moved = false;
@@ -176,6 +171,9 @@ pub struct App {
     /// viewport hugs the window's top-left.
     cursor: (f32, f32),
     dragging: bool,
+    /// Modifier state as of the last `ModifiersChanged`, tracked
+    /// because winit 0.30 key events carry no modifiers.
+    modifiers: ModifiersState,
     /// Set while any wanted seat is undecided. There is no spinner
     /// animation because it would force repaints of the parked loop.
     waiting_since: Option<Instant>,
@@ -188,7 +186,8 @@ pub struct App {
     /// memo between frames. `frame()` refreshes it after every egui pass.
     last_viewport: Viewport,
     fit: Fit,
-    /// Proxy for egui's repaint bridge. winit 0.30 cannot create one from
+    /// Proxy for waking the parked loop: egui's repaint bridge and
+    /// `frame()`'s timed waits. winit 0.30 cannot create one from
     /// `ActiveEventLoop`.
     proxy: EventLoopProxy<UserEvent>,
 }
@@ -213,6 +212,7 @@ impl App {
             retuned_spread: spread,
             cursor: (0.0, 0.0),
             dragging: false,
+            modifiers: ModifiersState::empty(),
             waiting_since: None,
             mode_toast_since: None,
             last_layout: SpreadLayout::default(),
@@ -397,8 +397,6 @@ impl App {
         }
     }
 
-    /// The (spread total, viewport) pair that pan and zoom work in, from
-    /// the last frame's memos.
     fn geometry(&self) -> ((f32, f32), Viewport) {
         (self.last_layout.total(), self.last_viewport)
     }
@@ -545,7 +543,7 @@ impl ApplicationHandler<UserEvent> for App {
         }
         let Some(gl) = self.gl.as_mut() else { return };
 
-        let egui_wants = {
+        let egui_wants_pointer = {
             let response = gl.egui.on_window_event(gl.window.winit(), &event);
             let wants = gl.egui.egui_ctx.egui_wants_pointer_input();
             if response.repaint {
@@ -561,10 +559,17 @@ impl ApplicationHandler<UserEvent> for App {
                 self.surface_size();
                 self.request_redraw();
             }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                self.modifiers = modifiers.state();
+            }
             WindowEvent::KeyboardInput { event: key, .. } => {
-                if key.state == ElementState::Pressed {
+                // No egui widget takes keyboard input today. The gate
+                // keeps a future text field from also firing the key map.
+                if key.state == ElementState::Pressed
+                    && !gl.egui.egui_ctx.egui_wants_keyboard_input()
+                {
                     if let PhysicalKey::Code(code) = key.physical_key {
-                        if let Some(act) = Action::from_key(code) {
+                        if let Some(act) = Action::from_key(code, self.modifiers) {
                             if !key.repeat || act.repeats() {
                                 self.dispatch(act, event_loop);
                             }
@@ -572,7 +577,7 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
             }
-            WindowEvent::MouseWheel { delta, .. } if !egui_wants => {
+            WindowEvent::MouseWheel { delta, .. } if !egui_wants_pointer => {
                 let wheel_delta_y = match delta {
                     MouseScrollDelta::LineDelta(_, lines) => *lines,
                     MouseScrollDelta::PixelDelta(pixels) => {
@@ -588,7 +593,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.request_redraw();
             }
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
-                self.dragging = *state == ElementState::Pressed && !egui_wants;
+                self.dragging = *state == ElementState::Pressed && !egui_wants_pointer;
             }
             WindowEvent::CursorMoved { position, .. } => {
                 #[expect(
@@ -596,7 +601,7 @@ impl ApplicationHandler<UserEvent> for App {
                     reason = "cursor positions are physical px, exact in f32"
                 )]
                 let cursor_pos = (position.x as f32, position.y as f32);
-                if self.dragging && !egui_wants {
+                if self.dragging && !egui_wants_pointer {
                     let (total, viewport) = self.geometry();
                     let pan_delta =
                         (cursor_pos.0 - self.cursor.0, cursor_pos.1 - self.cursor.1);

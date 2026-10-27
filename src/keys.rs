@@ -1,9 +1,8 @@
 //! The baked-in key map: physical keys to `Action`s.
 
 use crate::view::ViewMode;
-use winit::keyboard::KeyCode;
+use winit::keyboard::{KeyCode, ModifiersState};
 
-/// Input actions, derived from physical keys (layout-independent).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[expect(
     clippy::redundant_pub_crate,
@@ -25,13 +24,11 @@ pub(crate) enum Action {
 }
 
 impl Action {
-    /// Key map, baked in. Arrows page by screen direction. Space and
-    /// the Page keys page by reading order.
     #[expect(
         clippy::wildcard_enum_match_arm,
         reason = "winit's unmapped KeyCode variants map to no action"
     )]
-    pub(crate) fn from_key(code: KeyCode) -> Option<Self> {
+    pub(crate) fn from_key(code: KeyCode, modifiers: ModifiersState) -> Option<Self> {
         match code {
             KeyCode::Escape | KeyCode::KeyQ => Some(Self::Quit),
             KeyCode::KeyN => Some(Self::SelectMode(ViewMode::Normal)),
@@ -41,6 +38,7 @@ impl Action {
             KeyCode::KeyR => Some(Self::ResetView),
             KeyCode::ArrowRight => Some(Self::Right),
             KeyCode::ArrowLeft => Some(Self::Left),
+            KeyCode::Space if modifiers.shift_key() => Some(Self::Back),
             KeyCode::Space | KeyCode::PageDown => Some(Self::Forward),
             KeyCode::PageUp => Some(Self::Back),
             _ => None,
@@ -52,9 +50,9 @@ impl Action {
         matches!(self, Self::Right | Self::Left | Self::Forward | Self::Back)
     }
 
-    /// Whether this action advances reading order in `mode`. The
-    /// arrows follow the reading direction. The reading-order keys do
-    /// not.
+    /// Whether this action advances reading order in `mode`. Manga
+    /// flips the arrows (Left advances). The reading-order keys never
+    /// flip.
     pub(crate) fn is_forward(self, mode: ViewMode) -> bool {
         match self {
             Self::Forward => true,
@@ -94,7 +92,29 @@ mod tests {
             (KeyCode::ArrowUp, None),
         ];
         for (code, action) in bindings {
-            assert_eq!(Action::from_key(*code), *action, "{code:?}");
+            assert_eq!(Action::from_key(*code, ModifiersState::empty()), *action, "{code:?}");
+        }
+    }
+
+    /// Any modifier state holding Shift reverses Space. Every other
+    /// binding ignores modifiers.
+    #[test]
+    fn modifier_interactions() {
+        let bindings: &[(KeyCode, ModifiersState, Option<Action>)] = &[
+            (KeyCode::Space, ModifiersState::SHIFT, Some(Action::Back)),
+            // Shift wins even combined with other modifiers.
+            (
+                KeyCode::Space,
+                ModifiersState::SHIFT | ModifiersState::CONTROL,
+                Some(Action::Back),
+            ),
+            (KeyCode::Space, ModifiersState::CONTROL, Some(Action::Forward)),
+            (KeyCode::PageDown, ModifiersState::SHIFT, Some(Action::Forward)),
+            (KeyCode::PageUp, ModifiersState::SHIFT, Some(Action::Back)),
+            (KeyCode::KeyQ, ModifiersState::CONTROL, Some(Action::Quit)),
+        ];
+        for (code, modifiers, action) in bindings {
+            assert_eq!(Action::from_key(*code, *modifiers), *action, "{code:?} {modifiers:?}");
         }
     }
 

@@ -43,7 +43,7 @@ flake.nix package doesn't work for now. Later!
 ## Shortcuts
 
 - `←/→` arrow keys switch pages
-- `space` page by reading order
+- `space`/`shift+space` page forward/backward by reading order
 - `n`/`m`/`c` normal, manga, comic mode (first letter of each mode)
 - `f` toggle fullscreen
 - `mouse wheel` zoom
