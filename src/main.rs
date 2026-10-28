@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 use app::{App, UserEvent};
 use source::Source;
+use view::ViewMode;
 use worker::Worker;
 
 use rustfs_mimalloc::MiMalloc;
@@ -116,7 +117,8 @@ fn run(open_path: &Path, land_on: Option<&str>) -> eros::Result<()> {
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
 
-    let spread = view::spread_for(index, view::ViewMode::Normal, source.len());
+    // The seed must be the spread App::new opens on (Normal mode).
+    let spread = view::spread_for(index, ViewMode::Normal, source.len());
     let worker = Worker::spawn(Arc::clone(&source), spread, move || {
         app::post(&proxy, UserEvent::PagesUpdated);
     })?;

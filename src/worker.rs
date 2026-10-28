@@ -86,8 +86,6 @@ struct Book {
 const NEVER_WANTED_RANK: u64 = 0;
 
 impl Book {
-    /// A book opened on `initial`, which is wanted and pending from the
-    /// start.
     fn new(initial: Spread, page_count: usize) -> Self {
         let mut book = Self {
             wanted: initial,
