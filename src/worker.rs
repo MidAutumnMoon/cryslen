@@ -86,16 +86,20 @@ struct Book {
 const NEVER_WANTED_RANK: u64 = 0;
 
 impl Book {
-    fn new() -> Self {
-        Self {
-            wanted: Spread::lone(0),
+    /// A book opened on `initial`, which is wanted and pending from the
+    /// start.
+    fn new(initial: Spread, page_count: usize) -> Self {
+        let mut book = Self {
+            wanted: initial,
             decided: HashMap::new(),
             pending: BTreeSet::new(),
             last_wanted: HashMap::new(),
             recency_counter: 0,
             budget: BOOK_BUDGET_BYTES,
             live_bytes: 0,
-        }
+        };
+        book.retune(initial, page_count);
+        book
     }
 
     /// Point the worker at a spread. Both its pages join the trail and
@@ -103,13 +107,9 @@ impl Book {
     fn retune(&mut self, wanted: Spread, page_count: usize) {
         self.wanted = wanted;
         self.recency_counter += 1;
-        self.last_wanted.insert(wanted.first, self.recency_counter);
-        if let Some(second) = wanted.second {
-            self.last_wanted.insert(second, self.recency_counter);
-        }
-        self.pending.insert(wanted.first);
-        if let Some(second) = wanted.second {
-            self.pending.insert(second);
+        for page in [Some(wanted.first), wanted.second].into_iter().flatten() {
+            self.last_wanted.insert(page, self.recency_counter);
+            self.pending.insert(page);
         }
         self.pending.extend(neighbors(wanted.first, page_count));
         retain_trail(&mut self.pending, wanted.first, &wanted);
@@ -216,14 +216,18 @@ pub struct Worker {
 }
 
 impl Worker {
-    /// Spawn the worker for `source`. `notify` fires after every decided
-    /// page and should send the winit user event. The worker itself
-    /// knows nothing about winit.
-    pub fn spawn(source: Arc<Source>, notify: impl Fn() + Send + Sync + 'static) -> io::Result<Self> {
+    /// Spawn the worker for `source`, opened on `initial`. `notify`
+    /// fires after every decided page and should send the winit user
+    /// event. The worker itself knows nothing about winit.
+    pub fn spawn(
+        source: Arc<Source>,
+        initial: Spread,
+        notify: impl Fn() + Send + Sync + 'static,
+    ) -> io::Result<Self> {
         use std::thread::Builder;
 
         let (tx, rx) = mpsc::channel::<ToWorker>();
-        let book = Arc::new(Mutex::new(Book::new()));
+        let book = Arc::new(Mutex::new(Book::new(initial, source.len())));
         let handle = Builder::new()
             .name("cy-decode".into())
             .spawn({
@@ -274,10 +278,7 @@ fn run(
     notify: &dyn Fn(),
 ) {
     let page_count = source.len();
-    let mut retunes: Vec<Spread> = vec![match rx.recv() {
-        Ok(ToWorker::Retune(wanted)) => wanted,
-        Ok(ToWorker::Stop) | Err(_) => return,
-    }];
+    let mut retunes: Vec<Spread> = Vec::new();
     loop {
         while let Ok(message) = rx.try_recv() {
             let ToWorker::Retune(spread) = message else { return };
@@ -442,9 +443,9 @@ mod tests {
     /// `take_next` picks the nearest undecided page, the page ahead of the spread winning distance ties; decided pages never return.
     #[test]
     fn next_pick_is_nearest_then_ahead() {
-        let mut book = Book::new();
-        book.wanted = Spread { first: 10, second: Some(11) };
-        book.pending.extend([10, 11]);
+        // A page count of 0 admits no neighbours, so the trail starts as
+        // the wanted pair alone.
+        let mut book = Book::new(Spread { first: 10, second: Some(11) }, 0);
         book.store(10, ready_seat(2, 1));
         book.pending.extend(8..=12);
         assert_eq!(book.take_next(), Some(11));
@@ -471,7 +472,7 @@ mod tests {
             // both were wanted: the least recently wanted evicts first
             (8, vec![Spread::lone(1), Spread::lone(2), wanted], vec![1, 2], vec![2], vec![1]),
         ] {
-            let mut book = Book::new();
+            let mut book = Book::new(Spread::lone(0), 10);
             book.budget = budget;
             for spread in &retunes {
                 book.retune(*spread, 10);
@@ -498,10 +499,9 @@ mod tests {
     /// A saturating store evicts the oldest unwanted page, never a page of the spread the user just turned to.
     #[test]
     fn saturating_store_never_drops_the_wanted_spread() {
-        let mut book = Book::new();
+        let mut book = Book::new(Spread::lone(1), 20);
         book.budget = 16;
         let wanted = Spread { first: 7, second: Some(8) };
-        book.retune(Spread::lone(1), 20);
         book.retune(wanted, 20);
         book.store(1, ready_seat(2, 1));
         book.store(7, ready_seat(2, 1));
@@ -519,10 +519,9 @@ mod tests {
     // saturates the book.
     #[test]
     fn wanted_spread_survives_its_own_oversize() {
-        let mut book = Book::new();
-        book.budget = 10;
         let wanted = Spread { first: 3, second: Some(4) };
-        book.retune(wanted, 10);
+        let mut book = Book::new(wanted, 10);
+        book.budget = 10;
         book.store(3, ready_seat(10, 10));
         assert!(book.decided.contains_key(&3));
     }
@@ -588,7 +587,7 @@ mod tests {
         }
     }
 
-    /// End to end: a retune decodes its page and notifies; a bad page fails sticky across turns.
+    /// End to end: the seeded spread decodes its page and notifies; a bad page fails sticky across turns.
     #[test]
     fn worker_end_to_end() {
         let dir = TempDir::new("worker-e2e");
@@ -597,14 +596,13 @@ mod tests {
         let source = Arc::new(Source::open(dir.path()).expect("temp source opens"));
         let updates = Arc::new(Mutex::new(0_usize));
         let counted = Arc::clone(&updates);
-        let worker = Worker::spawn(source, move || {
+        let ok = Spread::lone(1);
+        let worker = Worker::spawn(source, ok, move || {
             *counted.lock() += 1;
         })
         .expect("worker spawns");
 
-        // happy path: the ok page reaches Ready with its dims, and notify fired
-        let ok = Spread::lone(1);
-        worker.retune(ok);
+        // happy path: the seeded page reaches Ready with its dims, and notify fired
         wait_ready(&worker, &[1]);
         let SeatView::Ready(page) = worker.snapshot(&ok).first else {
             panic!("ok page not Ready");
@@ -640,7 +638,7 @@ mod tests {
     #[test]
     fn retune_decoding() {
         let (_dir, source) = tiny_source("worker-retune", 50);
-        let worker = Worker::spawn(source, || {}).expect("worker spawns");
+        let worker = Worker::spawn(source, Spread::lone(0), || {}).expect("worker spawns");
         // 50 retunes queue faster than pages decode; every page still decodes
         for page in 0..50 {
             worker.retune(Spread::lone(page));
@@ -666,8 +664,8 @@ mod tests {
             let (_dir, source) = tiny_source("worker-bound", 140);
             let gate = Gate::new();
             let parked = gate.clone();
-            let worker = Worker::spawn(source, move || parked.hold()).expect("worker spawns");
-            worker.retune(Spread::lone(0));
+            let worker = Worker::spawn(source, Spread::lone(0), move || parked.hold())
+                .expect("worker spawns");
             wait_ready(&worker, &[0]);
             // All 139 retunes queue while the worker is parked on page 0.
             for page in 1..140 {
@@ -687,8 +685,8 @@ mod tests {
             let (_dir, source) = tiny_source("worker-prio", 70);
             let gate = Gate::new();
             let parked = gate.clone();
-            let worker = Worker::spawn(source, move || parked.hold()).expect("worker spawns");
-            worker.retune(Spread::lone(0));
+            let worker = Worker::spawn(source, Spread::lone(0), move || parked.hold())
+                .expect("worker spawns");
             wait_ready(&worker, &[0]);
             worker.retune(Spread::lone(60));
             gate.release(1);

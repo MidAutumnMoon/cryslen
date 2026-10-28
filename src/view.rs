@@ -145,6 +145,7 @@ pub fn seating<T>(first: T, second: Option<T>, mode: ViewMode) -> [Option<T>; 2]
 
 impl Spread {
     /// A lone-page spread.
+    #[cfg(test)]
     pub const fn lone(first: usize) -> Self {
         Self { first, second: None }
     }
@@ -205,13 +206,9 @@ pub struct SpreadLayout {
 impl SpreadLayout {
     /// Bounding size of the composed spread, in image pixels.
     pub fn total(&self) -> (f32, f32) {
-        let mut total_width: f32 = 0.0;
-        let mut total_height: f32 = 0.0;
-        for page_rect in self.rects.iter().flatten() {
-            total_width += page_rect.size.0;
-            total_height = total_height.max(page_rect.size.1);
-        }
-        (total_width, total_height)
+        self.rects.iter().flatten().fold((0.0, 0.0), |total, page_rect| {
+            (total.0 + page_rect.size.0, total.1.max(page_rect.size.1))
+        })
     }
 }
 

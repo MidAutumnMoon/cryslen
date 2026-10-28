@@ -116,7 +116,8 @@ fn run(open_path: &Path, land_on: Option<&str>) -> eros::Result<()> {
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
 
-    let worker = Worker::spawn(Arc::clone(&source), move || {
+    let spread = view::spread_for(index, view::ViewMode::Normal, source.len());
+    let worker = Worker::spawn(Arc::clone(&source), spread, move || {
         app::post(&proxy, UserEvent::PagesUpdated);
     })?;
 
