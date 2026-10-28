@@ -124,19 +124,15 @@ decoded)` no-ops on the same page id, uploads only on a cache miss, and
 otherwise rebinds the seat to the cached textures. Page revisits and
 the mode re-seat are pure binds. `stage(page, decoded)` uploads without
 binding a seat, moving a decided page's upload off the frame that will
-show it. A spread commit waits for every wanted seat to decide, so each
-holding frame has at most one decided wanted page to stage.
+show it.
 
 The app owns what the screen shows (`held` dims per seat, plus the
 `shown` spread they belong to) and changes seats only through one
-whole-screen plan per frame. Mid-change, an undecided wanted seat
-freezes every seat, and a decided spread swaps both seats in one frame.
-An undecided seat during cold start, or on the shown spread itself,
-freezes nothing.
+whole-screen plan per frame.
 
 Each entry counts its plane bytes plus the mip chain against a 3 GiB
 cap. An insert past the cap evicts unbound pages, farthest from the
 nearest bound page first. Bound pages are never evicted, so a held last
 spread keeps drawing. A staged page is unbound and may be evicted,
-which reverts it to an upload at commit. A page that alone exceeds the
-cap renders until a later insert finds it unbound.
+which reverts it to an upload when the page is shown. A page that alone
+exceeds the cap renders until a later insert finds it unbound.

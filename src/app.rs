@@ -98,13 +98,9 @@ fn fold_status(
     folded
 }
 
-/// One seat's instruction for the frame the plan covers.
 enum SeatStep<'view> {
-    /// Bind this decided page.
     Show { page: usize, decoded: &'view Arc<Decoded> },
-    /// Keep exactly what the seat shows.
     Hold,
-    /// Draw background: the seat wants no page, or its page failed.
     Clear,
 }
 
@@ -113,21 +109,16 @@ struct ScreenPlan<'view> {
     steps: [SeatStep<'view>; 2],
     /// The spread the on-screen pixels belong to after the frame.
     shown_after: Option<Spread>,
-    /// The frame put a new spread on screen (cold start's first show
-    /// included), so the fit decision is due.
+    /// The frame put a new spread on screen.
     committed: bool,
-    /// A decided wanted page frozen behind its undecided partner:
-    /// upload it now, so the commit frame is a pure rebind. A freeze
-    /// leaves a wanted seat undecided, so at most one decided wanted
-    /// page exists. The Option is that bound.
+    /// A decided wanted page frozen behind its undecided partner. A
+    /// freeze leaves a wanted seat undecided, so at most one decided
+    /// wanted page exists; the Option is that bound.
     stage: Option<(usize, &'view Arc<Decoded>)>,
 }
 
-/// One seat's step from its wanted page and the worker's view of it,
-/// paired so an unwanted seat and a missing view are one fact.
 fn seat_step(fact: Option<(usize, &SeatView)>) -> SeatStep<'_> {
     match fact {
-        // An unwanted seat and a decided failure both draw background.
         None | Some((_, SeatView::Failed(_))) => SeatStep::Clear,
         Some((page, SeatView::Ready(decoded))) => SeatStep::Show { page, decoded },
         Some((_, SeatView::Pending)) => SeatStep::Hold,
@@ -200,9 +191,10 @@ impl Fit {
         self.user_moved = true;
     }
 
-    /// The user turned: the on-screen placement no longer speaks for the
-    /// next commit. The settle stands, so a held frame stays frozen at
-    /// its current placement. The commit decides the refit.
+    /// A turn or a re-pairing mode switch navigated the book: user
+    /// moves made before it must not gate the next commit's fit. The
+    /// settle stands, so a held frame stays frozen at its current
+    /// placement.
     fn begin_turn(&mut self) {
         self.user_moved = false;
     }
@@ -253,15 +245,13 @@ pub struct App {
     state: State,
     gl: Option<Gl>,
     fatal_error: Option<eros::ErrorUnion>,
-    /// The dims each seat shows, the last frame included. The layout
-    /// derives from these, and the pixels live in the GL cache.
+    /// The dims each seat shows, the last frame included.
     held: [Option<(u32, u32)>; 2],
     /// The spread the on-screen pixels belong to. None until any seat
     /// has ever shown a page (cold start).
     shown: Option<Spread>,
-    /// The spread last sent to the worker. `frame()` asserts the wanted
-    /// spread equals this, so every spread change must retune. The
-    /// on-screen spread (`shown`) may lag it during a hold.
+    /// The spread last sent to the worker. The on-screen spread
+    /// (`shown`) may lag it during a hold.
     retuned_spread: Spread,
     /// Cursor position in viewport px, equal to window px because the
     /// viewport hugs the window's top-left.
@@ -364,7 +354,6 @@ impl App {
                     }
                     *held = Some((decoded.width, decoded.height));
                 }
-                // The seat keeps exactly what it shows.
                 SeatStep::Hold => {}
                 SeatStep::Clear => {
                     *held = None;
@@ -793,9 +782,7 @@ mod tests {
     // helpers they consume.
 
     /// A fit refits until settled, user moves survive settles, and
-    /// viewport/reset discard both. The turn splits its discard:
-    /// `begin_turn` keeps the settle and drops pre-turn moves, while
-    /// `committed` demands a refit and keeps hold-time moves.
+    /// viewport/reset discard both.
     #[test]
     fn fit_lifecycle() {
         let mut fit = Fit::default();
@@ -888,10 +875,6 @@ mod tests {
         }
     }
 
-    /// The screen plan, row by row: a hold freezes every seat and stages
-    /// its decided partner, a commit moves every seat in one frame, cold
-    /// start shows decided seats as they arrive, and a failure is as
-    /// settled as a ready page.
     #[test]
     fn plan_screen_table() {
         #[derive(Debug, PartialEq)]

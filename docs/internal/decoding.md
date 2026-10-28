@@ -135,8 +135,6 @@ write orientation tags, so fixtures for it must come from real files.
   `Failed` page, not kill the only worker.
 - Per-page latency is decode-bound, so holding the last complete spread
   plus a status flag after a short grace period beats any spinner. A
-  spread commits only when every wanted seat is decided. Before
-  anything has been shown, decided seats display as they arrive. A
   spinner forces repaints of a parked loop.
 
 ## Thumbnail sources (known, currently unused)
