@@ -181,8 +181,8 @@ impl PageTextures {
     }
 
     /// Record that `seat` draws `page`, uploading its textures only on a
-    /// cache miss. Binding an unchanged page is a no-op. A bound page is
-    /// never evicted, so a held seat keeps drawing.
+    /// cache miss. A bound page is never evicted, so a held seat keeps
+    /// drawing.
     pub fn bind(&mut self, seat: Seat, page: usize, decoded: &Decoded) {
         if *self.seat_slot(seat) == Some(page) {
             return;
@@ -201,9 +201,9 @@ impl PageTextures {
     ///
     /// # Panics
     ///
-    /// Panics if the page exceeds this context's `MAX_TEXTURE_SIZE`. Decode
-    /// rejects edges over its own cap first, so only a GPU advertising a
-    /// smaller limit can trip this.
+    /// Panics if the page has a zero dimension or exceeds this context's
+    /// `MAX_TEXTURE_SIZE`. Decode rejects edges over its own cap first,
+    /// so only a GPU advertising a smaller limit can trip the size check.
     fn ensure_cached(&mut self, page: usize, decoded: &Decoded) {
         if self.textures.contains_key(&page) {
             return;

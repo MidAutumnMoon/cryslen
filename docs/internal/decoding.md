@@ -134,8 +134,9 @@ write orientation tags, so fixtures for it must come from real files.
 - Wrap decode in `catch_unwind`: a panicking decoder must degrade to a
   `Failed` page, not kill the only worker.
 - Per-page latency is decode-bound, so holding the last complete spread
-  — the app commits a spread only when every wanted seat is decided —
   plus a status flag after a short grace period beats any spinner. A
+  spread commits only when every wanted seat is decided. Before
+  anything has been shown, decided seats display as they arrive. A
   spinner forces repaints of a parked loop.
 
 ## Thumbnail sources (known, currently unused)

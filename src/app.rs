@@ -70,7 +70,11 @@ struct FoldedStatus {
 /// order so the spread's lead page speaks. `seat_views[i]` is the worker's
 /// view for `spread.seats(mode)[i]`. A failed page stops the fold, because
 /// its facts do not exist and the partner's would describe the wrong page.
-fn fold_status(spread: Spread, mode: ViewMode, seat_views: &[Option<&SeatView>; 2]) -> FoldedStatus {
+fn fold_status(
+    spread: Spread,
+    mode: ViewMode,
+    seat_views: &[Option<&SeatView>; 2],
+) -> FoldedStatus {
     use std::iter;
 
     let waiting = iter::zip(spread.seats(mode), seat_views)
@@ -104,8 +108,7 @@ enum SeatStep<'view> {
     Clear,
 }
 
-/// What one frame does to the screen, plus the spread the screen
-/// belongs to afterwards.
+/// What one frame does to the screen.
 struct ScreenPlan<'view> {
     steps: [SeatStep<'view>; 2],
     /// The spread the on-screen pixels belong to after the frame.
@@ -116,14 +119,14 @@ struct ScreenPlan<'view> {
     /// A decided wanted page frozen behind its undecided partner:
     /// upload it now, so the commit frame is a pure rebind. A freeze
     /// leaves a wanted seat undecided, so at most one decided wanted
-    /// page exists — the Option is that bound.
+    /// page exists. The Option is that bound.
     stage: Option<(usize, &'view Arc<Decoded>)>,
 }
 
 /// One seat's step from its wanted page and the worker's view of it,
 /// paired so an unwanted seat and a missing view are one fact.
-fn seat_step(pair: Option<(usize, &SeatView)>) -> SeatStep<'_> {
-    match pair {
+fn seat_step(fact: Option<(usize, &SeatView)>) -> SeatStep<'_> {
+    match fact {
         // An unwanted seat and a decided failure both draw background.
         None | Some((_, SeatView::Failed(_))) => SeatStep::Clear,
         Some((page, SeatView::Ready(decoded))) => SeatStep::Show { page, decoded },
@@ -143,12 +146,12 @@ fn plan_screen(
 ) -> ScreenPlan<'_> {
     let [wanted_left, wanted_right] = wanted.seats(mode);
     let [view_left, view_right] = seat_views;
-    let pairs = [wanted_left.zip(view_left), wanted_right.zip(view_right)];
-    let [pair_left, pair_right] = pairs;
+    let seat_facts = [wanted_left.zip(view_left), wanted_right.zip(view_right)];
+    let [fact_left, fact_right] = seat_facts;
     let undecided =
-        pairs.into_iter().any(|pair| matches!(pair, Some((_, SeatView::Pending))));
+        seat_facts.into_iter().any(|fact| matches!(fact, Some((_, SeatView::Pending))));
     if undecided && shown.is_some_and(|shown| shown != wanted) {
-        let stage = pairs.into_iter().find_map(|pair| match pair {
+        let stage = seat_facts.into_iter().find_map(|fact| match fact {
             Some((page, SeatView::Ready(decoded))) => Some((page, decoded)),
             _ => None,
         });
@@ -159,7 +162,7 @@ fn plan_screen(
             stage,
         };
     }
-    let steps = [seat_step(pair_left), seat_step(pair_right)];
+    let steps = [seat_step(fact_left), seat_step(fact_right)];
     #[expect(
         clippy::rest_pattern_accessible_field,
         reason = "the matched fields are unused here, so naming them would trip unneeded_field_pattern"
@@ -199,12 +202,12 @@ impl Fit {
 
     /// The user turned: the on-screen placement no longer speaks for the
     /// next commit. The settle stands, so a held frame stays frozen at
-    /// its current placement; the commit decides the refit.
+    /// its current placement. The commit decides the refit.
     fn begin_turn(&mut self) {
         self.user_moved = false;
     }
 
-    /// A new spread reached the screen; its fit decision is due. User
+    /// A new spread reached the screen, so its fit decision is due. User
     /// moves made since the turn survive to gate the refit.
     fn committed(&mut self) {
         self.settled = None;
@@ -251,7 +254,7 @@ pub struct App {
     gl: Option<Gl>,
     fatal_error: Option<eros::ErrorUnion>,
     /// The dims each seat shows, the last frame included. The layout
-    /// derives from these; the pixels live in the GL cache.
+    /// derives from these, and the pixels live in the GL cache.
     held: [Option<(u32, u32)>; 2],
     /// The spread the on-screen pixels belong to. None until any seat
     /// has ever shown a page (cold start).
@@ -343,7 +346,12 @@ impl App {
     }
 
     fn display(&mut self, spread: Spread, snapshot: &SpreadView) {
-        let plan = plan_screen(self.shown, spread, self.state.mode, snapshot.seats(self.state.mode));
+        let plan = plan_screen(
+            self.shown,
+            spread,
+            self.state.mode,
+            snapshot.seats(self.state.mode),
+        );
         for ((seat, held), step) in Seat::ALL
             .into_iter()
             .zip(self.held.each_mut())
@@ -356,8 +364,7 @@ impl App {
                     }
                     *held = Some((decoded.width, decoded.height));
                 }
-                // The freeze: neither seat, nor the GL bindings, nor the
-                // layout below may move while the spread is undecided.
+                // The seat keeps exactly what it shows.
                 SeatStep::Hold => {}
                 SeatStep::Clear => {
                     *held = None;
@@ -785,11 +792,10 @@ mod tests {
     // frame() and dispatch() are GL/winit-bound, so this mod pins the pure
     // helpers they consume.
 
-    /// A fit refits until settled, user moves survive settles, viewport and
-    /// reset discard both, and the turn splits its discard across the hold:
-    /// `begin_turn` keeps the settle so the held frame stays frozen and
-    /// drops pre-turn moves, while `committed` demands a refit but keeps
-    /// moves made during the hold.
+    /// A fit refits until settled, user moves survive settles, and
+    /// viewport/reset discard both. The turn splits its discard:
+    /// `begin_turn` keeps the settle and drops pre-turn moves, while
+    /// `committed` demands a refit and keeps hold-time moves.
     #[test]
     fn fit_lifecycle() {
         let mut fit = Fit::default();
@@ -810,14 +816,11 @@ mod tests {
             assert!(fit.should_refit((100.0, 200.0)), "{name} discards the settle");
             assert!(!fit.user_moved, "{name} discards the user move");
         }
-        // The turn keeps the settle, so the held frame keeps its placement
-        // (a user zoom made before the turn does not snap back mid-hold).
         fit.settle((100.0, 200.0));
         fit.note_user_move();
         fit.begin_turn();
         assert!(!fit.should_refit((100.0, 200.0)), "begin_turn keeps the held frame frozen");
         assert!(!fit.user_moved, "begin_turn discards pre-turn moves");
-        // A move during the hold survives to gate the commit's refit.
         fit.note_user_move();
         fit.committed();
         assert!(fit.should_refit((100.0, 200.0)), "committed demands a refit");

@@ -121,20 +121,22 @@ a whole class of "slightly wrong colors" regressions without a GPU.
 Texture uploads are expensive, a full upload plus mipmap generation per
 plane, so uploaded pages stay in a page-keyed cache. `bind(seat, page,
 decoded)` no-ops on the same page id, uploads only on a cache miss, and
-otherwise rebinds the seat to the cached textures. `stage(page,
-decoded)` uploads without binding a seat, moving a decided page's
-upload off the frame that will show it: a spread commit waits for every
-wanted seat to decide, so each holding frame has at most one decided
-wanted page to stage. Page revisits and the mode re-seat are pure
-binds. The app owns what the screen shows (`held` pixels per seat, and
-the spread they belong to) and changes seats only through one
-whole-screen plan per frame: mid-change, an undecided wanted seat
+otherwise rebinds the seat to the cached textures. Page revisits and
+the mode re-seat are pure binds. `stage(page, decoded)` uploads without
+binding a seat, moving a decided page's upload off the frame that will
+show it. A spread commit waits for every wanted seat to decide, so each
+holding frame has at most one decided wanted page to stage.
+
+The app owns what the screen shows (`held` dims per seat, plus the
+`shown` spread they belong to) and changes seats only through one
+whole-screen plan per frame. Mid-change, an undecided wanted seat
 freezes every seat, and a decided spread swaps both seats in one frame.
 An undecided seat during cold start, or on the shown spread itself,
-freezes nothing. Each entry counts its plane bytes plus the mip chain
-against a 3 GiB cap. An
-insert past the cap evicts unbound pages, farthest from the nearest
-bound page first. Bound pages are never evicted, so a held last spread
-keeps drawing; a staged page is unbound and may be evicted, which
-reverts it to an upload at commit. A page that alone exceeds the cap
-renders until a later insert finds it unbound.
+freezes nothing.
+
+Each entry counts its plane bytes plus the mip chain against a 3 GiB
+cap. An insert past the cap evicts unbound pages, farthest from the
+nearest bound page first. Bound pages are never evicted, so a held last
+spread keeps drawing. A staged page is unbound and may be evicted,
+which reverts it to an upload at commit. A page that alone exceeds the
+cap renders until a later insert finds it unbound.
