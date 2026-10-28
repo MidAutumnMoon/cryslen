@@ -294,8 +294,8 @@ impl PageTextures {
             let Some(rect) = rect else { continue };
             let Some(page) = page else { continue };
             let Some(entry) = self.textures.get(page) else { continue };
-            // Whole-pixel rect origin: LINEAR samples shimmer at 1:1 zoom
-            // on fractional offsets otherwise.
+            // Whole-pixel rect origin: at 1:1 zoom a fractional origin
+            // makes NEAREST draw uneven texel rows.
             let screen_origin = (
                 rect.pos.0.mul_add(placement.scale, placement.offset.0).round(),
                 rect.pos.1.mul_add(placement.scale, placement.offset.1).round(),
@@ -535,13 +535,31 @@ fn gl_int(value: u32) -> i32 {
     value as i32
 }
 
+/// Magnification policy for one texture.
+#[derive(Clone, Copy)]
+enum Mag {
+    /// Zoomed-in texels stay sharp squares.
+    Sharp,
+    /// Bilinear interpolation between texels.
+    Smooth,
+}
+
+impl Mag {
+    fn gl(self) -> u32 {
+        match self {
+            Self::Sharp => glow::NEAREST,
+            Self::Smooth => glow::LINEAR,
+        }
+    }
+}
+
 /// Texture with viewer defaults. CLAMP keeps edge texels from bleeding.
 /// `filterable` false (GLES R16) means NEAREST and no mips.
 ///
 /// # Safety
 ///
 /// The context must be current. The returned name is live until deleted.
-unsafe fn new_texture(gl: &glow::Context, filterable: bool) -> <glow::Context as HasContext>::Texture {
+unsafe fn new_texture(gl: &glow::Context, filterable: bool, mag: Mag) -> <glow::Context as HasContext>::Texture {
     #[expect(
         clippy::expect_used,
         reason = "texture-creation failure panics by policy"
@@ -551,9 +569,8 @@ unsafe fn new_texture(gl: &glow::Context, filterable: bool) -> <glow::Context as
     gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, gl_int(glow::CLAMP_TO_EDGE));
     gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, gl_int(glow::CLAMP_TO_EDGE));
     let (min, mag) = if filterable {
-        // Mipmapped minification: a fit view of a 50MP page minifies
-        // ~8x. LINEAR-only minification shimmers.
-        (glow::LINEAR_MIPMAP_LINEAR, glow::LINEAR)
+        // A fit view of a 50MP page minifies ~8x, where LINEAR-only shimmers.
+        (glow::LINEAR_MIPMAP_LINEAR, mag.gl())
     } else {
         (glow::NEAREST, glow::NEAREST)
     };
@@ -573,7 +590,7 @@ unsafe fn upload_rgba(
     data: &[u8],
     dims: (u32, u32),
 ) -> <glow::Context as HasContext>::Texture {
-    let texture = new_texture(gl, true);
+    let texture = new_texture(gl, true, Mag::Sharp);
     gl.bind_texture(glow::TEXTURE_2D, Some(texture));
     gl.tex_image_2d(
         glow::TEXTURE_2D, 0, gl_int(glow::RGBA8),
@@ -598,9 +615,10 @@ unsafe fn upload_plane(
     dims: (u32, u32),
     wide: bool,
     filterable: bool,
+    mag: Mag,
 ) -> <glow::Context as HasContext>::Texture {
     let (internal, ty) = if wide { (glow::R16, glow::UNSIGNED_SHORT) } else { (glow::R8, glow::UNSIGNED_BYTE) };
-    let texture = new_texture(gl, filterable);
+    let texture = new_texture(gl, filterable, mag);
     gl.bind_texture(glow::TEXTURE_2D, Some(texture));
     // Odd row widths: GL's default 4-byte unpack alignment would desync
     // every row after the first.
@@ -646,7 +664,7 @@ unsafe fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> Entry {
             };
             expect(&yuv.luma, luma_w as usize * luma_h as usize, "luma");
             let luma_texture =
-                upload_plane(gl, plane_bytes(&yuv.luma), (luma_w, luma_h), wide, filterable);
+                upload_plane(gl, plane_bytes(&yuv.luma), (luma_w, luma_h), wide, filterable, Mag::Sharp);
             let (cb_texture, cr_texture) = if yuv.subsampling == Subsampling::Mono {
                 // 1x1 chroma at the range midpoint, which the matrix
                 // cancels to neutral gray. Native byte pairs match
@@ -662,13 +680,13 @@ unsafe fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> Entry {
                 } else {
                     MONO_CHROMA_MIDPOINT_8.to_ne_bytes().to_vec()
                 };
-                (upload_plane(gl, &midpoint_bytes, (1, 1), wide, filterable),
-                 upload_plane(gl, &midpoint_bytes, (1, 1), wide, filterable))
+                (upload_plane(gl, &midpoint_bytes, (1, 1), wide, filterable, Mag::Smooth),
+                 upload_plane(gl, &midpoint_bytes, (1, 1), wide, filterable, Mag::Smooth))
             } else {
                 expect(&yuv.cb, chroma_w as usize * chroma_h as usize, "cb");
                 expect(&yuv.cr, chroma_w as usize * chroma_h as usize, "cr");
-                (upload_plane(gl, plane_bytes(&yuv.cb), (chroma_w, chroma_h), wide, filterable),
-                 upload_plane(gl, plane_bytes(&yuv.cr), (chroma_w, chroma_h), wide, filterable))
+                (upload_plane(gl, plane_bytes(&yuv.cb), (chroma_w, chroma_h), wide, filterable, Mag::Smooth),
+                 upload_plane(gl, plane_bytes(&yuv.cr), (chroma_w, chroma_h), wide, filterable, Mag::Smooth))
             };
             (Textures::Yuv { luma: luma_texture, cb: cb_texture, cr: cr_texture },
              depth_norm(yuv.depth, wide),

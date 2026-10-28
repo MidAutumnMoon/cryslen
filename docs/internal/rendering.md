@@ -58,11 +58,12 @@ arboard bundle.
   itself, runs after you, and nothing resets it on resize.
 - egui's painter leaves `BLEND` enabled. Disable it before drawing page
   quads or transparent PNGs ghost against stale buffers.
-- Snap quad origins to whole pixels. LINEAR sampling shimmers at 1:1
-  zoom on fractional offsets.
+- Snap quad origins to whole pixels. At 1:1 zoom a fractional origin
+  makes NEAREST draw uneven texel rows.
 - Generate mipmaps and use `LINEAR_MIPMAP_LINEAR` for minification.
   A fit view minifies a photo page several-fold, where LINEAR-only
-  aliases hard.
+  aliases hard. Magnification is `NEAREST` so zoomed-in pixels stay
+  sharp, except chroma planes, which reconstruct bilinearly.
 - `UNPACK_ALIGNMENT = 1` before uploading single-channel planes. Odd
   row widths desync every row after the first under GL's default
   4-byte alignment.
