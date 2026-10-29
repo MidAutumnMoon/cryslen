@@ -20,11 +20,11 @@ I built it from scratch because I want:
 
 Proper CLI handling later.
 
-## Build
+## Build/Run
 
     nix develop -c cargo build --release
 
-flake.nix package doesn't work for now. Later!
+    nix run github:MidAutumnMoon/cryslen
 
 ## Screenshots (2026-10)
 
