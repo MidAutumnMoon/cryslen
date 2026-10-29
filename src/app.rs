@@ -1,7 +1,4 @@
 //! App: winit event handling, state transitions, frame composition.
-//!
-//! State is a single plain struct. Key commands map to an `Action` first
-//! (pure, testable), then mutate state.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -27,15 +24,12 @@ use crate::worker::{SeatView, SpreadView, Worker};
 
 /// User events that wake the parked loop.
 pub enum UserEvent {
-    /// Arms a wake only. The redraw fires from `new_events` when the
-    /// deadline is reached.
+    /// Arms a wake; `new_events` requests the redraw at the deadline.
     Repaint(Duration),
-    /// The decode book changed.
     PagesUpdated,
 }
 
-/// A failed send means the loop is gone, so the event has no consumer
-/// left and quitting already won.
+/// A failed send means the loop is gone, leaving the event with no consumer.
 #[expect(
     clippy::redundant_pub_crate,
     reason = "pub(crate) is the crate's visibility style for crate-wide items, even inside private modules"
@@ -45,7 +39,6 @@ pub(crate) fn post(proxy: &EventLoopProxy<UserEvent>, event: UserEvent) {
 }
 
 struct State {
-    /// Index of the spread's first page (a spread start).
     index: usize,
     mode: ViewMode,
     placement: Placement,
@@ -58,18 +51,16 @@ const DEFAULT_STATE: State = State {
 };
 
 struct FoldedStatus {
-    /// A wanted page is still undecided.
     waiting: bool,
     /// First failure among the spread's pages, in reading order.
     error: Option<String>,
-    /// The first Ready page in reading order: its index, format, and dims.
+    /// The first ready page before any failure.
     page: Option<(usize, Format, (u32, u32))>,
 }
 
-/// Fold the spread's pages into status facts, in reading order: the
-/// first page, then its partner (`Spread.first` is by definition the
-/// page read first). A failed page stops the fold, because its facts do
-/// not exist and the partner's would describe the wrong page.
+/// Fold the spread's pages into the status line's error and page facts
+/// in reading order: `Spread.first` (the page read first), then its
+/// partner.
 fn fold_status(spread: Spread, snapshot: &SpreadView) -> FoldedStatus {
     let mut folded = FoldedStatus {
         waiting: matches!(snapshot.first, SeatView::Pending)
@@ -102,24 +93,18 @@ enum SeatStep<'view> {
     Clear,
 }
 
-/// What one frame does to the screen.
 struct ScreenPlan<'view> {
     steps: [SeatStep<'view>; 2],
-    /// The spread the on-screen pixels belong to after the frame.
     shown_after: Option<Spread>,
-    /// The frame put a new spread on screen.
     committed: bool,
-    /// A decided wanted page frozen behind its undecided partner. A
-    /// freeze leaves a wanted seat undecided, so at most one decided
-    /// wanted page exists; the Option is that bound.
+    /// The ready page staged while its partner is undecided.
     stage: Option<(usize, &'view Arc<Decoded>)>,
 }
 
 fn seat_step(fact: Option<(usize, &SeatView)>, bound: Option<usize>) -> SeatStep<'_> {
     match fact {
         Some((page, SeatView::Ready(decoded))) => SeatStep::Show { page, decoded },
-        // An undecided page keeps a seat's pixels only while the seat
-        // still shows that page; a seat left on another page clears.
+        // A pending page holds while the seat is empty or shows that page.
         Some((page, SeatView::Pending)) if bound.is_none_or(|bound_page| bound_page == page) => {
             SeatStep::Hold
         }
@@ -127,11 +112,10 @@ fn seat_step(fact: Option<(usize, &SeatView)>, bound: Option<usize>) -> SeatStep
     }
 }
 
-/// The screen policy: a spread change becomes visible only in a frame
-/// where every wanted seat is decided, and then every seat changes in
-/// that one frame. Before anything has ever been shown, decided seats
-/// display as they arrive. `bound[i]` is the page seat i currently
-/// shows.
+/// The screen policy: a spread change is held while any wanted seat is
+/// undecided; once all are decided, all seats change in one frame.
+/// Before anything has been shown, ready seats appear as they arrive.
+/// `bound[i]` is the page seat i currently shows.
 fn plan_screen(
     shown: Option<Spread>,
     wanted: Spread,
@@ -164,7 +148,7 @@ fn plan_screen(
         reason = "the matched fields are unused here, so naming them would trip unneeded_field_pattern"
     )]
     let any_shown = steps.iter().any(|step| matches!(step, SeatStep::Show { .. }));
-    // An all-failed first spread shows nothing, so cold start outlives it.
+    // An all-failed first spread shows nothing, so `shown` stays None.
     let shown_after = (shown.is_some() || any_shown).then_some(wanted);
     ScreenPlan {
         steps,
@@ -176,9 +160,10 @@ fn plan_screen(
 
 #[derive(Default)]
 struct Fit {
-    /// Spread total the refit decision was settled for. None demands a refit.
+    /// The spread total the last refit decision settled; any other total
+    /// demands a refit.
     settled: Option<(f32, f32)>,
-    /// The user zoomed or panned since the last fit.
+    /// The user zoomed or panned since the last turn, viewport change, or reset.
     user_moved: bool,
 }
 
@@ -187,7 +172,6 @@ impl Fit {
         self.settled != Some(total)
     }
 
-    /// Settle the refit decision for `total`, fitted or not.
     fn settle(&mut self, total: (f32, f32)) {
         self.settled = Some(total);
     }
@@ -196,16 +180,12 @@ impl Fit {
         self.user_moved = true;
     }
 
-    /// A turn or a re-pairing mode switch navigated the book: user
-    /// moves made before it must not gate the next commit's fit. The
-    /// settle stands, so a held frame stays frozen at its current
-    /// placement.
+    /// A turn or re-pairing mode switch: pre-turn user moves must not
+    /// gate the next commit's fit.
     fn begin_turn(&mut self) {
         self.user_moved = false;
     }
 
-    /// A new spread reached the screen, so its fit decision is due. User
-    /// moves made since the turn survive to gate the refit.
     fn committed(&mut self) {
         self.settled = None;
     }
@@ -218,17 +198,14 @@ impl Fit {
         self.refit();
     }
 
-    /// Discard the settle and any user placement, so the next frame
-    /// fits afresh.
     fn refit(&mut self) {
         self.settled = None;
         self.user_moved = false;
     }
 }
 
-/// Everything that exists only between `resumed` and exit (winit
-/// requirement). The window owns the GL context, so it drops last,
-/// after pages and egui.
+/// The window owns the surface and context, so it is declared last to
+/// outlive pages and egui.
 struct Gl {
     pages: PageTextures,
     egui: egui_glow::EguiGlow,
@@ -237,9 +214,8 @@ struct Gl {
 
 impl Drop for Gl {
     fn drop(&mut self) {
-        // The drop body runs before the field drops, so egui's GL objects
-        // die here while the context is alive. egui_glow logs a leak
-        // warning if destroy never runs.
+        // egui's GL objects must be destroyed while the window's context is
+        // alive; egui_glow reports leaked resources if destroy never runs.
         self.egui.destroy();
     }
 }
@@ -256,33 +232,25 @@ pub struct App {
     state: State,
     gl: Option<Gl>,
     fatal_error: Option<eros::ErrorUnion>,
-    /// What each seat shows, the last frame included.
     shown_seats: [Option<SeatShow>; 2],
-    /// The spread the on-screen pixels belong to. None until any seat
-    /// has ever shown a page (cold start).
+    /// The last spread the screen plan committed; None before the first
+    /// commit (cold start).
     shown: Option<Spread>,
-    /// The spread the worker was last tuned to. The on-screen spread
-    /// (`shown`) may lag it during a hold.
+    /// The spread the worker was last tuned to; `shown` lags until the
+    /// plan commits it.
     retuned_spread: Spread,
-    /// Cursor position in viewport px, equal to window px because the
-    /// viewport hugs the window's top-left.
+    /// Cursor position in viewport px, same as window px.
     cursor: (f32, f32),
     dragging: bool,
-    /// Modifier state as of the last `ModifiersChanged`, tracked
-    /// because winit 0.30 key events carry no modifiers.
+    /// Last `ModifiersChanged` state; winit 0.30 key events carry none.
     modifiers: ModifiersState,
-    /// Set while any wanted seat is undecided. There is no spinner
-    /// animation because it would force repaints of the parked loop.
     waiting_since: Option<Instant>,
-    /// Set while the mode-switch toast is showing in the status bar.
     mode_toast_since: Option<Instant>,
-    /// The viewport the last frame painted into. Pan and zoom read this
-    /// memo between frames. `frame()` refreshes it after every egui pass.
+    /// The viewport the last frame painted into, read by input between frames.
     last_viewport: Viewport,
     fit: Fit,
-    /// Proxy for waking the parked loop: egui's repaint bridge and
-    /// `frame()`'s timed waits. winit 0.30 cannot create one from
-    /// `ActiveEventLoop`.
+    /// Wakes the parked loop from egui and timed waits; winit 0.30 cannot
+    /// create a proxy from `ActiveEventLoop`.
     proxy: EventLoopProxy<UserEvent>,
 }
 
@@ -315,8 +283,8 @@ impl App {
         }
     }
 
-    /// Record `error` and leave the event loop. The stored error outlives
-    /// the loop so `main` can report it.
+    /// Store `error` and exit so `main` can report it after `run_app`
+    /// returns.
     fn fail(&mut self, error: eros::ErrorUnion, event_loop: &ActiveEventLoop) {
         self.fatal_error = Some(error);
         event_loop.exit();
@@ -334,8 +302,8 @@ impl App {
         self.shown_seats.each_ref().map(|seat| seat.map(|show| show.dims))
     }
 
-    /// Fit `total` into `viewport` when a refit is due. A user zoom or
-    /// pan wins over the shape-triggered refit.
+    /// Fit `total` into `viewport` when due. A user zoom or pan wins over
+    /// the shape-triggered refit.
     fn refit_into(&mut self, total: (f32, f32), viewport: Viewport) {
         if self.fit.should_refit(total) {
             if !self.fit.user_moved {
@@ -392,8 +360,6 @@ impl App {
         use crate::ui::PageFacts;
         use crate::ui::StatusLine;
 
-        // The worker's wanted spread follows the app's, and this is the
-        // only retune site, so every change retunes exactly once.
         let spread = self.spread();
         if spread != self.retuned_spread {
             self.retuned_spread = spread;
@@ -407,8 +373,8 @@ impl App {
         let snapshot = self.worker.snapshot(&spread);
         self.display(spread, &snapshot);
 
-        // Refit with the viewport memo before the status line reads the
-        // scale, so the bar does not show a superseded zoom.
+        // Refit before the status line reads the scale, so the bar does
+        // not show a superseded zoom.
         let layout = view::layout(self.seat_dims());
         let total = layout.total();
         self.refit_into(total, self.last_viewport);
@@ -425,7 +391,7 @@ impl App {
             }
         }
 
-        // Wake once at expiry so the toast disappears without other
+        // Arm a wake at expiry so the toast disappears without other
         // traffic.
         self.mode_toast_since =
             self.mode_toast_since.filter(|&since| since.elapsed() < MODE_TOAST);
@@ -434,8 +400,7 @@ impl App {
             post(&self.proxy, UserEvent::Repaint(remaining));
         }
 
-        // The bar names the page whose facts it shows: the fold's
-        // speaking page, or the lead before anything has spoken.
+        // The bar names the page whose facts it shows: the fold's page, else the lead.
         let speaking_page = folded.page.map_or(spread.first, |(page, _, _)| page);
         let page = folded.page.map(|(page, decoded, dims)| PageFacts {
             claimed: self.source.name(page).and_then(decode::format_from_name),
@@ -454,19 +419,16 @@ impl App {
             error: folded.error,
         };
 
-        // egui lays out first: `EguiGlow::run` only records shapes, so
-        // the chrome rect is settled before pages are placed, and paint
-        // still draws the bar after the pages.
+        // `EguiGlow::run` only records shapes, so egui lays out before
+        // pages are placed; `paint` later draws the bar above them.
         let viewport = {
             let Some(gl) = self.gl.as_mut() else { return Ok(()) };
             let mut content = egui::Rect::NOTHING;
             gl.egui.run(gl.window.winit(), |ui| content = ui::show(ui, &status));
             content_viewport(size, content, gl.egui.egui_ctx.pixels_per_point())
         };
-        // The bar's height moves with fonts and egui zoom, with no winit
-        // resize event, so the viewport is diffed every frame. The status
-        // line above was built at the old scale, so redraw once to
-        // correct it.
+        // The bar's height changes without a winit resize, so diff every
+        // frame; the status line used the old scale, so redraw once.
         if viewport != self.last_viewport {
             self.fit.viewport_changed();
             self.last_viewport = viewport;
@@ -480,14 +442,13 @@ impl App {
         gl.pages.draw((size.width, size.height), viewport, &layout, &self.state.placement);
         gl.egui.paint(gl.window.winit());
         gl.window.pre_present_and_swap()?;
-        // Reveal only after the first frame is presented, so the window
-        // never maps empty.
+        // Reveal after presenting, so the window never maps empty.
         gl.window.winit().set_visible(true);
         Ok(())
     }
 
-    /// Physical surface size, resizing the GL surface to match.
-    /// None when there is no window yet or it is minimized.
+    /// Physical surface size, resized to match; None without a window or
+    /// with a zero dimension.
     fn surface_size(&mut self) -> Option<PhysicalSize<u32>> {
         let gl = self.gl.as_mut()?;
         let size = gl.window.winit().inner_size();
@@ -524,7 +485,7 @@ impl App {
                 if switch.pairing_changed {
                     self.after_page_change();
                 } else {
-                    self.request_redraw(); // same pages, seats swap
+                    self.request_redraw(); // same pairing: no page turn
                 }
             }
             Action::ToggleFullscreen => {
@@ -565,8 +526,8 @@ impl App {
 )]
 impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        // SAFETY: the app owns this window and is dropped before the event
-        // loop is, so the loop's display outlives every GL object in it.
+        // SAFETY: `exiting` sets `self.gl = None`, dropping the window and
+        // its GL objects while the event loop's display is still alive.
         let window = match unsafe { Window::new(event_loop) } {
             Ok(window) => window,
             Err(error) => {
@@ -582,10 +543,9 @@ impl ApplicationHandler<UserEvent> for App {
                 return;
             }
         };
-        // `EguiGlow::new` can panic. Accepted upstream risk.
+        // `EguiGlow::new` panics if its painter cannot initialize; accepted upstream risk.
         let egui = egui_glow::EguiGlow::new(event_loop, Arc::clone(&gl), None, None, true);
-        // System fonts join the family fallback chains lazily, for filename
-        // characters the built-in fonts cannot render.
+        // System fonts cover filename characters the built-in fonts cannot render.
         egui.egui_ctx
             .add_font_provider(Arc::new(egui_system_font_provider::SystemFontProvider::new()));
         {
@@ -596,9 +556,7 @@ impl ApplicationHandler<UserEvent> for App {
                 post(&proxy.lock(), UserEvent::Repaint(info.delay));
             });
         }
-        // Opaque mode deliberately keeps egui's default panel fill. The
-        // fill applies once here; frame()'s clear follows the mode every
-        // frame.
+        // Opaque mode keeps egui's default panel fill.
         if window.translucent() {
             egui.egui_ctx.all_styles_mut(|style| style.visuals.panel_fill = glass_fill());
         }
@@ -610,8 +568,8 @@ impl ApplicationHandler<UserEvent> for App {
         match event {
             UserEvent::Repaint(delay) => {
                 let Some(deadline) = Instant::now().checked_add(delay) else { return };
-                // A repaint request must never delay an already-armed
-                // earlier wake, so keep the sooner deadline.
+                // Never delay an earlier armed wake: keep the sooner
+                // deadline.
                 if let ControlFlow::WaitUntil(armed) = event_loop.control_flow() {
                     if armed <= deadline {
                         return;
@@ -658,8 +616,7 @@ impl ApplicationHandler<UserEvent> for App {
 
         match &event {
             WindowEvent::Resized(_) => {
-                // The refit lands in frame(), where the viewport memo
-                // notices the new size.
+                // The refit happens in `frame()` when the viewport notices the new size.
                 self.surface_size();
                 self.request_redraw();
             }
@@ -667,8 +624,6 @@ impl ApplicationHandler<UserEvent> for App {
                 self.modifiers = modifiers.state();
             }
             WindowEvent::KeyboardInput { event: key, .. } => {
-                // No egui widget takes keyboard input today. The gate
-                // keeps a future text field from also firing the key map.
                 if key.state == ElementState::Pressed
                     && !gl.egui.egui_ctx.egui_wants_keyboard_input()
                 {
@@ -702,7 +657,7 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CursorMoved { position, .. } => {
                 #[expect(
                     clippy::cast_possible_truncation,
-                    reason = "cursor positions are physical px, exact in f32"
+                    reason = "cursor positions are physical px; f32 keeps subpixel precision at window sizes"
                 )]
                 let cursor_pos = (position.x as f32, position.y as f32);
                 if self.dragging && !egui_wants_pointer {
@@ -721,7 +676,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.fail(error, event_loop);
                     return;
                 }
-                // Park until the next input, so idle costs nothing.
+                // Park until the next input or wake, so idle costs nothing.
                 event_loop.set_control_flow(ControlFlow::Wait);
             }
             _ => {}
@@ -752,24 +707,23 @@ fn clear_color(translucent: bool) -> [f32; 4] {
     }
 }
 
-/// The page viewport from the chrome egui just laid out: the window
-/// above the status bar's top edge, in physical px, full width. The
-/// scale is egui's own (`pixels_per_point` = egui zoom x output scale),
-/// never the window's scale factor.
+/// The page viewport from the chrome egui just laid out: the full-width
+/// window area above the status bar, in physical px. Uses egui's
+/// `pixels_per_point`, not the window's scale factor.
 fn content_viewport(window: PhysicalSize<u32>, content: egui::Rect, pixels_per_point: f32) -> Viewport {
     let win = view::px_f32((window.width, window.height));
     // The bar's top edge rounds to a whole physical px, matching the
-    // rounding of egui's own clip rects.
+    // painter's clip-rect rounding.
     let bar_top = (content.max.y * pixels_per_point).round();
     Viewport::above_bottom_bar(win, bar_top)
 }
 
-/// The glass as egui's u8 color: only a conversion of [`clear_color`],
-/// never a second premultiplication.
+/// The glass in egui's u8 color: a conversion of [`clear_color`], never a
+/// second premultiplication.
 #[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
-    reason = "the clear color's channels are clamped 0..=1 values scaled into u8"
+    reason = "the clear color's channels lie in 0..=1, so the rounded scaled value is a valid u8"
 )]
 fn glass_fill() -> egui::Color32 {
     let [red, green, blue, alpha] = clear_color(true);
@@ -799,11 +753,6 @@ mod tests {
     use super::*;
     use crate::testkit::ready_seat;
 
-    // frame() and dispatch() are GL/winit-bound, so this mod pins the pure
-    // helpers they consume.
-
-    /// A fit refits until settled, user moves survive settles, and
-    /// viewport/reset discard both.
     #[test]
     fn fit_lifecycle() {
         let mut fit = Fit::default();
@@ -835,7 +784,6 @@ mod tests {
         assert!(fit.user_moved, "committed keeps hold-time moves");
     }
 
-    /// The fold, row by row: who waits, which error wins, which page speaks.
     #[test]
     fn fold_status_table() {
         struct Expect {
@@ -1096,7 +1044,6 @@ mod tests {
         }
     }
 
-    /// The background glass is one premultiplied color, pinned as exact bytes.
     #[expect(
         clippy::float_cmp_const,
         reason = "the opaque variant returns the same constants untouched, so equality is exact"
@@ -1105,17 +1052,15 @@ mod tests {
     fn background_glass() {
         let [red, green, blue, alpha] = clear_color(true);
         assert!((alpha - GLASS_ALPHA).abs() < 1e-6);
-        // Each channel stores its straight value times alpha.
         for (channel, straight) in [red, green, blue].into_iter().zip(BACKGROUND) {
             assert!((straight.mul_add(GLASS_ALPHA, -channel)).abs() < 1e-6);
         }
         assert_eq!(clear_color(false), [BACKGROUND[0], BACKGROUND[1], BACKGROUND[2], 1.0]);
-        // The bar must repeat the background glass. Exact bytes, so no
-        // formula or constructor change can drift them apart silently.
+        // The bar must repeat the translucent background. Exact bytes, so
+        // no formula or constructor change can drift them apart silently.
         assert_eq!(glass_fill(), egui::Color32::from_rgba_premultiplied(16, 16, 18, 204));
     }
 
-    /// The content viewport subtracts the bar in physical px, scaling the egui content rect by egui's own pixels-per-point.
     #[test]
     fn content_viewport_subtracts_the_bar_in_physical_px() {
         let content = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1280.0, 772.0));
@@ -1127,7 +1072,6 @@ mod tests {
         assert_eq!(fractional.size(), (1600.0, 965.0));
     }
 
-    /// Pixel-mode wheel motion divides by the output scale factor, so the same physical scroll yields the same zoom lines at any scale.
     #[test]
     fn pixel_wheel_zoom_speed_does_not_vary_with_output_scale_factor() {
         assert_eq!(wheel_lines(40.0, 1.0), 1.0);
