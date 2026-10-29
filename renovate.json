@@ -17,14 +17,8 @@
         {
             "description": "egui and windowing stack must update in lockstep; always review",
             "matchPackageNames": [
-                "egui",
-                "egui-winit",
-                "egui_glow",
-                "egui_system_font_provider",
-                "glow",
-                "glutin",
-                "glutin-winit",
-                "winit"
+                "egui*",
+                "glutin*"
             ],
             "groupName": "egui stack",
             "automerge": false
