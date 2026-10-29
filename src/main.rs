@@ -104,7 +104,7 @@ fn landing<'entries>(
 }
 
 fn run(open_path: &Path, land_on: Option<&str>) -> eros::Result<()> {
-    use winit::event_loop::EventLoop;
+    use egui_winit::winit::event_loop::EventLoop;
 
     let source = Arc::new(Source::open(open_path)?);
 

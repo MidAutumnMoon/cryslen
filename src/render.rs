@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::mem;
 use std::sync::Arc;
 
-use glow::HasContext;
+use egui_glow::glow::{self, HasContext};
 
 use crate::decode::{plane_bytes, plane_dims, Decoded, Matrix, Pixels, Plane, Subsampling};
 use crate::view;

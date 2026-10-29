@@ -3,6 +3,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use egui_winit::winit;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::StartCause;

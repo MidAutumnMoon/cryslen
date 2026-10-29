@@ -3,6 +3,7 @@
 use core::num::NonZeroU32;
 use std::sync::Arc;
 
+use egui_glow::glow;
 use egui_winit::winit;
 use glutin::context::PossiblyCurrentContext;
 use glutin::surface::Surface;

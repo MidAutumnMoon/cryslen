@@ -1,6 +1,7 @@
 //! The baked-in key map: physical keys to `Action`s.
 
 use crate::view::ViewMode;
+use egui_winit::winit;
 use winit::keyboard::{KeyCode, ModifiersState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

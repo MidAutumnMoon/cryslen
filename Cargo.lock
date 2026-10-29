@@ -383,7 +383,6 @@ dependencies = [
  "egui_glow",
  "egui_system_font_provider",
  "eros",
- "glow",
  "glutin",
  "glutin-winit",
  "image",
@@ -395,7 +394,6 @@ dependencies = [
  "rustfs-mimalloc",
  "sevenz-rust2",
  "tracing",
- "winit",
  "zip",
 ]
 
