@@ -342,9 +342,11 @@ fn decide_page(source: &Source, page_index: usize) -> Decision {
             match result {
                 Ok(Ok(page)) => Decision::Ready(Arc::new(page)),
                 Ok(Err(error)) => Decision::Failed(format!("page {}: {error}", page_index + 1)),
-                Err(panic) => {
-                    Decision::Failed(format!("page {}: {}", page_index + 1, panic_message(panic.as_ref())))
-                }
+                Err(panic) => Decision::Failed(format!(
+                    "page {}: decoder {}",
+                    page_index + 1,
+                    panic_message(panic.as_ref())
+                )),
             }
         }
         Bytes::Failed(message) => Decision::Failed(format!("page {}: {message}", page_index + 1)),

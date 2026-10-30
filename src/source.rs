@@ -61,7 +61,7 @@ impl fmt::Display for SourceError {
 
 impl Error for SourceError {}
 
-/// What the user asked the current page's name segment to be called.
+/// What the status line calls the current page.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageName {
     /// Directory shown before the basename, e.g. a volume inside an archive.
@@ -99,8 +99,8 @@ pub(crate) fn is_archive(path: &Path) -> bool {
     archive_kind(path).is_some()
 }
 
-/// The answer to one page read. It never blocks: `NotYet` reports an
-/// archive still unpacking, and the caller decides how to wait.
+/// The answer to one page read. `NotYet` reports an archive still
+/// unpacking, so no caller waits inside the call for the unpack.
 pub enum Bytes {
     Ready(Arc<[u8]>),
     NotYet,
@@ -208,47 +208,46 @@ impl Source {
                 listed.push((name, entry.size()));
             }
         }
-        listed.sort_by(|left, right| natord::compare(&left.0, &right.0));
-        // The empty check runs before the spawn, so a pageless archive
-        // starts no fill thread.
-        if listed.is_empty() {
-            return Err(SourceError::Empty);
-        }
-        let total: u64 = listed.iter().map(|(_, size)| size).sum();
-        let names: Vec<String> = listed.into_iter().map(|(name, _)| name).collect();
-        guard_memory(total, mem_available())?;
-        let fill_state = Arc::new(Mutex::new(Fill::empty()));
-        spawn_zip_fill(zip, names.clone(), Arc::clone(&fill_state));
-        Self::from_names(Backend::Archive(fill_state), names)
+        Self::open_archive(listed, |names, fill| spawn_zip_fill(zip, names, &fill))
     }
 
     fn open_sevenzip(path: &Path) -> Result<Self, SourceError> {
         let archive = sevenz_rust2::ArchiveReader::open(path, sevenz_rust2::Password::empty())
             .map_err(SourceError::SevenZip)?;
-        let mut listed: Vec<(String, u64)> = archive
+        let listed: Vec<(String, u64)> = archive
             .archive()
             .files
             .iter()
             .filter(|entry| !entry.is_directory() && format_from_name(&entry.name).is_some())
             .map(|entry| (entry.name.clone(), entry.size()))
             .collect();
-        listed.sort_by(|left, right| natord::compare(&left.0, &right.0));
-        // The empty check runs before the spawn, so a pageless archive
-        // starts no fill thread.
-        if listed.is_empty() {
+        Self::open_archive(listed, |names, fill| {
+            let by_name: HashMap<String, usize> = names
+                .iter()
+                .enumerate()
+                .map(|(index, name)| (name.clone(), index))
+                .collect();
+            spawn_sevenzip_fill(archive, by_name, &fill);
+        })
+    }
+
+    /// Finish opening an archive from its listed pages: sort them,
+    /// refuse a pageless listing before any thread starts, refuse a
+    /// memory-size mismatch, and hand the sorted names to `spawn_fill`.
+    fn open_archive(
+        listed: Vec<(String, u64)>,
+        spawn_fill: impl FnOnce(Vec<String>, Arc<Mutex<Fill>>),
+    ) -> Result<Self, SourceError> {
+        let total: u64 = listed.iter().map(|(_, size)| size).sum();
+        let mut names: Vec<String> = listed.into_iter().map(|(name, _)| name).collect();
+        sort_pages(&mut names);
+        if names.is_empty() {
             return Err(SourceError::Empty);
         }
-        let total: u64 = listed.iter().map(|(_, size)| size).sum();
-        let names: Vec<String> = listed.into_iter().map(|(name, _)| name).collect();
         guard_memory(total, mem_available())?;
-        let by_name: HashMap<String, usize> = names
-            .iter()
-            .enumerate()
-            .map(|(index, name)| (name.clone(), index))
-            .collect();
-        let fill_state = Arc::new(Mutex::new(Fill::empty()));
-        spawn_sevenzip_fill(archive, by_name, Arc::clone(&fill_state));
-        Self::from_names(Backend::Archive(fill_state), names)
+        let fill = Arc::new(Mutex::new(Fill::empty()));
+        spawn_fill(names.clone(), Arc::clone(&fill));
+        Self::from_names(Backend::Archive(fill), names)
     }
 
     fn from_names(backend: Backend, names: Vec<String>) -> Result<Self, SourceError> {
@@ -290,8 +289,9 @@ impl Source {
         PageName { parent, file }
     }
 
-    /// The encoded bytes of one page, never blocking: an archive still
-    /// unpacking answers `NotYet`, and the caller decides how to wait.
+    /// The encoded bytes of one page. An archive still unpacking
+    /// answers `NotYet` instead of blocking, and the caller decides how
+    /// to wait.
     pub fn bytes(&self, index: usize) -> Bytes {
         let Some(name) = self.names.get(index) else {
             return Bytes::Failed(format!("page {}: no such page", index + 1));
@@ -328,28 +328,31 @@ fn read_member(member: &mut impl Read) -> Result<Arc<[u8]>, String> {
 fn spawn_zip_fill(
     mut zip: zip::ZipArchive<BufReader<File>>,
     names: Vec<String>,
-    fill: Arc<Mutex<Fill>>,
+    fill: &Arc<Mutex<Fill>>,
 ) {
     // Dropping the handle detaches the thread, so quitting never waits
-    // on it.
-    drop(Builder::new()
-        .name("cy-unpack".into())
-        .spawn(move || {
-            let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
-                for (index, name) in names.iter().enumerate() {
-                    let page = match zip.by_name(name) {
-                        Ok(mut entry) => read_member(&mut entry),
-                        Err(error) => Err(error.to_string()),
-                    };
-                    fill.lock().pages.insert(index, page);
-                }
-            }));
-            let mut state = fill.lock();
-            state.pass = Some(match outcome {
-                Ok(()) => Ok(()),
-                Err(panic) => Err(panic_message(panic.as_ref())),
-            });
+    // on it. A failed spawn settles the pass, so no page can wait on a
+    // thread that never ran.
+    let thread_fill = Arc::clone(fill);
+    let spawned = Builder::new().name("cy-unpack".into()).spawn(move || {
+        let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+            for (index, name) in names.iter().enumerate() {
+                let page = match zip.by_name(name) {
+                    Ok(mut entry) => read_member(&mut entry),
+                    Err(error) => Err(error.to_string()),
+                };
+                thread_fill.lock().pages.insert(index, page);
+            }
         }));
+        let mut state = thread_fill.lock();
+        state.pass = Some(match outcome {
+            Ok(()) => Ok(()),
+            Err(panic) => Err(format!("unpack {}", panic_message(panic.as_ref()))),
+        });
+    });
+    if let Err(error) = spawned {
+        fill.lock().pass = Some(Err(format!("could not start the unpack thread: {error}")));
+    }
 }
 
 /// Fill a 7z's pages in storage order, the only order a solid stream
@@ -359,33 +362,36 @@ fn spawn_zip_fill(
 fn spawn_sevenzip_fill(
     mut reader: sevenz_rust2::ArchiveReader<File>,
     pages: HashMap<String, usize>,
-    fill: Arc<Mutex<Fill>>,
+    fill: &Arc<Mutex<Fill>>,
 ) {
-    drop(Builder::new()
-        .name("cy-unpack".into())
-        .spawn(move || {
-            let outcome = panic::catch_unwind(AssertUnwindSafe(|| reader.for_each_entries(
-                |entry, data| {
-                    let mut member = Vec::new();
-                    data.read_to_end(&mut member)?;
-                    if let Some(&index) = pages.get(&entry.name) {
-                        fill.lock()
-                            .pages
-                            .insert(index, Ok(Arc::from(member.as_slice())));
-                    }
-                    Ok(true)
-                },
-            )));
-            let mut state = fill.lock();
-            state.pass = Some(match outcome {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(error)) => {
-                    tracing::warn!(%error, "7z unpack ended early");
-                    Err(error.to_string())
+    // Dropping the handle detaches the thread, so quitting never waits
+    // on it. A failed spawn settles the pass, so no page can wait on a
+    // thread that never ran.
+    let thread_fill = Arc::clone(fill);
+    let spawned = Builder::new().name("cy-unpack".into()).spawn(move || {
+        let outcome = panic::catch_unwind(AssertUnwindSafe(|| reader.for_each_entries(
+            |entry, data| {
+                let mut member = Vec::new();
+                data.read_to_end(&mut member)?;
+                if let Some(&index) = pages.get(&entry.name) {
+                    thread_fill.lock().pages.insert(index, Ok(member.into()));
                 }
-                Err(panic) => Err(panic_message(panic.as_ref())),
-            });
-        }));
+                Ok(true)
+            },
+        )));
+        let mut state = thread_fill.lock();
+        state.pass = Some(match outcome {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "7z unpack ended early");
+                Err(error.to_string())
+            }
+            Err(panic) => Err(format!("unpack {}", panic_message(panic.as_ref()))),
+        });
+    });
+    if let Err(error) = spawned {
+        fill.lock().pass = Some(Err(format!("could not start the unpack thread: {error}")));
+    }
 }
 
 /// A panic payload rendered as a failure message, for the thread panic
