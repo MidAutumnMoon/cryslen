@@ -206,6 +206,43 @@ impl Book {
     }
 }
 
+/// Orders by distance to `anchor`, with `false` (ahead) sorting before
+/// `true` (behind) at equal distance.
+fn next_pick_key(page: usize, anchor: usize) -> (usize, bool) {
+    (page.abs_diff(anchor), page < anchor)
+}
+
+/// How many pages on each side of the wanted spread's first page to
+/// prefetch. A double-mode turn steps two pages, so the far page of
+/// the next spread sits at distance 3. Single-page mode over-prefetches by
+/// the same margin, which the book reclaims first as never-wanted.
+const PREFETCH_RADIUS: usize = 3;
+
+/// Decode order around the wanted spread: its first page, then
+/// neighbours out to [`PREFETCH_RADIUS`], nearest first.
+fn neighbors(current: usize, page_count: usize) -> Vec<usize> {
+    use std::iter;
+
+    iter::once(current)
+        .chain(
+            (1..=PREFETCH_RADIUS)
+                .flat_map(|distance| [current.checked_sub(distance), current.checked_add(distance)])
+                .flatten(),
+        )
+        .filter(|&page| page < page_count)
+        .collect()
+}
+
+/// How many pages on each side of the wanted spread may stay pending. A
+/// held key sends retunes faster than pages decode, so pages past this
+/// radius are dropped rather than queued for a reader that has already
+/// moved on. The wanted spread itself never drops.
+const TRAIL_RADIUS: usize = 64;
+
+fn retain_trail(pending: &mut BTreeSet<usize>, anchor: usize, wanted: &Spread) {
+    pending.retain(|&page| page.abs_diff(anchor) <= TRAIL_RADIUS || wanted.contains(page));
+}
+
 /// Handle to the worker. `retune` is cheap and never blocks.
 pub struct Worker {
     tx: mpsc::Sender<ToWorker>,
@@ -226,12 +263,10 @@ impl Worker {
 
         let (tx, rx) = mpsc::channel::<ToWorker>();
         let book = Arc::new(Mutex::new(Book::new(initial, source.len())));
+        let thread_book = Arc::clone(&book);
         let handle = Builder::new()
             .name("cy-decode".into())
-            .spawn({
-                let book = Arc::clone(&book);
-                move || run(&source, &rx, &book, &notify)
-            })?;
+            .spawn(move || run(&source, &rx, &thread_book, &notify))?;
         Ok(Self { tx, book, handle: Some(handle) })
     }
 
@@ -282,6 +317,8 @@ fn run(
     notify: &dyn Fn(),
 ) {
     let page_count = source.len();
+    // Retunes accumulate while a page decides; all are replayed, in
+    // arrival order, so last-wanted recency stays truthful.
     let mut retunes: Vec<Spread> = Vec::new();
     loop {
         while let Ok(message) = rx.try_recv() {
@@ -352,43 +389,6 @@ fn decide_page(source: &Source, page_index: usize) -> Decision {
         Bytes::Failed(message) => Decision::Failed(format!("page {}: {message}", page_index + 1)),
         Bytes::NotYet => Decision::NotYet,
     }
-}
-
-/// Orders by distance to `anchor`, with `false` (ahead) sorting before
-/// `true` (behind) at equal distance.
-fn next_pick_key(page: usize, anchor: usize) -> (usize, bool) {
-    (page.abs_diff(anchor), page < anchor)
-}
-
-/// How many pages on each side of the wanted spread's first page to
-/// prefetch. A double-mode turn steps two pages, so the far page of the
-/// next spread sits at distance 3. Single-page mode over-prefetches by
-/// the same margin, which the book reclaims first as never-wanted.
-const PREFETCH_RADIUS: usize = 3;
-
-/// Decode order around the wanted spread: its first page, then
-/// neighbours out to [`PREFETCH_RADIUS`], nearest first.
-fn neighbors(current: usize, page_count: usize) -> Vec<usize> {
-    use std::iter;
-
-    iter::once(current)
-        .chain(
-            (1..=PREFETCH_RADIUS)
-                .flat_map(|distance| [current.checked_sub(distance), current.checked_add(distance)])
-                .flatten(),
-        )
-        .filter(|&page| page < page_count)
-        .collect()
-}
-
-/// How many pages on each side of the wanted spread may stay pending. A
-/// held key sends retunes faster than pages decode, so pages past this
-/// radius are dropped rather than queued for a reader that has already
-/// moved on. The wanted spread itself never drops.
-const TRAIL_RADIUS: usize = 64;
-
-fn retain_trail(pending: &mut BTreeSet<usize>, anchor: usize, wanted: &Spread) {
-    pending.retain(|&page| page.abs_diff(anchor) <= TRAIL_RADIUS || wanted.contains(page));
 }
 
 #[cfg(test)]
@@ -708,50 +708,52 @@ mod tests {
         assert!(was_wanted(4), "page 4 never recorded as wanted");
     }
 
-    /// Gated decode order: the trail radius bounds what ever decodes; a newer retune overtakes far pending pages.
+    /// The trail radius bounds what ever decodes: retunes queued while
+    /// the worker is parked decode only within the radius of the last
+    /// one.
     #[test]
-    fn gated_decode_order() {
-        // pages past the trail radius never decode
-        {
-            let (_dir, source) = tiny_source("worker-bound", 140);
-            let gate = Gate::new();
-            let parked = gate.clone();
-            let worker = Worker::spawn(source, Spread::lone(0), move || parked.hold())
-                .expect("worker spawns");
-            wait_ready(&worker, &[0]);
-            // All 139 retunes queue while the worker is parked on page 0.
-            for page in 1..140 {
-                worker.retune(Spread::lone(page));
-            }
-            gate.release(u64::MAX);
-            wait_ready(&worker, &(75..140).collect::<Vec<_>>());
-            for page in 1..75 {
-                assert!(
-                    matches!(worker.snapshot(&Spread::lone(page)).first, SeatView::Pending),
-                    "page {page} decoded past the trail radius"
-                );
-            }
+    fn trail_radius_bounds_decoding() {
+        let (_dir, source) = tiny_source("worker-bound", 140);
+        let gate = Gate::new();
+        let parked = gate.clone();
+        let worker = Worker::spawn(source, Spread::lone(0), move || parked.hold())
+            .expect("worker spawns");
+        wait_ready(&worker, &[0]);
+        // All 139 retunes queue while the worker is parked on page 0.
+        for page in 1..140 {
+            worker.retune(Spread::lone(page));
         }
-        // a newer retune overtakes far pending pages
-        {
-            let (_dir, source) = tiny_source("worker-prio", 70);
-            let gate = Gate::new();
-            let parked = gate.clone();
-            let worker = Worker::spawn(source, Spread::lone(0), move || parked.hold())
-                .expect("worker spawns");
-            wait_ready(&worker, &[0]);
-            worker.retune(Spread::lone(60));
-            gate.release(1);
-            wait_ready(&worker, &[60]);
-            // The worker is parked on page 60's store, so the old window
-            // pages 1 and 2 cannot have been decoded before it.
-            for page in [1, 2] {
-                assert!(
-                    matches!(worker.snapshot(&Spread::lone(page)).first, SeatView::Pending),
-                    "page {page} decoded before the wanted page"
-                );
-            }
-            gate.release(u64::MAX);
+        gate.release(u64::MAX);
+        wait_ready(&worker, &(75..140).collect::<Vec<_>>());
+        for page in 1..75 {
+            assert!(
+                matches!(worker.snapshot(&Spread::lone(page)).first, SeatView::Pending),
+                "page {page} decoded past the trail radius"
+            );
         }
+    }
+
+    /// A newer retune overtakes far pending pages: the wanted page
+    /// decodes before the old window the reader has already left.
+    #[test]
+    fn newer_retune_overtakes_far_pending() {
+        let (_dir, source) = tiny_source("worker-prio", 70);
+        let gate = Gate::new();
+        let parked = gate.clone();
+        let worker = Worker::spawn(source, Spread::lone(0), move || parked.hold())
+            .expect("worker spawns");
+        wait_ready(&worker, &[0]);
+        worker.retune(Spread::lone(60));
+        gate.release(1);
+        wait_ready(&worker, &[60]);
+        // The worker is parked on page 60's store, so the old window
+        // pages 1 and 2 cannot have been decoded before it.
+        for page in [1, 2] {
+            assert!(
+                matches!(worker.snapshot(&Spread::lone(page)).first, SeatView::Pending),
+                "page {page} decoded before the wanted page"
+            );
+        }
+        gate.release(u64::MAX);
     }
 }

@@ -407,6 +407,12 @@ impl App {
             decoded,
             dims,
         });
+        // Once the grace has passed, the wait word names what holds the
+        // page: the unpack, or the decode.
+        let waiting = self
+            .waiting_since
+            .is_some_and(|since| since.elapsed() >= WAIT_GRACE)
+            .then(|| if self.source.filling() { Wait::Unpacking } else { Wait::Decoding });
         let status = StatusLine {
             total: self.source.len(),
             spread,
@@ -415,10 +421,7 @@ impl App {
             name: self.source.page_name(speaking_page),
             page,
             zoom: self.state.placement.scale,
-            waiting: self
-                .waiting_since
-                .is_some_and(|since| since.elapsed() >= WAIT_GRACE)
-                .then(|| if self.source.filling() { Wait::Unpacking } else { Wait::Decoding }),
+            waiting,
             error: folded.error,
         };
 

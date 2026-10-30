@@ -118,8 +118,8 @@ const NAME_COLOR: egui::Color32 = egui::Color32::from_rgb(0xa2, 0x92, 0xc5);
 fn line(style: &egui::Style, status: &StatusLine) -> LayoutJob {
     let font = egui::TextStyle::Monospace.resolve(style);
     let plain = style.visuals.text_color();
-    let section = |job: &mut LayoutJob, text: String, color: egui::Color32| {
-        job.append(&text, 0.0, egui::TextFormat::simple(font.clone(), color));
+    let section = |job: &mut LayoutJob, text: &str, color: egui::Color32| {
+        job.append(text, 0.0, egui::TextFormat::simple(font.clone(), color));
     };
     let mut job = LayoutJob::default();
 
@@ -127,18 +127,18 @@ fn line(style: &egui::Style, status: &StatusLine) -> LayoutJob {
         || format!("{}", status.spread.first + 1),
         |second| format!("{}-{}", status.spread.first + 1, second + 1),
     );
-    section(&mut job, head, HEAD_COLOR);
-    section(&mut job, format!("/{}", status.total), plain);
+    section(&mut job, &head, HEAD_COLOR);
+    section(&mut job, &format!("/{}", status.total), plain);
 
-    section(&mut job, " · ".into(), plain);
+    section(&mut job, " · ", plain);
     if let Some(parent) = &status.name.parent {
-        section(&mut job, parent.clone(), plain);
-        section(&mut job, "/".into(), plain);
+        section(&mut job, parent, plain);
+        section(&mut job, "/", plain);
     }
-    section(&mut job, status.name.file.clone(), NAME_COLOR);
+    section(&mut job, &status.name.file, NAME_COLOR);
 
     if let Some(facts) = &status.page {
-        section(&mut job, " · ".into(), plain);
+        section(&mut job, " · ", plain);
         // A format label shows only when the filename's extension lies.
         let (width, height) = facts.dims;
         let dims_text = if facts.claimed == Some(facts.decoded) {
@@ -146,14 +146,14 @@ fn line(style: &egui::Style, status: &StatusLine) -> LayoutJob {
         } else {
             format!("{} {width}x{height}", facts.decoded.label())
         };
-        section(&mut job, dims_text, plain);
+        section(&mut job, &dims_text, plain);
     }
-    section(&mut job, format!(" · {:.0}%", status.zoom * 100.0), plain);
+    section(&mut job, &format!(" · {:.0}%", status.zoom * 100.0), plain);
     if let Some(wait) = status.waiting {
-        section(&mut job, format!(" · {}", wait.label()), plain);
+        section(&mut job, &format!(" · {}", wait.label()), plain);
     }
     if let Some(error) = &status.error {
-        section(&mut job, format!(" · {error}"), plain);
+        section(&mut job, &format!(" · {error}"), plain);
     }
     job
 }

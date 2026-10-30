@@ -215,6 +215,8 @@ impl Source {
         Self::open_archive(listed, |names, fill| spawn_zip_fill(zip, names, &fill))
     }
 
+    /// No password: an archive with encrypted headers fails to open,
+    /// and encrypted members settle as their own pages' failures.
     fn open_sevenzip(path: &Path) -> Result<Self, SourceError> {
         let archive = sevenz_rust2::ArchiveReader::open(path, sevenz_rust2::Password::empty())
             .map_err(SourceError::SevenZip)?;
@@ -225,14 +227,7 @@ impl Source {
             .filter(|entry| !entry.is_directory() && format_from_name(&entry.name).is_some())
             .map(|entry| (entry.name.clone(), entry.size()))
             .collect();
-        Self::open_archive(listed, |names, fill| {
-            let by_name: HashMap<String, usize> = names
-                .iter()
-                .enumerate()
-                .map(|(index, name)| (name.clone(), index))
-                .collect();
-            spawn_sevenzip_fill(archive, by_name, &fill);
-        })
+        Self::open_archive(listed, |names, fill| spawn_sevenzip_fill(archive, &names, &fill))
     }
 
     /// Finish opening an archive from its listed pages: sort them,
@@ -245,14 +240,11 @@ impl Source {
     ) -> Result<Self, SourceError> {
         // Header sizes are claims, so the sum saturates rather than
         // wraps a liar archive past the guard.
-        let total: u64 = listed
-            .iter()
-            .map(|(_, size)| size)
-            .fold(0_u64, |sum, size| sum.saturating_add(*size));
+        let total: u64 = listed.iter().map(|&(_, size)| size).fold(0, u64::saturating_add);
         let mut names: Vec<String> = listed.into_iter().map(|(name, _)| name).collect();
         sort_pages(&mut names);
         if let Some(name) = duplicate_name(&names) {
-            return Err(SourceError::Duplicate(name.clone()));
+            return Err(SourceError::Duplicate(name.to_owned()));
         }
         if names.is_empty() {
             return Err(SourceError::Empty);
@@ -331,19 +323,52 @@ impl Source {
 /// The first name a sorted listing carries twice, if any. Duplicate
 /// names would pair one entry's bytes with two pages and strand the
 /// other, so the listing refuses them outright.
-fn duplicate_name(sorted: &[String]) -> Option<&String> {
+fn duplicate_name(sorted: &[String]) -> Option<&str> {
     sorted
         .iter()
         .zip(sorted.iter().skip(1))
         .find(|(left, right)| left == right)
-        .map(|(name, _)| name)
+        .map(|(name, _)| name.as_str())
 }
 
-/// One member's bytes, with its read error as the message.
-fn read_member(member: &mut impl Read) -> Result<Arc<[u8]>, String> {
+/// Pages read in filename order for humans: c2 before c10.
+fn sort_pages(names: &mut [String]) {
+    names.sort_by(|left, right| natord::compare(left, right));
+}
+
+/// One member's bytes, with its read error as the message. A failed
+/// member is drained, so the next member of a solid stream decodes
+/// from its true start; an independent entry simply discards the rest.
+fn read_member(member: &mut (impl Read + ?Sized)) -> Result<Arc<[u8]>, String> {
     let mut bytes = Vec::new();
-    member.read_to_end(&mut bytes).map_err(|error| error.to_string())?;
-    Ok(bytes.into())
+    match member.read_to_end(&mut bytes) {
+        Ok(_) => Ok(bytes.into()),
+        Err(error) => {
+            #[expect(
+                clippy::let_underscore_must_use,
+                clippy::let_underscore_untyped,
+                reason = "the drain's outcome is irrelevant; only its side effect of consuming the member's remaining bytes matters"
+            )]
+            let _ = member.read_to_end(&mut bytes);
+            Err(error.to_string())
+        }
+    }
+}
+
+/// Start the unpack thread for one pass body. Dropping the handle
+/// detaches the thread, so quitting never waits on it. A failed spawn
+/// settles the pass, so no page can wait on a thread that never ran.
+fn spawn_pass(
+    fill: &Arc<Mutex<Fill>>,
+    body: impl FnOnce(&Arc<Mutex<Fill>>) -> Result<(), String> + Send + 'static,
+) {
+    let thread_fill = Arc::clone(fill);
+    let spawned = Builder::new()
+        .name("cy-unpack".into())
+        .spawn(move || settle_pass(&thread_fill, body));
+    if let Err(error) = spawned {
+        fill.lock().pass = Some(Err(format!("could not start the unpack thread: {error}")));
+    }
 }
 
 /// Fill a zip's pages in reading order. Zip members decode
@@ -354,25 +379,16 @@ fn spawn_zip_fill(
     names: Vec<String>,
     fill: &Arc<Mutex<Fill>>,
 ) {
-    // Dropping the handle detaches the thread, so quitting never waits
-    // on it. A failed spawn settles the pass, so no page can wait on a
-    // thread that never ran.
-    let thread_fill = Arc::clone(fill);
-    let spawned = Builder::new().name("cy-unpack".into()).spawn(move || {
-        settle_pass(&thread_fill, || {
-            for (index, name) in names.iter().enumerate() {
-                let page = match zip.by_name(name) {
-                    Ok(mut entry) => read_member(&mut entry),
-                    Err(error) => Err(error.to_string()),
-                };
-                thread_fill.lock().pages.insert(index, page);
-            }
-            Ok(())
-        });
+    spawn_pass(fill, move |fill| {
+        for (index, name) in names.iter().enumerate() {
+            let page = match zip.by_name(name) {
+                Ok(mut entry) => read_member(&mut entry),
+                Err(error) => Err(error.to_string()),
+            };
+            fill.lock().pages.insert(index, page);
+        }
+        Ok(())
     });
-    if let Err(error) = spawned {
-        fill.lock().pass = Some(Err(format!("could not start the unpack thread: {error}")));
-    }
 }
 
 /// Fill a 7z's pages in storage order, the only order a solid stream
@@ -382,49 +398,33 @@ fn spawn_zip_fill(
 /// ends the pass.
 fn spawn_sevenzip_fill(
     mut reader: sevenz_rust2::ArchiveReader<File>,
-    pages: HashMap<String, usize>,
+    names: &[String],
     fill: &Arc<Mutex<Fill>>,
 ) {
-    // Dropping the handle detaches the thread, so quitting never waits
-    // on it. A failed spawn settles the pass, so no page can wait on a
-    // thread that never ran.
-    let thread_fill = Arc::clone(fill);
-    let spawned = Builder::new().name("cy-unpack".into()).spawn(move || {
-        settle_pass(&thread_fill, || {
-            reader
-                .for_each_entries(|entry, data| {
-                    // The failed member is drained so the next member
-                    // decodes from its true start.
-                    let mut member = Vec::new();
-                    let page = match data.read_to_end(&mut member) {
-                        Ok(_) => Ok(member.into()),
-                        Err(error) => {
-                            #[expect(
-                                clippy::let_underscore_must_use,
-                                clippy::let_underscore_untyped,
-                                reason = "the drain's outcome is irrelevant; only its side effect of consuming the member's remaining bytes matters"
-                            )]
-                            let _ = data.read_to_end(&mut member);
-                            Err(error.to_string())
-                        }
-                    };
-                    if let Some(&index) = pages.get(&entry.name) {
-                        thread_fill.lock().pages.insert(index, page);
-                    }
-                    Ok(true)
-                })
-                .map_err(|error| error.to_string())
-        });
+    // The pass walks storage order, so it needs pages by name rather
+    // than by the reading order the listing sorted them into.
+    let by_name: HashMap<String, usize> = names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| (name.clone(), index))
+        .collect();
+    spawn_pass(fill, move |fill| {
+        reader
+            .for_each_entries(|entry, data| {
+                let page = read_member(data);
+                if let Some(&index) = by_name.get(&entry.name) {
+                    fill.lock().pages.insert(index, page);
+                }
+                Ok(true)
+            })
+            .map_err(|error| error.to_string())
     });
-    if let Err(error) = spawned {
-        fill.lock().pass = Some(Err(format!("could not start the unpack thread: {error}")));
-    }
 }
 
 /// Run one fill pass body and settle the pass by its outcome: whole,
 /// ended early by a reason, or ended by a panic.
-fn settle_pass(fill: &Arc<Mutex<Fill>>, body: impl FnOnce() -> Result<(), String>) {
-    let outcome = panic::catch_unwind(AssertUnwindSafe(body));
+fn settle_pass(fill: &Arc<Mutex<Fill>>, body: impl FnOnce(&Arc<Mutex<Fill>>) -> Result<(), String>) {
+    let outcome = panic::catch_unwind(AssertUnwindSafe(|| body(fill)));
     let mut state = fill.lock();
     state.pass = Some(match outcome {
         Ok(Ok(())) => Ok(()),
@@ -476,11 +476,6 @@ fn guard_memory(unpacked: u64, available: Option<u64>) -> Result<(), SourceError
         }
         _ => Ok(()),
     }
-}
-
-/// Pages read in filename order for humans: c2 before c10.
-fn sort_pages(names: &mut [String]) {
-    names.sort_by(|left, right| natord::compare(left, right));
 }
 
 #[cfg(test)]
@@ -541,26 +536,24 @@ mod tests {
             guard_memory(100, Some(50)),
             Err(SourceError::TooBig { unpacked: 100, available: 50 })
         ));
-        assert!(matches!(
-            guard_memory(50, Some(100)),
-            Ok(())
-        ));
-        assert!(matches!(guard_memory(u64::MAX, None), Ok(())));
+        guard_memory(50, Some(100)).unwrap();
+        guard_memory(u64::MAX, None).unwrap();
     }
+
     /// `settle_pass` ends the pass by its outcome — whole, early, or
     /// panicked — so no page can wait on a pass that never settles.
     #[test]
     fn settle_pass_outcomes() {
         let whole = Arc::new(Mutex::new(Fill::empty()));
-        settle_pass(&whole, || Ok(()));
+        settle_pass(&whole, |_| Ok(()));
         assert!(matches!(&whole.lock().pass, Some(Ok(()))));
 
         let broke = Arc::new(Mutex::new(Fill::empty()));
-        settle_pass(&broke, || Err("stream broke".into()));
+        settle_pass(&broke, |_| Err("stream broke".into()));
         assert!(matches!(&broke.lock().pass, Some(Err(reason)) if reason.contains("broke")));
 
         let boom = Arc::new(Mutex::new(Fill::empty()));
-        settle_pass(&boom, || panic!("boom"));
+        settle_pass(&boom, |_| panic!("boom"));
         assert!(matches!(boom.lock().resolve(0), Bytes::Failed(reason) if reason.contains("boom")));
     }
 
@@ -616,25 +609,32 @@ mod tests {
         assert!(matches!(Source::open(&zip_path), Err(SourceError::Empty)));
     }
 
-    /// 7z sources list pages, read them through the fill, and the
-    /// background pass settles every page.
+    /// 7z sources list pages natural-sorted and name them by their
+    /// entry paths; a flat archive names no parent.
     #[test]
-    fn sevenz_source() {
+    fn sevenz_listing() {
         let source = Source::open(Path::new(SEVENZ_FIXTURE)).expect("7z opens");
         assert_eq!(source.names, ["p1.png", "p2.png"]);
         assert_eq!(
             source.page_name(0),
             PageName { parent: None, file: "p1.png".into() }
         );
+    }
+
+    /// 7z pages read through the fill, byte-identically on repeats,
+    /// and the background pass settles every page.
+    #[test]
+    fn sevenz_read_through_fill() {
+        let source = Source::open(Path::new(SEVENZ_FIXTURE)).expect("7z opens");
         let bytes = eventually(20, "first page never unpacked", || match source.bytes(0) {
             Bytes::Ready(bytes) => Some(bytes),
             Bytes::Failed(message) => panic!("page 0 failed: {message}"),
             Bytes::NotYet => None,
         });
-        // A repeat read returns the same bytes from the fill.
+        // a repeat read returns the same bytes from the fill
         assert!(matches!(source.bytes(0), Bytes::Ready(repeat) if repeat.as_ref() == bytes.as_ref()));
         assert_eq!(bytes.get(..8), Some(&b"\x89PNG\r\n\x1a\n"[..]));
-        // The decoder is the oracle for the fixture's dims.
+        // the decoder is the oracle for the fixture's dims
         let page = decode::decode(&bytes, "p1.png").expect("fixture page decodes");
         assert_eq!((page.width, page.height), (40, 30));
 
