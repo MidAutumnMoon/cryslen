@@ -1,10 +1,11 @@
 //! Decode worker: one thread serving the spread the app is showing. One
 //! book holds every decided page and the pending trail. The wanted
 //! spread never leaves the book, and every other page leaves by recency
-//! then distance. No disk persistence at all.
+//! then distance. Nothing is persisted to disk.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap};
+use std::fmt;
 use std::io;
 use std::mem;
 use std::sync::{mpsc, Arc};
@@ -14,7 +15,7 @@ use std::time::Duration;
 use parking_lot::Mutex;
 
 use crate::decode::Decoded;
-use crate::source::{panic_message, Bytes, Source};
+use crate::source::{panic_message, PageRead, Source};
 use crate::view::{Spread, ViewMode};
 
 /// Approximate decoded bytes the book may hold. The wanted spread
@@ -73,8 +74,6 @@ struct Book {
     wanted: Spread,
     decided: HashMap<usize, SeatView>,
     pending: BTreeSet<usize>,
-    /// When each page was last wanted, written only by `retune`. A page
-    /// never recorded here was never wanted and leaves the book first.
     last_wanted: HashMap<usize, u64>,
     recency_counter: u64,
     budget: usize,
@@ -100,8 +99,6 @@ impl Book {
         book
     }
 
-    /// Point the worker at a spread. Both its pages join the trail and
-    /// are protected from trail pruning.
     fn retune(&mut self, wanted: Spread, page_count: usize) {
         self.wanted = wanted;
         self.recency_counter += 1;
@@ -114,10 +111,6 @@ impl Book {
         self.assert_wanted_covered();
     }
 
-    /// The pending page to decode next. The undecided page nearest the
-    /// spread's first wins, ahead of the reader before behind at equal
-    /// distance. Decided pages leave the pending set, so a page is never
-    /// decoded twice.
     fn take_next(&mut self) -> Option<usize> {
         self.pending.retain(|page| !self.decided.contains_key(page));
         self.pending
@@ -126,13 +119,12 @@ impl Book {
             .min_by_key(|&page| next_pick_key(page, self.wanted.first))
     }
 
-    /// Decide a pending page, then evict until under budget.
     fn store(&mut self, page: usize, seat_view: SeatView) {
-        let bytes = seat_view.resident_bytes();
+        let resident_bytes = seat_view.resident_bytes();
         if let Some(old) = self.decided.insert(page, seat_view) {
             self.live_bytes -= old.resident_bytes();
         }
-        self.live_bytes += bytes;
+        self.live_bytes += resident_bytes;
         self.pending.remove(&page);
         if self.live_bytes > self.budget {
             self.evict();
@@ -141,8 +133,6 @@ impl Book {
         self.assert_live_bytes();
     }
 
-    /// Both seats of the wanted spread. Cloning a `Ready` page is an
-    /// `Arc` bump.
     fn snapshot(&self, wanted: &Spread) -> SpreadView {
         SpreadView {
             first: self.seat_view(wanted.first),
@@ -155,8 +145,8 @@ impl Book {
     }
 
     /// Eviction victims are never-wanted pages first, then least
-    /// recently wanted, then farthest from the spread. A wanted page has
-    /// no path into the victim list.
+    /// recently wanted, then farthest from the spread. A wanted page is
+    /// never a victim.
     fn evict(&mut self) {
         if self.live_bytes <= self.budget {
             return;
@@ -195,8 +185,6 @@ impl Book {
         }
     }
 
-    /// `live_bytes` always equals the summed resident bytes of the
-    /// decided entries.
     fn assert_live_bytes(&self) {
         debug_assert_eq!(
             self.live_bytes,
@@ -218,15 +206,13 @@ fn next_pick_key(page: usize, anchor: usize) -> (usize, bool) {
 /// the same margin, which the book reclaims first as never-wanted.
 const PREFETCH_RADIUS: usize = 3;
 
-/// Decode order around the wanted spread: its first page, then
-/// neighbours out to [`PREFETCH_RADIUS`], nearest first.
-fn neighbors(current: usize, page_count: usize) -> Vec<usize> {
+fn neighbors(anchor: usize, page_count: usize) -> Vec<usize> {
     use std::iter;
 
-    iter::once(current)
+    iter::once(anchor)
         .chain(
             (1..=PREFETCH_RADIUS)
-                .flat_map(|distance| [current.checked_sub(distance), current.checked_add(distance)])
+                .flat_map(|distance| [anchor.checked_sub(distance), anchor.checked_add(distance)])
                 .flatten(),
         )
         .filter(|&page| page < page_count)
@@ -270,13 +256,12 @@ impl Worker {
         Ok(Self { tx, book, handle: Some(handle) })
     }
 
-    /// Tell the worker thread `message`. A failed send means the
-    /// thread already exited, so the message has no reader left.
+    /// A failed send means the thread already exited, so the message has
+    /// no reader left.
     fn tell(&self, message: ToWorker) {
         let Ok(()) = self.tx.send(message) else { return; };
     }
 
-    /// Tell the worker which spread the app is now showing.
     pub fn retune(&self, wanted: Spread) {
         self.tell(ToWorker::Retune(wanted));
     }
@@ -308,8 +293,8 @@ const FILL_POLL: Duration = Duration::from_millis(15);
 
 /// Worker loop: the channel is observed between decodes, so a newer
 /// spread overtakes the backlog. One decode in flight always runs to
-/// completion. A page the source has not unpacked yet naps the loop
-/// instead of blocking it, so no wait can outlive a Stop.
+/// completion. A page the source has not unpacked yet makes the loop
+/// nap instead of block, so no wait can outlive a Stop.
 fn run(
     source: &Source,
     rx: &mpsc::Receiver<ToWorker>,
@@ -354,40 +339,43 @@ fn run(
     }
 }
 
-/// One undecided page's next step.
 enum Decision {
     Ready(Arc<Decoded>),
     Failed(String),
-    /// The source has not unpacked the page yet.
     NotYet,
 }
 
-/// Resolve one page to a decision: its bytes decoded, a terminal
-/// failure, or a nap because the unpack has not reached it. The
-/// decoder runs behind the panic boundary, so a panicking decoder must
-/// not kill the only worker thread.
+/// A terminal failure labelled with the page's 1-based display number.
+/// This is the only place the prefix is added.
+fn page_failure(page_index: usize, message: impl fmt::Display) -> Decision {
+    Decision::Failed(format!("page {}: {message}", page_index + 1))
+}
+
+/// Resolve one page to a decision: decoded, a terminal failure, or a
+/// nap because the unpack has not reached it. The decoder runs behind
+/// the panic boundary, so a panicking decoder must not kill the only
+/// worker thread.
 fn decide_page(source: &Source, page_index: usize) -> Decision {
     use crate::decode;
     use std::panic::{self, AssertUnwindSafe};
 
     let Some(name) = source.name(page_index) else {
-        return Decision::Failed(format!("page {}: no such page", page_index + 1));
+        return page_failure(page_index, "no such page");
     };
     match source.bytes(page_index) {
-        Bytes::Ready(bytes) => {
+        PageRead::Ready(bytes) => {
             let result = panic::catch_unwind(AssertUnwindSafe(|| decode::decode(&bytes, name)));
             match result {
                 Ok(Ok(page)) => Decision::Ready(Arc::new(page)),
-                Ok(Err(error)) => Decision::Failed(format!("page {}: {error}", page_index + 1)),
-                Err(panic) => Decision::Failed(format!(
-                    "page {}: decoder {}",
-                    page_index + 1,
-                    panic_message(panic.as_ref())
-                )),
+                Ok(Err(error)) => page_failure(page_index, error),
+                Err(payload) => page_failure(
+                    page_index,
+                    format!("decoder {}", panic_message(payload.as_ref())),
+                ),
             }
         }
-        Bytes::Failed(message) => Decision::Failed(format!("page {}: {message}", page_index + 1)),
-        Bytes::NotYet => Decision::NotYet,
+        PageRead::Failed(message) => page_failure(page_index, message),
+        PageRead::NotYet => Decision::NotYet,
     }
 }
 
@@ -400,7 +388,6 @@ mod tests {
     use parking_lot::Condvar;
     use std::time::{Duration, Instant};
 
-    /// The prefetch window reads the focus, then its neighbors nearest first, never past the book's ends.
     #[test]
     fn neighbors_are_nearest_first() {
         assert_eq!(neighbors(5, 10), vec![5, 4, 6, 3, 7, 2, 8]);
@@ -408,7 +395,6 @@ mod tests {
         assert_eq!(neighbors(9, 10), vec![9, 8, 7, 6]);
     }
 
-    /// The prefetch window covers a double-mode spread and its next turn's pages, except across the wrap.
     // Pins PREFETCH_RADIUS against view's double-mode turn math.
     #[test]
     fn prefetch_window_covers_double_mode_turns() {
@@ -447,7 +433,6 @@ mod tests {
         }
     }
 
-    /// `take_next` picks the nearest undecided page, the page ahead of the spread winning distance ties; decided pages never return.
     #[test]
     fn next_pick_is_nearest_then_ahead() {
         // A page count of 0 admits no neighbours, so the trail starts as
@@ -465,18 +450,14 @@ mod tests {
         assert_eq!(order, vec![11, 9, 12, 8]);
     }
 
-    /// Eviction rank under budget pressure: never-wanted pages first, then least-recently-wanted, then farthest.
     // store()'s debug asserts guard wanted coverage and live_bytes. The
     // kept/dropped checks below also protect release builds.
     #[test]
     fn eviction_rank() {
         let wanted = Spread { first: 5, second: Some(6) };
         for (budget, retunes, stores, kept, dropped) in [
-            // page 3 is nearer, but 1 is farther from the spread: farthest evicts first
             (8, vec![wanted], vec![1_usize, 3], vec![3_usize], vec![1_usize]),
-            // page 3 is nearer but was never wanted: once-wanted outlives never-wanted
             (8, vec![Spread::lone(1), wanted], vec![1, 3], vec![1], vec![3]),
-            // both were wanted: the least recently wanted evicts first
             (8, vec![Spread::lone(1), Spread::lone(2), wanted], vec![1, 2], vec![2], vec![1]),
         ] {
             let mut book = Book::new(Spread::lone(0), 10);
@@ -503,7 +484,6 @@ mod tests {
         }
     }
 
-    /// A saturating store evicts the oldest unwanted page, never a page of the spread the user just turned to.
     #[test]
     fn saturating_store_never_drops_the_wanted_spread() {
         let mut book = Book::new(Spread::lone(1), 20);
@@ -521,7 +501,6 @@ mod tests {
         assert!(matches!(snapshot.second, Some(SeatView::Ready(_))));
     }
 
-    /// A wanted page over the whole budget survives its own store's eviction pass.
     // 10x10 rgba is 400 bytes against a budget of 10: the store itself
     // saturates the book.
     #[test]
@@ -548,8 +527,6 @@ mod tests {
     #[derive(Clone)]
     struct Gate(Arc<(Mutex<GateTickets>, Condvar)>);
 
-    /// Ticket ledger of a [`Gate`]: the next number to hand out and the
-    /// highest number released so far.
     struct GateTickets {
         next: u64,
         released_through: u64,
@@ -594,7 +571,6 @@ mod tests {
         }
     }
 
-    /// End to end: the seeded spread decodes its page and notifies; a bad page fails sticky across turns.
     #[test]
     fn worker_end_to_end() {
         let dir = TempDir::new("worker-e2e");
@@ -609,7 +585,6 @@ mod tests {
         })
         .expect("worker spawns");
 
-        // happy path: the seeded page reaches Ready with its dims, and notify fired
         wait_ready(&worker, &[1]);
         let SeatView::Ready(page) = worker.snapshot(&ok).first else {
             panic!("ok page not Ready");
@@ -617,7 +592,6 @@ mod tests {
         assert_eq!((page.width, page.height), (3, 2));
         assert!(*updates.lock() > 0);
 
-        // failure path: the bad page fails with the page number
         let bad = Spread::lone(0);
         worker.retune(bad);
         let failed = eventually(20, "page 0 not decided in time", || {
@@ -627,7 +601,8 @@ mod tests {
                 SeatView::Pending => None,
             }
         });
-        assert!(failed.contains("page 1"), "{failed}");
+        assert!(failed.starts_with("page 1: "), "{failed}");
+        assert!(!failed.contains("page 1: page 1"), "{failed}");
         // The entry is sticky across turns: turn to the ok page, then back.
         worker.retune(ok);
         wait_ready(&worker, &[1]);
@@ -642,8 +617,9 @@ mod tests {
     }
 
     /// The worker naps through an unpack instead of failing or
-    /// hanging: seeded on the page a zip fill reaches last, the seat
-    /// settles once the pass arrives, and a mid-unpack retune re-aims.
+    /// hanging: seeded on the page the zip fill reaches last, the seat
+    /// settles once that page lands, and a retune afterwards settles
+    /// the first page from the fill.
     #[test]
     fn worker_waits_out_an_unpack() {
         use std::fs::File;
@@ -656,11 +632,10 @@ mod tests {
             let file = File::create(&zip_path).expect("zip creates");
             let mut zip = zip::ZipWriter::new(file);
             let options = SimpleFileOptions::default();
-            // Zero pages deflate small but inflate slowly enough in a
-            // debug build that the far page is still NotYet when the
-            // worker first asks for it. Zeros are not a PNG, so the
-            // seat settles as a decode failure — the point is that it
-            // settles at all, through naps.
+            // 32 MiB of zeros inflates slowly enough in a debug build that
+            // the far page is still NotYet when the worker first asks
+            // for it. Zeros are not a PNG, so the seat settles as a
+            // decode failure; the point is that it settles at all.
             for page in 0..32_u32 {
                 zip.start_file(format!("{page:03}.png"), options).expect("entry starts");
                 zip.write_all(&vec![0_u8; 1024 * 1024]).expect("entry writes");
@@ -681,12 +656,15 @@ mod tests {
                 }
             })
         };
-        assert!(settled(far).contains(&format!("page {}", far + 1)));
+        let far_page = settled(far);
+        assert!(far_page.starts_with(&format!("page {}: ", far + 1)), "{far_page}");
+        assert!(!far_page.contains("no entry in the archive"), "{far_page}");
+        assert!(!far_page.contains("could not start the unpack thread"), "{far_page}");
         worker.retune(Spread::lone(0));
-        assert!(settled(0).contains("page 1"));
+        let first_page = settled(0);
+        assert!(first_page.starts_with("page 1: "), "{first_page}");
     }
 
-    /// Retune-driven decoding: rapid retunes decode every trail page; a double-mode spread decodes both pages.
     #[test]
     fn retune_decoding() {
         let (_dir, source) = tiny_source("worker-retune", 50);
@@ -696,7 +674,6 @@ mod tests {
             worker.retune(Spread::lone(page));
         }
         wait_ready(&worker, &(0..50).collect::<Vec<_>>());
-        // a double-mode retune decides both its pages
         worker.retune(Spread { first: 3, second: Some(4) });
         wait_ready(&worker, &[3, 4]);
         // The last-wanted records are what keep a wanted spread in the
@@ -708,9 +685,6 @@ mod tests {
         assert!(was_wanted(4), "page 4 never recorded as wanted");
     }
 
-    /// The trail radius bounds what ever decodes: retunes queued while
-    /// the worker is parked decode only within the radius of the last
-    /// one.
     #[test]
     fn trail_radius_bounds_decoding() {
         let (_dir, source) = tiny_source("worker-bound", 140);
@@ -733,8 +707,6 @@ mod tests {
         }
     }
 
-    /// A newer retune overtakes far pending pages: the wanted page
-    /// decodes before the old window the reader has already left.
     #[test]
     fn newer_retune_overtakes_far_pending() {
         let (_dir, source) = tiny_source("worker-prio", 70);

@@ -27,12 +27,13 @@ silently re-import x11rb.
 
 `default-features = false, features = ["bzip2"]` keeps LZMA decode and
 drops the AES stack (aes/cbc/sha2/getrandom) and the LZMA encoder,
-which the read-only path never calls. The `ArchiveReader` handle is
-retained for the session. A background pass decompresses every page
-once into a byte-budgeted tier, so solid archives pay their block
-decode once.
-Non-UTF-8 entry names surface as errors from `file_names()` and are
-skipped.
+which the read-only path never calls. Pages are listed from the parsed
+header's `files`, then the `ArchiveReader` moves into the unpack thread
+and drops when its pass ends. That pass decompresses every entry once,
+so a solid archive pays each block decode once, and every page's bytes
+stay in memory. Opening therefore refuses an archive whose listed
+entry sizes exceed `MemAvailable`. Names come from the archive's UTF-16
+table; an invalid table fails the open.
 
 ## Benchmarking on this machine
 
@@ -66,6 +67,7 @@ invisible to `--all` until a bookmark covers them. `jj restore --from
 
 ## Gates
 
-All inside `nix develop`: `cargo clippy --all-targets -- -D warnings`
-plus `cargo test`. dav1d compiles from source on the first run, then
-cargo caches it.
+Inside `nix develop`: `cargo clippy --all-features --all-targets --package
+cryslen` and `cargo test --all-features --package cryslen`. CI runs the
+tests with the native build tools installed, without the devShell.
+dav1d compiles from source on the first run, then cargo caches it.

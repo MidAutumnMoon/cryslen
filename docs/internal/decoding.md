@@ -15,7 +15,7 @@ on the target machine before quoting numbers externally.
   JPEG. A full-resolution photo page takes hundreds of milliseconds,
   not tens, on any software decoder. This is inherent to the formats,
   not to the libraries.
-- Within that slow class, decoder *choice* moves the needle by whole
+- Within that slow class, decoder *choice* changes the cost by whole
   factors. See below.
 
 ## Library selection
@@ -97,7 +97,7 @@ write orientation tags, so fixtures for it must come from real files.
   jxl-oxide's partial-decode `render_loading_frame` still renders full
   resolution.
 - **AVIF scaled decode**: dav1d has none. Embedded `thmb` items parse
-  in avif-parse but essentially no encoder writes them, and progressive
+  in avif-parse but almost no encoder writes them, and progressive
   AVIF files are absent in the wild.
 - **Hardware AV1 for stills**: decode blocks exist on newer GPUs but
   are video-shaped (mostly 4:2:0 8-bit, no film-grain synthesis,
@@ -107,7 +107,7 @@ write orientation tags, so fixtures for it must come from real files.
 - **Pure-Rust AV1 bitstream decode**: does not exist. Container parsing
   (avif-parse) is pure Rust, the codec is not.
 
-## Decode worker pattern (what makes skimming feel right)
+## Decode worker pattern
 
 - One worker thread, mpsc retune channel carrying the wanted `Spread`.
   Every retune joins the spread to a pending trail with its ±3
@@ -129,19 +129,24 @@ write orientation tags, so fixtures for it must come from real files.
   spread. The wanted spread is never evicted. Each wanted page is
   decided or pending at every instant. An oversized spread stays over
   budget rather than losing a shown page.
+- An archive unpacks once on its own thread; `Source::bytes` answers
+  `NotYet` until the page is filled. The worker naps 15 ms and checks
+  the channel again on `NotYet`, so an unpack wait never blocks a
+  `Stop` or a newer retune.
 - The app reads one snapshot per frame, giving each seat Ready, Failed,
   or Pending. There is no unknown state.
 - Wrap decode in `catch_unwind`: a panicking decoder must degrade to a
   `Failed` page, not kill the only worker.
 - Per-page latency is decode-bound, so holding the last complete spread
-  plus a status flag after a short grace period beats any spinner. A
-  spinner forces repaints of a parked loop.
+  plus a status word after a short grace period beats any spinner. The
+  word is `unpacking…` while the archive pass runs and `decoding…` after
+  it. A spinner forces repaints of a parked loop.
 
 ## Thumbnail sources (known, currently unused)
 
 The freedesktop thumbnail cache (`~/.cache/thumbnails`, MD5-of-URI
-names, mtime/size freshness fields) reads + decodes essentially
+names, mtime/size freshness fields) reads and decodes almost
 instantly and Dolphin populates it. Unused by deliberate choice here
 ("the file explorer is the gallery"), though the mechanics are sound if
-ever wanted. EXIF IFD1 embedded thumbnails are the only embedded-preview
-ecology that exists in real photo collections.
+ever wanted. EXIF IFD1 embedded thumbnails are the only embedded
+previews that exist in real photo collections.

@@ -1,9 +1,8 @@
-# Rendering: the Wayland/GL stack and its sharp edges
+# Rendering: the Wayland/GL stack and its pitfalls
 
 Reference for anyone touching render.rs, window.rs, or the event loop. The
 working stack is winit + glutin + glow + egui_glow with no eframe and no
 X11.
-Knowing why each piece exists prevents rewrites that regress latency.
 
 ## Stack layers (what each crate answers)
 
@@ -20,7 +19,7 @@ packaging of the same layers. Going direct costs the boilerplate in
 render.rs and window.rs and buys page textures outside egui's paint
 list, zero framework opinions about repaint, and no hidden X11.
 
-## Feature flags that actually matter
+## Feature flags that matter
 
 `egui-winit`'s *default* features are `["clipboard", "links",
 "winit/default", "x11", "wayland"]`. `winit/default` re-imports X11 and
@@ -31,7 +30,7 @@ dependency tree and a third of the binary. If clipboard is ever
 wanted, prefer `smithay-clipboard` (Wayland-native) over egui-winit's
 arboard bundle.
 
-## Frame pacing (the part that silently breaks)
+## Frame pacing hazards
 
 - Present with `SwapInterval::DontWait` **and** call
   `window.pre_present_notify()` before swapping. A blocking
@@ -46,8 +45,8 @@ arboard bundle.
   `egui_ctx.set_request_repaint_callback` → send a user event. The
   proxy must come from `EventLoop::create_proxy` *before* `run_app`.
   winit 0.30 has no `create_proxy` on `ActiveEventLoop`.
-- While a decode is pending, re-arm at the status-grace deadline or
-  the "decoding…" flag never appears (the loop is parked).
+- While a page is pending, re-arm at the status-grace deadline or
+  the wait word never appears (the loop is parked).
 
 ## GL state gotchas
 
@@ -72,7 +71,7 @@ arboard bundle.
   when `is_embedded && wide`.
 - `precision highp` in the ES fragment shader. mediump may be fp16,
   where a large image's coordinate ulp grows to whole texels and
-  wrecks the math. ES3 mandates highp support.
+  breaks the math. ES3 mandates highp support.
 - Assert against `MAX_TEXTURE_SIZE` before uploading. GL silently
   rejects oversized `tex_image_2d` and the texture then samples black.
   The bounds checks in shader-land cannot catch it. Decode rejects

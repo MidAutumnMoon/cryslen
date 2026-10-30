@@ -11,12 +11,12 @@ I built it from scratch because I want:
 - Minimal, config-less, stateless viewer. This thing draws raw OpenGL. Knobs and shortcuts are all baked in. They fit my habit but maybe not yours.
 - Support enough file formats. Besides PNG, JPEG, I use AVIF and JXL extensively. Animated formats are not yet supported (soon).
 - Manga mode: right to left, double page. Of course it also has left to right mode like a normal image viewer.
-- Read manga directly from archives: 7z, zip, cbz.
+- Read manga directly from archives: 7z, cb7, zip, cbz.
 - Heavily utilize background decoding and prefetch to make it "feel snappy". As a result, hold arrow keys can flip pages extremely smooth. The bottleneck is always the decoder and CPU power.
 
 ## Usage
 
-    cy <dir/ | archive.{7z,cbz,zip} | image-file.{png,jpg,avif,jxl,...}>
+    cy <dir/ | archive.{7z,cb7,cbz,zip} | image-file.{png,jpg,avif,jxl,...}>
 
 Proper CLI handling later.
 

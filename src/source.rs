@@ -1,8 +1,8 @@
 //! Page source: a directory or archive viewed as a natural-sorted list
 //! of pages. An archive unpacks once into memory on a background
-//! thread while `bytes` serves whatever the pass has filled, so no
-//! read blocks and no member is ever unpacked twice. A directory keeps
-//! reading files, which the OS page cache serves.
+//! thread while `bytes` serves whatever the pass has filled, so archive
+//! reads never block and no member is ever unpacked twice. A directory
+//! keeps reading files, which the OS page cache serves.
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -10,14 +10,13 @@ use std::error::Error;
 use std::fmt;
 use std::fs;
 use std::fs::File;
+use std::io;
 use std::io::BufReader;
 use std::io::Error as IoError;
 use std::io::ErrorKind;
 use std::io::Read;
-use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::thread::Builder;
 
 use parking_lot::Mutex;
 use zip::result::ZipError;
@@ -29,11 +28,10 @@ pub enum SourceError {
     NotFound(PathBuf),
     Empty,
     Unsupported(PathBuf),
-    /// The listing names one entry twice, which would strand one of
-    /// the two pages.
+    /// The listing names one entry twice.
     Duplicate(String),
-    /// The archive's pages unpack to more bytes than the machine has
-    /// available.
+    /// The sizes the listing claims exceed the memory the machine
+    /// reports available.
     TooBig { unpacked: u64, available: u64 },
     Zip(ZipError),
     SevenZip(sevenz_rust2::Error),
@@ -47,15 +45,10 @@ impl fmt::Display for SourceError {
             Self::Empty => write!(f, "no image pages found"),
             Self::Unsupported(path) => write!(f, "unsupported source: {}", path.display()),
             Self::Duplicate(name) => write!(f, "duplicate entry name: {name}"),
-            Self::TooBig { unpacked, available } => {
-                const MIB: u64 = 1024 * 1024;
-                write!(
-                    f,
-                    "unpacked pages are {} MiB but only {} MiB of memory is available",
-                    unpacked / MIB,
-                    available / MIB
-                )
-            }
+            Self::TooBig { unpacked, available } => write!(
+                f,
+                "archive too big: {unpacked} bytes claimed, {available} bytes available"
+            ),
             Self::Zip(error) => write!(f, "zip: {error}"),
             Self::SevenZip(error) => write!(f, "7z: {error}"),
             Self::Io(error) => write!(f, "io: {error}"),
@@ -104,23 +97,21 @@ pub(crate) fn is_archive(path: &Path) -> bool {
 }
 
 /// The answer to one page read. `NotYet` reports an archive still
-/// unpacking, so no caller waits inside the call for the unpack.
-pub enum Bytes {
+/// unpacking; the read never waits for the unpack.
+pub enum PageRead {
     Ready(Arc<[u8]>),
     NotYet,
     Failed(String),
 }
 
-/// The unpacked pages one background pass fills. Every page ends with
-/// its own result — bytes or an error. A member that fails settles as
-/// its own page's error while the pass continues; only a failure that
-/// ends the whole pass (an undecodable block, a panic, a thread that
-/// never started) names the reason its unfilled pages read, while the
-/// filled prefix stays readable.
+/// The pages one background pass fills. A page member that fails to
+/// read settles as its own page's error and the pass continues. A
+/// failure that ends the pass (an undecodable block, a non-page member
+/// that cannot be drained, a panic, a failed thread spawn) is what its
+/// unfilled pages report, while filled pages keep their results.
 struct Fill {
     pages: HashMap<usize, Result<Arc<[u8]>, String>>,
-    /// `None` while the pass runs; `Some(Ok(()))` when it ended whole;
-    /// `Some(Err(reason))` when it ended early.
+    /// `None` while the pass runs, `Some(Ok(()))` when it ended whole, `Some(Err(reason))` when it ended early.
     pass: Option<Result<(), String>>,
 }
 
@@ -129,25 +120,19 @@ impl Fill {
         Self { pages: HashMap::new(), pass: None }
     }
 
-    /// One page's answer under the lock.
-    fn resolve(&self, index: usize) -> Bytes {
+    fn resolve(&self, index: usize) -> PageRead {
         match self.pages.get(&index) {
-            Some(Ok(bytes)) => Bytes::Ready(Arc::clone(bytes)),
-            Some(Err(message)) => Bytes::Failed(message.clone()),
+            Some(Ok(bytes)) => PageRead::Ready(Arc::clone(bytes)),
+            Some(Err(message)) => PageRead::Failed(message.clone()),
             None => match &self.pass {
-                None => Bytes::NotYet,
-                Some(Ok(())) => {
-                    Bytes::Failed(format!("page {}: no entry in the archive", index + 1))
-                }
-                Some(Err(fatal)) => Bytes::Failed(fatal.clone()),
+                None => PageRead::NotYet,
+                Some(Ok(())) => PageRead::Failed(String::from("no entry in the archive")),
+                Some(Err(fatal)) => PageRead::Failed(fatal.clone()),
             },
         }
     }
 }
 
-/// Where pages come from, decided by `Source::open` from one path
-/// argument. Archives share one shape: a background pass unpacks the
-/// pages into memory. A directory keeps reading its files.
 enum Backend {
     Directory(PathBuf),
     Archive(Arc<Mutex<Fill>>),
@@ -181,7 +166,7 @@ impl Source {
     fn open_dir(dir: &Path) -> Result<Self, SourceError> {
         #[expect(
             clippy::filetype_is_file,
-            reason = "directory pages are regular files, so symlinks are skipped"
+            reason = "the entry's own type is wanted, so symlinks stay out; `is_file()` would follow them"
         )]
         let mut names: Vec<String> = fs::read_dir(dir)
             .map_err(SourceError::Io)?
@@ -194,16 +179,15 @@ impl Source {
         Self::from_names(Backend::Directory(dir.to_path_buf()), names)
     }
 
-    /// Raw entries carry name and size without building a decoder, so
-    /// listing never trips on a member whose method this build cannot
-    /// decode — that member settles as its own page's error at fill
-    /// time.
+    /// Listing reads the central directory, so a damaged local header
+    /// does not refuse the whole book: that member fails when the fill
+    /// reaches it.
     fn open_zip(path: &Path) -> Result<Self, SourceError> {
         let file = File::open(path).map_err(SourceError::Io)?;
-        let mut zip = zip::ZipArchive::new(BufReader::new(file)).map_err(SourceError::Zip)?;
+        let zip = zip::ZipArchive::new(BufReader::new(file)).map_err(SourceError::Zip)?;
         let mut listed: Vec<(String, u64)> = Vec::new();
         for entry_index in 0..zip.len() {
-            let entry = zip.by_index_raw(entry_index).map_err(SourceError::Zip)?;
+            let entry = zip.by_index_data(entry_index).map_err(SourceError::Zip)?;
             if entry.is_dir() {
                 continue;
             }
@@ -215,8 +199,8 @@ impl Source {
         Self::open_archive(listed, |names, fill| spawn_zip_fill(zip, names, &fill))
     }
 
-    /// No password: an archive with encrypted headers fails to open,
-    /// and encrypted members settle as their own pages' failures.
+    /// No password: a 7z with encrypted headers fails to open, and the
+    /// first encrypted block ends the pass.
     fn open_sevenzip(path: &Path) -> Result<Self, SourceError> {
         let archive = sevenz_rust2::ArchiveReader::open(path, sevenz_rust2::Password::empty())
             .map_err(SourceError::SevenZip)?;
@@ -230,26 +214,23 @@ impl Source {
         Self::open_archive(listed, |names, fill| spawn_sevenzip_fill(archive, &names, &fill))
     }
 
-    /// Finish opening an archive from its listed pages: sort them,
-    /// refuse a duplicated or pageless listing before any thread
-    /// starts, refuse a memory-size mismatch, and hand the sorted names
-    /// to `spawn_fill`.
     fn open_archive(
         listed: Vec<(String, u64)>,
         spawn_fill: impl FnOnce(Vec<String>, Arc<Mutex<Fill>>),
     ) -> Result<Self, SourceError> {
         // Header sizes are claims, so the sum saturates rather than
         // wraps a liar archive past the guard.
-        let total: u64 = listed.iter().map(|&(_, size)| size).fold(0, u64::saturating_add);
+        let unpacked_bytes: u64 =
+            listed.iter().map(|&(_, size)| size).fold(0, u64::saturating_add);
         let mut names: Vec<String> = listed.into_iter().map(|(name, _)| name).collect();
         sort_pages(&mut names);
         if let Some(name) = duplicate_name(&names) {
-            return Err(SourceError::Duplicate(name.to_owned()));
+            return Err(SourceError::Duplicate(name));
         }
         if names.is_empty() {
             return Err(SourceError::Empty);
         }
-        guard_memory(total, mem_available())?;
+        guard_memory(unpacked_bytes, mem_available_bytes())?;
         let fill = Arc::new(Mutex::new(Fill::empty()));
         spawn_fill(names.clone(), Arc::clone(&fill));
         Self::from_names(Backend::Archive(fill), names)
@@ -277,7 +258,7 @@ impl Source {
     /// directory; directory pages get the opened directory itself.
     #[expect(
         clippy::indexing_slicing,
-        reason = "the page list is non-empty and immutable, and every page index is clamped to its length before reaching here"
+        reason = "the page list is non-empty and immutable, and callers pass an index below its length; the debug assert restates it"
     )]
     pub fn page_name(&self, index: usize) -> PageName {
         debug_assert!(index < self.names.len(), "caller clamps the page index");
@@ -295,24 +276,24 @@ impl Source {
     }
 
     /// The encoded bytes of one page. An archive still unpacking
-    /// answers `NotYet` instead of blocking, and the caller decides how
-    /// to wait.
-    pub fn bytes(&self, index: usize) -> Bytes {
+    /// answers `NotYet`; the caller decides how to wait. A failure
+    /// message carries no page number; the reader names the page.
+    pub fn bytes(&self, index: usize) -> PageRead {
         let Some(name) = self.names.get(index) else {
-            return Bytes::Failed(format!("page {}: no such page", index + 1));
+            return PageRead::Failed(String::from("no such page"));
         };
         match &self.backend {
             Backend::Directory(dir) => match fs::read(dir.join(name)) {
-                Ok(bytes) => Bytes::Ready(bytes.into()),
-                Err(error) => Bytes::Failed(error.to_string()),
+                Ok(bytes) => PageRead::Ready(bytes.into()),
+                Err(error) => PageRead::Failed(error.to_string()),
             },
             Backend::Archive(fill) => fill.lock().resolve(index),
         }
     }
 
     /// Whether the unpack pass is still running, for the status line's
-    /// wait word. A directory is never filling.
-    pub fn filling(&self) -> bool {
+    /// wait word. A directory never unpacks.
+    pub fn unpacking(&self) -> bool {
         match &self.backend {
             Backend::Directory(_) => false,
             Backend::Archive(fill) => fill.lock().pass.is_none(),
@@ -320,25 +301,24 @@ impl Source {
     }
 }
 
-/// The first name a sorted listing carries twice, if any. Duplicate
-/// names would pair one entry's bytes with two pages and strand the
-/// other, so the listing refuses them outright.
-fn duplicate_name(sorted: &[String]) -> Option<&str> {
+/// The first name a sorted listing carries twice, if any. Two pages
+/// would then share one entry's bytes, or one page would find no
+/// entry, so the listing refuses them.
+fn duplicate_name(sorted: &[String]) -> Option<String> {
     sorted
         .iter()
         .zip(sorted.iter().skip(1))
         .find(|(left, right)| left == right)
-        .map(|(name, _)| name.as_str())
+        .map(|(name, _)| name.clone())
 }
 
-/// Pages read in filename order for humans: c2 before c10.
 fn sort_pages(names: &mut [String]) {
     names.sort_by(|left, right| natord::compare(left, right));
 }
 
 /// One member's bytes, with its read error as the message. A failed
 /// member is drained, so the next member of a solid stream decodes
-/// from its true start; an independent entry simply discards the rest.
+/// from its true start; an independent entry discards the rest.
 fn read_member(member: &mut (impl Read + ?Sized)) -> Result<Arc<[u8]>, String> {
     let mut bytes = Vec::new();
     match member.read_to_end(&mut bytes) {
@@ -362,6 +342,8 @@ fn spawn_pass(
     fill: &Arc<Mutex<Fill>>,
     body: impl FnOnce(&Arc<Mutex<Fill>>) -> Result<(), String> + Send + 'static,
 ) {
+    use std::thread::Builder;
+
     let thread_fill = Arc::clone(fill);
     let spawned = Builder::new()
         .name("cy-unpack".into())
@@ -372,8 +354,8 @@ fn spawn_pass(
 }
 
 /// Fill a zip's pages in reading order. Zip members decode
-/// independently, so each page settles on its own result — one bad
-/// member fails only its page — and the pass always reaches its end.
+/// independently, so each page settles on its own result: one bad
+/// member fails only its page, and the pass always reaches its end.
 fn spawn_zip_fill(
     mut zip: zip::ZipArchive<BufReader<File>>,
     names: Vec<String>,
@@ -392,17 +374,15 @@ fn spawn_zip_fill(
 }
 
 /// Fill a 7z's pages in storage order, the only order a solid stream
-/// permits: every member is consumed — page or not — before the next
-/// decodes. A member that fails to read settles as its own page's
-/// error and the pass walks on; a block that cannot decode at all
-/// ends the pass.
+/// permits: every member is consumed, page or not, before the next
+/// decodes. A page member that fails to read settles as its own page's
+/// error and the pass continues; a block that cannot decode or a
+/// non-page member that cannot be drained ends the pass.
 fn spawn_sevenzip_fill(
     mut reader: sevenz_rust2::ArchiveReader<File>,
     names: &[String],
     fill: &Arc<Mutex<Fill>>,
 ) {
-    // The pass walks storage order, so it needs pages by name rather
-    // than by the reading order the listing sorted them into.
     let by_name: HashMap<String, usize> = names
         .iter()
         .enumerate()
@@ -411,9 +391,16 @@ fn spawn_sevenzip_fill(
     spawn_pass(fill, move |fill| {
         reader
             .for_each_entries(|entry, data| {
-                let page = read_member(data);
-                if let Some(&index) = by_name.get(&entry.name) {
-                    fill.lock().pages.insert(index, page);
+                match by_name.get(&entry.name) {
+                    Some(&index) => {
+                        fill.lock().pages.insert(index, read_member(data));
+                    }
+                    None => {
+                        // A solid block yields its later members only
+                        // after this one is consumed, so non-pages are
+                        // drained rather than buffered.
+                        io::copy(data, &mut io::sink())?;
+                    }
                 }
                 Ok(true)
             })
@@ -421,9 +408,9 @@ fn spawn_sevenzip_fill(
     });
 }
 
-/// Run one fill pass body and settle the pass by its outcome: whole,
-/// ended early by a reason, or ended by a panic.
 fn settle_pass(fill: &Arc<Mutex<Fill>>, body: impl FnOnce(&Arc<Mutex<Fill>>) -> Result<(), String>) {
+    use std::panic::{self, AssertUnwindSafe};
+
     let outcome = panic::catch_unwind(AssertUnwindSafe(|| body(fill)));
     let mut state = fill.lock();
     state.pass = Some(match outcome {
@@ -432,7 +419,7 @@ fn settle_pass(fill: &Arc<Mutex<Fill>>, body: impl FnOnce(&Arc<Mutex<Fill>>) -> 
             tracing::warn!(%reason, "unpack pass ended early");
             Err(reason)
         }
-        Err(panic) => Err(format!("unpack {}", panic_message(panic.as_ref()))),
+        Err(payload) => Err(format!("unpack {}", panic_message(payload.as_ref()))),
     });
 }
 
@@ -442,33 +429,28 @@ fn settle_pass(fill: &Arc<Mutex<Fill>>, body: impl FnOnce(&Arc<Mutex<Fill>>) -> 
     clippy::redundant_pub_crate,
     reason = "pub(crate) is the crate's visibility style for crate-wide items, even inside private modules"
 )]
-pub(crate) fn panic_message(panic: &(dyn Any + Send)) -> String {
-    if let Some(text) = panic.downcast_ref::<&str>() {
+pub(crate) fn panic_message(payload: &(dyn Any + Send)) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
         return format!("panicked: {text}");
     }
-    if let Some(text) = panic.downcast_ref::<String>() {
+    if let Some(text) = payload.downcast_ref::<String>() {
         return format!("panicked: {text}");
     }
     String::from("panicked")
 }
 
-/// Kibibytes available, from a `/proc/meminfo` text. `None` when the
-/// file or line is missing.
-fn parse_mem_available(info: &str) -> Option<u64> {
-    let line = info.lines().find(|line| line.starts_with("MemAvailable:"))?;
+/// `MemAvailable` from a `/proc/meminfo` text, converted to bytes. The
+/// line counts KiB. `None` when the line is missing or unparsable.
+fn parse_mem_available_bytes(meminfo: &str) -> Option<u64> {
+    let line = meminfo.lines().find(|line| line.starts_with("MemAvailable:"))?;
     let kib = line.split_whitespace().nth(1)?.parse::<u64>().ok()?;
     Some(kib * 1024)
 }
 
-/// Bytes of memory the fill may hold, or `None` when the host reports
-/// none, which skips the check.
-fn mem_available() -> Option<u64> {
-    parse_mem_available(&fs::read_to_string("/proc/meminfo").ok()?)
+fn mem_available_bytes() -> Option<u64> {
+    parse_mem_available_bytes(&fs::read_to_string("/proc/meminfo").ok()?)
 }
 
-/// Refuse an archive whose pages cannot all stay in memory at once.
-/// The error names both numbers; a host reporting no availability is
-/// not guarded.
 fn guard_memory(unpacked: u64, available: Option<u64>) -> Result<(), SourceError> {
     match available {
         Some(available) if unpacked > available => {
@@ -499,35 +481,41 @@ mod tests {
         "/tests/fixtures/two_pages.7z"
     );
 
-    /// `Fill` resolution: per-page results while the pass runs, and
-    /// the pass's reason for every page it never filled. A settled
-    /// page keeps its own result after the pass ended.
+    /// LZMA solid 7z with two PNGs and a non-page text member in the
+    /// same block, built by 7zz.
+    const MIXED_SEVENZ_FIXTURE: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/mixed_pages.7z"
+    );
+
     #[test]
     fn fill_resolution() {
         let mut fill = Fill::empty();
-        assert!(matches!(fill.resolve(0), Bytes::NotYet));
+        assert!(matches!(fill.resolve(0), PageRead::NotYet));
         fill.pages.insert(0, Ok(Arc::from(&b"a"[..])));
         fill.pages.insert(1, Err("bad page".into()));
-        assert!(matches!(fill.resolve(0), Bytes::Ready(_)));
-        assert!(matches!(fill.resolve(1), Bytes::Failed(message) if message == "bad page"));
-        assert!(matches!(fill.resolve(2), Bytes::NotYet));
+        assert!(matches!(fill.resolve(0), PageRead::Ready(_)));
+        assert!(matches!(fill.resolve(1), PageRead::Failed(message) if message == "bad page"));
+        assert!(matches!(fill.resolve(2), PageRead::NotYet));
 
         fill.pass = Some(Err("stream broke".into()));
-        assert!(matches!(fill.resolve(1), Bytes::Failed(message) if message == "bad page"));
-        assert!(matches!(fill.resolve(2), Bytes::Failed(message) if message == "stream broke"));
+        assert!(matches!(fill.resolve(1), PageRead::Failed(message) if message == "bad page"));
+        assert!(matches!(fill.resolve(2), PageRead::Failed(message) if message == "stream broke"));
+
+        fill.pass = Some(Ok(()));
+        assert!(
+            matches!(fill.resolve(2), PageRead::Failed(message) if message == "no entry in the archive")
+        );
     }
 
-    /// `/proc/meminfo` parsing: the `MemAvailable` line, and nothing else.
     #[test]
     fn meminfo_parsing() {
-        let info = "MemTotal:       100 kB\nMemAvailable:   4096 kB\nSwapTotal:      2 kB\n";
-        assert_eq!(parse_mem_available(info), Some(4096 * 1024));
-        assert_eq!(parse_mem_available("MemTotal: 1 kB\n"), None);
-        assert_eq!(parse_mem_available("MemAvailable: notanumber kB\n"), None);
+        let meminfo = "MemTotal:       100 kB\nMemAvailable:   4096 kB\nSwapTotal:      2 kB\n";
+        assert_eq!(parse_mem_available_bytes(meminfo), Some(4096 * 1024));
+        assert_eq!(parse_mem_available_bytes("MemTotal: 1 kB\n"), None);
+        assert_eq!(parse_mem_available_bytes("MemAvailable: notanumber kB\n"), None);
     }
 
-    /// The memory guard refuses only an archive bigger than what the
-    /// host reports available; a host reporting nothing is not guarded.
     #[test]
     fn memory_guard() {
         assert!(matches!(
@@ -538,8 +526,6 @@ mod tests {
         guard_memory(u64::MAX, None).unwrap();
     }
 
-    /// `settle_pass` ends the pass by its outcome — whole, early, or
-    /// panicked — so no page can wait on a pass that never settles.
     #[test]
     fn settle_pass_outcomes() {
         let whole = Arc::new(Mutex::new(Fill::empty()));
@@ -552,20 +538,15 @@ mod tests {
 
         let boom = Arc::new(Mutex::new(Fill::empty()));
         settle_pass(&boom, |_| panic!("boom"));
-        assert!(matches!(boom.lock().resolve(0), Bytes::Failed(reason) if reason.contains("boom")));
+        assert!(matches!(boom.lock().resolve(0), PageRead::Failed(reason) if reason.contains("boom")));
     }
 
-    /// Liar header sizes cannot wrap the guard past the machine's
-    /// memory: the sum saturates and the archive refuses.
     #[test]
     fn liar_sizes_refuse() {
         let listed = vec![("a.png".to_owned(), u64::MAX), ("b.png".to_owned(), u64::MAX)];
-        // The saturated sum is the assertion; the two field-pattern
-        // lints are mutually unsatisfiable for it, so the rest pattern
-        // stays with an expect.
         #[expect(
             clippy::rest_pattern_accessible_field,
-            reason = "naming the ignored field as a wildcard instead trips unneeded_field_pattern"
+            reason = "binding the ignored field as `_` instead trips unneeded_field_pattern"
         )]
         match Source::open_archive(listed, |_, _| {}) {
             Err(SourceError::TooBig { unpacked: u64::MAX, .. }) => {}
@@ -574,8 +555,6 @@ mod tests {
         }
     }
 
-    /// A listing that names one entry twice refuses the archive rather
-    /// than stranding a page behind a false "no entry" error.
     #[test]
     fn duplicate_names_refuse() {
         let listed = vec![
@@ -589,8 +568,6 @@ mod tests {
         ));
     }
 
-    /// 7z sources list pages natural-sorted and name them by their
-    /// entry paths; a flat archive names no parent.
     #[test]
     fn sevenz_listing() {
         let source = Source::open(Path::new(SEVENZ_FIXTURE)).expect("7z opens");
@@ -601,31 +578,50 @@ mod tests {
         );
     }
 
-    /// 7z pages read through the fill, byte-identically on repeats,
-    /// and the background pass settles every page.
     #[test]
     fn sevenz_read_through_fill() {
         let source = Source::open(Path::new(SEVENZ_FIXTURE)).expect("7z opens");
         let bytes = eventually(20, "first page never unpacked", || match source.bytes(0) {
-            Bytes::Ready(bytes) => Some(bytes),
-            Bytes::Failed(message) => panic!("page 0 failed: {message}"),
-            Bytes::NotYet => None,
+            PageRead::Ready(bytes) => Some(bytes),
+            PageRead::Failed(message) => panic!("page 0 failed: {message}"),
+            PageRead::NotYet => None,
         });
-        // a repeat read returns the same bytes from the fill
-        assert!(matches!(source.bytes(0), Bytes::Ready(repeat) if repeat.as_ref() == bytes.as_ref()));
+        assert!(matches!(source.bytes(0), PageRead::Ready(repeat) if repeat.as_ref() == bytes.as_ref()));
         assert_eq!(bytes.get(..8), Some(&b"\x89PNG\r\n\x1a\n"[..]));
         // the decoder is the oracle for the fixture's dims
         let page = decode::decode(&bytes, "p1.png").expect("fixture page decodes");
         assert_eq!((page.width, page.height), (40, 30));
 
-        // the pass settles both pages
-        eventually(20, "pass never ended", || (!source.filling()).then_some(()));
-        assert!(matches!(source.bytes(1), Bytes::Ready(_)));
+        eventually(20, "pass never ended", || (!source.unpacking()).then_some(()));
+        assert!(matches!(source.bytes(1), PageRead::Ready(_)));
     }
 
-    /// Directory sources list pages natural-sorted and image-filtered, and read back written bytes.
+    /// A non-page member in the same solid block is drained, so the
+    /// later page still decodes.
     #[test]
-    fn dir_source() {
+    fn sevenz_drains_non_page_members() {
+        let source = Source::open(Path::new(MIXED_SEVENZ_FIXTURE)).expect("7z opens");
+        assert_eq!(source.len(), 2);
+        let mut pages = Vec::new();
+        for index in 0..source.len() {
+            let name = source.name(index).expect("page listed");
+            let bytes = eventually(20, "page never unpacked", || match source.bytes(index) {
+                PageRead::Ready(bytes) => Some(bytes),
+                PageRead::Failed(message) => panic!("{name} failed: {message}"),
+                PageRead::NotYet => None,
+            });
+            let page = decode::decode(&bytes, name).expect("fixture page decodes");
+            assert_eq!(page.format, decode::Format::Png);
+            pages.push(bytes);
+        }
+        let [first, second] = pages.as_slice() else {
+            panic!("two pages listed");
+        };
+        assert_ne!(first.as_ref(), second.as_ref());
+    }
+
+    #[test]
+    fn dir_listing_and_read() {
         let dir = TempDir::new("pagedir");
         dir.write("c10.png", &tiny_png(1, 1, [0, 0, 0, 255]));
         dir.write("c2.png", &tiny_png(1, 1, [7, 8, 9, 255]));
@@ -633,8 +629,6 @@ mod tests {
         dir.write("cover.PNG", &tiny_png(1, 1, [0, 0, 0, 255]));
         dir.write("notes.txt", b"not a page");
         let source = Source::open(dir.path()).expect("dir opens");
-        // c2 before c10 (natural order), notes.txt filtered, uppercase
-        // extension kept
         assert_eq!(source.names, ["c1.png", "c2.png", "c10.png", "cover.PNG"]);
         assert_eq!(source.len(), 4);
         assert_eq!(source.name(2), Some("c10.png"));
@@ -645,12 +639,10 @@ mod tests {
                 file: "c10.png".into(),
             }
         );
-        // a directory is never filling; bytes reads back byte-identical
-        assert!(!source.filling());
-        assert!(matches!(source.bytes(1), Bytes::Ready(read) if read.as_ref() == tiny_png(1, 1, [7, 8, 9, 255]).as_slice()));
+        assert!(!source.unpacking());
+        assert!(matches!(source.bytes(1), PageRead::Ready(read) if read.as_ref() == tiny_png(1, 1, [7, 8, 9, 255]).as_slice()));
     }
 
-    /// A zip source lists its image entries natural-sorted across inner directories, names pages by the immediate parent, and the fill reads an entry back byte-identical.
     #[test]
     fn zip_listing_and_read() {
         use zip::write::SimpleFileOptions;
@@ -675,23 +667,20 @@ mod tests {
         let source = Source::open(&zip_path).expect("zip opens");
         assert_eq!(source.names, ["b/002.png", "b/010.png", "b/020.png", "b/deep/005.png"]);
         assert_eq!(source.page_name(1), PageName { parent: Some("b".into()), file: "010.png".into() });
-        // A nested entry shows its immediate parent, not the whole path.
         assert_eq!(
             source.page_name(3),
             PageName { parent: Some("deep".into()), file: "005.png".into() }
         );
         // bytes(1) is b/010.png, written with color 1.
         let page = eventually(20, "zip page never unpacked", || match source.bytes(1) {
-            Bytes::Ready(bytes) => Some(bytes),
-            Bytes::Failed(message) => panic!("page 1 failed: {message}"),
-            Bytes::NotYet => None,
+            PageRead::Ready(bytes) => Some(bytes),
+            PageRead::Failed(message) => panic!("page 1 failed: {message}"),
+            PageRead::NotYet => None,
         });
         assert_eq!(page.as_ref(), tiny_png(2, 2, [1, 0, 0, 255]).as_slice());
-        eventually(20, "pass never ended", || (!source.filling()).then_some(()));
+        eventually(20, "pass never ended", || (!source.unpacking()).then_some(()));
     }
 
-    /// A corrupt zip member fails only its own page; the pass still
-    /// settles every other page.
     #[test]
     fn zip_corrupt_member_fails_only_its_page() {
         use zip::write::SimpleFileOptions;
@@ -725,25 +714,96 @@ mod tests {
 
         let source = Source::open(&zip_path).expect("zip opens");
         let failure = eventually(20, "corrupt page never settled", || match source.bytes(1) {
-            Bytes::Failed(message) => Some(message),
-            Bytes::Ready(_) => panic!("corrupt page unpacked"),
-            Bytes::NotYet => None,
+            PageRead::Failed(message) => Some(message),
+            PageRead::Ready(_) => panic!("corrupt page unpacked"),
+            PageRead::NotYet => None,
         });
         assert!(failure.to_lowercase().contains("checksum"), "{failure}");
-        // The neighbors settle whole.
         assert_eq!(
             eventually(20, "page 0 never unpacked", || match source.bytes(0) {
-                Bytes::Ready(bytes) => Some(bytes),
-                Bytes::Failed(message) => panic!("page 0 failed: {message}"),
-                Bytes::NotYet => None,
+                PageRead::Ready(bytes) => Some(bytes),
+                PageRead::Failed(message) => panic!("page 0 failed: {message}"),
+                PageRead::NotYet => None,
             })
             .as_ref(),
             pages[0].as_slice()
         );
-        assert!(matches!(source.bytes(2), Bytes::Ready(read) if read.as_ref() == pages[2].as_slice()));
+        assert_eq!(
+            eventually(20, "page 2 never unpacked", || match source.bytes(2) {
+                PageRead::Ready(bytes) => Some(bytes),
+                PageRead::Failed(message) => panic!("page 2 failed: {message}"),
+                PageRead::NotYet => None,
+            })
+            .as_ref(),
+            pages[2].as_slice()
+        );
     }
 
-    /// Every unusable source opens as its matching error: not found, empty, unsupported, io.
+    /// A damaged local header must not refuse the book: the central
+    /// directory still lists the page, and the fill fails only that member.
+    #[test]
+    fn zip_corrupt_local_header_keeps_the_book_open() {
+        use zip::write::SimpleFileOptions;
+
+        let dir = TempDir::new("pagezipheader");
+        let zip_path = dir.path().join("book.cbz");
+        let pages = [
+            tiny_png(2, 2, [1, 0, 0, 255]),
+            tiny_png(2, 2, [2, 0, 0, 255]),
+            tiny_png(2, 2, [3, 0, 0, 255]),
+        ];
+        {
+            let file = File::create(&zip_path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let options = SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for (index, page) in pages.iter().enumerate() {
+                zip.start_file(format!("{index:03}.png"), options).unwrap();
+                zip.write_all(page).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        // Local headers start with `PK\x03\x04`; damage the second one
+        // while leaving its central-directory entry intact.
+        {
+            let mut book = fs::read(&zip_path).unwrap();
+            let mut headers = book
+                .windows(4)
+                .enumerate()
+                .filter(|(_, bytes)| *bytes == b"PK\x03\x04")
+                .map(|(offset, _)| offset);
+            headers.next().expect("first local header");
+            let second = headers.next().expect("second local header");
+            *book.get_mut(second).expect("offset points into the file") ^= 0xff;
+            fs::write(&zip_path, &book).unwrap();
+        }
+
+        let source = Source::open(&zip_path).expect("central directory still opens the book");
+        eventually(20, "damaged header never settled", || match source.bytes(1) {
+            PageRead::Failed(message) => Some(message),
+            PageRead::Ready(_) => panic!("damaged local header unpacked"),
+            PageRead::NotYet => None,
+        });
+        assert_eq!(
+            eventually(20, "page 0 never unpacked", || match source.bytes(0) {
+                PageRead::Ready(bytes) => Some(bytes),
+                PageRead::Failed(message) => panic!("page 0 failed: {message}"),
+                PageRead::NotYet => None,
+            })
+            .as_ref(),
+            pages[0].as_slice()
+        );
+        assert_eq!(
+            eventually(20, "page 2 never unpacked", || match source.bytes(2) {
+                PageRead::Ready(bytes) => Some(bytes),
+                PageRead::Failed(message) => panic!("page 2 failed: {message}"),
+                PageRead::NotYet => None,
+            })
+            .as_ref(),
+            pages[2].as_slice()
+        );
+    }
+
     #[test]
     fn open_errors() {
         assert!(matches!(

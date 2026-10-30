@@ -53,9 +53,7 @@ const DEFAULT_STATE: State = State {
 
 struct FoldedStatus {
     waiting: bool,
-    /// First failure among the spread's pages, in reading order.
     error: Option<String>,
-    /// The first ready page before any failure.
     page: Option<(usize, Format, (u32, u32))>,
 }
 
@@ -98,14 +96,12 @@ struct ScreenPlan<'view> {
     steps: [SeatStep<'view>; 2],
     shown_after: Option<Spread>,
     committed: bool,
-    /// The ready page staged while its partner is undecided.
     stage: Option<(usize, &'view Arc<Decoded>)>,
 }
 
 fn seat_step(fact: Option<(usize, &SeatView)>, bound: Option<usize>) -> SeatStep<'_> {
     match fact {
         Some((page, SeatView::Ready(decoded))) => SeatStep::Show { page, decoded },
-        // A pending page holds while the seat is empty or shows that page.
         Some((page, SeatView::Pending)) if bound.is_none_or(|bound_page| bound_page == page) => {
             SeatStep::Hold
         }
@@ -161,10 +157,7 @@ fn plan_screen(
 
 #[derive(Default)]
 struct Fit {
-    /// The spread total the last refit decision settled; any other total
-    /// demands a refit.
     settled: Option<(f32, f32)>,
-    /// The user zoomed or panned since the last turn, viewport change, or reset.
     user_moved: bool,
 }
 
@@ -376,14 +369,14 @@ impl App {
         // Refit before the status line reads the scale, so the bar does
         // not show a superseded zoom.
         let layout = view::layout(self.seat_dims());
-        let total = layout.total();
-        self.refit_into(total, self.last_viewport);
+        let spread_size = layout.total();
+        self.refit_into(spread_size, self.last_viewport);
 
         let folded = fold_status(spread, &snapshot);
         self.waiting_since = folded
             .waiting
             .then(|| self.waiting_since.unwrap_or_else(Instant::now));
-        // The parked loop otherwise never shows the "decoding…" flag.
+        // The parked loop otherwise never shows the wait flag.
         if let Some(since) = self.waiting_since {
             let elapsed = since.elapsed();
             if elapsed < WAIT_GRACE {
@@ -400,19 +393,16 @@ impl App {
             post(&self.proxy, UserEvent::Repaint(remaining));
         }
 
-        // The bar names the page whose facts it shows: the fold's page, else the lead.
         let speaking_page = folded.page.map_or(spread.first, |(page, _, _)| page);
         let page = folded.page.map(|(page, decoded, dims)| PageFacts {
             claimed: self.source.name(page).and_then(decode::format_from_name),
             decoded,
             dims,
         });
-        // Once the grace has passed, the wait word names what holds the
-        // page: the unpack, or the decode.
         let waiting = self
             .waiting_since
             .is_some_and(|since| since.elapsed() >= WAIT_GRACE)
-            .then(|| if self.source.filling() { Wait::Unpacking } else { Wait::Decoding });
+            .then(|| if self.source.unpacking() { Wait::Unpacking } else { Wait::Decoding });
         let status = StatusLine {
             total: self.source.len(),
             spread,
@@ -440,7 +430,7 @@ impl App {
             self.last_viewport = viewport;
             self.request_redraw();
         }
-        self.refit_into(total, viewport);
+        self.refit_into(spread_size, viewport);
 
         let Some(gl) = self.gl.as_mut() else { return Ok(()) };
 
@@ -453,8 +443,6 @@ impl App {
         Ok(())
     }
 
-    /// Physical surface size, resized to match; None without a window or
-    /// with a zero dimension.
     fn surface_size(&mut self) -> Option<PhysicalSize<u32>> {
         let gl = self.gl.as_mut()?;
         let size = gl.window.winit().inner_size();
@@ -800,31 +788,22 @@ mod tests {
         let pair = Spread { first: 0, second: Some(1) };
         let spread_view = |first: SeatView, second: Option<SeatView>| SpreadView { first, second };
         let rows = [
-            // a decided pair never waits; the trailing failure still reports
             (pair, spread_view(ready_seat(2, 2), Some(SeatView::Failed("x".into()))),
                 Expect { waiting: false, error: Some("x"), page: Some((0, Format::Png, (2, 2))) }),
-            // a pending lead waits and yields its place to the partner
             (pair, spread_view(SeatView::Pending, Some(ready_seat(2, 2))),
                 Expect { waiting: true, error: None, page: Some((1, Format::Png, (2, 2))) }),
-            // a lone page
             (Spread::lone(0), spread_view(ready_seat(2, 2), None),
                 Expect { waiting: false, error: None, page: Some((0, Format::Png, (2, 2))) }),
-            // the first failure in reading order wins
             (pair, spread_view(SeatView::Failed("first".into()), Some(SeatView::Failed("second".into()))),
                 Expect { waiting: false, error: Some("first"), page: None }),
-            // both ready: the lead speaks
             (pair, spread_view(ready_seat(800, 600), Some(ready_seat(640, 480))),
                 Expect { waiting: false, error: None, page: Some((0, Format::Png, (800, 600))) }),
-            // a ready lead speaks before the trailing failure stops the fold
             (pair, spread_view(ready_seat(800, 600), Some(SeatView::Failed("second".into()))),
                 Expect { waiting: false, error: Some("second"), page: Some((0, Format::Png, (800, 600))) }),
-            // a failed lead stops the fold before the partner can speak
             (pair, spread_view(SeatView::Failed("first".into()), Some(ready_seat(640, 480))),
                 Expect { waiting: false, error: Some("first"), page: None }),
-            // a pending page behind a failure still waits
             (pair, spread_view(SeatView::Pending, Some(SeatView::Failed("x".into()))),
                 Expect { waiting: true, error: Some("x"), page: None }),
-            // a lone undecided page waits and speaks nothing
             (Spread::lone(0), spread_view(SeatView::Pending, None),
                 Expect { waiting: true, error: None, page: None }),
         ];

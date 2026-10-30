@@ -28,12 +28,11 @@ pub struct StatusLine {
 pub enum Wait {
     /// The archive's unpack pass has not ended.
     Unpacking,
-    /// The page's bytes are in; the decoder is running.
+    /// The source is not unpacking; the wait is the decode.
     Decoding,
 }
 
 impl Wait {
-    /// The flag word for the wait.
     fn label(self) -> &'static str {
         match self {
             Self::Unpacking => "unpacking…",
@@ -91,12 +90,10 @@ fn right_end(ui: &mut egui::Ui, status: &StatusLine) {
     }
 }
 
-/// One entry of the mode group, e.g. `Normal (n)`.
 fn group_label(mode: ViewMode) -> String {
     format!("{} ({})", mode.label(), mode.shortcut())
 }
 
-/// A muted hue per mode, for the active entry of the group.
 fn mode_color(mode: ViewMode) -> egui::Color32 {
     match mode {
         ViewMode::Normal => egui::Color32::from_rgb(0x87, 0xb3, 0x7d),
@@ -109,7 +106,6 @@ fn mode_color(mode: ViewMode) -> egui::Color32 {
 /// group keeps the bar's strongest accent.
 const HEAD_COLOR: egui::Color32 = egui::Color32::from_rgb(0xc2, 0x9e, 0x6f);
 
-/// Muted hue for the current file's basename.
 const NAME_COLOR: egui::Color32 = egui::Color32::from_rgb(0xa2, 0x92, 0xc5);
 
 /// The left-side facts as one job of colored sections, separate so they
@@ -139,7 +135,6 @@ fn line(style: &egui::Style, status: &StatusLine) -> LayoutJob {
 
     if let Some(facts) = &status.page {
         section(&mut job, " · ", plain);
-        // A format label shows only when the filename's extension lies.
         let (width, height) = facts.dims;
         let dims_text = if facts.claimed == Some(facts.decoded) {
             format!("{width}x{height}")
@@ -183,7 +178,6 @@ mod tests {
         }
     }
 
-    /// The status line's text per variant, with sections colored by meaning.
     #[test]
     fn status_line_text() {
         let style = egui::Style::default();
@@ -199,15 +193,12 @@ mod tests {
         single.spread = Spread::lone(4);
         single.page = None;
         single.zoom = 1.0;
-        // a wait flag and a decode error append after the zoom.
         let mut appending = status();
         appending.waiting = Some(Wait::Decoding);
         appending.error = Some("boom".into());
-        // a pending page whose archive is still unpacking names that wait.
         let mut unpacking = status();
         unpacking.waiting = Some(Wait::Unpacking);
         let rows = [
-            // mismatching extension: the decoded format prefixes the dims
             (&base, "12-13/214 · b/010.png · jxl 6000x4000 · 87%"),
             (&matching, "12-13/214 · b/010.png · 6000x4000 · 87%"),
             (&single, "5/214 · b/010.png · 100%"),
@@ -217,13 +208,10 @@ mod tests {
         for (i, (status_line, want)) in rows.iter().enumerate() {
             assert_eq!(line(&style, status_line).text, *want, "row {i}");
         }
-        // Section colors in append order. Equal adjacent formats merge:
-        // head | range-total, parent | basename | dims, zoom.
         let section_colors = |job: &LayoutJob| -> Vec<egui::Color32> {
             job.sections.iter().map(|section| section.format.color).collect()
         };
         assert_eq!(section_colors(&line(&style, &base)), vec![HEAD_COLOR, plain, NAME_COLOR, plain]);
-        // The mode group names every mode with its key.
         assert_eq!(group_label(ViewMode::Normal), "Normal (n)");
         assert_eq!(group_label(ViewMode::Manga), "Manga (m)");
         assert_eq!(group_label(ViewMode::Comic), "Comic (c)");
@@ -296,14 +284,12 @@ mod tests {
     /// flush-right anchor. `ROUND` tolerates pixel rounding.
     const PANEL_MARGIN: f32 = 8.0;
     const ROUND: f32 = 0.51;
-    /// The screen height every helper renders into.
     const SCREEN_HEIGHT: f32 = 600.0;
     /// Screen widths: wide enough to show everything, narrow enough to
     /// force elision.
     const WIDE: f32 = 1280.0;
     const NARROW: f32 = 480.0;
 
-    /// Bar geometry: content rect, flush anchors, toast placement, elision.
     #[test]
     fn bar_geometry() {
         let (plain, wide_rect) = render(WIDE, &status());
@@ -312,24 +298,20 @@ mod tests {
         let (toast, _) = render(WIDE, &with_toast);
         let (narrow, narrow_rect) = render(NARROW, &status());
 
-        // Content rect: the window above the bar, full width.
         assert!(wide_rect.min.x.abs() < ROUND, "{}", wide_rect.min.x);
         assert!(wide_rect.min.y.abs() < ROUND, "{}", wide_rect.min.y);
         assert!((wide_rect.width() - WIDE).abs() < ROUND, "{}", wide_rect.width());
         assert!(wide_rect.max.y > 400.0, "content must span most of the window: {}", wide_rect.max.y);
         assert!(wide_rect.max.y < SCREEN_HEIGHT, "content must exclude the bar strip: {}", wide_rect.max.y);
 
-        // Narrow screen: the rect tracks the screen width, the bar stays one truncating line.
         assert!((narrow_rect.width() - NARROW).abs() < ROUND, "{}", narrow_rect.width());
         // 8.0 tolerates a text line of bar-height difference across widths,
         // unlike ROUND's sub-pixel rounding.
         assert!((narrow_rect.max.y - wide_rect.max.y).abs() < 8.0, "{narrow_rect:?} vs {wide_rect:?}");
 
-        // Facts: flush left, unmoved by the toast.
         assert!((find(&plain, "12-13/214").rect.left() - PANEL_MARGIN).abs() < ROUND);
         assert_eq!(find(&plain, "12-13/214").rect.left(), find(&toast, "12-13/214").rect.left());
 
-        // Group: flush right, rightmost, unmoved by the toast.
         for items in [&plain, &toast] {
             let comic = find(items, "Comic (c)");
             let rightmost = items.iter().map(|item| item.rect.right()).fold(f32::MIN, f32::max);
@@ -345,11 +327,9 @@ mod tests {
             "the group must not move when the toast appears"
         );
 
-        // Toast: strictly left of the group when shown, absent when not.
         assert!(find(&toast, "right to left").rect.right() < find(&toast, "Comic (c)").rect.left());
         assert!(plain.iter().all(|item| !item.text.contains(status().mode.effect())));
 
-        // Facts truncate instead of pushing the group.
         let facts = find(&narrow, "12-13");
         assert!(facts.elided, "facts must elide on a narrow screen");
         assert!(facts.text.ends_with('…'));
