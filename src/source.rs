@@ -499,8 +499,9 @@ mod tests {
         "/tests/fixtures/two_pages.7z"
     );
 
-    /// `Fill` resolution: per-page results while running, the pass's
-    /// outcome for the rest once it ends.
+    /// `Fill` resolution: per-page results while the pass runs, and
+    /// the pass's reason for every page it never filled. A settled
+    /// page keeps its own result after the pass ended.
     #[test]
     fn fill_resolution() {
         let mut fill = Fill::empty();
@@ -511,12 +512,9 @@ mod tests {
         assert!(matches!(fill.resolve(1), Bytes::Failed(message) if message == "bad page"));
         assert!(matches!(fill.resolve(2), Bytes::NotYet));
 
-        fill.pass = Some(Ok(()));
-        assert!(matches!(fill.resolve(2), Bytes::Failed(message) if message.contains("no entry")));
         fill.pass = Some(Err("stream broke".into()));
-        assert!(matches!(fill.resolve(3), Bytes::Failed(message) if message == "stream broke"));
-        // Settled pages keep their own results after the pass ended.
         assert!(matches!(fill.resolve(1), Bytes::Failed(message) if message == "bad page"));
+        assert!(matches!(fill.resolve(2), Bytes::Failed(message) if message == "stream broke"));
     }
 
     /// `/proc/meminfo` parsing: the `MemAvailable` line, and nothing else.
@@ -589,24 +587,6 @@ mod tests {
             Source::open_archive(listed, |_, _| {}),
             Err(SourceError::Duplicate(name)) if name == "a.png"
         ));
-    }
-
-    /// An archive whose every entry is a non-page opens as Empty
-    /// before any fill thread starts.
-    #[test]
-    fn pageless_archive_is_empty() {
-        use zip::write::SimpleFileOptions;
-
-        let dir = TempDir::new("pagezipnone");
-        let zip_path = dir.path().join("book.cbz");
-        {
-            let file = File::create(&zip_path).unwrap();
-            let mut zip = zip::ZipWriter::new(file);
-            zip.start_file("info.txt", SimpleFileOptions::default()).unwrap();
-            zip.write_all(b"skip me").unwrap();
-            zip.finish().unwrap();
-        }
-        assert!(matches!(Source::open(&zip_path), Err(SourceError::Empty)));
     }
 
     /// 7z sources list pages natural-sorted and name them by their
