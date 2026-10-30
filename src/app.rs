@@ -358,8 +358,7 @@ impl App {
     fn frame(&mut self) -> eros::Result<()> {
         use crate::decode;
         use crate::ui;
-        use crate::ui::PageFacts;
-        use crate::ui::StatusLine;
+        use crate::ui::{PageFacts, StatusLine, Wait};
 
         let spread = self.spread();
         if spread != self.retuned_spread {
@@ -416,7 +415,10 @@ impl App {
             name: self.source.page_name(speaking_page),
             page,
             zoom: self.state.placement.scale,
-            waiting: self.waiting_since.is_some_and(|since| since.elapsed() >= WAIT_GRACE),
+            waiting: self
+                .waiting_since
+                .is_some_and(|since| since.elapsed() >= WAIT_GRACE)
+                .then(|| if self.source.filling() { Wait::Unpacking } else { Wait::Decoding }),
             error: folded.error,
         };
 

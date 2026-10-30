@@ -18,8 +18,28 @@ pub struct StatusLine {
     pub page: Option<PageFacts>,
     /// Placement scale, screen px per image px.
     pub zoom: f32,
-    pub waiting: bool,
+    /// The wait flag, once a pending seat has outlived the grace.
+    pub waiting: Option<Wait>,
     pub error: Option<String>,
+}
+
+/// What the status line says a still-pending page waits for.
+#[derive(Clone, Copy)]
+pub enum Wait {
+    /// The archive's unpack pass has not ended.
+    Unpacking,
+    /// The page's bytes are in; the decoder is running.
+    Decoding,
+}
+
+impl Wait {
+    /// The flag word for the wait.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Unpacking => "unpacking…",
+            Self::Decoding => "decoding…",
+        }
+    }
 }
 
 /// The decoded page as the status line sees it.
@@ -129,8 +149,8 @@ fn line(style: &egui::Style, status: &StatusLine) -> LayoutJob {
         section(&mut job, dims_text, plain);
     }
     section(&mut job, format!(" · {:.0}%", status.zoom * 100.0), plain);
-    if status.waiting {
-        section(&mut job, " · decoding…".into(), plain);
+    if let Some(wait) = status.waiting {
+        section(&mut job, format!(" · {}", wait.label()), plain);
     }
     if let Some(error) = &status.error {
         section(&mut job, format!(" · {error}"), plain);
@@ -158,7 +178,7 @@ mod tests {
                 dims: (6000, 4000),
             }),
             zoom: 0.866,
-            waiting: false,
+            waiting: None,
             error: None,
         }
     }
@@ -181,14 +201,18 @@ mod tests {
         single.zoom = 1.0;
         // a wait flag and a decode error append after the zoom.
         let mut appending = status();
-        appending.waiting = true;
+        appending.waiting = Some(Wait::Decoding);
         appending.error = Some("boom".into());
+        // a pending page whose archive is still unpacking names that wait.
+        let mut unpacking = status();
+        unpacking.waiting = Some(Wait::Unpacking);
         let rows = [
             // mismatching extension: the decoded format prefixes the dims
             (&base, "12-13/214 · b/010.png · jxl 6000x4000 · 87%"),
             (&matching, "12-13/214 · b/010.png · 6000x4000 · 87%"),
             (&single, "5/214 · b/010.png · 100%"),
             (&appending, "12-13/214 · b/010.png · jxl 6000x4000 · 87% · decoding… · boom"),
+            (&unpacking, "12-13/214 · b/010.png · jxl 6000x4000 · 87% · unpacking…"),
         ];
         for (i, (status_line, want)) in rows.iter().enumerate() {
             assert_eq!(line(&style, status_line).text, *want, "row {i}");

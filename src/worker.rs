@@ -3,18 +3,18 @@
 //! spread never leaves the book, and every other page leaves by recency
 //! then distance. No disk persistence at all.
 
-use std::any::Any;
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap};
 use std::io;
 use std::mem;
 use std::sync::{mpsc, Arc};
-use std::thread::JoinHandle;
+use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use parking_lot::Mutex;
 
 use crate::decode::Decoded;
-use crate::source::Source;
+use crate::source::{panic_message, Bytes, Source};
 use crate::view::{Spread, ViewMode};
 
 /// Approximate decoded bytes the book may hold. The wanted spread
@@ -266,9 +266,15 @@ impl Drop for Worker {
     }
 }
 
+/// How long the worker naps when the wanted page's bytes are still
+/// unpacking. The loop head observes the channel after every nap, so
+/// Stop and newer retunes answer within one nap.
+const FILL_POLL: Duration = Duration::from_millis(15);
+
 /// Worker loop: the channel is observed between decodes, so a newer
 /// spread overtakes the backlog. One decode in flight always runs to
-/// completion.
+/// completion. A page the source has not unpacked yet naps the loop
+/// instead of blocking it, so no wait can outlive a Stop.
 fn run(
     source: &Source,
     rx: &mpsc::Receiver<ToWorker>,
@@ -298,16 +304,51 @@ fn run(
             retunes.push(arrived);
             continue;
         };
-        let decoded = decode_page(source, page_index);
-        {
-            let mut book = book.lock();
-            let seat_view = match decoded {
-                Ok(page) => SeatView::Ready(page),
-                Err(message) => SeatView::Failed(message),
-            };
-            book.store(page_index, seat_view);
-        }
+        let seat_view = match decide_page(source, page_index) {
+            Decision::Ready(page) => SeatView::Ready(page),
+            Decision::Failed(message) => SeatView::Failed(message),
+            Decision::NotYet => {
+                thread::sleep(FILL_POLL);
+                continue;
+            }
+        };
+        book.lock().store(page_index, seat_view);
         notify();
+    }
+}
+
+/// One undecided page's next step.
+enum Decision {
+    Ready(Arc<Decoded>),
+    Failed(String),
+    /// The source has not unpacked the page yet.
+    NotYet,
+}
+
+/// Resolve one page to a decision: its bytes decoded, a terminal
+/// failure, or a nap because the unpack has not reached it. The
+/// decoder runs behind the panic boundary, so a panicking decoder must
+/// not kill the only worker thread.
+fn decide_page(source: &Source, page_index: usize) -> Decision {
+    use crate::decode;
+    use std::panic::{self, AssertUnwindSafe};
+
+    let Some(name) = source.name(page_index) else {
+        return Decision::Failed(format!("page {}: no such page", page_index + 1));
+    };
+    match source.bytes(page_index) {
+        Bytes::Ready(bytes) => {
+            let result = panic::catch_unwind(AssertUnwindSafe(|| decode::decode(&bytes, name)));
+            match result {
+                Ok(Ok(page)) => Decision::Ready(Arc::new(page)),
+                Ok(Err(error)) => Decision::Failed(format!("page {}: {error}", page_index + 1)),
+                Err(panic) => {
+                    Decision::Failed(format!("page {}: {}", page_index + 1, panic_message(panic.as_ref())))
+                }
+            }
+        }
+        Bytes::Failed(message) => Decision::Failed(format!("page {}: {message}", page_index + 1)),
+        Bytes::NotYet => Decision::NotYet,
     }
 }
 
@@ -315,40 +356,6 @@ fn run(
 /// `true` (behind) at equal distance.
 fn next_pick_key(page: usize, anchor: usize) -> (usize, bool) {
     (page.abs_diff(anchor), page < anchor)
-}
-
-/// One page through the panic boundary: a panicking decoder must not kill
-/// the only worker thread. The error string is the status-line message.
-fn decode_page(source: &Source, page_index: usize) -> Result<Arc<Decoded>, String> {
-    use std::panic;
-    use std::panic::AssertUnwindSafe;
-
-    use crate::decode;
-
-    let Some(name) = source.name(page_index) else {
-        return Err(format!("page {}: no such page", page_index + 1));
-    };
-    let result = panic::catch_unwind(AssertUnwindSafe(
-        || -> eros::Result<Decoded> {
-            let bytes = source.bytes(page_index)?;
-            Ok(decode::decode(&bytes, name)?)
-        },
-    ));
-    match result {
-        Ok(Ok(page)) => Ok(Arc::new(page)),
-        Ok(Err(error)) => Err(format!("page {}: {error}", page_index + 1)),
-        Err(panic) => Err(format!("page {}: {}", page_index + 1, panic_message(panic.as_ref()))),
-    }
-}
-
-fn panic_message(panic: &(dyn Any + Send)) -> String {
-    if let Some(text) = panic.downcast_ref::<&str>() {
-        return format!("decoder panicked: {text}");
-    }
-    if let Some(text) = panic.downcast_ref::<String>() {
-        return format!("decoder panicked: {text}");
-    }
-    String::from("decoder panicked")
 }
 
 /// How many pages on each side of the wanted spread's first page to
