@@ -29,6 +29,9 @@ pub enum SourceError {
     NotFound(PathBuf),
     Empty,
     Unsupported(PathBuf),
+    /// The listing names one entry twice, which would strand one of
+    /// the two pages.
+    Duplicate(String),
     /// The archive's pages unpack to more bytes than the machine has
     /// available.
     TooBig { unpacked: u64, available: u64 },
@@ -43,6 +46,7 @@ impl fmt::Display for SourceError {
             Self::NotFound(path) => write!(f, "not found: {}", path.display()),
             Self::Empty => write!(f, "no image pages found"),
             Self::Unsupported(path) => write!(f, "unsupported source: {}", path.display()),
+            Self::Duplicate(name) => write!(f, "duplicate entry name: {name}"),
             Self::TooBig { unpacked, available } => {
                 const MIB: u64 = 1024 * 1024;
                 write!(
@@ -108,11 +112,11 @@ pub enum Bytes {
 }
 
 /// The unpacked pages one background pass fills. Every page ends with
-/// its own result — bytes or an error — and a pass that ends early
-/// names why, which every unfilled page reads as. Zip members decode
-/// independently, so one bad member settles only its page; a solid 7z
-/// stream breaks at its first error, so its unfilled tail shares the
-/// reason while the filled prefix stays readable.
+/// its own result — bytes or an error. A member that fails settles as
+/// its own page's error while the pass continues; only a failure that
+/// ends the whole pass (an undecodable block, a panic, a thread that
+/// never started) names the reason its unfilled pages read, while the
+/// filled prefix stays readable.
 struct Fill {
     pages: HashMap<usize, Result<Arc<[u8]>, String>>,
     /// `None` while the pass runs; `Some(Ok(()))` when it ended whole;
@@ -232,15 +236,24 @@ impl Source {
     }
 
     /// Finish opening an archive from its listed pages: sort them,
-    /// refuse a pageless listing before any thread starts, refuse a
-    /// memory-size mismatch, and hand the sorted names to `spawn_fill`.
+    /// refuse a duplicated or pageless listing before any thread
+    /// starts, refuse a memory-size mismatch, and hand the sorted names
+    /// to `spawn_fill`.
     fn open_archive(
         listed: Vec<(String, u64)>,
         spawn_fill: impl FnOnce(Vec<String>, Arc<Mutex<Fill>>),
     ) -> Result<Self, SourceError> {
-        let total: u64 = listed.iter().map(|(_, size)| size).sum();
+        // Header sizes are claims, so the sum saturates rather than
+        // wraps a liar archive past the guard.
+        let total: u64 = listed
+            .iter()
+            .map(|(_, size)| size)
+            .fold(0_u64, |sum, size| sum.saturating_add(*size));
         let mut names: Vec<String> = listed.into_iter().map(|(name, _)| name).collect();
         sort_pages(&mut names);
+        if let Some(name) = duplicate_name(&names) {
+            return Err(SourceError::Duplicate(name.clone()));
+        }
         if names.is_empty() {
             return Err(SourceError::Empty);
         }
@@ -315,6 +328,17 @@ impl Source {
     }
 }
 
+/// The first name a sorted listing carries twice, if any. Duplicate
+/// names would pair one entry's bytes with two pages and strand the
+/// other, so the listing refuses them outright.
+fn duplicate_name(sorted: &[String]) -> Option<&String> {
+    sorted
+        .iter()
+        .zip(sorted.iter().skip(1))
+        .find(|(left, right)| left == right)
+        .map(|(name, _)| name)
+}
+
 /// One member's bytes, with its read error as the message.
 fn read_member(member: &mut impl Read) -> Result<Arc<[u8]>, String> {
     let mut bytes = Vec::new();
@@ -335,7 +359,7 @@ fn spawn_zip_fill(
     // thread that never ran.
     let thread_fill = Arc::clone(fill);
     let spawned = Builder::new().name("cy-unpack".into()).spawn(move || {
-        let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+        settle_pass(&thread_fill, || {
             for (index, name) in names.iter().enumerate() {
                 let page = match zip.by_name(name) {
                     Ok(mut entry) => read_member(&mut entry),
@@ -343,11 +367,7 @@ fn spawn_zip_fill(
                 };
                 thread_fill.lock().pages.insert(index, page);
             }
-        }));
-        let mut state = thread_fill.lock();
-        state.pass = Some(match outcome {
-            Ok(()) => Ok(()),
-            Err(panic) => Err(format!("unpack {}", panic_message(panic.as_ref()))),
+            Ok(())
         });
     });
     if let Err(error) = spawned {
@@ -357,8 +377,9 @@ fn spawn_zip_fill(
 
 /// Fill a 7z's pages in storage order, the only order a solid stream
 /// permits: every member is consumed — page or not — before the next
-/// decodes. One error ends the pass, so the unfilled tail reads as
-/// that error while the filled prefix stays readable.
+/// decodes. A member that fails to read settles as its own page's
+/// error and the pass walks on; a block that cannot decode at all
+/// ends the pass.
 fn spawn_sevenzip_fill(
     mut reader: sevenz_rust2::ArchiveReader<File>,
     pages: HashMap<String, usize>,
@@ -369,29 +390,50 @@ fn spawn_sevenzip_fill(
     // thread that never ran.
     let thread_fill = Arc::clone(fill);
     let spawned = Builder::new().name("cy-unpack".into()).spawn(move || {
-        let outcome = panic::catch_unwind(AssertUnwindSafe(|| reader.for_each_entries(
-            |entry, data| {
-                let mut member = Vec::new();
-                data.read_to_end(&mut member)?;
-                if let Some(&index) = pages.get(&entry.name) {
-                    thread_fill.lock().pages.insert(index, Ok(member.into()));
-                }
-                Ok(true)
-            },
-        )));
-        let mut state = thread_fill.lock();
-        state.pass = Some(match outcome {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(error)) => {
-                tracing::warn!(%error, "7z unpack ended early");
-                Err(error.to_string())
-            }
-            Err(panic) => Err(format!("unpack {}", panic_message(panic.as_ref()))),
+        settle_pass(&thread_fill, || {
+            reader
+                .for_each_entries(|entry, data| {
+                    // The failed member is drained so the next member
+                    // decodes from its true start.
+                    let mut member = Vec::new();
+                    let page = match data.read_to_end(&mut member) {
+                        Ok(_) => Ok(member.into()),
+                        Err(error) => {
+                            #[expect(
+                                clippy::let_underscore_must_use,
+                                clippy::let_underscore_untyped,
+                                reason = "the drain's outcome is irrelevant; only its side effect of consuming the member's remaining bytes matters"
+                            )]
+                            let _ = data.read_to_end(&mut member);
+                            Err(error.to_string())
+                        }
+                    };
+                    if let Some(&index) = pages.get(&entry.name) {
+                        thread_fill.lock().pages.insert(index, page);
+                    }
+                    Ok(true)
+                })
+                .map_err(|error| error.to_string())
         });
     });
     if let Err(error) = spawned {
         fill.lock().pass = Some(Err(format!("could not start the unpack thread: {error}")));
     }
+}
+
+/// Run one fill pass body and settle the pass by its outcome: whole,
+/// ended early by a reason, or ended by a panic.
+fn settle_pass(fill: &Arc<Mutex<Fill>>, body: impl FnOnce() -> Result<(), String>) {
+    let outcome = panic::catch_unwind(AssertUnwindSafe(body));
+    let mut state = fill.lock();
+    state.pass = Some(match outcome {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(reason)) => {
+            tracing::warn!(%reason, "unpack pass ended early");
+            Err(reason)
+        }
+        Err(panic) => Err(format!("unpack {}", panic_message(panic.as_ref()))),
+    });
 }
 
 /// A panic payload rendered as a failure message, for the thread panic
@@ -505,6 +547,75 @@ mod tests {
         ));
         assert!(matches!(guard_memory(u64::MAX, None), Ok(())));
     }
+    /// `settle_pass` ends the pass by its outcome — whole, early, or
+    /// panicked — so no page can wait on a pass that never settles.
+    #[test]
+    fn settle_pass_outcomes() {
+        let whole = Arc::new(Mutex::new(Fill::empty()));
+        settle_pass(&whole, || Ok(()));
+        assert!(matches!(&whole.lock().pass, Some(Ok(()))));
+
+        let broke = Arc::new(Mutex::new(Fill::empty()));
+        settle_pass(&broke, || Err("stream broke".into()));
+        assert!(matches!(&broke.lock().pass, Some(Err(reason)) if reason.contains("broke")));
+
+        let boom = Arc::new(Mutex::new(Fill::empty()));
+        settle_pass(&boom, || panic!("boom"));
+        assert!(matches!(boom.lock().resolve(0), Bytes::Failed(reason) if reason.contains("boom")));
+    }
+
+    /// Liar header sizes cannot wrap the guard past the machine's
+    /// memory: the sum saturates and the archive refuses.
+    #[test]
+    fn liar_sizes_refuse() {
+        let listed = vec![("a.png".to_owned(), u64::MAX), ("b.png".to_owned(), u64::MAX)];
+        // The saturated sum is the assertion; the two field-pattern
+        // lints are mutually unsatisfiable for it, so the rest pattern
+        // stays with an expect.
+        #[expect(
+            clippy::rest_pattern_accessible_field,
+            reason = "naming the ignored field as a wildcard instead trips unneeded_field_pattern"
+        )]
+        match Source::open_archive(listed, |_, _| {}) {
+            Err(SourceError::TooBig { unpacked: u64::MAX, .. }) => {}
+            Err(other) => panic!("liar sizes settled as {other}"),
+            Ok(source) => panic!("liar sizes opened as {} pages", source.len()),
+        }
+    }
+
+    /// A listing that names one entry twice refuses the archive rather
+    /// than stranding a page behind a false "no entry" error.
+    #[test]
+    fn duplicate_names_refuse() {
+        let listed = vec![
+            ("b.png".to_owned(), 8),
+            ("a.png".to_owned(), 8),
+            ("a.png".to_owned(), 8),
+        ];
+        assert!(matches!(
+            Source::open_archive(listed, |_, _| {}),
+            Err(SourceError::Duplicate(name)) if name == "a.png"
+        ));
+    }
+
+    /// An archive whose every entry is a non-page opens as Empty
+    /// before any fill thread starts.
+    #[test]
+    fn pageless_archive_is_empty() {
+        use zip::write::SimpleFileOptions;
+
+        let dir = TempDir::new("pagezipnone");
+        let zip_path = dir.path().join("book.cbz");
+        {
+            let file = File::create(&zip_path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            zip.start_file("info.txt", SimpleFileOptions::default()).unwrap();
+            zip.write_all(b"skip me").unwrap();
+            zip.finish().unwrap();
+        }
+        assert!(matches!(Source::open(&zip_path), Err(SourceError::Empty)));
+    }
+
     /// 7z sources list pages, read them through the fill, and the
     /// background pass settles every page.
     #[test]

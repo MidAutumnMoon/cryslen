@@ -641,6 +641,51 @@ mod tests {
         // suite rather than failing an assert.
     }
 
+    /// The worker naps through an unpack instead of failing or
+    /// hanging: seeded on the page a zip fill reaches last, the seat
+    /// settles once the pass arrives, and a mid-unpack retune re-aims.
+    #[test]
+    fn worker_waits_out_an_unpack() {
+        use std::fs::File;
+        use std::io::Write as _;
+        use zip::write::SimpleFileOptions;
+
+        let dir = TempDir::new("worker-unpack");
+        let zip_path = dir.path().join("book.cbz");
+        {
+            let file = File::create(&zip_path).expect("zip creates");
+            let mut zip = zip::ZipWriter::new(file);
+            let options = SimpleFileOptions::default();
+            // Zero pages deflate small but inflate slowly enough in a
+            // debug build that the far page is still NotYet when the
+            // worker first asks for it. Zeros are not a PNG, so the
+            // seat settles as a decode failure — the point is that it
+            // settles at all, through naps.
+            for page in 0..32_u32 {
+                zip.start_file(format!("{page:03}.png"), options).expect("entry starts");
+                zip.write_all(&vec![0_u8; 1024 * 1024]).expect("entry writes");
+            }
+            zip.finish().expect("zip finishes");
+        }
+        let source = Arc::new(Source::open(&zip_path).expect("zip opens"));
+        let far = source.len() - 1;
+        let worker =
+            Worker::spawn(Arc::clone(&source), Spread::lone(far), || {}).expect("worker spawns");
+
+        let settled = |page: usize| {
+            eventually(20, "page never settled", || {
+                match worker.snapshot(&Spread::lone(page)).first {
+                    SeatView::Pending => None,
+                    SeatView::Failed(message) => Some(message),
+                    SeatView::Ready(_) => panic!("zeros decoded as an image?"),
+                }
+            })
+        };
+        assert!(settled(far).contains(&format!("page {}", far + 1)));
+        worker.retune(Spread::lone(0));
+        assert!(settled(0).contains("page 1"));
+    }
+
     /// Retune-driven decoding: rapid retunes decode every trail page; a double-mode spread decodes both pages.
     #[test]
     fn retune_decoding() {
