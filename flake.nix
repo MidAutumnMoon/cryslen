@@ -14,19 +14,20 @@
         fontconfig
       ];
 
+      nativeTools = with pkgs; [
+        cmake
+        meson
+        ninja
+        nasm
+      ];
+
       package = pkgs.rustPlatform.buildRustPackage {
         pname = "cryslen";
         version = "0.1.0";
         src = self;
         cargoLock.lockFile = ./Cargo.lock;
 
-        nativeBuildInputs = with pkgs; [
-          cmake
-          meson
-          ninja
-          nasm
-          makeBinaryWrapper
-        ];
+        nativeBuildInputs = nativeTools ++ [ pkgs.makeBinaryWrapper ];
         dontUseNinjaBuild = true;
         dontUseNinjaInstall = true;
 
@@ -50,9 +51,9 @@
     {
       packages.x86_64-linux.default = package;
 
+      # The toolchain comes from the global rust profile.
       devShells.x86_64-linux.default = pkgs.mkShell {
-        inputsFrom = [ package ];
-        packages = [ pkgs.clang ];
+        packages = [ pkgs.clang ] ++ nativeTools;
         env.LD_LIBRARY_PATH = makeLibraryPath dlopenLibs;
       };
     };
