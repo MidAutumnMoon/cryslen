@@ -193,8 +193,7 @@ pub struct Placement {
 }
 
 impl Default for Placement {
-    /// The 1:1 placement at the origin: what the first fit or a user
-    /// move replaces before anything draws.
+    /// What the first fit or a user move replaces before anything draws.
     fn default() -> Self {
         Self { scale: 1.0, offset: (0.0, 0.0) }
     }

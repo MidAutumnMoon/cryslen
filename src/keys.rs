@@ -38,10 +38,9 @@ pub(crate) enum Action {
 }
 
 impl Action {
-    /// Bindings answer only to bare keys. `Shift` makes two deliberate
-    /// exceptions (Shift+Space pages back, Shift+B steps to the previous
-    /// book); every other modifier combo (Ctrl+C, Ctrl+Q, anything the
-    /// desktop owns) stays with the desktop.
+    /// Bindings answer only to bare keys, `Shift+Space` and `Shift+B`
+    /// excepted; every other modifier combo (anything the desktop owns)
+    /// stays with the desktop.
     #[expect(
         clippy::wildcard_enum_match_arm,
         reason = "winit's unmapped KeyCode variants map to no action"
@@ -160,7 +159,6 @@ mod tests {
             (KeyCode::KeyC, ModifiersState::CONTROL, None),
             (KeyCode::Space, ModifiersState::CONTROL, None),
             (KeyCode::ArrowRight, ModifiersState::ALT, None),
-            // Shift combined with other modifiers is no longer bare.
             (
                 KeyCode::Space,
                 ModifiersState::SHIFT | ModifiersState::CONTROL,

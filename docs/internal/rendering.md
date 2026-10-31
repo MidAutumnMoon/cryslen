@@ -55,8 +55,10 @@ arboard bundle.
   else top-origin.
 - Set `gl.viewport` before your own draw. egui's paint sets it for
   itself, runs after you, and nothing resets it on resize.
-- egui's painter leaves `BLEND` enabled. Disable it before drawing page
-  quads or transparent PNGs ghost against stale buffers.
+- egui's painter leaves `BLEND` enabled with its own blend function. Page
+  quads set theirs in `begin_frame` (`ONE, ONE_MINUS_SRC_ALPHA`: pages
+  draw premultiplied over the clear). egui's paint re-sets its state
+  after, so nothing needs restoring.
 - Snap quad origins to whole pixels. At 1:1 zoom a fractional origin
   makes NEAREST draw uneven texel rows.
 - Generate mipmaps and use `LINEAR_MIPMAP_LINEAR` for minification.
@@ -72,11 +74,11 @@ arboard bundle.
 - `precision highp` in the ES fragment shader. mediump may be fp16,
   where a large image's coordinate ulp grows to whole texels and
   breaks the math. ES3 mandates highp support.
-- Assert against `MAX_TEXTURE_SIZE` before uploading. GL silently
-  rejects oversized `tex_image_2d` and the texture then samples black.
-  The bounds checks in shader-land cannot catch it. Decode rejects
-  edges over its own cap, so the assert only fires on GPUs advertising
-  a smaller limit.
+- Check against `MAX_TEXTURE_SIZE` before uploading. GL silently rejects
+  oversized `tex_image_2d` and the texture then samples black, so the
+  cache refuses the page as its own error instead. Decode rejects edges
+  over its own cap first, so only a GPU advertising a smaller limit
+  trips it.
 - GL objects must be deleted while their context is alive. Keep the
   window/context as the last field of the owning struct (Rust drop
   order) and call `egui_glow.destroy()` in `Drop` before the painter
@@ -93,30 +95,32 @@ and complicates tiling later.
 
 ## YUV-in-shader (why AVIF renders without a CPU conversion)
 
-One program handles RGBA and YUV via uniforms: mode (0/1), chroma id
-(mono/420/422/444 → chroma UV scaling), depth normalizer, range
-offsets, and a mat3. Deriving the matrix on the CPU keeps the shader
-trivial:
+One program handles RGBA and YUV, sRGB and PQ, via uniforms: the mode
+and transfer ids, the screen-px→texel maps, the folded conversion mat3
+and offset, and the alpha depth normalizer. Folding every per-draw
+constant on the CPU keeps the shader trivial:
 
 - KR/KB per standard: BT.601 (0.299, 0.114), BT.709 (0.2126, 0.0722),
   BT.2020 (0.2627, 0.0593). KG = 1 - KR - KB.
-- Limited range folds the studio-swing scales into the matrix (luma
-  255/219, chroma 255/224) so the subtracted anchors stay the plain
-  16/255 (luma black) and 128/255 (chroma neutral). Full range uses
-  anchors 0 and 0.5 with an identity scale.
+- Limited range folds the studio-swing scales into the matrix so the
+  anchors stay the plain code values: luma black 16 and chroma neutral
+  128, both shifted by `depth - 8` bits. Full range anchors at 0 and
+  `2^(depth-1)` with an identity scale.
 - Sampling divides an R16 texture by 65535. Only `depth` bits are
-  significant, so multiply by `65535 / (2^depth - 1)`.
+  significant, so multiply by `65535 / (2^depth - 1)` — folded into the
+  matrix for color, the `u_norm` uniform for alpha.
 - Mono pages get a 1×1 midpoint chroma texture (128, or `1 << (depth-1)`
-  as LE u16). The matrix cancels it to neutral gray.
+  as native-endian u16). The folded quantization anchor cancels it
+  exactly.
 - Chroma is sampled bilinearly at centered (interstitial) positions,
   the JPEG convention and the AVIF default: exact for 444, sub-texel
   for subsampled. Chroma siting metadata is not applied, so declared
   co-sited chroma biases by half a texel. The bias is invisible in
   practice.
 
-Unit-test the matrix constants against the published coefficient
-tables and that studio-swing black/white map to 0.0/1.0. That catches
-a whole class of "slightly wrong colors" regressions without a GPU.
+Unit-test that studio-swing black and white map to 0.0/1.0 at every
+depth. That catches a whole class of "slightly wrong colors"
+regressions without a GPU.
 
 ## Upload policy
 

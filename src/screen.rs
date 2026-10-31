@@ -225,8 +225,7 @@ impl Screen {
         self.noted_error = Some(message);
     }
 
-    /// Drop every shown fact: a book switch renumbers pages from zero,
-    /// so nothing of the old book can stay.
+    /// Drop every shown fact.
     pub(crate) fn clear_book(&mut self) {
         self.shown = None;
         self.seats = [None, None];

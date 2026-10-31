@@ -87,6 +87,8 @@ pub struct App {
     /// Cursor position in viewport px, same as window px.
     cursor: (f32, f32),
     dragging: bool,
+    /// Held modifier state; winit 0.30 key events carry none, only
+    /// `ModifiersChanged` does.
     modifiers: ModifiersState,
     waiting_since: Option<Instant>,
     mode_toast_since: Option<Instant>,
@@ -359,6 +361,8 @@ impl App {
         self.source = source;
         self.index = view::first_spread();
         self.retuned_spread = spread;
+        // A book switch renumbers pages from zero, so nothing of the old
+        // book can stay.
         self.screen.clear_book();
         if let Some(gl) = self.gl.as_mut() {
             gl.pages.clear_all();

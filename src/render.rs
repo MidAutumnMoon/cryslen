@@ -34,8 +34,7 @@ use crate::view::Seat;
 use crate::view::SpreadLayout;
 use crate::view::Viewport;
 
-/// Both dialect variants of one shader source, so the pair cannot drift:
-/// each variant is its version preamble concatenated with the shared body.
+/// Both dialect variants of one shader source, so the pair cannot drift.
 macro_rules! shader_variants {
     ($core:ident, $es:ident, $core_preamble:literal, $es_preamble:literal, $body:literal) => {
         const $core: &str = concat!($core_preamble, $body);
@@ -72,11 +71,12 @@ shader_variants!(
 //
 // One shader, both pixel layouts and both transfers: mode and transfer
 // arrive as uniforms, so there are no per-variant programs. Every
-// per-draw constant (the coordinate maps, the depth normalization, the
-// quantization anchors) is folded CPU-side into `u_lmap`/`u_cmap`,
-// `u_mat`, and `u_off`, leaving the color path one matrix multiply and
-// one subtract per fragment. Output is premultiplied for compositing
-// over the background.
+// per-draw constant (the coordinate maps, the quantization anchors, the
+// color-path depth normalization) is folded CPU-side into
+// `u_lmap`/`u_cmap`, `u_mat`, and `u_off` — alpha's depth normalization
+// rides `u_norm` — leaving the color path one matrix multiply and one
+// subtract per fragment. Output is premultiplied for compositing over
+// the background.
 shader_variants!(
     FS_CORE,
     FS_ES,
@@ -148,8 +148,7 @@ shader_variants!(
     }"
 );
 
-/// Page-keyed texture cache plus the spread draw. Each entry is an RGBA
-/// texture or a YUV plane triple.
+/// Page-keyed texture cache plus the spread draw.
 pub struct PageTextures {
     gl: Arc<glow::Context>,
     pipeline: Pipeline,
@@ -183,7 +182,6 @@ struct Locations {
 /// is folded here at upload, so the frame path only divides by the
 /// live zoom scale.
 enum Entry {
-    /// Single RGBA texture (alpha in its fourth channel).
     Rgba {
         texture: <glow::Context as glow::HasContext>::Texture,
         /// Screen px -> texel, before the zoom-scale divide.
@@ -202,7 +200,6 @@ enum Entry {
         lmap_base: (f32, f32),
         /// Screen px -> chroma texel, subsample-folded, before the divide.
         cmap_base: (f32, f32),
-        /// Storage samples -> gamma RGB, quantization folded.
         conversion: Conversion,
         /// Depth-normalize factor for the alpha sample (1.0 for 8-bit
         /// storage).
@@ -312,8 +309,7 @@ impl PageTextures {
         *self.seat_slot(seat) = None;
     }
 
-    /// Drop every cached page and unbind both seats. A book switch
-    /// renumbers pages from zero, so nothing of the old book can stay.
+    /// Drop every cached page and unbind both seats.
     pub fn clear_all(&mut self) {
         for entry in mem::take(&mut self.textures).into_values() {
             // SAFETY: the take empties the map, so this loop holds the
@@ -863,15 +859,11 @@ unsafe fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> Entry {
     }
 }
 
-/// The `u_lmap` map before the zoom divide: screen px -> luma texel at
-/// scale 1.
 fn lmap_base(size: (u32, u32)) -> (f32, f32) {
     let img = view::px_f32(size);
     (1.0 / img.0, 1.0 / img.1)
 }
 
-/// The `u_cmap` map before the zoom divide: screen px -> chroma texel at
-/// scale 1, with the subsample ratio folded in.
 fn cmap_base(size: (u32, u32), subsampling: Subsampling) -> (f32, f32) {
     let (_, (chroma_w, chroma_h)) = plane_dims(size, subsampling);
     let chroma = view::px_f32((chroma_w, chroma_h));
@@ -1001,11 +993,9 @@ struct Quantization {
     luma_black: f32,
     /// Chroma neutral, 2^(depth-1) under both ranges.
     chroma_neutral: f32,
-    /// Slope from a depth-normalized luma sample to RGB: 1.0 at full
-    /// range, `max_code` / 219·2^(depth-8) at limited range.
+    /// Slope from a depth-normalized luma sample to RGB.
     luma_scale: f32,
-    /// Slope from a depth-normalized chroma sample to RGB: 1.0 at full
-    /// range, `max_code` / 224·2^(depth-8) at limited range.
+    /// Slope from a depth-normalized chroma sample to RGB.
     chroma_scale: f32,
     /// Codes the storage can hold: 255 or 65535.
     storage_max: f32,

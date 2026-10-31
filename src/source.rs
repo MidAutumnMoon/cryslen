@@ -386,8 +386,6 @@ pub(crate) fn compare_names(left: &str, right: &str) -> Ordering {
                 } else {
                     let order = left_byte.cmp(&right_byte);
                     if order == Ordering::Equal {
-                        // Both sides hold a byte here, so the split
-                        // cannot go out of range.
                         left = left.split_at(1).1;
                         right = right.split_at(1).1;
                     } else {
