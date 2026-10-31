@@ -105,7 +105,7 @@ struct SeatShow {
 }
 
 /// What the screen shows: the committed spread, the page each seat
-/// holds, and the error no page owns. The hold and commit policy and
+/// holds, and the errors no page owns. The hold and commit policy and
 /// the facts it tracks have one owner here, so they cannot drift apart.
 #[derive(Default)]
 #[expect(
@@ -117,8 +117,14 @@ pub(crate) struct Screen {
     /// commit (cold start).
     shown: Option<Spread>,
     seats: [Option<SeatShow>; 2],
-    /// A texture upload the GPU refused, or a book switch that failed.
-    error: Option<String>,
+    /// A texture upload the GPU refused. A binding frame rewrites this:
+    /// a refused bind retries every frame while its page stays wanted,
+    /// so the error holds exactly that long.
+    upload_error: Option<String>,
+    /// A failure the app noted (a book switch that failed). No frame
+    /// retries it, so it holds until a successful switch clears the
+    /// book.
+    noted_error: Option<String>,
 }
 
 impl Screen {
@@ -135,7 +141,7 @@ impl Screen {
         let plan = plan_screen(self.shown, wanted, mode, snapshot.seats(mode), bound);
         // The frame's binds are one outcome: a refused upload on either
         // seat must survive the partner's success. A frame that bound
-        // cleanly clears the screen error; a hold frame touches neither.
+        // cleanly clears the upload error; a hold frame touches it not.
         let mut bind_error = None;
         let mut bound_cleanly = false;
         for ((seat, shown), step) in Seat::ALL
@@ -162,7 +168,7 @@ impl Screen {
             }
         }
         if bind_error.is_some() || bound_cleanly {
-            self.error = bind_error;
+            self.upload_error = bind_error;
         }
         if let Some((page, decoded)) = plan.stage {
             self.stage(pages, page, decoded);
@@ -197,10 +203,11 @@ impl Screen {
     }
 
     /// Upload `page`'s textures without binding a seat, so the turn that
-    /// shows it is a pure rebind. A refusal surfaces in the status line.
+    /// shows it is a pure rebind. A refusal surfaces in the status line
+    /// and repeats while staging retries each frame.
     fn stage(&mut self, pages: &mut PageTextures, page: usize, decoded: &Arc<Decoded>) {
         if let Err(error) = pages.stage(page, decoded) {
-            self.error = Some(error.to_string());
+            self.upload_error = Some(error.to_string());
         }
     }
 
@@ -209,15 +216,16 @@ impl Screen {
         self.seats.each_ref().map(|seat| seat.map(|show| show.dims))
     }
 
-    /// An error the status line must show that no page owns.
+    /// An error the status line must show that no page owns: a noted
+    /// failure first, else the refused upload.
     pub(crate) fn error(&self) -> Option<&str> {
-        self.error.as_deref()
+        self.noted_error.as_deref().or(self.upload_error.as_deref())
     }
 
-    /// Record an error the status line must show that no page owns,
-    /// e.g. a book switch that failed.
+    /// Record a failure the status line must show that no page owns and
+    /// no frame retries, e.g. a book switch that failed.
     pub(crate) fn note_error(&mut self, message: String) {
-        self.error = Some(message);
+        self.noted_error = Some(message);
     }
 
     /// Drop every shown fact: a book switch renumbers pages from zero,
@@ -225,7 +233,8 @@ impl Screen {
     pub(crate) fn clear_book(&mut self) {
         self.shown = None;
         self.seats = [None, None];
-        self.error = None;
+        self.upload_error = None;
+        self.noted_error = None;
     }
 }
 

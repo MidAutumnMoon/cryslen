@@ -1,5 +1,6 @@
 //! App: winit event handling, state transitions, frame composition.
 
+use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -39,6 +40,19 @@ pub enum UserEvent {
 )]
 pub(crate) fn post(proxy: &EventLoopProxy<UserEvent>, event: UserEvent) {
     let Ok(()) = proxy.send_event(event) else { return; };
+}
+
+/// Spawn the worker serving `spread`; every page it decides posts a
+/// `PagesUpdated` wake.
+fn spawn_worker(
+    source: &Arc<Source>,
+    spread: Spread,
+    proxy: &EventLoopProxy<UserEvent>,
+) -> io::Result<Worker> {
+    let proxy = proxy.clone();
+    Worker::spawn(Arc::clone(source), spread, move |page| {
+        post(&proxy, UserEvent::PagesUpdated(page));
+    })
 }
 
 /// The window owns the surface and context, so it is declared last to
@@ -88,13 +102,13 @@ pub struct App {
 impl App {
     pub fn new(
         source: Arc<Source>,
-        worker: Worker,
         index: usize,
         proxy: EventLoopProxy<UserEvent>,
-    ) -> Self {
+    ) -> io::Result<Self> {
         let mode = ViewMode::Normal;
         let spread = view::spread_for(index, mode, source.len());
-        Self {
+        let worker = spawn_worker(&source, spread, &proxy)?;
+        Ok(Self {
             source,
             worker,
             gl: None,
@@ -111,7 +125,7 @@ impl App {
             mode_toast_since: None,
             last_viewport: Viewport::default(),
             proxy,
-        }
+        })
     }
 
     /// Store `error` and exit so `main` can report it after `run_app`
@@ -169,7 +183,7 @@ impl App {
         // not show a superseded zoom.
         let layout = view::layout(self.screen.seat_dims());
         let spread_size = layout.total();
-        self.fit.resolve(spread_size, self.last_viewport);
+        let placed = self.fit.resolve(spread_size, self.last_viewport);
 
         let folded = ui::fold_status(spread, &snapshot);
         self.waiting_since = folded
@@ -209,7 +223,7 @@ impl App {
             toast: self.mode_toast_since.is_some(),
             name: self.source.page_name(speaking_page),
             page,
-            zoom: self.fit.scale(),
+            zoom: placed.scale,
             waiting,
             error: folded.error.or_else(|| self.screen.error().map(str::to_owned)),
         };
@@ -232,12 +246,12 @@ impl App {
             self.last_viewport = viewport;
             self.request_redraw();
         }
-        self.fit.resolve(spread_size, viewport);
+        let drawn = self.fit.resolve(spread_size, viewport);
 
         let Some(gl) = self.gl.as_mut() else { return Ok(()) };
 
         gl.egui.painter.clear([size.width, size.height], clear_color(gl.window.translucent()));
-        gl.pages.draw((size.width, size.height), viewport, &layout, &self.fit.placement());
+        gl.pages.draw((size.width, size.height), viewport, &layout, &drawn);
         gl.egui.paint(gl.window.winit());
         gl.window.pre_present_and_swap()?;
         Ok(())
@@ -340,10 +354,7 @@ impl App {
             }
         };
         let spread = view::spread_for(view::first_spread(), self.mode, source.len());
-        let proxy = self.proxy.clone();
-        let worker = match Worker::spawn(Arc::clone(&source), spread, move |page| {
-            post(&proxy, UserEvent::PagesUpdated(page));
-        }) {
+        let worker = match spawn_worker(&source, spread, &self.proxy) {
             Ok(worker) => worker,
             Err(error) => {
                 self.screen.note_error(error.to_string());

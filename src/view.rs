@@ -362,16 +362,6 @@ pub struct Fit {
 }
 
 impl Fit {
-    /// The live placement of the spread in the viewport.
-    pub fn placement(self) -> Placement {
-        self.placement
-    }
-
-    /// The live zoom, screen px per image px.
-    pub fn scale(self) -> f32 {
-        self.placement.scale
-    }
-
     /// Fit `total` into `viewport` when due and return the placement. A
     /// user-placed view keeps its zoom and only clamps its pan into the
     /// new shape or viewport; otherwise the fit mode places the spread.
@@ -762,21 +752,21 @@ mod tests {
         // A user zoom pins the placement: a later total change clamps
         // instead of refitting, so the zoom survives.
         fit.zoom(2.0, (10.0, 10.0), total, viewport);
-        let zoomed = fit.scale();
+        let zoomed = fit.placement.scale;
         assert!(zoomed > fitted.scale, "the zoom zooms in");
         fit.resolve((120.0, 200.0), viewport);
-        assert_eq!(fit.scale(), zoomed, "a user zoom survives a later settle");
+        assert_eq!(fit.placement.scale, zoomed, "a user zoom survives a later settle");
 
         // A pan pins the placement the same way and keeps the zoom.
         let wide = (2000.0, 1000.0);
         let mut zoomed_view = Fit::default();
         let wide_fitted = zoomed_view.resolve(wide, viewport);
         zoomed_view.zoom(4.0, (250.0, 250.0), wide, viewport);
-        let before = zoomed_view.placement();
+        let before = zoomed_view.placement;
         zoomed_view.pan((-100.0, 0.0), wide, viewport);
-        assert_eq!(zoomed_view.scale(), before.scale, "pan keeps the zoom");
+        assert_eq!(zoomed_view.placement.scale, before.scale, "pan keeps the zoom");
         assert!(
-            zoomed_view.placement().offset.0 < before.offset.0,
+            zoomed_view.placement.offset.0 < before.offset.0,
             "pan moves the oversized spread"
         );
         assert!(wide_fitted.scale < before.scale, "the zoom zoomed in");
@@ -797,17 +787,17 @@ mod tests {
         let mut turn_view = Fit::default();
         turn_view.resolve(total, viewport);
         turn_view.zoom(2.0, (0.0, 0.0), total, viewport);
-        let held = turn_view.placement();
+        let held = turn_view.placement;
         turn_view.begin_turn();
         assert_eq!(turn_view.resolve(total, viewport), held, "begin_turn keeps the held frame frozen");
 
         // commit re-arms the fit and keeps hold-time moves: a zoom made
         // during the hold carries into the new spread as a clamp.
         turn_view.zoom(2.0, (0.0, 0.0), total, viewport);
-        let hold_zoom = turn_view.scale();
+        let hold_zoom = turn_view.placement.scale;
         turn_view.commit();
         turn_view.resolve((200.0, 400.0), viewport);
-        assert_eq!(turn_view.scale(), hold_zoom, "commit keeps hold-time moves");
+        assert_eq!(turn_view.placement.scale, hold_zoom, "commit keeps hold-time moves");
 
         // refit discards both the settle and the pin.
         turn_view.refit();

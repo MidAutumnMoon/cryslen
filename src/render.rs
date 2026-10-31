@@ -562,8 +562,9 @@ const MODE_RGBA: i32 = 0;
 const MODE_YUV: i32 = 1;
 
 /// Draw one seat's quad. Every uniform is per-draw constant except the
-/// coordinate maps' zoom-scale divide; the unused mode's uniforms are
-/// set to their inert values so no draw reads a stale one.
+/// coordinate maps' zoom-scale divide. The shader's `u_mode` branch
+/// guards the mode-specific uniforms, so each variant sets only its
+/// branch reads and the unused ones stay stale without effect.
 ///
 /// # Safety
 ///
@@ -595,14 +596,6 @@ unsafe fn draw_page(
                 lmap_base.0 / scale,
                 lmap_base.1 / scale,
             );
-            gl.uniform_2_f32(
-                Some(&locations.cmap),
-                lmap_base.0 / scale,
-                lmap_base.1 / scale,
-            );
-            gl.uniform_1_f32(Some(&locations.norm), 1.0);
-            gl.uniform_matrix_3_f32_slice(Some(&locations.mat), false, &IDENTITY3);
-            gl.uniform_3_f32(Some(&locations.off), 0.0, 0.0, 0.0);
             gl.bind_texture(glow::TEXTURE_2D, Some(*texture));
         }
         Entry::Yuv {

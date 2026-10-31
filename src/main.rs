@@ -24,8 +24,6 @@ use std::sync::Arc;
 
 use app::{App, UserEvent};
 use source::Source;
-use view::ViewMode;
-use worker::Worker;
 
 use rustfs_mimalloc::MiMalloc;
 
@@ -116,15 +114,7 @@ fn run(open_path: &Path, land_on: Option<&str>) -> eros::Result<()> {
     });
 
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
-    let proxy = event_loop.create_proxy();
-
-    // The seed must be the spread App::new opens on (Normal mode).
-    let spread = view::spread_for(index, ViewMode::Normal, source.len());
-    let worker = Worker::spawn(Arc::clone(&source), spread, move |page| {
-        app::post(&proxy, UserEvent::PagesUpdated(page));
-    })?;
-
-    let mut app = App::new(source, worker, index, event_loop.create_proxy());
+    let mut app = App::new(source, index, event_loop.create_proxy())?;
     event_loop.run_app(&mut app)?;
     if let Some(error) = app.take_fatal_error() {
         return Err(error);
