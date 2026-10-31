@@ -62,9 +62,26 @@ struct FoldedStatus {
     page: Option<(usize, Format, (u32, u32))>,
 }
 
+/// Pair a spread's pages with their seat views, in reading order:
+/// `Spread.first` (the page read first), then its partner.
+fn spread_facts(spread: Spread, view: &SpreadView) -> impl Iterator<Item = (usize, &SeatView)> {
+    [
+        (Some(spread.first), Some(&view.first)),
+        (spread.second, view.second.as_ref()),
+    ]
+    .into_iter()
+    .filter_map(|(page, seat)| page.zip(seat))
+}
+
+/// The spread one forward turn lands on: the only neighbor the frame
+/// stages and watches, because reading runs forward.
+fn forward_spread(spread: Spread, mode: ViewMode, len: usize) -> Spread {
+    let next = view::advance(spread.first, true, mode, len);
+    view::spread_for(next, mode, len)
+}
+
 /// Fold the spread's pages into the status line's error and page facts
-/// in reading order: `Spread.first` (the page read first), then its
-/// partner.
+/// in reading order.
 fn fold_status(spread: Spread, snapshot: &SpreadView) -> FoldedStatus {
     let mut folded = FoldedStatus {
         waiting: matches!(snapshot.first, SeatView::Pending)
@@ -72,11 +89,7 @@ fn fold_status(spread: Spread, snapshot: &SpreadView) -> FoldedStatus {
         error: None,
         page: None,
     };
-    let pages = [
-        (Some(spread.first), Some(&snapshot.first)),
-        (spread.second, snapshot.second.as_ref()),
-    ];
-    for (page, view) in pages.into_iter().filter_map(|(page, view)| page.zip(view)) {
+    for (page, view) in spread_facts(spread, snapshot) {
         match view {
             SeatView::Failed(message) => {
                 folded.error = Some(message.clone());
@@ -189,14 +202,8 @@ impl Fit {
         self.settled = None;
     }
 
-    fn viewport_changed(&mut self) {
-        self.refit();
-    }
-
-    fn reset_view(&mut self) {
-        self.refit();
-    }
-
+    /// Discard the placement memory: the next frame refits, and a user
+    /// placement no longer pins the zoom.
     fn refit(&mut self) {
         self.settled = None;
         self.user_moved = false;
@@ -300,16 +307,19 @@ impl App {
         view::spread_for(self.state.index, self.state.mode, self.source.len())
     }
 
+    fn is_fullscreen(&self) -> bool {
+        self.gl
+            .as_ref()
+            .is_some_and(|gl| gl.window.winit().fullscreen().is_some())
+    }
+
     /// Whether `page`'s decision changes the screen: a wanted seat's
     /// arrival commits or ends a hold, and a next-spread page becomes
     /// texture-staged. Everything else is prefetch the screen never shows.
     fn page_watched(&self, page: usize) -> bool {
         let spread = self.spread();
-        if spread.contains(page) {
-            return true;
-        }
-        let next = view::advance(spread.first, true, self.state.mode, self.source.len());
-        view::spread_for(next, self.state.mode, self.source.len()).contains(page)
+        spread.contains(page)
+            || forward_spread(spread, self.state.mode, self.source.len()).contains(page)
     }
 
     fn seat_dims(&self) -> [Option<(u32, u32)>; 2] {
@@ -340,6 +350,11 @@ impl App {
             snapshot.seats(self.state.mode),
             bound,
         );
+        // The frame's binds are one outcome: a refused upload on either
+        // seat must survive the partner's success. A frame that bound
+        // cleanly clears the screen error; a hold frame touches neither.
+        let mut bind_error = None;
+        let mut bound_cleanly = false;
         for ((seat, shown), step) in Seat::ALL
             .into_iter()
             .zip(self.shown_seats.each_mut())
@@ -349,8 +364,8 @@ impl App {
                 SeatStep::Show { page, decoded } => {
                     if let Some(gl) = self.gl.as_mut() {
                         match gl.pages.bind(seat, page, decoded) {
-                            Ok(()) => self.screen_error = None,
-                            Err(error) => self.screen_error = Some(error.to_string()),
+                            Ok(()) => bound_cleanly = true,
+                            Err(error) => bind_error = Some(error.to_string()),
                         }
                     }
                     *shown = Some(SeatShow { page, dims: (decoded.width, decoded.height) });
@@ -364,12 +379,11 @@ impl App {
                 }
             }
         }
+        if bind_error.is_some() || bound_cleanly {
+            self.screen_error = bind_error;
+        }
         if let Some((page, decoded)) = plan.stage {
-            if let Some(gl) = self.gl.as_mut() {
-                if let Err(error) = gl.pages.stage(page, decoded) {
-                    self.screen_error = Some(error.to_string());
-                }
-            }
+            self.stage_page(page, decoded);
         }
         self.shown = plan.shown_after;
         if plan.committed {
@@ -383,25 +397,24 @@ impl App {
     /// visible one. Reading runs forward, so only the forward spread is
     /// staged.
     fn stage_next_spread(&mut self, spread: Spread) {
-        let next = view::advance(spread.first, true, self.state.mode, self.source.len());
-        let next_spread = view::spread_for(next, self.state.mode, self.source.len());
+        let next_spread = forward_spread(spread, self.state.mode, self.source.len());
         if next_spread == spread {
             return;
         }
         let snapshot = self.worker.snapshot(&next_spread);
-        for (page, seat) in [
-            (Some(next_spread.first), Some(&snapshot.first)),
-            (next_spread.second, snapshot.second.as_ref()),
-        ]
-        .into_iter()
-        .filter_map(|(page, seat)| page.zip(seat))
-        {
+        for (page, seat) in spread_facts(next_spread, &snapshot) {
             if let SeatView::Ready(decoded) = seat {
-                if let Some(gl) = self.gl.as_mut() {
-                    if let Err(error) = gl.pages.stage(page, decoded) {
-                        self.screen_error = Some(error.to_string());
-                    }
-                }
+                self.stage_page(page, decoded);
+            }
+        }
+    }
+
+    /// Upload `page`'s textures without binding a seat, so the turn that
+    /// shows it is a pure rebind. A refusal surfaces in the status line.
+    fn stage_page(&mut self, page: usize, decoded: &Arc<Decoded>) {
+        if let Some(gl) = self.gl.as_mut() {
+            if let Err(error) = gl.pages.stage(page, decoded) {
+                self.screen_error = Some(error.to_string());
             }
         }
     }
@@ -417,7 +430,7 @@ impl App {
             self.worker.retune(spread);
         }
 
-        let Some(size) = self.surface_size() else {
+        let Some(size) = self.sync_surface_size() else {
             return Ok(());
         };
 
@@ -479,8 +492,8 @@ impl App {
         // Fullscreen is chrome-free: the bar hides and the viewport is
         // the whole window.
         let viewport = {
+            let bar = !self.is_fullscreen();
             let Some(gl) = self.gl.as_mut() else { return Ok(()) };
-            let bar = gl.window.winit().fullscreen().is_none();
             let mut content = egui::Rect::NOTHING;
             gl.egui.run(gl.window.winit(), |ui| content = ui::show(ui, &status, bar));
             content_viewport(size, content, gl.egui.egui_ctx.pixels_per_point())
@@ -488,7 +501,7 @@ impl App {
         // The bar's height changes without a winit resize, so diff every
         // frame; the status line used the old scale, so redraw once.
         if viewport != self.last_viewport {
-            self.fit.viewport_changed();
+            self.fit.refit();
             self.last_viewport = viewport;
             self.request_redraw();
         }
@@ -503,7 +516,9 @@ impl App {
         Ok(())
     }
 
-    fn surface_size(&mut self) -> Option<PhysicalSize<u32>> {
+    /// Bring the GL surface up to the window's current size and report
+    /// it; None while the window is zero-sized (minimized).
+    fn sync_surface_size(&mut self) -> Option<PhysicalSize<u32>> {
         let gl = self.gl.as_mut()?;
         let size = gl.window.winit().inner_size();
         if size.width == 0 || size.height == 0 {
@@ -529,11 +544,7 @@ impl App {
             Action::Escape => {
                 // Esc steps out of fullscreen first; quitting is the
                 // bare-window case.
-                let fullscreen = self
-                    .gl
-                    .as_ref()
-                    .is_some_and(|gl| gl.window.winit().fullscreen().is_some());
-                if fullscreen {
+                if self.is_fullscreen() {
                     if let Some(gl) = self.gl.as_ref() {
                         gl.window.winit().set_fullscreen(None);
                     }
@@ -561,19 +572,18 @@ impl App {
                 use winit::window::Fullscreen;
 
                 if let Some(gl) = self.gl.as_ref() {
-                    let entering = gl.window.winit().fullscreen().is_none();
-                    let fullscreen_request = entering.then_some(Fullscreen::Borderless(None));
-                    gl.window.winit().set_fullscreen(fullscreen_request);
+                    let request = (!self.is_fullscreen()).then_some(Fullscreen::Borderless(None));
+                    gl.window.winit().set_fullscreen(request);
                 }
             }
             Action::ResetView => {
                 self.state.fit_mode = FitMode::Page;
-                self.fit.reset_view();
+                self.fit.refit();
                 self.request_redraw();
             }
             Action::SelectFit(mode) => {
                 self.state.fit_mode = mode;
-                self.fit.reset_view();
+                self.fit.refit();
                 self.request_redraw();
             }
             Action::First | Action::Last => {
@@ -798,7 +808,7 @@ impl ApplicationHandler<UserEvent> for App {
         match &event {
             WindowEvent::Resized(_) => {
                 // The refit happens in `frame()` when the viewport notices the new size.
-                self.surface_size();
+                self.sync_surface_size();
                 self.request_redraw();
             }
             WindowEvent::ModifiersChanged(modifiers) => {
@@ -945,15 +955,11 @@ mod tests {
         fit.note_user_move();
         fit.settle((120.0, 200.0));
         assert!(fit.user_moved, "a user move survives a later settle");
-        let discards = [Fit::viewport_changed, Fit::reset_view];
-        let names = ["viewport change", "reset view"];
-        for (discard, name) in discards.into_iter().zip(names) {
-            fit.settle((100.0, 200.0));
-            fit.note_user_move();
-            discard(&mut fit);
-            assert!(fit.should_refit((100.0, 200.0)), "{name} discards the settle");
-            assert!(!fit.user_moved, "{name} discards the user move");
-        }
+        fit.settle((100.0, 200.0));
+        fit.note_user_move();
+        fit.refit();
+        assert!(fit.should_refit((100.0, 200.0)), "refit discards the settle");
+        assert!(!fit.user_moved, "refit discards the user move");
         fit.settle((100.0, 200.0));
         fit.note_user_move();
         fit.begin_turn();

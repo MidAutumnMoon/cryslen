@@ -146,18 +146,21 @@ pub struct PageTextures {
 }
 
 /// Uniform locations, resolved once at link time so draws never look
-/// names up by string.
+/// names up by string. Every name is declared and statically used by
+/// this file's in-tree shaders, so a missing location is an in-tree
+/// regression and fails pipeline creation instead of silently skipping
+/// per-draw state.
 struct Locations {
-    win: Option<<glow::Context as glow::HasContext>::UniformLocation>,
-    offset: Option<<glow::Context as glow::HasContext>::UniformLocation>,
-    size: Option<<glow::Context as glow::HasContext>::UniformLocation>,
-    lmap: Option<<glow::Context as glow::HasContext>::UniformLocation>,
-    cmap: Option<<glow::Context as glow::HasContext>::UniformLocation>,
-    mat: Option<<glow::Context as glow::HasContext>::UniformLocation>,
-    off: Option<<glow::Context as glow::HasContext>::UniformLocation>,
-    norm: Option<<glow::Context as glow::HasContext>::UniformLocation>,
-    mode: Option<<glow::Context as glow::HasContext>::UniformLocation>,
-    transfer: Option<<glow::Context as glow::HasContext>::UniformLocation>,
+    win: <glow::Context as glow::HasContext>::UniformLocation,
+    offset: <glow::Context as glow::HasContext>::UniformLocation,
+    size: <glow::Context as glow::HasContext>::UniformLocation,
+    lmap: <glow::Context as glow::HasContext>::UniformLocation,
+    cmap: <glow::Context as glow::HasContext>::UniformLocation,
+    mat: <glow::Context as glow::HasContext>::UniformLocation,
+    off: <glow::Context as glow::HasContext>::UniformLocation,
+    norm: <glow::Context as glow::HasContext>::UniformLocation,
+    mode: <glow::Context as glow::HasContext>::UniformLocation,
+    transfer: <glow::Context as glow::HasContext>::UniformLocation,
 }
 
 /// One cached page's GPU state, freed by budget eviction and on drop. Every
@@ -229,13 +232,19 @@ impl PageTextures {
 
     /// Record that `seat` draws `page`, uploading its textures only on a
     /// cache miss. A bound page is never evicted, so a held seat keeps
-    /// drawing. An upload the GPU refuses surfaces as the page's error.
+    /// drawing. An upload the GPU refuses leaves the seat unbound —
+    /// nothing draws — and returns as the page's error; the next bind
+    /// retries, so the error holds exactly while the page stays wanted.
     pub fn bind(&mut self, seat: Seat, page: usize, decoded: &Decoded) -> eros::Result<()> {
         if *self.seat_slot(seat) == Some(page) {
             return Ok(());
         }
+        if let Err(error) = self.ensure_cached(page, decoded) {
+            self.clear(seat);
+            return Err(error);
+        }
         *self.seat_slot(seat) = Some(page);
-        self.ensure_cached(page, decoded)
+        Ok(())
     }
 
     /// Ensure `page`'s textures are cached without binding any seat, so
@@ -477,12 +486,20 @@ unsafe fn create_pipeline(gl: &glow::Context, vs: &str, fs: &str) -> eros::Resul
     gl.enable_vertex_attrib_array(loc);
     gl.vertex_attrib_pointer_f32(loc, 2, glow::FLOAT, false, 8, 0);
 
-    // Sampler units are fixed. Draw rebinds textures only.
+    // Sampler units are fixed. Draw rebinds textures only. A silently
+    // skipped sampler uniform would point every unit at 0, so a missing
+    // location fails creation.
     gl.use_program(Some(program));
+    let location = |name: &str| {
+        #[expect(
+            clippy::expect_used,
+            reason = "the uniform is declared and statically used by this file's in-tree shader sources, so a missing location means an in-tree regression"
+        )]
+        gl.get_uniform_location(program, name).expect("uniform location in page shader")
+    };
     for (unit, name) in [(0_i32, "u_tex0"), (1, "u_tex1"), (2, "u_tex2"), (3, "u_tex3")] {
-        gl.uniform_1_i32(gl.get_uniform_location(program, name).as_ref(), unit);
+        gl.uniform_1_i32(Some(&location(name)), unit);
     }
-    let location = |name: &str| gl.get_uniform_location(program, name);
     let locations = Locations {
         win: location("u_win"),
         offset: location("u_offset"),
@@ -518,7 +535,7 @@ unsafe fn begin_frame(gl: &glow::Context, pipeline: &Pipeline, size: (u32, u32))
     gl.use_program(Some(pipeline.program));
     gl.bind_vertex_array(Some(pipeline.vao));
     let win = view::px_f32(size);
-    gl.uniform_2_f32(pipeline.locations.win.as_ref(), win.0, win.1);
+    gl.uniform_2_f32(Some(&pipeline.locations.win), win.0, win.1);
 }
 
 /// Draw one seat's quad. Every uniform is per-draw constant except the
@@ -538,24 +555,24 @@ unsafe fn draw_page(
 ) {
     let locations = &pipeline.locations;
     gl.use_program(Some(pipeline.program));
-    gl.uniform_2_f32(locations.offset.as_ref(), screen_origin.0, screen_origin.1);
-    gl.uniform_2_f32(locations.size.as_ref(), screen_size.0, screen_size.1);
+    gl.uniform_2_f32(Some(&locations.offset), screen_origin.0, screen_origin.1);
+    gl.uniform_2_f32(Some(&locations.size), screen_size.0, screen_size.1);
     gl.uniform_2_f32(
-        locations.lmap.as_ref(),
+        Some(&locations.lmap),
         entry.lmap_base.0 / scale,
         entry.lmap_base.1 / scale,
     );
     gl.uniform_2_f32(
-        locations.cmap.as_ref(),
+        Some(&locations.cmap),
         entry.cmap_base.0 / scale,
         entry.cmap_base.1 / scale,
     );
-    gl.uniform_1_i32(locations.mode.as_ref(), entry.mode);
-    gl.uniform_1_i32(locations.transfer.as_ref(), entry.transfer);
-    gl.uniform_1_f32(locations.norm.as_ref(), entry.norm);
-    gl.uniform_matrix_3_f32_slice(locations.mat.as_ref(), false, &entry.conversion.matrix);
+    gl.uniform_1_i32(Some(&locations.mode), entry.mode);
+    gl.uniform_1_i32(Some(&locations.transfer), entry.transfer);
+    gl.uniform_1_f32(Some(&locations.norm), entry.norm);
+    gl.uniform_matrix_3_f32_slice(Some(&locations.mat), false, &entry.conversion.matrix);
     gl.uniform_3_f32(
-        locations.off.as_ref(),
+        Some(&locations.off),
         entry.conversion.offset[0],
         entry.conversion.offset[1],
         entry.conversion.offset[2],
@@ -741,7 +758,7 @@ unsafe fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> Entry {
             let depth = yuv.depth.clamp(MIN_PLANE_DEPTH, MAX_PLANE_DEPTH);
             let expect = |plane: &Plane, want_samples: usize, what: &str| {
                 let want_bytes = want_samples * if wide { 2 } else { 1 };
-                assert_eq!(plane_bytes(plane).len(), want_bytes, "{what} plane bytes");
+                assert_eq!(plane.byte_len(), want_bytes, "{what} plane bytes");
             };
             expect(&yuv.luma, luma_w as usize * luma_h as usize, "luma");
             let luma_texture =
@@ -749,9 +766,9 @@ unsafe fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> Entry {
             let (cb_texture, cr_texture) = if yuv.subsampling == Subsampling::Mono {
                 // 1x1 chroma at the neutral code, which the folded
                 // quantization anchor cancels exactly.
-                let neutral = stub_bytes(depth, 1_u32 << (depth - 1));
-                (upload_plane(gl, &neutral, (1, 1), wide, filterable, Mag::Smooth),
-                 upload_plane(gl, &neutral, (1, 1), wide, filterable, Mag::Smooth))
+                let neutral = stub_plane(depth, 1_u32 << (depth - 1));
+                (upload_plane(gl, plane_bytes(&neutral), (1, 1), wide, filterable, Mag::Smooth),
+                 upload_plane(gl, plane_bytes(&neutral), (1, 1), wide, filterable, Mag::Smooth))
             } else {
                 expect(&yuv.cb, chroma_w as usize * chroma_h as usize, "cb");
                 expect(&yuv.cr, chroma_w as usize * chroma_h as usize, "cr");
@@ -760,7 +777,7 @@ unsafe fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> Entry {
             };
             let alpha_texture = yuv.alpha.as_ref().map_or_else(
                 // 1x1 opaque: the max code, which `u_norm` maps to 1.0.
-                || upload_plane(gl, &stub_bytes(depth, (1_u32 << depth) - 1), (1, 1), wide, filterable, Mag::Smooth),
+                || upload_plane(gl, plane_bytes(&stub_plane(depth, (1_u32 << depth) - 1)), (1, 1), wide, filterable, Mag::Smooth),
                 |alpha| {
                     expect(alpha, width as usize * height as usize, "alpha");
                     upload_plane(gl, plane_bytes(alpha), (width, height), wide, filterable, Mag::Smooth)
@@ -799,40 +816,28 @@ fn cmap_base(size: (u32, u32), decoded: &Decoded) -> (f32, f32) {
     };
     let (_, (chroma_w, chroma_h)) = plane_dims(size, subsampling);
     let chroma = view::px_f32((chroma_w, chroma_h));
-    let ratio = chroma_ratio(subsampling);
+    let ratio = subsampling.chroma_ratio();
     (ratio.0 / chroma.0, ratio.1 / chroma.1)
 }
 
-/// Chroma texels per luma texel on each axis.
-fn chroma_ratio(subsampling: Subsampling) -> (f32, f32) {
-    match subsampling {
-        Subsampling::Mono | Subsampling::Yuv444 => (1.0, 1.0),
-        Subsampling::Yuv420 => (0.5, 0.5),
-        Subsampling::Yuv422 => (0.5, 1.0),
-    }
-}
-
-/// One 1x1 stub plane's bytes: the code value `code` at `depth`, in the
-/// plane storage layout `plane_bytes` produces.
-#[expect(
-    clippy::host_endian_bytes,
-    reason = "the stub pairs with plane_bytes' native-endian U16 layout"
-)]
-fn stub_bytes(depth: u8, code: u32) -> Vec<u8> {
+/// One 1x1 stub plane holding `code` at `depth`: mono's neutral chroma,
+/// the opaque alpha's max code. Uploaded through `plane_bytes` like any
+/// real plane, so the storage layout has one home.
+fn stub_plane(depth: u8, code: u32) -> Plane {
     if depth > 8 {
         #[expect(
             clippy::cast_possible_truncation,
             reason = "the depth clamp keeps codes within u16"
         )]
         let wide = code as u16;
-        wide.to_ne_bytes().to_vec()
+        Plane::U16(vec![wide].into_boxed_slice())
     } else {
         #[expect(
             clippy::cast_possible_truncation,
             reason = "an 8-bit depth keeps codes within u8"
         )]
         let byte = code as u8;
-        vec![byte]
+        Plane::U8(vec![byte].into_boxed_slice())
     }
 }
 
@@ -850,13 +855,13 @@ fn entry_cost_bytes(decoded: &Decoded, mips: bool) -> usize {
                 // Mono uploads a 1x1 midpoint texture per chroma channel.
                 Subsampling::Mono => 2 * per_sample,
                 Subsampling::Yuv420 | Subsampling::Yuv422 | Subsampling::Yuv444 => {
-                    plane_bytes(&yuv.cb).len() + plane_bytes(&yuv.cr).len()
+                    yuv.cb.byte_len() + yuv.cr.byte_len()
                 }
             };
-            plane_bytes(&yuv.luma).len()
+            yuv.luma.byte_len()
                 + chroma
                 // A page without alpha uploads a 1x1 opaque stub instead.
-                + yuv.alpha.as_ref().map_or(per_sample, |alpha| plane_bytes(alpha).len())
+                + yuv.alpha.as_ref().map_or(per_sample, Plane::byte_len)
         }
     };
     #[expect(

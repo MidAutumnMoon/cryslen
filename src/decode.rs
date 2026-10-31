@@ -59,15 +59,11 @@ impl Decoded {
     ) -> Result<Self, DecodeError> {
         check_dims(width, height)?;
         let (_, (cw, ch)) = plane_dims((width, height), yuv.subsampling);
-        let samples = |plane: &Plane| match plane {
-            Plane::U8(bytes) => bytes.len(),
-            Plane::U16(bytes) => bytes.len(),
-        };
-        if samples(&yuv.luma) != width as usize * height as usize
-            || yuv.alpha.as_ref().is_some_and(|alpha| samples(alpha) != width as usize * height as usize)
+        if yuv.luma.sample_count() != width as usize * height as usize
+            || yuv.alpha.as_ref().is_some_and(|alpha| alpha.sample_count() != width as usize * height as usize)
             || (yuv.subsampling != Subsampling::Mono
-                && (samples(&yuv.cb) != cw as usize * ch as usize
-                    || samples(&yuv.cr) != cw as usize * ch as usize))
+                && (yuv.cb.sample_count() != cw as usize * ch as usize
+                    || yuv.cr.sample_count() != cw as usize * ch as usize))
         {
             return Err(DecodeError::Corrupt("yuv plane extent"));
         }
@@ -76,19 +72,13 @@ impl Decoded {
 
     /// Approximate resident size, for cache budget accounting.
     pub fn resident_bytes(&self) -> usize {
-        fn plane(plane: &Plane) -> usize {
-            match plane {
-                Plane::U8(bytes) => bytes.len(),
-                Plane::U16(bytes) => bytes.len() * 2,
-            }
-        }
         match &self.pixels {
             Pixels::Rgba8(bytes) => bytes.len(),
             Pixels::Yuv(yuv) => {
-                plane(&yuv.luma)
-                    + plane(&yuv.cb)
-                    + plane(&yuv.cr)
-                    + yuv.alpha.as_ref().map_or(0, plane)
+                yuv.luma.byte_len()
+                    + yuv.cb.byte_len()
+                    + yuv.cr.byte_len()
+                    + yuv.alpha.as_ref().map_or(0, Plane::byte_len)
             }
         }
     }
@@ -181,6 +171,19 @@ pub enum Subsampling {
     Yuv444,
 }
 
+impl Subsampling {
+    /// Chroma texels per luma texel on each axis: the sampling ratio
+    /// behind [`plane_dims`]'s texel counts. Mono carries no chroma, so
+    /// its ratio is identity for the renderer's midpoint stub.
+    pub fn chroma_ratio(self) -> (f32, f32) {
+        match self {
+            Self::Mono | Self::Yuv444 => (1.0, 1.0),
+            Self::Yuv420 => (0.5, 0.5),
+            Self::Yuv422 => (0.5, 1.0),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Matrix {
     Bt601,
@@ -193,6 +196,25 @@ pub enum Matrix {
 pub enum Plane {
     U8(Box<[u8]>),
     U16(Box<[u16]>),
+}
+
+impl Plane {
+    /// Samples the plane holds: one per texel of its plane dims.
+    pub fn sample_count(&self) -> usize {
+        match self {
+            Self::U8(bytes) => bytes.len(),
+            Self::U16(words) => words.len(),
+        }
+    }
+
+    /// Storage bytes the plane holds; [`plane_bytes`] slices exactly
+    /// this many.
+    pub fn byte_len(&self) -> usize {
+        match self {
+            Self::U8(bytes) => bytes.len(),
+            Self::U16(words) => words.len() * 2,
+        }
+    }
 }
 
 /// Plane dims (luma, chroma) for an image size and subsampling. Mono chroma
@@ -492,7 +514,7 @@ mod avif {
     use libavif_sys::AVIF_TRANSFORM_IROT;
     use std::marker::PhantomData;
 
-    use super::{transform_plane, DecodeError, Decoded, DisplayTransform, Format, Matrix, Plane, Subsampling, Transfer, YuvImage};
+    use super::{plane_dims, transform_plane, DecodeError, Decoded, DisplayTransform, Format, Matrix, Plane, Subsampling, Transfer, YuvImage};
 
     /// dav1d parallelism saturates quickly on stills, so the thread count
     /// is capped.
@@ -549,12 +571,9 @@ mod avif {
             return Err(DecodeError::Unsupported("avif: rotated 4:2:2"));
         }
 
-        let (chroma_width, chroma_height) = match subsampling {
-            Subsampling::Mono => (0, 0),
-            Subsampling::Yuv420 => (width.div_ceil(2), height.div_ceil(2)),
-            Subsampling::Yuv422 => (width.div_ceil(2), height),
-            Subsampling::Yuv444 => (width, height),
-        };
+        // Mono skips the chroma copy below, so its 1x1 stub dims from
+        // `plane_dims` are unused.
+        let (_, (chroma_width, chroma_height)) = plane_dims((width, height), subsampling);
         // SAFETY: the guard still owns the frame, so the luma plane is live.
         // `copy_plane` rejects null planes and short strides.
         let luma_plane =
