@@ -63,6 +63,17 @@ impl SpreadView {
 
         view::seating(&self.first, self.second.as_ref(), mode)
     }
+
+    /// Pair the spread's pages with their seat views in reading order:
+    /// `spread.first` (the page read first), then its partner.
+    pub fn reading_order(&self, spread: Spread) -> impl Iterator<Item = (usize, &SeatView)> {
+        [
+            (Some(spread.first), Some(&self.first)),
+            (spread.second, self.second.as_ref()),
+        ]
+        .into_iter()
+        .filter_map(|(page, seat)| page.zip(seat))
+    }
 }
 
 /// Decided pages and the pending trail under one lock. The book owns the

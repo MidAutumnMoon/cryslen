@@ -4,6 +4,7 @@ mod app;
 mod decode;
 mod keys;
 mod render;
+mod screen;
 mod source;
 #[cfg(test)]
 #[expect(

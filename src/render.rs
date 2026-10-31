@@ -163,30 +163,21 @@ struct Locations {
     transfer: <glow::Context as glow::HasContext>::UniformLocation,
 }
 
-/// One cached page's GPU state, freed by budget eviction and on drop. Every
-/// per-draw constant is folded here at upload, so the frame path only
-/// divides by the live zoom scale.
-struct Entry {
-    textures: Textures,
-    /// Screen px -> luma texel, before the zoom-scale divide.
-    lmap_base: (f32, f32),
-    /// Screen px -> chroma texel, subsample-folded, before the divide.
-    cmap_base: (f32, f32),
-    /// Storage samples -> gamma RGB, quantization folded.
-    conversion: Conversion,
-    /// Depth-normalize factor for the alpha sample (1.0 for 8-bit storage).
-    norm: f32,
-    /// `u_mode` value: 0 = RGBA, 1 = YUV.
-    mode: i32,
-    /// `u_transfer` value: 0 = sRGB passthrough, 1 = PQ tone-mapped.
-    transfer: i32,
-    /// Approximate GPU bytes, counted against [`TEXTURE_BUDGET_BYTES`].
-    cost: usize,
-}
-
-enum Textures {
+/// One cached page's GPU state, freed by budget eviction and on drop.
+/// The variant is the pixel layout, so an entry carries exactly the
+/// textures and folded maps its draw path samples — an RGBA entry has
+/// no chroma map or conversion to leave stale. Every per-draw constant
+/// is folded here at upload, so the frame path only divides by the
+/// live zoom scale.
+enum Entry {
     /// Single RGBA texture (alpha in its fourth channel).
-    Rgba(<glow::Context as glow::HasContext>::Texture),
+    Rgba {
+        texture: <glow::Context as glow::HasContext>::Texture,
+        /// Screen px -> texel, before the zoom-scale divide.
+        lmap_base: (f32, f32),
+        transfer: Transfer,
+        cost: usize,
+    },
     /// Luma + Cb + Cr + alpha plane textures. Mono binds 1x1 midpoint
     /// chroma; a page without alpha binds a 1x1 opaque stub.
     Yuv {
@@ -194,7 +185,31 @@ enum Textures {
         cb: <glow::Context as glow::HasContext>::Texture,
         cr: <glow::Context as glow::HasContext>::Texture,
         alpha: <glow::Context as glow::HasContext>::Texture,
+        /// Screen px -> luma texel, before the zoom-scale divide.
+        lmap_base: (f32, f32),
+        /// Screen px -> chroma texel, subsample-folded, before the divide.
+        cmap_base: (f32, f32),
+        /// Storage samples -> gamma RGB, quantization folded.
+        conversion: Conversion,
+        /// Depth-normalize factor for the alpha sample (1.0 for 8-bit
+        /// storage).
+        norm: f32,
+        transfer: Transfer,
+        cost: usize,
     },
+}
+
+impl Entry {
+    /// Approximate GPU bytes, counted against [`TEXTURE_BUDGET_BYTES`].
+    #[expect(
+        clippy::rest_pattern_accessible_field,
+        reason = "both variants carry the budget figure in the same slot, so the others stay unnamed"
+    )]
+    fn cost(&self) -> usize {
+        match self {
+            Self::Rgba { cost, .. } | Self::Yuv { cost, .. } => *cost,
+        }
+    }
 }
 
 /// One page's storage-sample-to-RGB math, folded at upload:
@@ -290,7 +305,7 @@ impl PageTextures {
         for entry in mem::take(&mut self.textures).into_values() {
             // SAFETY: the take empties the map, so this loop holds the
             // only reference to each entry.
-            unsafe { delete_textures(&self.gl, &entry.textures); }
+            unsafe { delete_entry(&self.gl, &entry); }
         }
         self.seats = [None, None];
     }
@@ -306,14 +321,14 @@ impl PageTextures {
     /// Drop cached pages until the map fits [`TEXTURE_BUDGET_BYTES`].
     fn evict_over_budget(&mut self) {
         let victims = eviction_victims(
-            self.textures.iter().map(|(page, entry)| (*page, entry.cost)),
+            self.textures.iter().map(|(page, entry)| (*page, entry.cost())),
             self.seats,
             TEXTURE_BUDGET_BYTES,
         );
         self.textures.retain(|page, entry| {
             if victims.contains(page) {
                 // SAFETY: the entry leaves the map in this same step, so this is its only deletion.
-                unsafe { delete_textures(&self.gl, &entry.textures); }
+                unsafe { delete_entry(&self.gl, entry); }
                 false
             } else {
                 true
@@ -396,7 +411,7 @@ impl Drop for PageTextures {
         for entry in mem::take(&mut self.textures).into_values() {
             // SAFETY: the take empties the map, so this loop holds the
             // only reference to each entry.
-            unsafe { delete_textures(&self.gl, &entry.textures); }
+            unsafe { delete_entry(&self.gl, &entry); }
         }
         // SAFETY: the context outlives this drop. These names are
         // deleted once, here.
@@ -538,13 +553,26 @@ unsafe fn begin_frame(gl: &glow::Context, pipeline: &Pipeline, size: (u32, u32))
     gl.uniform_2_f32(Some(&pipeline.locations.win), win.0, win.1);
 }
 
+/// `u_mode` value of [`Entry::Rgba`]: the fragment shader samples one
+/// RGBA texture.
+const MODE_RGBA: i32 = 0;
+
+/// `u_mode` value of [`Entry::Yuv`]: the fragment shader samples the
+/// plane set.
+const MODE_YUV: i32 = 1;
+
 /// Draw one seat's quad. Every uniform is per-draw constant except the
-/// coordinate maps' zoom-scale divide.
+/// coordinate maps' zoom-scale divide; the unused mode's uniforms are
+/// set to their inert values so no draw reads a stale one.
 ///
 /// # Safety
 ///
 /// The context must be current. `pipeline`'s names and `entry`'s texture
 /// names are live for the duration of the call.
+#[expect(
+    clippy::rest_pattern_accessible_field,
+    reason = "the draw path names the state it samples; the budget figure needs no binding"
+)]
 unsafe fn draw_page(
     gl: &glow::Context,
     pipeline: &Pipeline,
@@ -557,32 +585,58 @@ unsafe fn draw_page(
     gl.use_program(Some(pipeline.program));
     gl.uniform_2_f32(Some(&locations.offset), screen_origin.0, screen_origin.1);
     gl.uniform_2_f32(Some(&locations.size), screen_size.0, screen_size.1);
-    gl.uniform_2_f32(
-        Some(&locations.lmap),
-        entry.lmap_base.0 / scale,
-        entry.lmap_base.1 / scale,
-    );
-    gl.uniform_2_f32(
-        Some(&locations.cmap),
-        entry.cmap_base.0 / scale,
-        entry.cmap_base.1 / scale,
-    );
-    gl.uniform_1_i32(Some(&locations.mode), entry.mode);
-    gl.uniform_1_i32(Some(&locations.transfer), entry.transfer);
-    gl.uniform_1_f32(Some(&locations.norm), entry.norm);
-    gl.uniform_matrix_3_f32_slice(Some(&locations.mat), false, &entry.conversion.matrix);
-    gl.uniform_3_f32(
-        Some(&locations.off),
-        entry.conversion.offset[0],
-        entry.conversion.offset[1],
-        entry.conversion.offset[2],
-    );
     gl.active_texture(glow::TEXTURE0);
-    match &entry.textures {
-        Textures::Rgba(rgba_texture) => {
-            gl.bind_texture(glow::TEXTURE_2D, Some(*rgba_texture));
+    match entry {
+        Entry::Rgba { texture, lmap_base, transfer, .. } => {
+            gl.uniform_1_i32(Some(&locations.mode), MODE_RGBA);
+            gl.uniform_1_i32(Some(&locations.transfer), transfer_id(*transfer));
+            gl.uniform_2_f32(
+                Some(&locations.lmap),
+                lmap_base.0 / scale,
+                lmap_base.1 / scale,
+            );
+            gl.uniform_2_f32(
+                Some(&locations.cmap),
+                lmap_base.0 / scale,
+                lmap_base.1 / scale,
+            );
+            gl.uniform_1_f32(Some(&locations.norm), 1.0);
+            gl.uniform_matrix_3_f32_slice(Some(&locations.mat), false, &IDENTITY3);
+            gl.uniform_3_f32(Some(&locations.off), 0.0, 0.0, 0.0);
+            gl.bind_texture(glow::TEXTURE_2D, Some(*texture));
         }
-        Textures::Yuv { luma, cb, cr, alpha } => {
+        Entry::Yuv {
+            luma,
+            cb,
+            cr,
+            alpha,
+            lmap_base,
+            cmap_base,
+            conversion,
+            norm,
+            transfer,
+            ..
+        } => {
+            gl.uniform_1_i32(Some(&locations.mode), MODE_YUV);
+            gl.uniform_1_i32(Some(&locations.transfer), transfer_id(*transfer));
+            gl.uniform_2_f32(
+                Some(&locations.lmap),
+                lmap_base.0 / scale,
+                lmap_base.1 / scale,
+            );
+            gl.uniform_2_f32(
+                Some(&locations.cmap),
+                cmap_base.0 / scale,
+                cmap_base.1 / scale,
+            );
+            gl.uniform_1_f32(Some(&locations.norm), *norm);
+            gl.uniform_matrix_3_f32_slice(Some(&locations.mat), false, &conversion.matrix);
+            gl.uniform_3_f32(
+                Some(&locations.off),
+                conversion.offset[0],
+                conversion.offset[1],
+                conversion.offset[2],
+            );
             gl.bind_texture(glow::TEXTURE_2D, Some(*luma));
             gl.active_texture(glow::TEXTURE1);
             gl.bind_texture(glow::TEXTURE_2D, Some(*cb));
@@ -611,10 +665,14 @@ unsafe fn delete_pipeline(gl: &glow::Context, pipeline: &Pipeline) {
 /// # Safety
 ///
 /// The context must be current. The names are live and deleted at most once.
-unsafe fn delete_textures(gl: &glow::Context, textures: &Textures) {
-    match textures {
-        Textures::Rgba(rgba_texture) => gl.delete_texture(*rgba_texture),
-        Textures::Yuv { luma, cb, cr, alpha } => {
+#[expect(
+    clippy::rest_pattern_accessible_field,
+    reason = "deletion touches the texture names only, so the folded draw state stays unnamed"
+)]
+unsafe fn delete_entry(gl: &glow::Context, entry: &Entry) {
+    match entry {
+        Entry::Rgba { texture, .. } => gl.delete_texture(*texture),
+        Entry::Yuv { luma, cb, cr, alpha, .. } => {
             gl.delete_texture(*luma);
             gl.delete_texture(*cb);
             gl.delete_texture(*cr);
@@ -743,10 +801,15 @@ unsafe fn upload_plane(
 )]
 unsafe fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> Entry {
     let (width, height) = (decoded.width, decoded.height);
-    let (textures, norm, mips) = match &decoded.pixels {
+    match &decoded.pixels {
         Pixels::Rgba8(rgba_bytes) => {
             assert_eq!(rgba_bytes.len(), width as usize * height as usize * 4, "rgba byte length");
-            (Textures::Rgba(upload_rgba(gl, rgba_bytes, (width, height))), 1.0, true)
+            Entry::Rgba {
+                texture: upload_rgba(gl, rgba_bytes, (width, height)),
+                lmap_base: lmap_base((width, height)),
+                transfer: decoded.transfer,
+                cost: entry_cost_bytes(decoded, true),
+            }
         }
         Pixels::Yuv(yuv) => {
             let ((luma_w, luma_h), (chroma_w, chroma_h)) =
@@ -783,20 +846,19 @@ unsafe fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> Entry {
                     upload_plane(gl, plane_bytes(alpha), (width, height), wide, filterable, Mag::Smooth)
                 },
             );
-            (Textures::Yuv { luma: luma_texture, cb: cb_texture, cr: cr_texture, alpha: alpha_texture },
-             depth_norm(depth, wide),
-             filterable)
+            Entry::Yuv {
+                luma: luma_texture,
+                cb: cb_texture,
+                cr: cr_texture,
+                alpha: alpha_texture,
+                lmap_base: lmap_base((width, height)),
+                cmap_base: cmap_base((width, height), yuv.subsampling),
+                conversion: page_conversion(decoded),
+                norm: depth_norm(depth, wide),
+                transfer: decoded.transfer,
+                cost: entry_cost_bytes(decoded, filterable),
+            }
         }
-    };
-    Entry {
-        textures,
-        lmap_base: lmap_base((width, height)),
-        cmap_base: cmap_base((width, height), decoded),
-        conversion: page_conversion(decoded),
-        norm,
-        mode: mode_id(&decoded.pixels),
-        transfer: transfer_id(decoded.transfer),
-        cost: entry_cost_bytes(decoded, mips),
     }
 }
 
@@ -809,11 +871,7 @@ fn lmap_base(size: (u32, u32)) -> (f32, f32) {
 
 /// The `u_cmap` map before the zoom divide: screen px -> chroma texel at
 /// scale 1, with the subsample ratio folded in.
-fn cmap_base(size: (u32, u32), decoded: &Decoded) -> (f32, f32) {
-    let subsampling = match &decoded.pixels {
-        Pixels::Yuv(yuv) => yuv.subsampling,
-        Pixels::Rgba8(_) => return lmap_base(size),
-    };
+fn cmap_base(size: (u32, u32), subsampling: Subsampling) -> (f32, f32) {
     let (_, (chroma_w, chroma_h)) = plane_dims(size, subsampling);
     let chroma = view::px_f32((chroma_w, chroma_h));
     let ratio = subsampling.chroma_ratio();
@@ -903,15 +961,8 @@ fn eviction_victims(
     victims
 }
 
-/// The `u_mode` value of a page's pixel layout.
-fn mode_id(pixels: &Pixels) -> i32 {
-    match pixels {
-        Pixels::Rgba8(_) => 0,
-        Pixels::Yuv(_) => 1,
-    }
-}
-
-/// The `u_transfer` value of a page's sample encoding.
+/// The `u_transfer` value of a page's sample encoding: 0 = sRGB
+/// passthrough, 1 = PQ tone-mapped.
 fn transfer_id(transfer: Transfer) -> i32 {
     match transfer {
         Transfer::Srgb => 0,
@@ -1253,13 +1304,14 @@ mod tests {
         }
     }
 
-    /// The shader id encodings of pixel layout and transfer.
+    /// The shader id encodings the draw path sends: the two `u_mode`
+    /// values are distinct and match the shader's RGBA/YUV branches,
+    /// and `u_transfer` encodes the transfer.
     #[test]
     fn shader_ids() {
-        let rgba = Decoded::rgba(1, 1, Format::Png, Transfer::Srgb, vec![0; 4].into_boxed_slice())
-            .expect("rgba page");
-        assert_eq!(mode_id(&rgba.pixels), 0);
-        assert_eq!(mode_id(&yuv_page(8, Subsampling::Mono, true, Matrix::Bt601).pixels), 1);
+        assert_ne!(MODE_RGBA, MODE_YUV, "the mode uniform must pick a branch");
+        assert_eq!(MODE_RGBA, 0, "the shader samples RGBA at u_mode 0");
+        assert_eq!(MODE_YUV, 1, "the shader samples the plane set at u_mode 1");
         assert_eq!(transfer_id(Transfer::Srgb), 0);
         assert_eq!(transfer_id(Transfer::Pq), 1);
     }

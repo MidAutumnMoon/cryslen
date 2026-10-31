@@ -5,6 +5,7 @@ use egui::text::LayoutJob;
 use crate::decode::Format;
 use crate::source::PageName;
 use crate::view::{Spread, ViewMode};
+use crate::worker::{SeatView, SpreadView};
 
 /// Everything the status bar shows, built by the app each frame.
 pub struct StatusLine {
@@ -39,6 +40,39 @@ impl Wait {
             Self::Decoding => "decoding…",
         }
     }
+}
+
+/// The status line's view of one spread's snapshot: whether it still
+/// waits, the first failure in reading order, and the first decoded
+/// page's facts.
+pub struct FoldedStatus {
+    pub waiting: bool,
+    pub error: Option<String>,
+    pub page: Option<(usize, Format, (u32, u32))>,
+}
+
+/// Fold the spread's pages into the status line's error and page facts
+/// in reading order.
+pub fn fold_status(spread: Spread, snapshot: &SpreadView) -> FoldedStatus {
+    let mut folded = FoldedStatus {
+        waiting: matches!(snapshot.first, SeatView::Pending)
+            || matches!(snapshot.second.as_ref(), Some(SeatView::Pending)),
+        error: None,
+        page: None,
+    };
+    for (page, view) in snapshot.reading_order(spread) {
+        match view {
+            SeatView::Failed(message) => {
+                folded.error = Some(message.clone());
+                break;
+            }
+            SeatView::Ready(decoded) if folded.page.is_none() => {
+                folded.page = Some((page, decoded.format, (decoded.width, decoded.height)));
+            }
+            SeatView::Ready(_) | SeatView::Pending => {}
+        }
+    }
+    folded
 }
 
 /// The decoded page as the status line sees it.
@@ -161,6 +195,44 @@ fn line(style: &egui::Style, status: &StatusLine) -> LayoutJob {
 #[expect(clippy::expect_used, reason = "a panic in test code is inconsequential")]
 mod tests {
     use super::*;
+    use crate::testkit::ready_seat;
+
+    #[test]
+    fn fold_status_table() {
+        struct Expect {
+            waiting: bool,
+            error: Option<&'static str>,
+            page: Option<(usize, Format, (u32, u32))>,
+        }
+        let pair = Spread { first: 0, second: Some(1) };
+        let spread_view = |first: SeatView, second: Option<SeatView>| SpreadView { first, second };
+        let rows = [
+            (pair, spread_view(ready_seat(2, 2), Some(SeatView::Failed("x".into()))),
+                Expect { waiting: false, error: Some("x"), page: Some((0, Format::Png, (2, 2))) }),
+            (pair, spread_view(SeatView::Pending, Some(ready_seat(2, 2))),
+                Expect { waiting: true, error: None, page: Some((1, Format::Png, (2, 2))) }),
+            (Spread::lone(0), spread_view(ready_seat(2, 2), None),
+                Expect { waiting: false, error: None, page: Some((0, Format::Png, (2, 2))) }),
+            (pair, spread_view(SeatView::Failed("first".into()), Some(SeatView::Failed("second".into()))),
+                Expect { waiting: false, error: Some("first"), page: None }),
+            (pair, spread_view(ready_seat(800, 600), Some(ready_seat(640, 480))),
+                Expect { waiting: false, error: None, page: Some((0, Format::Png, (800, 600))) }),
+            (pair, spread_view(ready_seat(800, 600), Some(SeatView::Failed("second".into()))),
+                Expect { waiting: false, error: Some("second"), page: Some((0, Format::Png, (800, 600))) }),
+            (pair, spread_view(SeatView::Failed("first".into()), Some(ready_seat(640, 480))),
+                Expect { waiting: false, error: Some("first"), page: None }),
+            (pair, spread_view(SeatView::Pending, Some(SeatView::Failed("x".into()))),
+                Expect { waiting: true, error: Some("x"), page: None }),
+            (Spread::lone(0), spread_view(SeatView::Pending, None),
+                Expect { waiting: true, error: None, page: None }),
+        ];
+        for (i, (spread, snapshot, want)) in rows.iter().enumerate() {
+            let folded = fold_status(*spread, snapshot);
+            assert_eq!(folded.waiting, want.waiting, "row {i}: waiting");
+            assert_eq!(folded.error.as_deref(), want.error, "row {i}: error");
+            assert_eq!(folded.page, want.page, "row {i}: page");
+        }
+    }
 
     fn status() -> StatusLine {
         StatusLine {

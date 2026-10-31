@@ -190,10 +190,19 @@ pub struct Placement {
     pub offset: (f32, f32),
 }
 
+impl Default for Placement {
+    /// The 1:1 placement at the origin: what the first fit or a user
+    /// move replaces before anything draws.
+    fn default() -> Self {
+        Self { scale: 1.0, offset: (0.0, 0.0) }
+    }
+}
+
 /// How a spread fits the viewport when the view is not user-placed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum FitMode {
     /// The whole spread inside the viewport.
+    #[default]
     Page,
     /// The spread width fills the viewport.
     Width,
@@ -335,6 +344,89 @@ fn clamp_axis(offset: f32, content: f32, size: f32) -> f32 {
         (size - content) / 2.0
     } else {
         offset.clamp(size - content - EDGE_KEEP_PX, EDGE_KEEP_PX)
+    }
+}
+
+/// The placed view of the current spread: the fit mode, the live
+/// placement, and whether the placement is due for recomputation. A
+/// user zoom or pan pins the placement against refits until a turn
+/// discards the pin; the screen's commit re-arms the fit.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Fit {
+    mode: FitMode,
+    placement: Placement,
+    /// The spread total the placement was computed for.
+    settled: Option<(f32, f32)>,
+    /// A user zoom or pan owns the placement until discarded.
+    user_moved: bool,
+}
+
+impl Fit {
+    /// The live placement of the spread in the viewport.
+    pub fn placement(self) -> Placement {
+        self.placement
+    }
+
+    /// The live zoom, screen px per image px.
+    pub fn scale(self) -> f32 {
+        self.placement.scale
+    }
+
+    /// Fit `total` into `viewport` when due and return the placement. A
+    /// user-placed view keeps its zoom and only clamps its pan into the
+    /// new shape or viewport; otherwise the fit mode places the spread.
+    pub fn resolve(&mut self, total: (f32, f32), viewport: Viewport) -> Placement {
+        if self.settled == Some(total) {
+            return self.placement;
+        }
+        self.placement = if self.user_moved {
+            clamp(self.placement, total, viewport)
+        } else {
+            fit_as(self.mode, total, viewport)
+        };
+        self.settled = Some(total);
+        self.placement
+    }
+
+    /// Zoom by `factor` around `cursor` (viewport px), keeping the spread
+    /// reachable. A user move pins the placement against later refits.
+    pub fn zoom(&mut self, factor: f32, cursor: (f32, f32), total: (f32, f32), viewport: Viewport) {
+        self.placement = clamp(zoom_at(self.placement, cursor, factor), total, viewport);
+        self.user_moved = true;
+    }
+
+    /// Pan by `delta` viewport px, keeping the spread reachable. A user
+    /// move pins the placement against later refits.
+    pub fn pan(&mut self, delta: (f32, f32), total: (f32, f32), viewport: Viewport) {
+        self.placement = clamp(pan(self.placement, delta), total, viewport);
+        self.user_moved = true;
+    }
+
+    /// Select a fit mode and discard the placement memory, so the next
+    /// `resolve` places the spread by it. Re-selecting the live mode
+    /// resets the view.
+    pub fn select(&mut self, mode: FitMode) {
+        self.mode = mode;
+        self.refit();
+    }
+
+    /// A turn or re-pairing mode switch: pre-turn user moves must not
+    /// gate the next commit's fit.
+    pub fn begin_turn(&mut self) {
+        self.user_moved = false;
+    }
+
+    /// The screen committed a new spread: the next `resolve` places it.
+    /// Moves made during the hold carry into it.
+    pub fn commit(&mut self) {
+        self.settled = None;
+    }
+
+    /// Discard the placement memory: the next frame refits, and a user
+    /// placement no longer pins the zoom.
+    pub fn refit(&mut self) {
+        self.settled = None;
+        self.user_moved = false;
     }
 }
 
@@ -649,5 +741,80 @@ mod tests {
         let recentered = clamp(dragged, total, viewport);
         assert!((recentered.offset.0 - fitted.offset.0).abs() < 1e-4);
         assert!((recentered.offset.1 - fitted.offset.1).abs() < 1e-4);
+    }
+
+    /// The fit lifecycle: `resolve` places by the mode when due and
+    /// returns the settled placement otherwise; a user zoom or pan pins
+    /// the placement; a turn discards the pin while the held spread
+    /// stays frozen; a commit re-arms the fit but keeps hold-time moves.
+    #[test]
+    fn fit_lifecycle() {
+        let viewport = full_window((500.0, 500.0));
+        let total = (100.0, 200.0);
+        let mut fit = Fit::default();
+
+        // A fresh fit places the spread by the mode; the settled total
+        // returns the same placement.
+        let fitted = fit_as(FitMode::Page, total, viewport);
+        assert_eq!(fit.resolve(total, viewport), fitted, "a fresh fit places by the mode");
+        assert_eq!(fit.resolve(total, viewport), fitted, "the settled total keeps the placement");
+
+        // A user zoom pins the placement: a later total change clamps
+        // instead of refitting, so the zoom survives.
+        fit.zoom(2.0, (10.0, 10.0), total, viewport);
+        let zoomed = fit.scale();
+        assert!(zoomed > fitted.scale, "the zoom zooms in");
+        fit.resolve((120.0, 200.0), viewport);
+        assert_eq!(fit.scale(), zoomed, "a user zoom survives a later settle");
+
+        // A pan pins the placement the same way and keeps the zoom.
+        let wide = (2000.0, 1000.0);
+        let mut zoomed_view = Fit::default();
+        let wide_fitted = zoomed_view.resolve(wide, viewport);
+        zoomed_view.zoom(4.0, (250.0, 250.0), wide, viewport);
+        let before = zoomed_view.placement();
+        zoomed_view.pan((-100.0, 0.0), wide, viewport);
+        assert_eq!(zoomed_view.scale(), before.scale, "pan keeps the zoom");
+        assert!(
+            zoomed_view.placement().offset.0 < before.offset.0,
+            "pan moves the oversized spread"
+        );
+        assert!(wide_fitted.scale < before.scale, "the zoom zoomed in");
+
+        // select discards the pin: the next resolve places by the mode.
+        let mut select_view = Fit::default();
+        select_view.resolve(total, viewport);
+        select_view.zoom(2.0, (10.0, 10.0), total, viewport);
+        select_view.select(FitMode::Width);
+        assert_eq!(
+            select_view.resolve((120.0, 200.0), viewport),
+            fit_as(FitMode::Width, (120.0, 200.0), viewport),
+            "select refits by the mode"
+        );
+
+        // begin_turn discards pre-turn moves but keeps the held spread's
+        // placement frozen.
+        let mut turn_view = Fit::default();
+        turn_view.resolve(total, viewport);
+        turn_view.zoom(2.0, (0.0, 0.0), total, viewport);
+        let held = turn_view.placement();
+        turn_view.begin_turn();
+        assert_eq!(turn_view.resolve(total, viewport), held, "begin_turn keeps the held frame frozen");
+
+        // commit re-arms the fit and keeps hold-time moves: a zoom made
+        // during the hold carries into the new spread as a clamp.
+        turn_view.zoom(2.0, (0.0, 0.0), total, viewport);
+        let hold_zoom = turn_view.scale();
+        turn_view.commit();
+        turn_view.resolve((200.0, 400.0), viewport);
+        assert_eq!(turn_view.scale(), hold_zoom, "commit keeps hold-time moves");
+
+        // refit discards both the settle and the pin.
+        turn_view.refit();
+        assert_eq!(
+            turn_view.resolve((200.0, 400.0), viewport),
+            fit_as(FitMode::Page, (200.0, 400.0), viewport),
+            "refit discards the pin"
+        );
     }
 }

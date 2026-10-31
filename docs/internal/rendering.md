@@ -126,7 +126,7 @@ the mode re-seat are pure binds. `stage(page, decoded)` uploads without
 binding a seat, moving a decided page's upload off the frame that will
 show it.
 
-The app owns what the screen shows (`shown_seats`, the page and dims
+The screen module owns what the screen shows (the page and dims
 per seat, plus the `shown` spread they belong to) and changes seats
 only through one whole-screen plan per frame.
 

@@ -8,6 +8,7 @@ use std::any::Any;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::error::Error;
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::fs::File;
@@ -166,9 +167,40 @@ impl Source {
         }
     }
 
-    /// The path this source was opened from.
-    pub fn path(&self) -> &Path {
-        &self.path
+    /// The next (`forward`) or previous sibling book of the same kind in
+    /// this book's parent directory, in natural order: archives beside
+    /// archives, directories beside directories. `None` at either end or
+    /// when the parent holds no order to walk.
+    pub fn sibling(&self, forward: bool) -> Option<PathBuf> {
+        let parent = self.path.parent()?;
+        let current = self.path.file_name()?;
+        let archive = is_archive(&self.path);
+        let mut siblings: Vec<(String, PathBuf)> = fs::read_dir(parent)
+            .ok()?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|entry| {
+                if archive {
+                    entry.is_file() && is_archive(entry)
+                } else {
+                    entry.is_dir()
+                }
+            })
+            .filter_map(|entry| {
+                let name = entry.file_name()?.to_string_lossy().into_owned();
+                Some((name, entry))
+            })
+            .collect();
+        siblings.sort_by(|left, right| compare_names(&left.0, &right.0));
+        let position = siblings
+            .iter()
+            .position(|(name, _)| OsStr::new(name.as_str()) == current)?;
+        let next = if forward {
+            position.checked_add(1)?
+        } else {
+            position.checked_sub(1)?
+        };
+        siblings.get(next).map(|(_, sibling)| sibling.clone())
     }
 
     fn open_dir(dir: &Path) -> Result<Self, SourceError> {
@@ -940,5 +972,55 @@ mod tests {
             Source::open(&dir.path().join("plain.txt").join("page.png")),
             Err(SourceError::Io(_))
         ));
+    }
+
+    /// A book's siblings are the same kind in its parent directory, in
+    /// natural order: directories step between directories, archives
+    /// between archives, and the other kind and plain files never
+    /// interleave. The ends of the shelf answer `None`.
+    #[test]
+    fn sibling_books_step_between_their_own_kind() {
+        let parent = TempDir::new("siblings");
+        let volume = |name: &str| {
+            let dir = parent.path().join(name);
+            fs::create_dir_all(&dir).expect("volume dir creates");
+            fs::write(dir.join("p.png"), tiny_png(1, 1, [0, 0, 0, 255]))
+                .expect("volume page writes");
+            dir
+        };
+        // Natural order puts "v1" < "v2" < "v10" by digit value.
+        let first = volume("v1");
+        let middle = volume("v2");
+        let last = volume("v10");
+        fs::write(parent.path().join("notes.txt"), b"not a book").expect("plain file writes");
+
+        let book = Source::open(&middle).expect("volume opens");
+        assert_eq!(book.sibling(true), Some(last), "forward follows natural order");
+        assert_eq!(book.sibling(false), Some(first.clone()), "backward follows natural order");
+        let cover = Source::open(&first).expect("volume opens");
+        assert_eq!(cover.sibling(false), None, "the shelf's start has no earlier book");
+
+        // Archives step between archives only.
+        let shelf = TempDir::new("siblings-archives");
+        let write_cbz = |name: &str| {
+            use zip::write::SimpleFileOptions;
+
+            let path = shelf.path().join(name);
+            let file = File::create(&path).expect("zip creates");
+            let mut zip = zip::ZipWriter::new(file);
+            zip.start_file("p.png", SimpleFileOptions::default())
+                .expect("entry starts");
+            zip.write_all(&tiny_png(1, 1, [0, 0, 0, 255])).expect("entry writes");
+            zip.finish().expect("zip finishes");
+            path
+        };
+        let before = write_cbz("a.cbz");
+        let after = write_cbz("b.cbz");
+        fs::write(shelf.path().join("notes.txt"), b"not a book").expect("plain file writes");
+        let archive = Source::open(&before).expect("zip opens");
+        // The volumes directory is a sibling entry of the other kind and
+        // must not answer.
+        assert_eq!(archive.sibling(true), Some(after), "archives step between archives");
+        assert_eq!(archive.sibling(false), None, "the first archive has no earlier book");
     }
 }
