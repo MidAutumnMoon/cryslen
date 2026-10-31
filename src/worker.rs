@@ -4,19 +4,25 @@
 //! then distance. Nothing is persisted to disk.
 
 use std::cmp::Reverse;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::mem;
-use std::sync::{mpsc, Arc};
-use std::thread::{self, JoinHandle};
+use std::sync::mpsc;
+use std::sync::Arc;
+use std::thread;
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use parking_lot::Mutex;
 
 use crate::decode::Decoded;
-use crate::source::{panic_message, PageRead, Source};
-use crate::view::{Spread, ViewMode};
+use crate::source::panic_message;
+use crate::source::PageRead;
+use crate::source::Source;
+use crate::view::Spread;
+use crate::view::ViewMode;
 
 /// Approximate decoded bytes the book may hold. The wanted spread
 /// stays resident even over this budget.
@@ -283,7 +289,7 @@ impl Worker {
     }
 
     /// Stop the worker without joining it. Quitting must not wait out an
-    /// in-flight decode — a hostile page can hold the thread for seconds —
+    /// in-flight decode (a hostile page can hold the thread for seconds),
     /// and the process exits regardless. The thread owns its state through
     /// `Arc`s, so detachment leaks nothing before exit.
     pub fn detach(&mut self) {
@@ -377,7 +383,8 @@ fn page_failure(page_index: usize, message: impl fmt::Display) -> Decision {
 /// worker thread.
 fn decide_page(source: &Source, page_index: usize) -> Decision {
     use crate::decode;
-    use std::panic::{self, AssertUnwindSafe};
+    use std::panic;
+    use std::panic::AssertUnwindSafe;
 
     let Some(name) = source.name(page_index) else {
         return page_failure(page_index, "no such page");
@@ -403,10 +410,14 @@ fn decide_page(source: &Source, page_index: usize) -> Decision {
 #[expect(clippy::expect_used, clippy::panic, reason = "a panic in test code is inconsequential")]
 mod tests {
     use super::*;
-    use crate::testkit::{eventually, ready_seat, tiny_png, TempDir};
+    use crate::testkit::eventually;
+    use crate::testkit::ready_seat;
+    use crate::testkit::tiny_png;
+    use crate::testkit::TempDir;
 
     use parking_lot::Condvar;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
+    use std::time::Instant;
 
     #[test]
     fn neighbors_are_nearest_first() {

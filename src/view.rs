@@ -84,8 +84,7 @@ pub fn advance(current: usize, forward: bool, mode: ViewMode, len: usize) -> usi
         let next = if forward { current + 1 } else { current + len - 1 };
         return next % len;
     }
-    // The double-mode cycle is the lone cover, then the pairs.
-    let spreads = 1 + (len - 1).div_ceil(2);
+    let spreads = spread_count(len);
     let number = spread_number(current);
     let next = if forward { (number + 1) % spreads } else { (number + spreads - 1) % spreads };
     spread_start(next)
@@ -119,6 +118,13 @@ fn spread_number(page: usize) -> usize {
 /// First page of a double-mode spread number. Pairs start on odd pages.
 fn spread_start(number: usize) -> usize {
     if number > 0 { 2 * number - 1 } else { 0 }
+}
+
+/// How many spreads a book of `len` pages holds: the lone cover, then
+/// the pairs.
+fn spread_count(len: usize) -> usize {
+    let len = len.max(1);
+    1 + (len - 1).div_ceil(2)
 }
 
 /// One of the two seats of an on-screen spread.
@@ -288,12 +294,11 @@ pub fn last_spread(mode: ViewMode, len: usize) -> usize {
     if !mode.pairs() {
         return len - 1;
     }
-    let spreads = 1 + (len - 1).div_ceil(2);
-    spread_start(spreads - 1)
+    spread_start(spread_count(len) - 1)
 }
 
-/// Zoom scale bounds on `scale`, which is screen px per image px. The
-/// bounds apply at zoom time only. `fit` does not clamp.
+/// Zoom scale bounds, in screen px per image px. Applied at zoom time
+/// only; `fit_as` does not clamp.
 const MIN_SCALE: f32 = 0.05;
 const MAX_SCALE: f32 = 40.0;
 
@@ -378,15 +383,16 @@ impl Fit {
         self.placement
     }
 
-    /// Zoom by `factor` around `cursor` (viewport px), keeping the spread
-    /// reachable. A user move pins the placement against later refits.
+    /// Zoom by `factor` around `cursor` (viewport px), clamped so the
+    /// spread stays reachable. A user move pins the placement against
+    /// later refits.
     pub fn zoom(&mut self, factor: f32, cursor: (f32, f32), total: (f32, f32), viewport: Viewport) {
         self.placement = clamp(zoom_at(self.placement, cursor, factor), total, viewport);
         self.user_moved = true;
     }
 
-    /// Pan by `delta` viewport px, keeping the spread reachable. A user
-    /// move pins the placement against later refits.
+    /// Pan by `delta` viewport px, clamped so the spread stays reachable.
+    /// A user move pins the placement against later refits.
     pub fn pan(&mut self, delta: (f32, f32), total: (f32, f32), viewport: Viewport) {
         self.placement = clamp(pan(self.placement, delta), total, viewport);
         self.user_moved = true;

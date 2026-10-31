@@ -108,9 +108,11 @@ trivial:
   significant, so multiply by `65535 / (2^depth - 1)`.
 - Mono pages get a 1×1 midpoint chroma texture (128, or `1 << (depth-1)`
   as LE u16). The matrix cancels it to neutral gray.
-- Chroma is sampled bilinearly at cosited scaled coordinates: exact for
-  444, sub-texel for subsampled. Chroma siting metadata is not applied.
-  The bias is invisible in practice.
+- Chroma is sampled bilinearly at centered (interstitial) positions,
+  the JPEG convention and the AVIF default: exact for 444, sub-texel
+  for subsampled. Chroma siting metadata is not applied, so declared
+  co-sited chroma biases by half a texel. The bias is invisible in
+  practice.
 
 Unit-test the matrix constants against the published coefficient
 tables and that studio-swing black/white map to 0.0/1.0. That catches

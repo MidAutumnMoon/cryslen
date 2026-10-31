@@ -4,8 +4,10 @@ use egui::text::LayoutJob;
 
 use crate::decode::Format;
 use crate::source::PageName;
-use crate::view::{Spread, ViewMode};
-use crate::worker::{SeatView, SpreadView};
+use crate::view::Spread;
+use crate::view::ViewMode;
+use crate::worker::SeatView;
+use crate::worker::SpreadView;
 
 /// Everything the status bar shows, built by the app each frame.
 pub struct StatusLine {

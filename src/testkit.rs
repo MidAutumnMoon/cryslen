@@ -3,10 +3,14 @@
 //! observe another thread.
 
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
-use crate::decode::{Decoded, Format, Transfer};
+use crate::decode::Decoded;
+use crate::decode::Format;
+use crate::decode::Transfer;
 use crate::worker::SeatView;
 
 fn encode(img: &image::DynamicImage, format: image::ImageFormat) -> Vec<u8> {
@@ -71,7 +75,8 @@ pub fn ready_seat(width: u32, height: u32) -> SeatView {
 /// Panics with `what` on timeout.
 pub fn eventually<T>(secs: u64, what: &str, mut probe: impl FnMut() -> Option<T>) -> T {
     use std::thread;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
+    use std::time::Instant;
 
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {

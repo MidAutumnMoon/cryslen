@@ -7,8 +7,13 @@ use std::sync::Arc;
 
 use crate::decode::Decoded;
 use crate::render::PageTextures;
-use crate::view::{self, Seat, Spread, ViewMode};
-use crate::worker::{SeatView, SpreadView, Worker};
+use crate::view;
+use crate::view::Seat;
+use crate::view::Spread;
+use crate::view::ViewMode;
+use crate::worker::SeatView;
+use crate::worker::SpreadView;
+use crate::worker::Worker;
 
 enum SeatStep<'view> {
     Show { page: usize, decoded: &'view Arc<Decoded> },
@@ -23,8 +28,8 @@ struct ScreenPlan<'view> {
     stage: Option<(usize, &'view Arc<Decoded>)>,
 }
 
-fn seat_step(fact: Option<(usize, &SeatView)>, bound: Option<usize>) -> SeatStep<'_> {
-    match fact {
+fn seat_step(seat: Option<(usize, &SeatView)>, bound: Option<usize>) -> SeatStep<'_> {
+    match seat {
         Some((page, SeatView::Ready(decoded))) => SeatStep::Show { page, decoded },
         Some((page, SeatView::Pending)) if bound.is_none_or(|bound_page| bound_page == page) => {
             SeatStep::Hold
@@ -33,10 +38,9 @@ fn seat_step(fact: Option<(usize, &SeatView)>, bound: Option<usize>) -> SeatStep
     }
 }
 
-/// The screen policy: a spread change is held while any wanted seat is
-/// undecided; once all are decided, all seats change in one frame.
-/// Before anything has been shown, ready seats appear as they arrive.
-/// `bound[i]` is the page seat i currently shows.
+/// The screen policy (see the module doc). Before anything has been
+/// shown, ready seats appear as they arrive instead of waiting for the
+/// whole spread. `bound[i]` is the page seat i currently shows.
 fn plan_screen(
     shown: Option<Spread>,
     wanted: Spread,
@@ -47,12 +51,12 @@ fn plan_screen(
     let [wanted_left, wanted_right] = wanted.seats(mode);
     let [view_left, view_right] = seat_views;
     let [bound_left, bound_right] = bound;
-    let seat_facts = [wanted_left.zip(view_left), wanted_right.zip(view_right)];
-    let [fact_left, fact_right] = seat_facts;
+    let seats = [wanted_left.zip(view_left), wanted_right.zip(view_right)];
+    let [seat_left, seat_right] = seats;
     let undecided =
-        seat_facts.into_iter().any(|fact| matches!(fact, Some((_, SeatView::Pending))));
+        seats.into_iter().any(|seat| matches!(seat, Some((_, SeatView::Pending))));
     if undecided && shown.is_some_and(|shown| shown != wanted) {
-        let stage = seat_facts.into_iter().find_map(|fact| match fact {
+        let stage = seats.into_iter().find_map(|seat| match seat {
             Some((page, SeatView::Ready(decoded))) => Some((page, decoded)),
             _ => None,
         });
@@ -63,7 +67,7 @@ fn plan_screen(
             stage,
         };
     }
-    let steps = [seat_step(fact_left, bound_left), seat_step(fact_right, bound_right)];
+    let steps = [seat_step(seat_left, bound_left), seat_step(seat_right, bound_right)];
     #[expect(
         clippy::rest_pattern_accessible_field,
         reason = "the matched fields are unused here, so naming them would trip unneeded_field_pattern"
@@ -104,9 +108,8 @@ struct SeatShow {
     dims: (u32, u32),
 }
 
-/// What the screen shows: the committed spread, the page each seat
-/// holds, and the errors no page owns. The hold and commit policy and
-/// the facts it tracks have one owner here, so they cannot drift apart.
+/// The hold and commit policy and the seat state it tracks have one
+/// owner here, so they cannot drift apart.
 #[derive(Default)]
 #[expect(
     clippy::redundant_pub_crate,
@@ -140,8 +143,8 @@ impl Screen {
         let bound = self.seats.each_ref().map(|seat| seat.map(|show| show.page));
         let plan = plan_screen(self.shown, wanted, mode, snapshot.seats(mode), bound);
         // The frame's binds are one outcome: a refused upload on either
-        // seat must survive the partner's success. A frame that bound
-        // cleanly clears the upload error; a hold frame touches it not.
+        // seat must survive the partner's success, and a frame that
+        // bound cleanly clears the upload error. A hold frame leaves it.
         let mut bind_error = None;
         let mut bound_cleanly = false;
         for ((seat, shown), step) in Seat::ALL
@@ -180,8 +183,7 @@ impl Screen {
     /// Upload the forward spread's decided pages ahead of the turn, so
     /// an ordinary commit is a pure rebind: the multi-megabyte upload
     /// lands on this frame, which redraws anyway, instead of the turn's
-    /// first visible one. Reading runs forward, so only the forward
-    /// spread is staged.
+    /// first visible one.
     pub(crate) fn stage_forward(
         &mut self,
         pages: &mut PageTextures,
@@ -202,16 +204,15 @@ impl Screen {
         }
     }
 
-    /// Upload `page`'s textures without binding a seat, so the turn that
-    /// shows it is a pure rebind. A refusal surfaces in the status line
-    /// and repeats while staging retries each frame.
+    /// Upload `page`'s textures without binding a seat. A refusal
+    /// surfaces in the status line and repeats while staging retries
+    /// each frame.
     fn stage(&mut self, pages: &mut PageTextures, page: usize, decoded: &Arc<Decoded>) {
         if let Err(error) = pages.stage(page, decoded) {
             self.upload_error = Some(error.to_string());
         }
     }
 
-    /// The dims of the pages the seats show, which the layout composes.
     pub(crate) fn seat_dims(&self) -> [Option<(u32, u32)>; 2] {
         self.seats.each_ref().map(|seat| seat.map(|show| show.dims))
     }

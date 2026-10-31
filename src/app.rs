@@ -2,7 +2,8 @@
 
 use std::io;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
 
 use egui_winit::winit;
 use winit::application::ApplicationHandler;
@@ -17,10 +18,14 @@ use winit::window::WindowId;
 
 use crate::keys::Action;
 use crate::render::PageTextures;
-use crate::screen::{self, Screen};
+use crate::screen;
+use crate::screen::Screen;
 use crate::source::Source;
 use crate::view;
-use crate::view::{FitMode, Spread, ViewMode, Viewport};
+use crate::view::FitMode;
+use crate::view::Spread;
+use crate::view::ViewMode;
+use crate::view::Viewport;
 use crate::window::Window;
 use crate::worker::Worker;
 
@@ -30,7 +35,7 @@ pub enum UserEvent {
     Repaint(Duration),
     /// The worker decided `page`. The handler redraws only when the
     /// decision changes the screen or its staged prefetch.
-    PagesUpdated(usize),
+    PageDecided(usize),
 }
 
 /// A failed send means the loop is gone, leaving the event with no consumer.
@@ -42,8 +47,6 @@ pub(crate) fn post(proxy: &EventLoopProxy<UserEvent>, event: UserEvent) {
     let Ok(()) = proxy.send_event(event) else { return; };
 }
 
-/// Spawn the worker serving `spread`; every page it decides posts a
-/// `PagesUpdated` wake.
 fn spawn_worker(
     source: &Arc<Source>,
     spread: Spread,
@@ -51,7 +54,7 @@ fn spawn_worker(
 ) -> io::Result<Worker> {
     let proxy = proxy.clone();
     Worker::spawn(Arc::clone(source), spread, move |page| {
-        post(&proxy, UserEvent::PagesUpdated(page));
+        post(&proxy, UserEvent::PageDecided(page));
     })
 }
 
@@ -152,7 +155,9 @@ impl App {
     fn frame(&mut self) -> eros::Result<()> {
         use crate::decode;
         use crate::ui;
-        use crate::ui::{PageFacts, StatusLine, Wait};
+        use crate::ui::PageFacts;
+        use crate::ui::StatusLine;
+        use crate::ui::Wait;
 
         let spread = self.spread();
         if spread != self.retuned_spread {
@@ -279,12 +284,10 @@ impl App {
         (view::layout(self.screen.seat_dims()).total(), self.last_viewport)
     }
 
-    fn dispatch(&mut self, act: Action, event_loop: &ActiveEventLoop) {
-        match act {
+    fn dispatch(&mut self, action: Action, event_loop: &ActiveEventLoop) {
+        match action {
             Action::Quit => event_loop.exit(),
             Action::Escape => {
-                // Esc steps out of fullscreen first; quitting is the
-                // bare-window case.
                 if self.is_fullscreen() {
                     if let Some(gl) = self.gl.as_ref() {
                         gl.window.winit().set_fullscreen(None);
@@ -321,7 +324,7 @@ impl App {
                 self.request_redraw();
             }
             Action::First | Action::Last => {
-                self.index = if matches!(act, Action::First) {
+                self.index = if matches!(action, Action::First) {
                     view::first_spread()
                 } else {
                     view::last_spread(self.mode, self.source.len())
@@ -329,20 +332,19 @@ impl App {
                 self.after_page_change();
             }
             Action::NextBook | Action::PrevBook => {
-                self.switch_book(matches!(act, Action::NextBook));
+                self.switch_book(matches!(action, Action::NextBook));
             }
             Action::Right | Action::Left | Action::Forward | Action::Back => {
-                let forward = act.is_forward(self.mode);
+                let forward = action.is_forward(self.mode);
                 self.index = view::advance(self.index, forward, self.mode, self.source.len());
                 self.after_page_change();
             }
         }
     }
 
-    /// Open the next (`forward`) or previous sibling book of the same
-    /// kind in this book's parent directory, landing on its cover. A
-    /// failed switch shows the error in the status line and keeps the
-    /// current book.
+    /// Open [`Source::sibling`]'s book and land on its cover. A failed
+    /// switch shows the error in the status line and keeps the current
+    /// book.
     fn switch_book(&mut self, forward: bool) {
         let Some(path) = self.source.sibling(forward) else { return };
         let source = match Source::open(&path) {
@@ -439,7 +441,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
             }
-            UserEvent::PagesUpdated(page) => {
+            UserEvent::PageDecided(page) => {
                 if screen::page_watched(page, self.spread(), self.mode, self.source.len()) {
                     self.request_redraw();
                 }
@@ -464,8 +466,10 @@ impl ApplicationHandler<UserEvent> for App {
         reason = "winit's unhandled WindowEvent variants need no work"
     )]
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
+        use winit::event::ElementState;
         use winit::event::MouseButton;
+        use winit::event::MouseScrollDelta;
+        use winit::event::WindowEvent;
         use winit::keyboard::PhysicalKey;
 
         if matches!(event, WindowEvent::CloseRequested | WindowEvent::Destroyed) {
@@ -502,9 +506,9 @@ impl ApplicationHandler<UserEvent> for App {
                     && !gl.egui.egui_ctx.egui_wants_keyboard_input()
                 {
                     if let PhysicalKey::Code(code) = key.physical_key {
-                        if let Some(act) = Action::from_key(code, self.modifiers) {
-                            if !key.repeat || act.repeats() {
-                                self.dispatch(act, event_loop);
+                        if let Some(action) = Action::from_key(code, self.modifiers) {
+                            if !key.repeat || action.repeats() {
+                                self.dispatch(action, event_loop);
                             }
                         }
                     }

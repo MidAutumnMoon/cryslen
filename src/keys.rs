@@ -1,8 +1,10 @@
 //! The baked-in key map: physical keys to `Action`s.
 
-use crate::view::{FitMode, ViewMode};
+use crate::view::FitMode;
+use crate::view::ViewMode;
 use egui_winit::winit;
-use winit::keyboard::{KeyCode, ModifiersState};
+use winit::keyboard::KeyCode;
+use winit::keyboard::ModifiersState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[expect(
@@ -36,9 +38,10 @@ pub(crate) enum Action {
 }
 
 impl Action {
-    /// Bindings answer only to bare keys. `Shift` makes one deliberate
-    /// exception (Shift+Space pages back); every other modifier combo —
-    /// Ctrl+C, Ctrl+Q, anything the desktop owns — stays with the desktop.
+    /// Bindings answer only to bare keys. `Shift` makes two deliberate
+    /// exceptions (Shift+Space pages back, Shift+B steps to the previous
+    /// book); every other modifier combo (Ctrl+C, Ctrl+Q, anything the
+    /// desktop owns) stays with the desktop.
     #[expect(
         clippy::wildcard_enum_match_arm,
         reason = "winit's unmapped KeyCode variants map to no action"
@@ -198,8 +201,8 @@ mod tests {
             Action::NextBook,
             Action::PrevBook,
         ];
-        for act in one_shot {
-            assert!(!act.repeats(), "{act:?} is one-shot");
+        for action in one_shot {
+            assert!(!action.repeats(), "{action:?} is one-shot");
         }
         let forwards: &[(Action, ViewMode, bool)] = &[
             // Left to right, the rightward arrow advances. The
@@ -219,8 +222,8 @@ mod tests {
             (Action::Forward, ViewMode::Comic, true),
             (Action::Back, ViewMode::Comic, false),
         ];
-        for &(act, mode, want) in forwards {
-            assert_eq!(act.is_forward(mode), want, "{act:?} in {mode:?}");
+        for &(action, mode, want) in forwards {
+            assert_eq!(action.is_forward(mode), want, "{action:?} in {mode:?}");
         }
     }
 }

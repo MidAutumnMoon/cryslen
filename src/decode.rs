@@ -84,8 +84,7 @@ impl Decoded {
     }
 }
 
-/// Pixel count with a hostile-header cap. The cap matches the image crate's
-/// 512 MiB allocation ceiling.
+/// Pixel count with a hostile-header cap.
 fn checked_pixels(width: u32, height: u32, what: &'static str) -> Result<u32, DecodeError> {
     width
         .checked_mul(height)
@@ -97,7 +96,12 @@ fn checked_extent(width: u32, height: u32, bytes_per_pixel: usize) -> Result<usi
     Ok(checked_pixels(width, height, "bad dimensions")? as usize * bytes_per_pixel)
 }
 
-const MAX_PIXELS: u32 = 512 << 18;
+/// The image crate's 512 MiB allocation ceiling, as RGBA pixels.
+#[expect(
+    clippy::integer_division,
+    reason = "the 512 MiB ceiling in 4-byte pixels divides exactly"
+)]
+const MAX_PIXELS: u32 = (512 << 20) / 4;
 
 /// Largest page edge accepted as one GL texture. 0x4000 is the common
 /// desktop limit.
@@ -256,7 +260,6 @@ impl DisplayTransform {
         self == Self::UPRIGHT
     }
 
-    /// Whether applying the transform swaps the plane axes.
     pub fn swaps_dims(self) -> bool {
         self.quarters % 2 == 1
     }
@@ -456,7 +459,7 @@ fn ftyp_brands(bytes: &[u8]) -> Option<&[u8]> {
 }
 
 /// image-crate path: decode with a concrete decoder so EXIF orientation is
-/// readable, then applies it.
+/// readable, then apply it.
 fn decode_image(bytes: &[u8], format: Format) -> Result<Decoded, DecodeError> {
     use std::io::Cursor;
     use image::ImageDecoder as _;
@@ -514,7 +517,17 @@ mod avif {
     use libavif_sys::AVIF_TRANSFORM_IROT;
     use std::marker::PhantomData;
 
-    use super::{plane_dims, transform_plane, DecodeError, Decoded, DisplayTransform, Format, Matrix, Plane, Subsampling, Transfer, YuvImage};
+    use super::plane_dims;
+    use super::transform_plane;
+    use super::DecodeError;
+    use super::Decoded;
+    use super::DisplayTransform;
+    use super::Format;
+    use super::Matrix;
+    use super::Plane;
+    use super::Subsampling;
+    use super::Transfer;
+    use super::YuvImage;
 
     /// dav1d parallelism saturates quickly on stills, so the thread count
     /// is capped.
@@ -785,7 +798,10 @@ mod jxl {
     use jxl::error::Error as JxlError;
     use jxl::error::Result as JxlResult;
 
-    use super::{DecodeError, Decoded, Format, Transfer};
+    use super::DecodeError;
+    use super::Decoded;
+    use super::Format;
+    use super::Transfer;
 
     const MAX_THREADS: usize = 16;
 

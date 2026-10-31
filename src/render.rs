@@ -8,7 +8,7 @@
 //! anyway, so recovery cannot be total. The failure is also rare on
 //! target hardware.
 //!
-//! Chroma is sampled bilinearly at centered (interstitial) positions —
+//! Chroma is sampled bilinearly at centered (interstitial) positions,
 //! the JPEG convention and the AVIF default. avifChromaSamplePosition is
 //! not applied, so declared co-sited chroma biases by half a texel.
 
@@ -17,11 +17,22 @@ use std::collections::HashMap;
 use std::mem;
 use std::sync::Arc;
 
-use egui_glow::glow::{self, HasContext};
+use egui_glow::glow;
+use egui_glow::glow::HasContext;
 
-use crate::decode::{plane_bytes, plane_dims, Decoded, Matrix, Pixels, Plane, Subsampling, Transfer};
+use crate::decode::plane_bytes;
+use crate::decode::plane_dims;
+use crate::decode::Decoded;
+use crate::decode::Matrix;
+use crate::decode::Pixels;
+use crate::decode::Plane;
+use crate::decode::Subsampling;
+use crate::decode::Transfer;
 use crate::view;
-use crate::view::{Placement, Seat, SpreadLayout, Viewport};
+use crate::view::Placement;
+use crate::view::Seat;
+use crate::view::SpreadLayout;
+use crate::view::Viewport;
 
 /// Both dialect variants of one shader source, so the pair cannot drift:
 /// each variant is its version preamble concatenated with the shared body.
@@ -61,8 +72,8 @@ shader_variants!(
 //
 // One shader, both pixel layouts and both transfers: mode and transfer
 // arrive as uniforms, so there are no per-variant programs. Every
-// per-draw constant — the coordinate maps, the depth normalization, the
-// quantization anchors — is folded CPU-side into `u_lmap`/`u_cmap`,
+// per-draw constant (the coordinate maps, the depth normalization, the
+// quantization anchors) is folded CPU-side into `u_lmap`/`u_cmap`,
 // `u_mat`, and `u_off`, leaving the color path one matrix multiply and
 // one subtract per fragment. Output is premultiplied for compositing
 // over the background.
@@ -93,7 +104,7 @@ shader_variants!(
     const float PQ_C2 = 2413.0 / 4096.0 * 32.0;
     const float PQ_C3 = 2392.0 / 4096.0 * 32.0;
     // PQ is absolute: diffuse white (203 nit) maps to display white and
-    // brighter highlights clip — the fixed HDR->SDR compromise.
+    // brighter highlights clip, the fixed HDR->SDR compromise.
     const float PQ_DIFFUSE_WHITE = 203.0;
     const float PQ_PEAK = 10000.0;
     vec3 display(vec3 x) {
@@ -103,6 +114,8 @@ shader_variants!(
         vec3 p = pow(clamp(x, 0.0, 1.0), vec3(1.0 / PQ_M2));
         vec3 lum = PQ_PEAK * pow(max(p - PQ_C1, 0.0) / (PQ_C2 - PQ_C3 * p), vec3(1.0 / PQ_M1));
         vec3 sdr = clamp(lum / PQ_DIFFUSE_WHITE, 0.0, 1.0);
+        // Linear light to the sRGB curve: the 12.92 slope below the
+        // 0.0031308 threshold, else 1.055 * s^(1/2.4) - 0.055.
         return mix(sdr * 12.92, 1.055 * pow(sdr, vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), sdr));
     }
     float bayer4(vec2 frag) {
@@ -142,7 +155,7 @@ pub struct PageTextures {
     pipeline: Pipeline,
     seats: [Option<usize>; 2],
     textures: HashMap<usize, Entry>,
-    max_tex: u32,
+    max_texture_edge: u32,
 }
 
 /// Uniform locations, resolved once at link time so draws never look
@@ -165,7 +178,7 @@ struct Locations {
 
 /// One cached page's GPU state, freed by budget eviction and on drop.
 /// The variant is the pixel layout, so an entry carries exactly the
-/// textures and folded maps its draw path samples — an RGBA entry has
+/// textures and folded maps its draw path samples: an RGBA entry has
 /// no chroma map or conversion to leave stale. Every per-draw constant
 /// is folded here at upload, so the frame path only divides by the
 /// live zoom scale.
@@ -234,21 +247,21 @@ impl PageTextures {
             reason = "the dropped conversion error says only that the value is out of range, which the message states"
         )]
         // SAFETY: MAX_TEXTURE_SIZE is a pure query with no object names.
-        let max_tex = u32::try_from(unsafe { gl.get_parameter_i32(glow::MAX_TEXTURE_SIZE) })
+        let max_texture_edge = u32::try_from(unsafe { gl.get_parameter_i32(glow::MAX_TEXTURE_SIZE) })
             .map_err(|_| eros::error!("GL MAX_TEXTURE_SIZE is not a positive GLint"))?;
         Ok(Self {
             gl,
             pipeline,
             seats: [None, None],
             textures: HashMap::new(),
-            max_tex,
+            max_texture_edge,
         })
     }
 
     /// Record that `seat` draws `page`, uploading its textures only on a
     /// cache miss. A bound page is never evicted, so a held seat keeps
-    /// drawing. An upload the GPU refuses leaves the seat unbound —
-    /// nothing draws — and returns as the page's error; the next bind
+    /// drawing. An upload the GPU refuses leaves the seat unbound
+    /// (nothing draws) and returns as the page's error; the next bind
     /// retries, so the error holds exactly while the page stays wanted.
     pub fn bind(&mut self, seat: Seat, page: usize, decoded: &Decoded) -> eros::Result<()> {
         if *self.seat_slot(seat) == Some(page) {
@@ -276,13 +289,13 @@ impl PageTextures {
             return Ok(());
         }
         let (width, height) = (decoded.width, decoded.height);
-        if width == 0 || height == 0 || width > self.max_tex || height > self.max_tex {
+        if width == 0 || height == 0 || width > self.max_texture_edge || height > self.max_texture_edge {
             return Err(eros::error!(
-                "page {}: {}x{} exceeds this GPU's {} texel texture limit",
+                "page {}: {}x{} exceeds this GPU's {}-texel texture edge limit",
                 page + 1,
                 width,
                 height,
-                self.max_tex
+                self.max_texture_edge
             ));
         }
         // SAFETY: the size check above keeps the page inside this
@@ -726,8 +739,6 @@ unsafe fn new_texture(gl: &glow::Context, filterable: bool, mag: Mag) -> <glow::
     texture
 }
 
-/// Upload `dims` of RGBA8 and generate its mip chain.
-///
 /// # Safety
 ///
 /// The context must be current. `data` holds exactly `dims.0 * dims.1 * 4`
@@ -748,9 +759,6 @@ unsafe fn upload_rgba(
     texture
 }
 
-/// Single-channel plane: R8 for 8-bit, R16 for wider. Mipmaps unless the
-/// format is unfilterable on this context.
-///
 /// # Safety
 ///
 /// The context must be current. `data` holds one sample per texel of
@@ -897,7 +905,7 @@ const TEXTURE_BUDGET_BYTES: usize = 3 * 1024 * 1024 * 1024;
 
 /// Approximate texture bytes one page occupies: plane bytes, plus the mip
 /// chain (`4/3` of the base levels) where mips are generated.
-fn entry_cost_bytes(decoded: &Decoded, mips: bool) -> usize {
+fn entry_cost_bytes(decoded: &Decoded, mipmapped: bool) -> usize {
     let base = match &decoded.pixels {
         Pixels::Rgba8(rgba) => rgba.len(),
         Pixels::Yuv(yuv) => {
@@ -919,7 +927,7 @@ fn entry_cost_bytes(decoded: &Decoded, mips: bool) -> usize {
         clippy::integer_division,
         reason = "the mip chain costs 4/3 of the base levels, rounded down for budgeting"
     )]
-    if mips { base * 4 / 3 } else { base }
+    if mipmapped { base * 4 / 3 } else { base }
 }
 
 /// Pages to drop so the cached costs fit `budget` after a fresh insert.
@@ -985,54 +993,48 @@ const MIN_PLANE_DEPTH: u8 = 1;
 const MAX_PLANE_DEPTH: u8 = 16;
 
 /// The quantization of one page's storage codes at `depth`: the anchor
-/// codes (luma black, chroma neutral) and the excursions from studio swing
-/// to full range. Full range spans 0..2^depth-1 with chroma neutral at
+/// codes (luma black, chroma neutral), the sample-to-RGB scales, and the
+/// storage capacity. Full range spans 0..2^depth-1 with chroma neutral at
 /// half; limited range scales the BT studio swing by 2^(depth-8).
 struct Quantization {
     /// Luma black, in code units.
     luma_black: f32,
-    /// Chroma neutral — 2^(depth-1) under both ranges.
+    /// Chroma neutral, 2^(depth-1) under both ranges.
     chroma_neutral: f32,
-    /// Full-range excursion per luma code.
-    luma_excursion: f32,
-    /// Full-range excursion per chroma code.
-    chroma_excursion: f32,
+    /// Slope from a depth-normalized luma sample to RGB: 1.0 at full
+    /// range, `max_code` / 219·2^(depth-8) at limited range.
+    luma_scale: f32,
+    /// Slope from a depth-normalized chroma sample to RGB: 1.0 at full
+    /// range, `max_code` / 224·2^(depth-8) at limited range.
+    chroma_scale: f32,
     /// Codes the storage can hold: 255 or 65535.
     storage_max: f32,
 }
 
 #[expect(
     clippy::cast_precision_loss,
-    reason = "codes and excursions stay below 65536, exact in f32"
+    reason = "codes and scales stay below 65536, exact in f32"
 )]
 fn quantization(depth: u8, full_range: bool) -> Quantization {
     let max_code = (1_u32 << depth) - 1;
+    let storage_max = if depth > 8 { R16_STORAGE_MAX } else { 255.0 };
     if full_range {
         Quantization {
             luma_black: 0.0,
             chroma_neutral: (1_u32 << (depth - 1)) as f32,
-            luma_excursion: 1.0,
-            chroma_excursion: 1.0,
-            storage_max: depth_norm_storage_max(depth),
+            luma_scale: 1.0,
+            chroma_scale: 1.0,
+            storage_max,
         }
     } else {
         let swing = u32::from(depth.saturating_sub(8));
         Quantization {
             luma_black: (16 << swing) as f32,
             chroma_neutral: (128 << swing) as f32,
-            luma_excursion: max_code as f32 / (219 << swing) as f32,
-            chroma_excursion: max_code as f32 / (224 << swing) as f32,
-            storage_max: depth_norm_storage_max(depth),
+            luma_scale: max_code as f32 / (219 << swing) as f32,
+            chroma_scale: max_code as f32 / (224 << swing) as f32,
+            storage_max,
         }
-    }
-}
-
-/// Largest code the storage layout holds: u8 planes 255, u16 planes 65535.
-fn depth_norm_storage_max(depth: u8) -> f32 {
-    if depth > 8 {
-        R16_STORAGE_MAX
-    } else {
-        255.0
     }
 }
 
@@ -1059,12 +1061,12 @@ fn page_conversion(decoded: &Decoded) -> Conversion {
             } else {
                 [0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0]
             };
-            (base, quantization.luma_excursion, quantization.luma_excursion, quantization.luma_black, quantization.luma_black)
+            (base, quantization.luma_scale, quantization.luma_scale, quantization.luma_black, quantization.luma_black)
         } else {
             (
                 full_range_yuv_matrix(yuv.matrix),
-                quantization.luma_excursion,
-                quantization.chroma_excursion,
+                quantization.luma_scale,
+                quantization.chroma_scale,
                 quantization.luma_black,
                 quantization.chroma_neutral,
             )
@@ -1127,7 +1129,9 @@ const IDENTITY3: [f32; 9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
 #[expect(clippy::expect_used, reason = "a panic in test code is inconsequential")]
 mod tests {
     use super::*;
-    use crate::decode::{Format, Transfer, YuvImage};
+    use crate::decode::Format;
+    use crate::decode::Transfer;
+    use crate::decode::YuvImage;
 
     // The GL draw path itself is out of reach headlessly. These tests pin
     // the CPU-side values it consumes.
@@ -1213,7 +1217,7 @@ mod tests {
     }
 
     /// Studio-swing black and diffuse white land at exactly 0.0 and 1.0 on
-    /// every luma row, at every depth — the depth-scaled anchors hold.
+    /// every luma row, at every depth: the depth-scaled anchors hold.
     #[test]
     fn conversion_anchors_black_and_white_at_every_depth() {
         for depth in [8_u8, 10, 12, 16] {
@@ -1377,7 +1381,7 @@ mod tests {
             },
         )
         .expect("mono page");
-        for (decoded, mips, want) in [
+        for (decoded, mipmapped, want) in [
             (&rgba, true, 64 * 4 / 3),
             // the alpha-less yuv page pays a 1x1 opaque stub
             (&yuv420, true, (16 + 4 + 4 + 1) * 4 / 3),
@@ -1385,7 +1389,7 @@ mod tests {
             // mono: luma + two chroma stubs + the alpha stub, all wide
             (&mono, false, 4 * 2 + 2 * 2 + 2),
         ] {
-            assert_eq!(entry_cost_bytes(decoded, mips), want);
+            assert_eq!(entry_cost_bytes(decoded, mipmapped), want);
         }
     }
 

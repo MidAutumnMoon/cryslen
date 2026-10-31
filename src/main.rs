@@ -18,11 +18,13 @@ mod view;
 mod window;
 mod worker;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use app::{App, UserEvent};
+use app::App;
+use app::UserEvent;
 use source::Source;
 
 use rustfs_mimalloc::MiMalloc;

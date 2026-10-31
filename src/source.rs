@@ -17,7 +17,8 @@ use std::io::BufReader;
 use std::io::Error as IoError;
 use std::io::ErrorKind;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -359,7 +360,7 @@ fn sort_pages(names: &mut [String]) {
 
 /// Natural page order: digit runs compare by numeric value, so padding
 /// width ("010" vs "10") and mixed widths ("9" vs "10") both order by
-/// number; everything else compares byte-wise, keeping case and spaces
+/// number; everything else compares byte-wise, with case and spaces
 /// significant like an archive listing.
 #[expect(
     clippy::redundant_pub_crate,
@@ -514,7 +515,8 @@ fn spawn_sevenzip_fill(
 }
 
 fn settle_pass(fill: &Arc<Mutex<Fill>>, body: impl FnOnce(&Arc<Mutex<Fill>>) -> Result<(), String>) {
-    use std::panic::{self, AssertUnwindSafe};
+    use std::panic;
+    use std::panic::AssertUnwindSafe;
 
     let outcome = panic::catch_unwind(AssertUnwindSafe(|| body(fill)));
     let mut state = fill.lock();
@@ -579,7 +581,9 @@ fn guard_memory(unpacked: u64, available: Option<u64>) -> Result<(), SourceError
 mod tests {
     use super::*;
     use crate::decode;
-    use crate::testkit::{eventually, tiny_png, TempDir};
+    use crate::testkit::eventually;
+    use crate::testkit::tiny_png;
+    use crate::testkit::TempDir;
 
     use std::io::Write as _;
 
