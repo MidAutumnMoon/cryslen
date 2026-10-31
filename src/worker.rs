@@ -238,12 +238,12 @@ pub struct Worker {
 
 impl Worker {
     /// Spawn the worker for `source`, opened on `initial`. `notify`
-    /// fires after every decided page and should send the winit user
-    /// event. The worker itself knows nothing about winit.
+    /// fires with the page index after every decided page and should send
+    /// the winit user event. The worker itself knows nothing about winit.
     pub fn spawn(
         source: Arc<Source>,
         initial: Spread,
-        notify: impl Fn() + Send + Sync + 'static,
+        notify: impl Fn(usize) + Send + Sync + 'static,
     ) -> io::Result<Self> {
         use std::thread::Builder;
 
@@ -269,6 +269,15 @@ impl Worker {
     /// The current view for both seats of `wanted`, read under one lock.
     pub fn snapshot(&self, wanted: &Spread) -> SpreadView {
         self.book.lock().snapshot(wanted)
+    }
+
+    /// Stop the worker without joining it. Quitting must not wait out an
+    /// in-flight decode — a hostile page can hold the thread for seconds —
+    /// and the process exits regardless. The thread owns its state through
+    /// `Arc`s, so detachment leaks nothing before exit.
+    pub fn detach(&mut self) {
+        self.tell(ToWorker::Stop);
+        self.handle = None;
     }
 }
 
@@ -299,7 +308,7 @@ fn run(
     source: &Source,
     rx: &mpsc::Receiver<ToWorker>,
     book: &Mutex<Book>,
-    notify: &dyn Fn(),
+    notify: &dyn Fn(usize),
 ) {
     let page_count = source.len();
     // Retunes accumulate while a page decides; all are replayed, in
@@ -335,7 +344,7 @@ fn run(
             }
         };
         book.lock().store(page_index, seat_view);
-        notify();
+        notify(page_index);
     }
 }
 
@@ -580,7 +589,7 @@ mod tests {
         let updates = Arc::new(Mutex::new(0_usize));
         let counted = Arc::clone(&updates);
         let ok = Spread::lone(1);
-        let worker = Worker::spawn(source, ok, move || {
+        let worker = Worker::spawn(source, ok, move |_| {
             *counted.lock() += 1;
         })
         .expect("worker spawns");
@@ -645,7 +654,7 @@ mod tests {
         let source = Arc::new(Source::open(&zip_path).expect("zip opens"));
         let far = source.len() - 1;
         let worker =
-            Worker::spawn(Arc::clone(&source), Spread::lone(far), || {}).expect("worker spawns");
+            Worker::spawn(Arc::clone(&source), Spread::lone(far), |_| {}).expect("worker spawns");
 
         let settled = |page: usize| {
             eventually(20, "page never settled", || {
@@ -668,7 +677,7 @@ mod tests {
     #[test]
     fn retune_decoding() {
         let (_dir, source) = tiny_source("worker-retune", 50);
-        let worker = Worker::spawn(source, Spread::lone(0), || {}).expect("worker spawns");
+        let worker = Worker::spawn(source, Spread::lone(0), |_| {}).expect("worker spawns");
         // 50 retunes queue faster than pages decode; every page still decodes
         for page in 0..50 {
             worker.retune(Spread::lone(page));
@@ -690,7 +699,7 @@ mod tests {
         let (_dir, source) = tiny_source("worker-bound", 140);
         let gate = Gate::new();
         let parked = gate.clone();
-        let worker = Worker::spawn(source, Spread::lone(0), move || parked.hold())
+        let worker = Worker::spawn(source, Spread::lone(0), move |_| parked.hold())
             .expect("worker spawns");
         wait_ready(&worker, &[0]);
         // All 139 retunes queue while the worker is parked on page 0.
@@ -712,7 +721,7 @@ mod tests {
         let (_dir, source) = tiny_source("worker-prio", 70);
         let gate = Gate::new();
         let parked = gate.clone();
-        let worker = Worker::spawn(source, Spread::lone(0), move || parked.hold())
+        let worker = Worker::spawn(source, Spread::lone(0), move |_| parked.hold())
             .expect("worker spawns");
         wait_ready(&worker, &[0]);
         worker.retune(Spread::lone(60));

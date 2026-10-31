@@ -52,10 +52,14 @@ pub struct PageFacts {
 }
 
 /// Render the status bar into `ui` and return the content rect: what
-/// the chrome has not consumed, the only legal page viewport. egui 0.37
-/// panels show into the `&mut Ui` that `EguiGlow::run` hands over, not
-/// into a context.
-pub fn show(ui: &mut egui::Ui, status: &StatusLine) -> egui::Rect {
+/// the chrome has not consumed, the only legal page viewport. A hidden
+/// bar (`fullscreen`) consumes nothing, so the rect is the whole window.
+/// egui 0.37 panels show into the `&mut Ui` that `EguiGlow::run` hands
+/// over, not into a context.
+pub fn show(ui: &mut egui::Ui, status: &StatusLine, bar: bool) -> egui::Rect {
+    if !bar {
+        return ui.available_rect_before_wrap();
+    }
     egui::Panel::bottom("status").show(ui, |ui| {
         // Sides measures the right end from what it renders, so the
         // facts truncate at the group's true edge. Without
@@ -264,9 +268,9 @@ mod tests {
             )),
             ..Default::default()
         };
-        ctx.run_ui(input(), |ui| { show(ui, status); }).drop_without_applying_deltas();
+        ctx.run_ui(input(), |ui| { show(ui, status, true); }).drop_without_applying_deltas();
         let mut content = egui::Rect::NOTHING;
-        let mut out = ctx.run_ui(input(), |ui| content = show(ui, status));
+        let mut out = ctx.run_ui(input(), |ui| content = show(ui, status, true));
         let shapes = mem::take(&mut out.shapes);
         out.drop_without_applying_deltas();
         let mut items = Vec::new();

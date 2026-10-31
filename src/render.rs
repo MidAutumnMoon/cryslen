@@ -8,9 +8,9 @@
 //! anyway, so recovery cannot be total. The failure is also rare on
 //! target hardware.
 //!
-//! Chroma siting (avifChromaSamplePosition) is not applied. The default
-//! co-sited/midway assumption biases chroma by at most half a texel,
-//! invisible in practice.
+//! Chroma is sampled bilinearly at centered (interstitial) positions —
+//! the JPEG convention and the AVIF default. avifChromaSamplePosition is
+//! not applied, so declared co-sited chroma biases by half a texel.
 
 use std::cmp::Reverse;
 use std::collections::HashMap;
@@ -19,16 +19,29 @@ use std::sync::Arc;
 
 use egui_glow::glow::{self, HasContext};
 
-use crate::decode::{plane_bytes, plane_dims, Decoded, Matrix, Pixels, Plane, Subsampling};
+use crate::decode::{plane_bytes, plane_dims, Decoded, Matrix, Pixels, Plane, Subsampling, Transfer};
 use crate::view;
 use crate::view::{Placement, Seat, SpreadLayout, Viewport};
 
-/// Fixed -1..1 strip. The VS places it at the seat's screen rect from
-/// uniforms, so pan/zoom never touch vertex data. Top-origin math lives in
-/// the VS, because GL clip space is bottom-origin while winit coords are
-/// top-origin.
-const VS_CORE: &str = "
-    #version 330 core
+/// Both dialect variants of one shader source, so the pair cannot drift:
+/// each variant is its version preamble concatenated with the shared body.
+macro_rules! shader_variants {
+    ($core:ident, $es:ident, $core_preamble:literal, $es_preamble:literal, $body:literal) => {
+        const $core: &str = concat!($core_preamble, $body);
+        const $es: &str = concat!($es_preamble, $body);
+    };
+}
+
+// Fixed -1..1 strip. The VS places it at the seat's screen rect from
+// uniforms, so pan/zoom never touch vertex data. Top-origin math lives in
+// the VS, because GL clip space is bottom-origin while winit coords are
+// top-origin.
+shader_variants!(
+    VS_CORE,
+    VS_ES,
+    "#version 330 core\n",
+    "#version 300 es\n",
+    "
     in vec2 pos;
     uniform vec2 u_win;    // window size, px
     uniform vec2 u_offset; // seat rect origin, screen px
@@ -38,130 +51,158 @@ const VS_CORE: &str = "
         vec2 px = u_offset + (pos * 0.5 + 0.5) * u_size;
         v_px = px;
         gl_Position = vec4(px.x / u_win.x * 2.0 - 1.0, 1.0 - px.y / u_win.y * 2.0, 0.0, 1.0);
-    }";
+    }"
+);
 
-/// One shader, both pixel layouts: mode/subsampling/depth/range/matrix arrive
-/// as uniforms, so there are no per-variant programs. Chroma is sampled
-/// bilinearly at cosited scaled coordinates, exact for 444.
-const FS_CORE: &str = "
-    #version 330 core
+// highp is required: mediump may be fp16, where the ulp at 16k image px is
+// 8.0 and wrecks the coordinate math. ES3 mandates highp support. The
+// samplers declare highp too, because ES defaults them to lowp and strict
+// hardware quantizes >8-bit samples to ~8 bits through the return path.
+//
+// One shader, both pixel layouts and both transfers: mode and transfer
+// arrive as uniforms, so there are no per-variant programs. Every
+// per-draw constant — the coordinate maps, the depth normalization, the
+// quantization anchors — is folded CPU-side into `u_lmap`/`u_cmap`,
+// `u_mat`, and `u_off`, leaving the color path one matrix multiply and
+// one subtract per fragment. Output is premultiplied for compositing
+// over the background.
+shader_variants!(
+    FS_CORE,
+    FS_ES,
+    "#version 330 core\n",
+    "#version 300 es\nprecision highp float;\nprecision highp sampler2D;\n",
+    "
     in vec2 v_px;
     out vec4 color;
-    uniform vec2 u_offset;
-    uniform vec2 u_scale;  // screen px per image px
-    uniform vec2 u_img;    // image size, texels
-    uniform vec2 u_csize;  // chroma plane size, texels
-    uniform int u_mode;    // 0 = RGBA, 1 = YUV
-    uniform int u_chroma;  // 0 mono, 1 = 420, 2 = 422, 3 = 444
-    uniform float u_norm;  // depth normalize (1.0 for 8-bit storage)
-    uniform vec3 u_yuv_off;
-    uniform mat3 u_mat;
+    uniform vec2 u_offset;   // page rect origin, screen px
+    uniform vec2 u_lmap;     // screen px -> luma texel: 1 / (scale * image size)
+    uniform vec2 u_cmap;     // screen px -> chroma texel, subsample-aware
+    uniform mat3 u_mat;      // storage samples -> gamma RGB
+    uniform vec3 u_off;      // u_mat times the quantization anchors
+    uniform float u_norm;    // depth normalize of the alpha sample; 1.0 for 8-bit storage
+    uniform int u_mode;      // 0 = RGBA, 1 = YUV
+    uniform int u_transfer;  // 0 = sRGB passthrough, 1 = PQ tone-mapped to SDR
     uniform sampler2D u_tex0; // RGBA or luma
     uniform sampler2D u_tex1; // Cb (1x1 midpoint for mono)
     uniform sampler2D u_tex2; // Cr
+    uniform sampler2D u_tex3; // alpha (1x1 opaque when the page carries none)
+    // ST 2084 constants.
+    const float PQ_M1 = 2610.0 / 16384.0;
+    const float PQ_M2 = 2523.0 / 4096.0 * 128.0;
+    const float PQ_C1 = 3424.0 / 4096.0;
+    const float PQ_C2 = 2413.0 / 4096.0 * 32.0;
+    const float PQ_C3 = 2392.0 / 4096.0 * 32.0;
+    // PQ is absolute: diffuse white (203 nit) maps to display white and
+    // brighter highlights clip — the fixed HDR->SDR compromise.
+    const float PQ_DIFFUSE_WHITE = 203.0;
+    const float PQ_PEAK = 10000.0;
+    vec3 display(vec3 x) {
+        if (u_transfer == 0) {
+            return x;
+        }
+        vec3 p = pow(clamp(x, 0.0, 1.0), vec3(1.0 / PQ_M2));
+        vec3 lum = PQ_PEAK * pow(max(p - PQ_C1, 0.0) / (PQ_C2 - PQ_C3 * p), vec3(1.0 / PQ_M1));
+        vec3 sdr = clamp(lum / PQ_DIFFUSE_WHITE, 0.0, 1.0);
+        return mix(sdr * 12.92, 1.055 * pow(sdr, vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), sdr));
+    }
+    float bayer4(vec2 frag) {
+        float tiles[16] = float[16](
+            0.0, 8.0, 2.0, 10.0,
+            12.0, 4.0, 14.0, 6.0,
+            3.0, 11.0, 1.0, 9.0,
+            15.0, 7.0, 13.0, 5.0
+        );
+        return tiles[int(mod(frag.x, 4.0)) + 4 * int(mod(frag.y, 4.0))] / 16.0;
+    }
     void main() {
-        // Fragment centers interpolate to image texel centers at 1:1 zoom
-        // (ip = k + 0.5), so ip / u_img already addresses texel centers
-        // with no extra half-texel offset.
-        vec2 ip = (v_px - u_offset) / u_scale;
-        if (u_mode == 0) { color = vec4(texture(u_tex0, ip / u_img).rgb, 1.0); return; }
-        float y = texture(u_tex0, ip / u_img).r;
-        vec2 ratio = u_chroma == 1 ? vec2(0.5) : vec2(u_chroma == 2 ? 0.5 : 1.0, 1.0);
-        vec2 cuv = ip * ratio / u_csize;
-        vec3 yuv = vec3(y, texture(u_tex1, cuv).r, texture(u_tex2, cuv).r);
-        color = vec4(u_mat * (yuv * u_norm - u_yuv_off), 1.0);
-    }";
-
-const VS_ES: &str = "
-    #version 300 es
-    in vec2 pos;
-    uniform vec2 u_win;
-    uniform vec2 u_offset;
-    uniform vec2 u_size;
-    out vec2 v_px;
-    void main() {
-        vec2 px = u_offset + (pos * 0.5 + 0.5) * u_size;
-        v_px = px;
-        gl_Position = vec4(px.x / u_win.x * 2.0 - 1.0, 1.0 - px.y / u_win.y * 2.0, 0.0, 1.0);
-    }";
-
-// highp is required: mediump may be fp16, where the ulp at 16k image px is
-// 8.0 and wrecks the coordinate math. ES3 mandates highp support.
-const FS_ES: &str = "
-    #version 300 es
-    precision highp float;
-    in vec2 v_px;
-    out vec4 color;
-    uniform vec2 u_offset;
-    uniform vec2 u_scale;
-    uniform vec2 u_img;
-    uniform vec2 u_csize;
-    uniform int u_mode;
-    uniform int u_chroma;
-    uniform float u_norm;
-    uniform vec3 u_yuv_off;
-    uniform mat3 u_mat;
-    uniform sampler2D u_tex0;
-    uniform sampler2D u_tex1;
-    uniform sampler2D u_tex2;
-    void main() {
-        vec2 ip = (v_px - u_offset) / u_scale;
-        if (u_mode == 0) { color = vec4(texture(u_tex0, ip / u_img).rgb, 1.0); return; }
-        float y = texture(u_tex0, ip / u_img).r;
-        vec2 ratio = u_chroma == 1 ? vec2(0.5) : vec2(u_chroma == 2 ? 0.5 : 1.0, 1.0);
-        vec2 cuv = ip * ratio / u_csize;
-        vec3 yuv = vec3(y, texture(u_tex1, cuv).r, texture(u_tex2, cuv).r);
-        color = vec4(u_mat * (yuv * u_norm - u_yuv_off), 1.0);
-    }";
+        // Fragment centers land on texel centers at 1:1 zoom with
+        // whole-pixel origins (px = k + 0.5), so the linear maps already
+        // address texel centers with no half-texel offset.
+        vec2 rel = v_px - u_offset;
+        // Ordered dither at half an output quantum, applied to the
+        // straight color, hides the deep->8-bit contouring of gradients.
+        float dither = (bayer4(gl_FragCoord.xy) - 0.5) / 255.0;
+        if (u_mode == 0) {
+            vec4 px = texture(u_tex0, rel * u_lmap);
+            color = vec4((display(px.rgb) + dither) * px.a, px.a);
+            return;
+        }
+        vec3 yuv = vec3(texture(u_tex0, rel * u_lmap).r,
+                        texture(u_tex1, rel * u_cmap).r,
+                        texture(u_tex2, rel * u_cmap).r);
+        float a = texture(u_tex3, rel * u_lmap).r * u_norm;
+        color = vec4((display(u_mat * yuv - u_off) + dither) * a, a);
+    }"
+);
 
 /// Page-keyed texture cache plus the spread draw. Each entry is an RGBA
 /// texture or a YUV plane triple.
 pub struct PageTextures {
     gl: Arc<glow::Context>,
-    program: <glow::Context as glow::HasContext>::Program,
-    vao: <glow::Context as glow::HasContext>::VertexArray,
+    pipeline: Pipeline,
     seats: [Option<usize>; 2],
     textures: HashMap<usize, Entry>,
-    vbo: <glow::Context as glow::HasContext>::Buffer,
     max_tex: u32,
 }
 
-/// One cached page's GPU state, freed by budget eviction and on drop.
+/// Uniform locations, resolved once at link time so draws never look
+/// names up by string.
+struct Locations {
+    win: Option<<glow::Context as glow::HasContext>::UniformLocation>,
+    offset: Option<<glow::Context as glow::HasContext>::UniformLocation>,
+    size: Option<<glow::Context as glow::HasContext>::UniformLocation>,
+    lmap: Option<<glow::Context as glow::HasContext>::UniformLocation>,
+    cmap: Option<<glow::Context as glow::HasContext>::UniformLocation>,
+    mat: Option<<glow::Context as glow::HasContext>::UniformLocation>,
+    off: Option<<glow::Context as glow::HasContext>::UniformLocation>,
+    norm: Option<<glow::Context as glow::HasContext>::UniformLocation>,
+    mode: Option<<glow::Context as glow::HasContext>::UniformLocation>,
+    transfer: Option<<glow::Context as glow::HasContext>::UniformLocation>,
+}
+
+/// One cached page's GPU state, freed by budget eviction and on drop. Every
+/// per-draw constant is folded here at upload, so the frame path only
+/// divides by the live zoom scale.
 struct Entry {
     textures: Textures,
-    size: (u32, u32),
-    uniforms: PageUniforms,
-    /// Depth-normalize factor for U16-stored planes (1.0 otherwise).
+    /// Screen px -> luma texel, before the zoom-scale divide.
+    lmap_base: (f32, f32),
+    /// Screen px -> chroma texel, subsample-folded, before the divide.
+    cmap_base: (f32, f32),
+    /// Storage samples -> gamma RGB, quantization folded.
+    conversion: Conversion,
+    /// Depth-normalize factor for the alpha sample (1.0 for 8-bit storage).
     norm: f32,
+    /// `u_mode` value: 0 = RGBA, 1 = YUV.
+    mode: i32,
+    /// `u_transfer` value: 0 = sRGB passthrough, 1 = PQ tone-mapped.
+    transfer: i32,
     /// Approximate GPU bytes, counted against [`TEXTURE_BUDGET_BYTES`].
     cost: usize,
 }
 
 enum Textures {
-    /// Single RGBA texture.
+    /// Single RGBA texture (alpha in its fourth channel).
     Rgba(<glow::Context as glow::HasContext>::Texture),
-    /// Luma + Cb + Cr plane textures. Mono binds 1x1 midpoint chroma.
+    /// Luma + Cb + Cr + alpha plane textures. Mono binds 1x1 midpoint
+    /// chroma; a page without alpha binds a 1x1 opaque stub.
     Yuv {
         luma: <glow::Context as glow::HasContext>::Texture,
         cb: <glow::Context as glow::HasContext>::Texture,
         cr: <glow::Context as glow::HasContext>::Texture,
+        alpha: <glow::Context as glow::HasContext>::Texture,
     },
 }
 
-/// Neutral gray chroma for mono pages in 8-bit storage, 128 of 255.
-/// The wide-plane equivalent is `1 << (depth - 1)`.
-const MONO_CHROMA_MIDPOINT_8: u8 = 128;
-
-const IDENTITY3: [f32; 9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
-
-/// Uniform set describing an RGBA page.
-const RGBA_UNIFORMS: PageUniforms = PageUniforms {
-    mode: Mode::Rgba,
-    subsampling: Subsampling::Yuv444,
-    depth: 8,
-    full_range: true,
-    matrix: Matrix::Identity,
-};
+/// One page's storage-sample-to-RGB math, folded at upload:
+/// `rgb = matrix * samples - offset`, with `samples` in 0..1 storage
+/// units (R16 samplers already divide by 65535).
+#[derive(Debug, Clone, Copy)]
+struct Conversion {
+    /// Column-major 3x3.
+    matrix: [f32; 9],
+    offset: [f32; 3],
+}
 
 impl PageTextures {
     pub fn new(gl: Arc<glow::Context>) -> eros::Result<Self> {
@@ -169,7 +210,7 @@ impl PageTextures {
         // SAFETY: the returned names land in Self, whose Drop deletes
         // them. The error path below leaks them into the process-fatal
         // exit.
-        let (program, vao, vbo) = unsafe { create_pipeline(&gl, vs, fs) }?;
+        let pipeline = unsafe { create_pipeline(&gl, vs, fs) }?;
         #[expect(
             clippy::map_err_ignore,
             reason = "the dropped conversion error says only that the value is out of range, which the message states"
@@ -177,55 +218,72 @@ impl PageTextures {
         // SAFETY: MAX_TEXTURE_SIZE is a pure query with no object names.
         let max_tex = u32::try_from(unsafe { gl.get_parameter_i32(glow::MAX_TEXTURE_SIZE) })
             .map_err(|_| eros::error!("GL MAX_TEXTURE_SIZE is not a positive GLint"))?;
-        Ok(Self { gl, program, vao, seats: [None, None], textures: HashMap::new(), vbo, max_tex })
+        Ok(Self {
+            gl,
+            pipeline,
+            seats: [None, None],
+            textures: HashMap::new(),
+            max_tex,
+        })
     }
 
     /// Record that `seat` draws `page`, uploading its textures only on a
     /// cache miss. A bound page is never evicted, so a held seat keeps
-    /// drawing.
-    pub fn bind(&mut self, seat: Seat, page: usize, decoded: &Decoded) {
+    /// drawing. An upload the GPU refuses surfaces as the page's error.
+    pub fn bind(&mut self, seat: Seat, page: usize, decoded: &Decoded) -> eros::Result<()> {
         if *self.seat_slot(seat) == Some(page) {
-            return;
+            return Ok(());
         }
         *self.seat_slot(seat) = Some(page);
-        self.ensure_cached(page, decoded);
+        self.ensure_cached(page, decoded)
     }
 
     /// Ensure `page`'s textures are cached without binding any seat, so
     /// the frame that later shows the page is a pure rebind.
-    pub fn stage(&mut self, page: usize, decoded: &Decoded) {
-        self.ensure_cached(page, decoded);
+    pub fn stage(&mut self, page: usize, decoded: &Decoded) -> eros::Result<()> {
+        self.ensure_cached(page, decoded)
     }
 
-    /// Upload `page` into the cache on a miss.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the page has a zero dimension or exceeds this context's
-    /// `MAX_TEXTURE_SIZE`. Decode rejects edges over its own cap first,
-    /// so only a GPU advertising a smaller limit can trip the size check.
-    fn ensure_cached(&mut self, page: usize, decoded: &Decoded) {
+    /// Upload `page` into the cache on a miss. A page over this context's
+    /// `MAX_TEXTURE_SIZE` would upload as silently black, so it is refused
+    /// as the page's error instead.
+    fn ensure_cached(&mut self, page: usize, decoded: &Decoded) -> eros::Result<()> {
         if self.textures.contains_key(&page) {
-            return;
+            return Ok(());
         }
         let (width, height) = (decoded.width, decoded.height);
-        // An oversized upload is silently rejected and then samples black.
-        assert!(width > 0 && height > 0, "decoded page has zero dimension");
-        assert!(
-            width <= self.max_tex && height <= self.max_tex,
-            "image {width}x{height} exceeds GL max texture size {} (tiling not implemented)",
-            self.max_tex
-        );
-        // SAFETY: the edge asserts above keep the page inside this
-        // context's texture limit.
+        if width == 0 || height == 0 || width > self.max_tex || height > self.max_tex {
+            return Err(eros::error!(
+                "page {}: {}x{} exceeds this GPU's {} texel texture limit",
+                page + 1,
+                width,
+                height,
+                self.max_tex
+            ));
+        }
+        // SAFETY: the size check above keeps the page inside this
+        // context's texture limit, and `upload_entry` asserts its own
+        // plane byte extents.
         let entry = unsafe { upload_entry(&self.gl, decoded) };
         self.textures.insert(page, entry);
         self.evict_over_budget();
+        Ok(())
     }
 
     /// Stop drawing `seat`. The page's textures stay cached.
     pub fn clear(&mut self, seat: Seat) {
         *self.seat_slot(seat) = None;
+    }
+
+    /// Drop every cached page and unbind both seats. A book switch
+    /// renumbers pages from zero, so nothing of the old book can stay.
+    pub fn clear_all(&mut self) {
+        for entry in mem::take(&mut self.textures).into_values() {
+            // SAFETY: the take empties the map, so this loop holds the
+            // only reference to each entry.
+            unsafe { delete_textures(&self.gl, &entry.textures); }
+        }
+        self.seats = [None, None];
     }
 
     fn seat_slot(&mut self, seat: Seat) -> &mut Option<usize> {
@@ -269,8 +327,8 @@ impl PageTextures {
         if size.0 == 0 || size.1 == 0 {
             return;
         }
-        // SAFETY: program and vao are Self's fields, live until Drop.
-        unsafe { begin_frame(&self.gl, self.program, self.vao, size); }
+        // SAFETY: the pipeline is Self's field, live until Drop.
+        unsafe { begin_frame(&self.gl, &self.pipeline, size); }
         // GL scissor is bottom-origin and the viewport hugs the window's
         // top-left, so only the height converts.
         #[expect(
@@ -306,7 +364,14 @@ impl PageTextures {
             }
             // SAFETY: &self pins the entry, so its texture names outlive the call.
             unsafe {
-                draw_page(&self.gl, self.program, entry, screen_origin, screen_size, placement.scale);
+                draw_page(
+                    &self.gl,
+                    &self.pipeline,
+                    entry,
+                    screen_origin,
+                    screen_size,
+                    placement.scale,
+                );
             }
         }
         // SAFETY: the context is current. This restores unclipped raster
@@ -326,7 +391,7 @@ impl Drop for PageTextures {
         }
         // SAFETY: the context outlives this drop. These names are
         // deleted once, here.
-        unsafe { delete_pipeline(&self.gl, self.program, self.vao, self.vbo); }
+        unsafe { delete_pipeline(&self.gl, &self.pipeline); }
     }
 }
 
@@ -354,22 +419,24 @@ unsafe fn compile_shader(
     Ok(shader)
 }
 
-/// Create the linked program, the vertex buffer, and the VAO wiring.
-/// Both shaders are deleted once the link succeeds. Objects left behind
-/// by a failed step leak into the process-fatal error path (module policy).
+/// The linked program and its fixed companions. The names are owned by
+/// [`PageTextures`] and deleted by its Drop.
+struct Pipeline {
+    program: <glow::Context as HasContext>::Program,
+    locations: Locations,
+    vao: <glow::Context as glow::HasContext>::VertexArray,
+    vbo: <glow::Context as HasContext>::Buffer,
+}
+
+/// Create the linked program with its cached uniform locations, the
+/// vertex buffer, and the VAO wiring. Both shaders are deleted once the
+/// link succeeds. Objects left behind by a failed step leak into the
+/// process-fatal error path (module policy).
 ///
 /// # Safety
 ///
 /// The context must be current. The returned names are live until deleted.
-unsafe fn create_pipeline(
-    gl: &glow::Context,
-    vs: &str,
-    fs: &str,
-) -> eros::Result<(
-    <glow::Context as HasContext>::Program,
-    <glow::Context as HasContext>::VertexArray,
-    <glow::Context as HasContext>::Buffer,
-)> {
+unsafe fn create_pipeline(gl: &glow::Context, vs: &str, fs: &str) -> eros::Result<Pipeline> {
     let program = gl
         .create_program()
         .map_err(|error| eros::error!("GL program object creation failed: {error}"))?;
@@ -412,84 +479,100 @@ unsafe fn create_pipeline(
 
     // Sampler units are fixed. Draw rebinds textures only.
     gl.use_program(Some(program));
-    for (unit, name) in [(0_i32, "u_tex0"), (1, "u_tex1"), (2, "u_tex2")] {
+    for (unit, name) in [(0_i32, "u_tex0"), (1, "u_tex1"), (2, "u_tex2"), (3, "u_tex3")] {
         gl.uniform_1_i32(gl.get_uniform_location(program, name).as_ref(), unit);
     }
+    let location = |name: &str| gl.get_uniform_location(program, name);
+    let locations = Locations {
+        win: location("u_win"),
+        offset: location("u_offset"),
+        size: location("u_size"),
+        lmap: location("u_lmap"),
+        cmap: location("u_cmap"),
+        mat: location("u_mat"),
+        off: location("u_off"),
+        norm: location("u_norm"),
+        mode: location("u_mode"),
+        transfer: location("u_transfer"),
+    };
 
-    Ok((program, vao, vbo))
+    Ok(Pipeline { program, locations, vao, vbo })
 }
 
-/// Set the frame state the page draws depend on. egui's paint leaves BLEND
-/// enabled, and nothing resets the viewport after a resize.
+/// Set the frame state the page draws depend on: the viewport, the
+/// premultiplied compositing pages draw with, and the window-size
+/// uniform. egui's own paint re-sets its blend state afterwards.
 ///
 /// # Safety
 ///
-/// The context must be current. `program` and `vao` are live names.
-unsafe fn begin_frame(
-    gl: &glow::Context,
-    program: <glow::Context as HasContext>::Program,
-    vao: <glow::Context as HasContext>::VertexArray,
-    size: (u32, u32),
-) {
+/// The context must be current. `pipeline`'s names are live.
+unsafe fn begin_frame(gl: &glow::Context, pipeline: &Pipeline, size: (u32, u32)) {
     gl.viewport(0, 0, gl_int(size.0), gl_int(size.1));
-    gl.disable(glow::BLEND);
-    gl.use_program(Some(program));
-    gl.bind_vertex_array(Some(vao));
+    gl.enable(glow::BLEND);
+    gl.blend_func_separate(
+        glow::ONE,
+        glow::ONE_MINUS_SRC_ALPHA,
+        glow::ONE,
+        glow::ONE_MINUS_SRC_ALPHA,
+    );
+    gl.use_program(Some(pipeline.program));
+    gl.bind_vertex_array(Some(pipeline.vao));
     let win = view::px_f32(size);
-    gl.uniform_2_f32(gl.get_uniform_location(program, "u_win").as_ref(), win.0, win.1);
+    gl.uniform_2_f32(pipeline.locations.win.as_ref(), win.0, win.1);
 }
 
-/// Draw one seat's quad.
+/// Draw one seat's quad. Every uniform is per-draw constant except the
+/// coordinate maps' zoom-scale divide.
 ///
 /// # Safety
 ///
-/// The context must be current. `program` and `entry`'s texture names are
-/// live for the duration of the call.
+/// The context must be current. `pipeline`'s names and `entry`'s texture
+/// names are live for the duration of the call.
 unsafe fn draw_page(
     gl: &glow::Context,
-    program: <glow::Context as HasContext>::Program,
+    pipeline: &Pipeline,
     entry: &Entry,
     screen_origin: (f32, f32),
     screen_size: (f32, f32),
     scale: f32,
 ) {
-    let uniform_location = |name: &str| gl.get_uniform_location(program, name);
-    let page_uniforms = entry.uniforms;
-    let (_, (chroma_width, chroma_height)) =
-        plane_dims(entry.size, page_uniforms.subsampling);
-    let (luma_anchor, chroma_anchor) = range_offsets(page_uniforms.full_range);
-    gl.uniform_2_f32(uniform_location("u_offset").as_ref(), screen_origin.0, screen_origin.1);
-    gl.uniform_2_f32(uniform_location("u_size").as_ref(), screen_size.0, screen_size.1);
-    gl.uniform_2_f32(uniform_location("u_scale").as_ref(), scale, scale);
-    let img = view::px_f32(entry.size);
-    gl.uniform_2_f32(uniform_location("u_img").as_ref(), img.0, img.1);
-    let csize = view::px_f32((chroma_width, chroma_height));
-    gl.uniform_2_f32(uniform_location("u_csize").as_ref(), csize.0, csize.1);
-    gl.uniform_1_i32(uniform_location("u_mode").as_ref(), mode_id(page_uniforms.mode));
-    gl.uniform_1_i32(uniform_location("u_chroma").as_ref(), chroma_id(page_uniforms.subsampling));
-    gl.uniform_1_f32(uniform_location("u_norm").as_ref(), entry.norm);
-    gl.uniform_3_f32(
-        uniform_location("u_yuv_off").as_ref(),
-        luma_anchor,
-        chroma_anchor,
-        chroma_anchor,
+    let locations = &pipeline.locations;
+    gl.use_program(Some(pipeline.program));
+    gl.uniform_2_f32(locations.offset.as_ref(), screen_origin.0, screen_origin.1);
+    gl.uniform_2_f32(locations.size.as_ref(), screen_size.0, screen_size.1);
+    gl.uniform_2_f32(
+        locations.lmap.as_ref(),
+        entry.lmap_base.0 / scale,
+        entry.lmap_base.1 / scale,
     );
-    gl.uniform_matrix_3_f32_slice(
-        uniform_location("u_mat").as_ref(),
-        false,
-        &yuv_to_rgb_matrix(page_uniforms.matrix, page_uniforms.full_range),
+    gl.uniform_2_f32(
+        locations.cmap.as_ref(),
+        entry.cmap_base.0 / scale,
+        entry.cmap_base.1 / scale,
+    );
+    gl.uniform_1_i32(locations.mode.as_ref(), entry.mode);
+    gl.uniform_1_i32(locations.transfer.as_ref(), entry.transfer);
+    gl.uniform_1_f32(locations.norm.as_ref(), entry.norm);
+    gl.uniform_matrix_3_f32_slice(locations.mat.as_ref(), false, &entry.conversion.matrix);
+    gl.uniform_3_f32(
+        locations.off.as_ref(),
+        entry.conversion.offset[0],
+        entry.conversion.offset[1],
+        entry.conversion.offset[2],
     );
     gl.active_texture(glow::TEXTURE0);
     match &entry.textures {
         Textures::Rgba(rgba_texture) => {
             gl.bind_texture(glow::TEXTURE_2D, Some(*rgba_texture));
         }
-        Textures::Yuv { luma, cb, cr } => {
+        Textures::Yuv { luma, cb, cr, alpha } => {
             gl.bind_texture(glow::TEXTURE_2D, Some(*luma));
             gl.active_texture(glow::TEXTURE1);
             gl.bind_texture(glow::TEXTURE_2D, Some(*cb));
             gl.active_texture(glow::TEXTURE2);
             gl.bind_texture(glow::TEXTURE_2D, Some(*cr));
+            gl.active_texture(glow::TEXTURE3);
+            gl.bind_texture(glow::TEXTURE_2D, Some(*alpha));
         }
     }
     gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
@@ -500,15 +583,10 @@ unsafe fn draw_page(
 /// # Safety
 ///
 /// The context must be current. Each name is live and deleted at most once.
-unsafe fn delete_pipeline(
-    gl: &glow::Context,
-    program: <glow::Context as HasContext>::Program,
-    vao: <glow::Context as HasContext>::VertexArray,
-    vbo: <glow::Context as HasContext>::Buffer,
-) {
-    gl.delete_program(program);
-    gl.delete_vertex_array(vao);
-    gl.delete_buffer(vbo);
+unsafe fn delete_pipeline(gl: &glow::Context, pipeline: &Pipeline) {
+    gl.delete_program(pipeline.program);
+    gl.delete_vertex_array(pipeline.vao);
+    gl.delete_buffer(pipeline.vbo);
 }
 
 /// Delete an entry's texture objects.
@@ -519,10 +597,11 @@ unsafe fn delete_pipeline(
 unsafe fn delete_textures(gl: &glow::Context, textures: &Textures) {
     match textures {
         Textures::Rgba(rgba_texture) => gl.delete_texture(*rgba_texture),
-        Textures::Yuv { luma, cb, cr } => {
+        Textures::Yuv { luma, cb, cr, alpha } => {
             gl.delete_texture(*luma);
             gl.delete_texture(*cb);
             gl.delete_texture(*cr);
+            gl.delete_texture(*alpha);
         }
     }
 }
@@ -634,7 +713,8 @@ unsafe fn upload_plane(
     texture
 }
 
-/// Upload one page's textures plus the draw state that goes with them.
+/// Upload one page's textures plus the folded draw state that goes with
+/// them.
 ///
 /// # Safety
 ///
@@ -658,6 +738,7 @@ unsafe fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> Entry {
             // GL_R16 is not filterable in GLES. LINEAR makes the texture
             // incomplete (samples black).
             let filterable = !(gl.version().is_embedded && wide);
+            let depth = yuv.depth.clamp(MIN_PLANE_DEPTH, MAX_PLANE_DEPTH);
             let expect = |plane: &Plane, want_samples: usize, what: &str| {
                 let want_bytes = want_samples * if wide { 2 } else { 1 };
                 assert_eq!(plane_bytes(plane).len(), want_bytes, "{what} plane bytes");
@@ -666,39 +747,92 @@ unsafe fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> Entry {
             let luma_texture =
                 upload_plane(gl, plane_bytes(&yuv.luma), (luma_w, luma_h), wide, filterable, Mag::Sharp);
             let (cb_texture, cr_texture) = if yuv.subsampling == Subsampling::Mono {
-                // 1x1 chroma at the range midpoint, which the matrix
-                // cancels to neutral gray. Native byte pairs match
-                // plane_bytes' U16 layout.
-                #[expect(
-                    clippy::host_endian_bytes,
-                    reason = "the midpoint pairs with plane_bytes' native-endian U16 layout"
-                )]
-                let midpoint_bytes: Vec<u8> = if wide {
-                    (1_u32 << (yuv.depth.clamp(MIN_PLANE_DEPTH, MAX_PLANE_DEPTH) - 1))
-                        .to_ne_bytes()
-                        .to_vec()
-                } else {
-                    MONO_CHROMA_MIDPOINT_8.to_ne_bytes().to_vec()
-                };
-                (upload_plane(gl, &midpoint_bytes, (1, 1), wide, filterable, Mag::Smooth),
-                 upload_plane(gl, &midpoint_bytes, (1, 1), wide, filterable, Mag::Smooth))
+                // 1x1 chroma at the neutral code, which the folded
+                // quantization anchor cancels exactly.
+                let neutral = stub_bytes(depth, 1_u32 << (depth - 1));
+                (upload_plane(gl, &neutral, (1, 1), wide, filterable, Mag::Smooth),
+                 upload_plane(gl, &neutral, (1, 1), wide, filterable, Mag::Smooth))
             } else {
                 expect(&yuv.cb, chroma_w as usize * chroma_h as usize, "cb");
                 expect(&yuv.cr, chroma_w as usize * chroma_h as usize, "cr");
                 (upload_plane(gl, plane_bytes(&yuv.cb), (chroma_w, chroma_h), wide, filterable, Mag::Smooth),
                  upload_plane(gl, plane_bytes(&yuv.cr), (chroma_w, chroma_h), wide, filterable, Mag::Smooth))
             };
-            (Textures::Yuv { luma: luma_texture, cb: cb_texture, cr: cr_texture },
-             depth_norm(yuv.depth, wide),
+            let alpha_texture = yuv.alpha.as_ref().map_or_else(
+                // 1x1 opaque: the max code, which `u_norm` maps to 1.0.
+                || upload_plane(gl, &stub_bytes(depth, (1_u32 << depth) - 1), (1, 1), wide, filterable, Mag::Smooth),
+                |alpha| {
+                    expect(alpha, width as usize * height as usize, "alpha");
+                    upload_plane(gl, plane_bytes(alpha), (width, height), wide, filterable, Mag::Smooth)
+                },
+            );
+            (Textures::Yuv { luma: luma_texture, cb: cb_texture, cr: cr_texture, alpha: alpha_texture },
+             depth_norm(depth, wide),
              filterable)
         }
     };
     Entry {
         textures,
-        size: (width, height),
+        lmap_base: lmap_base((width, height)),
+        cmap_base: cmap_base((width, height), decoded),
+        conversion: page_conversion(decoded),
         norm,
-        uniforms: PageUniforms::from(&decoded.pixels),
+        mode: mode_id(&decoded.pixels),
+        transfer: transfer_id(decoded.transfer),
         cost: entry_cost_bytes(decoded, mips),
+    }
+}
+
+/// The `u_lmap` map before the zoom divide: screen px -> luma texel at
+/// scale 1.
+fn lmap_base(size: (u32, u32)) -> (f32, f32) {
+    let img = view::px_f32(size);
+    (1.0 / img.0, 1.0 / img.1)
+}
+
+/// The `u_cmap` map before the zoom divide: screen px -> chroma texel at
+/// scale 1, with the subsample ratio folded in.
+fn cmap_base(size: (u32, u32), decoded: &Decoded) -> (f32, f32) {
+    let subsampling = match &decoded.pixels {
+        Pixels::Yuv(yuv) => yuv.subsampling,
+        Pixels::Rgba8(_) => return lmap_base(size),
+    };
+    let (_, (chroma_w, chroma_h)) = plane_dims(size, subsampling);
+    let chroma = view::px_f32((chroma_w, chroma_h));
+    let ratio = chroma_ratio(subsampling);
+    (ratio.0 / chroma.0, ratio.1 / chroma.1)
+}
+
+/// Chroma texels per luma texel on each axis.
+fn chroma_ratio(subsampling: Subsampling) -> (f32, f32) {
+    match subsampling {
+        Subsampling::Mono | Subsampling::Yuv444 => (1.0, 1.0),
+        Subsampling::Yuv420 => (0.5, 0.5),
+        Subsampling::Yuv422 => (0.5, 1.0),
+    }
+}
+
+/// One 1x1 stub plane's bytes: the code value `code` at `depth`, in the
+/// plane storage layout `plane_bytes` produces.
+#[expect(
+    clippy::host_endian_bytes,
+    reason = "the stub pairs with plane_bytes' native-endian U16 layout"
+)]
+fn stub_bytes(depth: u8, code: u32) -> Vec<u8> {
+    if depth > 8 {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "the depth clamp keeps codes within u16"
+        )]
+        let wide = code as u16;
+        wide.to_ne_bytes().to_vec()
+    } else {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "an 8-bit depth keeps codes within u8"
+        )]
+        let byte = code as u8;
+        vec![byte]
     }
 }
 
@@ -719,7 +853,10 @@ fn entry_cost_bytes(decoded: &Decoded, mips: bool) -> usize {
                     plane_bytes(&yuv.cb).len() + plane_bytes(&yuv.cr).len()
                 }
             };
-            plane_bytes(&yuv.luma).len() + chroma
+            plane_bytes(&yuv.luma).len()
+                + chroma
+                // A page without alpha uploads a 1x1 opaque stub instead.
+                + yuv.alpha.as_ref().map_or(per_sample, |alpha| plane_bytes(alpha).len())
         }
     };
     #[expect(
@@ -761,71 +898,19 @@ fn eviction_victims(
     victims
 }
 
-/// Pixel layout of the cached page: interleaved RGBA or planar YUV.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    Rgba,
-    Yuv,
-}
-
-/// How the shader should read a seat's texture set, derived CPU-side.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct PageUniforms {
-    mode: Mode,
-    subsampling: Subsampling,
-    depth: u8,
-    full_range: bool,
-    matrix: Matrix,
-}
-
-impl From<&Pixels> for PageUniforms {
-    fn from(pixels: &Pixels) -> Self {
-        match pixels {
-            Pixels::Rgba8(_) => RGBA_UNIFORMS,
-            Pixels::Yuv(yuv) => Self {
-                mode: Mode::Yuv,
-                subsampling: yuv.subsampling,
-                depth: yuv.depth,
-                full_range: yuv.full_range,
-                matrix: yuv.matrix,
-            },
-        }
+/// The `u_mode` value of a page's pixel layout.
+fn mode_id(pixels: &Pixels) -> i32 {
+    match pixels {
+        Pixels::Rgba8(_) => 0,
+        Pixels::Yuv(_) => 1,
     }
 }
 
-fn mode_id(mode: Mode) -> i32 {
-    match mode {
-        Mode::Rgba => 0,
-        Mode::Yuv => 1,
-    }
-}
-
-fn chroma_id(subsampling: Subsampling) -> i32 {
-    match subsampling {
-        Subsampling::Mono => 0,
-        Subsampling::Yuv420 => 1,
-        Subsampling::Yuv422 => 2,
-        Subsampling::Yuv444 => 3,
-    }
-}
-
-/// Chroma neutral point of full-range YUV (0.5 in 0..1 storage).
-const FULL_RANGE_CHROMA_NEUTRAL: f32 = 0.5;
-/// Limited-range (BT studio swing) anchors: Y 16..235, C 16..240 of 255.
-const LIMITED_LUMA_BLACK: f32 = 16.0 / 255.0;
-const LIMITED_CHROMA_NEUTRAL: f32 = 128.0 / 255.0;
-/// Limited-range excursion scales: 255/219 for luma, 255/224 for chroma.
-const LIMITED_LUMA_SCALE: f32 = 255.0 / 219.0;
-const LIMITED_CHROMA_SCALE: f32 = 255.0 / 224.0;
-/// Largest value an R16 (u16) texture sampler can return.
-const R16_STORAGE_MAX: f32 = 65535.0;
-
-/// Quantization anchors subtracted in-shader: (luma, chroma).
-fn range_offsets(full_range: bool) -> (f32, f32) {
-    if full_range {
-        (0.0, FULL_RANGE_CHROMA_NEUTRAL)
-    } else {
-        (LIMITED_LUMA_BLACK, LIMITED_CHROMA_NEUTRAL)
+/// The `u_transfer` value of a page's sample encoding.
+fn transfer_id(transfer: Transfer) -> i32 {
+    match transfer {
+        Transfer::Srgb => 0,
+        Transfer::Pq => 1,
     }
 }
 
@@ -843,55 +928,157 @@ fn depth_norm(depth: u8, wide: bool) -> f32 {
     R16_STORAGE_MAX / ((1_u32 << depth.clamp(MIN_PLANE_DEPTH, MAX_PLANE_DEPTH)) - 1) as f32
 }
 
+/// Largest value an R16 (u16) texture sampler can return.
+const R16_STORAGE_MAX: f32 = 65535.0;
+
 /// Plane bit depths the R8/R16 texture paths accept.
 const MIN_PLANE_DEPTH: u8 = 1;
 const MAX_PLANE_DEPTH: u8 = 16;
 
-/// Luma coefficients (KR, KB) of each conversion standard. KG = 1 - KR - KB.
-const BT601_KR_KB: (f32, f32) = (0.299, 0.114);
-const BT709_KR_KB: (f32, f32) = (0.2126, 0.0722);
-const BT2020_KR_KB: (f32, f32) = (0.2627, 0.0593);
+/// The quantization of one page's storage codes at `depth`: the anchor
+/// codes (luma black, chroma neutral) and the excursions from studio swing
+/// to full range. Full range spans 0..2^depth-1 with chroma neutral at
+/// half; limited range scales the BT studio swing by 2^(depth-8).
+struct Quantization {
+    /// Luma black, in code units.
+    luma_black: f32,
+    /// Chroma neutral — 2^(depth-1) under both ranges.
+    chroma_neutral: f32,
+    /// Full-range excursion per luma code.
+    luma_excursion: f32,
+    /// Full-range excursion per chroma code.
+    chroma_excursion: f32,
+    /// Codes the storage can hold: 255 or 65535.
+    storage_max: f32,
+}
 
-/// YUV→RGB conversion for `rgb = M · (yuv * norm - offsets)`, stored
-/// column-major for upload with transpose = false. Derived from the exact
-/// KR/KB of each standard. Limited range folds in the studio-swing scales
-/// ([`LIMITED_LUMA_SCALE`], [`LIMITED_CHROMA_SCALE`]) so the anchors stay
-/// the plain offsets from [`range_offsets`]. `Identity` passes planes
-/// through as RGB.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "codes and excursions stay below 65536, exact in f32"
+)]
+fn quantization(depth: u8, full_range: bool) -> Quantization {
+    let max_code = (1_u32 << depth) - 1;
+    if full_range {
+        Quantization {
+            luma_black: 0.0,
+            chroma_neutral: (1_u32 << (depth - 1)) as f32,
+            luma_excursion: 1.0,
+            chroma_excursion: 1.0,
+            storage_max: depth_norm_storage_max(depth),
+        }
+    } else {
+        let swing = u32::from(depth.saturating_sub(8));
+        Quantization {
+            luma_black: (16 << swing) as f32,
+            chroma_neutral: (128 << swing) as f32,
+            luma_excursion: max_code as f32 / (219 << swing) as f32,
+            chroma_excursion: max_code as f32 / (224 << swing) as f32,
+            storage_max: depth_norm_storage_max(depth),
+        }
+    }
+}
+
+/// Largest code the storage layout holds: u8 planes 255, u16 planes 65535.
+fn depth_norm_storage_max(depth: u8) -> f32 {
+    if depth > 8 {
+        R16_STORAGE_MAX
+    } else {
+        255.0
+    }
+}
+
+/// Fold a page's whole sample-to-RGB math at upload. The stored matrix
+/// maps storage-normalized samples (0..1 as the sampler returns them)
+/// through depth normalization, quantization, and the KR/KB matrix (or
+/// the GBR permutation of an identity page); the stored offset is that
+/// matrix times the anchor codes.
+fn page_conversion(decoded: &Decoded) -> Conversion {
+    let Pixels::Yuv(yuv) = &decoded.pixels else {
+        return Conversion { matrix: IDENTITY3, offset: [0.0; 3] };
+    };
+    let depth = yuv.depth.clamp(MIN_PLANE_DEPTH, MAX_PLANE_DEPTH);
+    let quantization = quantization(depth, yuv.full_range);
+    let norm = depth_norm(depth, depth > 8);
+    let (base, luma_scale, chroma_scale, luma_black, chroma_neutral) =
+        if yuv.matrix == Matrix::Identity {
+            // H.273 identity planes are GBR in the (Y, Cb, Cr) slots,
+            // quantized as luma on all three axes: permute into RGB and
+            // anchor every axis at luma black. Mono identity repeats the
+            // luma plane to RGB.
+            let base = if yuv.subsampling == Subsampling::Mono {
+                [1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+            } else {
+                [0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0]
+            };
+            (base, quantization.luma_excursion, quantization.luma_excursion, quantization.luma_black, quantization.luma_black)
+        } else {
+            (
+                full_range_yuv_matrix(yuv.matrix),
+                quantization.luma_excursion,
+                quantization.chroma_excursion,
+                quantization.luma_black,
+                quantization.chroma_neutral,
+            )
+        };
+    // Scale each column (storage is column-major), then fold the anchored
+    // columns into the offset.
+    let mut matrix = base;
+    for (column, matrix_column) in matrix.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+        let scale = if column == 0 { luma_scale } else { chroma_scale } * norm;
+        for cell in matrix_column {
+            *cell *= scale;
+        }
+    }
+    let anchors = [
+        luma_black / quantization.storage_max,
+        chroma_neutral / quantization.storage_max,
+        chroma_neutral / quantization.storage_max,
+    ];
+    let mut offset = [0.0_f32; 3];
+    for (matrix_column, anchor) in matrix.as_chunks::<3>().0.iter().zip(anchors) {
+        for (&cell, slot) in matrix_column.iter().zip(&mut offset) {
+            *slot = cell.mul_add(anchor, *slot);
+        }
+    }
+    Conversion { matrix, offset }
+}
+
+/// Full-range YUV→RGB from the exact KR/KB of each standard, stored
+/// column-major. KG = 1 - KR - KB. Identity pages never reach here;
+/// `page_conversion` routes them through the GBR permutation.
 #[expect(
     clippy::similar_names,
     reason = "the green coefficients are the Cb and Cr terms of the BT matrix derivation"
 )]
-fn yuv_to_rgb_matrix(matrix: Matrix, full_range: bool) -> [f32; 9] {
+fn full_range_yuv_matrix(matrix: Matrix) -> [f32; 9] {
     let (k_red, k_blue) = match matrix {
         Matrix::Bt601 => BT601_KR_KB,
         Matrix::Bt709 => BT709_KR_KB,
         Matrix::Bt2020 => BT2020_KR_KB,
-        Matrix::Identity => return IDENTITY3,
+        Matrix::Identity => (0.0, 0.0),
     };
     let k_green = 1.0 - k_red - k_blue;
-    let (luma_scale, chroma_scale) =
-        if full_range { (1.0, 1.0) } else { (LIMITED_LUMA_SCALE, LIMITED_CHROMA_SCALE) };
-    let green_from_cb = chroma_scale * 2.0 * k_blue * (1.0 - k_blue) / k_green;
-    let green_from_cr = chroma_scale * 2.0 * k_red * (1.0 - k_red) / k_green;
+    let green_from_cb = 2.0 * k_blue * (1.0 - k_blue) / k_green;
+    let green_from_cr = 2.0 * k_red * (1.0 - k_red) / k_green;
     [
-        luma_scale,
-        luma_scale,
-        luma_scale,
-        0.0,
-        -green_from_cb,
-        chroma_scale * 2.0 * (1.0 - k_blue),
-        chroma_scale * 2.0 * (1.0 - k_red),
-        -green_from_cr,
-        0.0,
+        1.0, 1.0, 1.0, //
+        0.0, -green_from_cb, 2.0 * (1.0 - k_blue), //
+        2.0 * (1.0 - k_red), -green_from_cr, 0.0,
     ]
 }
+
+/// Luma coefficients (KR, KB) of each conversion standard.
+const BT601_KR_KB: (f32, f32) = (0.299, 0.114);
+const BT709_KR_KB: (f32, f32) = (0.2126, 0.0722);
+const BT2020_KR_KB: (f32, f32) = (0.2627, 0.0593);
+
+const IDENTITY3: [f32; 9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
 
 #[cfg(test)]
 #[expect(clippy::expect_used, reason = "a panic in test code is inconsequential")]
 mod tests {
     use super::*;
-    use crate::decode::{Format, YuvImage};
+    use crate::decode::{Format, Transfer, YuvImage};
 
     // The GL draw path itself is out of reach headlessly. These tests pin
     // the CPU-side values it consumes.
@@ -905,56 +1092,194 @@ mod tests {
         matrix[col * 3 + row]
     }
 
-    /// Uniform-value helpers: shader id encodings, range anchors, depth normalization.
-    #[test]
-    fn uniform_values() {
-        // the u_mode and u_chroma uniforms the shaders branch on
-        assert_eq!(mode_id(Mode::Rgba), 0);
-        assert_eq!(mode_id(Mode::Yuv), 1);
-        assert_eq!(chroma_id(Subsampling::Mono), 0);
-        assert_eq!(chroma_id(Subsampling::Yuv420), 1);
-        assert_eq!(chroma_id(Subsampling::Yuv422), 2);
-        assert_eq!(chroma_id(Subsampling::Yuv444), 3);
-        // quantization anchors: (luma, chroma) per range
-        assert_eq!(range_offsets(true), (0.0, FULL_RANGE_CHROMA_NEUTRAL));
-        assert_eq!(range_offsets(false), (LIMITED_LUMA_BLACK, LIMITED_CHROMA_NEUTRAL));
-        // depth normalization: 1.0 for 8-bit storage, the storage-to-depth
-        // ratio for wide planes
-        assert_eq!(depth_norm(8, false), 1.0);
-        assert_eq!(depth_norm(MAX_PLANE_DEPTH, true), 1.0);
-        assert!((depth_norm(10, true) - R16_STORAGE_MAX / 1023.0).abs() < 1e-4);
-        assert!((depth_norm(12, true) - R16_STORAGE_MAX / 4095.0).abs() < 1e-4);
+    /// A zero-filled YUV page of `depth` bits, `subsampling`, range, and
+    /// matrix. U16 storage for depths past 8, matching the decoder's tie.
+    fn yuv_page(
+        depth: u8,
+        subsampling: Subsampling,
+        full_range: bool,
+        matrix: Matrix,
+    ) -> Decoded {
+        let size = (4_u32, 4);
+        let ((luma_w, luma_h), (chroma_w, chroma_h)) = plane_dims(size, subsampling);
+        let plane = |samples: usize| {
+            if depth > 8 {
+                Plane::U16(vec![0_u16; samples].into_boxed_slice())
+            } else {
+                Plane::U8(vec![0_u8; samples].into_boxed_slice())
+            }
+        };
+        let (cb, cr) = if subsampling == Subsampling::Mono {
+            (Plane::U8(Box::new([])), Plane::U8(Box::new([])))
+        } else {
+            (plane(chroma_w as usize * chroma_h as usize), plane(chroma_w as usize * chroma_h as usize))
+        };
+        Decoded::yuv(
+            size.0,
+            size.1,
+            Format::Avif,
+            Transfer::Srgb,
+            YuvImage {
+                depth,
+                subsampling,
+                full_range,
+                matrix,
+                luma: plane(luma_w as usize * luma_h as usize),
+                cb,
+                cr,
+                alpha: None,
+            },
+        )
+        .expect("yuv page")
     }
 
-    /// The limited-range offsets anchor studio-swing black and white at exactly 0.0 and 1.0.
+    /// The folded conversion through one row: `matrix * samples - offset`.
+    fn convert(conversion: &Conversion, samples: [f32; 3]) -> [f32; 3] {
+        let mut out = [0.0_f32; 3];
+        for (row, slot) in out.iter_mut().enumerate() {
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "row and col are 0..3 coordinates into the fixed 3-vectors under test"
+            )]
+            let converted = (0..3)
+                .map(|col| element(&conversion.matrix, row, col) * samples[col])
+                .sum::<f32>()
+                - conversion.offset[row];
+            *slot = converted;
+        }
+        out
+    }
+
+    /// Code values of one depth's quantization (black, white, neutral) in
+    /// code units, and the largest code the storage layout holds.
+    fn quantization_codes(depth: u8, full_range: bool) -> (f32, f32, f32, f32) {
+        let scale = 2.0_f32.powi(i32::from(depth) - 8);
+        let storage_max = 2.0_f32.powi(if depth > 8 { 16 } else { 8 }) - 1.0;
+        let codes = if full_range {
+            (0.0, 2.0_f32.powi(i32::from(depth)) - 1.0, 2.0_f32.powi(i32::from(depth) - 1))
+        } else {
+            (16.0 * scale, 235.0 * scale, 128.0 * scale)
+        };
+        (codes.0, codes.1, codes.2, storage_max)
+    }
+
+    /// Studio-swing black and diffuse white land at exactly 0.0 and 1.0 on
+    /// every luma row, at every depth — the depth-scaled anchors hold.
     #[test]
-    fn limited_range_anchors_hit_black_and_white() {
-        let matrix = yuv_to_rgb_matrix(Matrix::Bt601, false);
-        let (luma_anchor, chroma_anchor) = range_offsets(false);
-        assert_eq!((luma_anchor, chroma_anchor), (LIMITED_LUMA_BLACK, LIMITED_CHROMA_NEUTRAL));
-        let black = LIMITED_LUMA_BLACK;
-        let white = 235.0 / 255.0;
-        for (raw_luma, expected) in [(black, 0.0), (white, 1.0)] {
-            for row in 0..3 {
-                let got = element(&matrix, row, 0) * (raw_luma - luma_anchor);
-                assert!((got - expected).abs() < 1e-4, "row {row}: {got} vs {expected}");
+    fn conversion_anchors_black_and_white_at_every_depth() {
+        for depth in [8_u8, 10, 12, 16] {
+            for full_range in [true, false] {
+                let decoded = yuv_page(depth, Subsampling::Yuv444, full_range, Matrix::Bt601);
+                let conversion = page_conversion(&decoded);
+                let (black, white, neutral, storage_max) = quantization_codes(depth, full_range);
+                for (code, expected) in [(black, 0.0), (white, 1.0)] {
+                    // Chroma at its neutral code contributes nothing.
+                    let rgb = convert(
+                        &conversion,
+                        [code / storage_max, neutral / storage_max, neutral / storage_max],
+                    );
+                    for (row, channel) in rgb.into_iter().enumerate() {
+                        assert!(
+                            (channel - expected).abs() < 1e-4,
+                            "depth {depth} full {full_range} row {row}: {channel} vs {expected}"
+                        );
+                    }
+                }
             }
         }
     }
 
-    /// Entry cost sums the plane bytes and counts the mip chain only where one exists.
+    /// Identity pages: the GBR planes permute into RGB with luma anchors,
+    /// and mono identity repeats luma to all channels.
+    #[test]
+    fn identity_pages_permute_gbr() {
+        let color = page_conversion(&yuv_page(8, Subsampling::Yuv444, true, Matrix::Identity));
+        // Column j is plane j's contribution: Y->G, U->B, V->R.
+        for (col, row) in [(0, 1), (1, 2), (2, 0)] {
+            for probe in 0..3 {
+                let want = f32::from(probe == row);
+                assert!(
+                    (element(&color.matrix, probe, col) - want).abs() < 1e-6,
+                    "col {col} row {probe}"
+                );
+            }
+        }
+        // Full range anchors everything at black zero.
+        assert_eq!(color.offset, [0.0; 3]);
+
+        let mono = page_conversion(&yuv_page(10, Subsampling::Mono, true, Matrix::Identity));
+        for row in 0..3 {
+            assert!((element(&mono.matrix, row, 1)).abs() < 1e-6, "mono chroma col must be inert");
+            assert!((element(&mono.matrix, row, 2)).abs() < 1e-6, "mono chroma col must be inert");
+        }
+        assert_eq!(mono.offset, [0.0; 3]);
+        // The norm-folded luma column still spans the range: white (code
+        // 1023 in u16 storage) reads 1 on every channel.
+        let white = 1023.0 / 65535.0;
+        let rgb = convert(&mono, [white, white, white]);
+        for (row, channel) in rgb.into_iter().enumerate() {
+            assert!((channel - 1.0).abs() < 1e-4, "mono row {row}: {channel}");
+        }
+    }
+
+    /// The mono chroma stub (the neutral code) cancels the folded anchor
+    /// exactly, at every depth and range: a black mono page reads 0 and a
+    /// white one reads 1 with no chroma residue.
+    #[test]
+    fn mono_stub_cancels_exactly() {
+        for depth in [8_u8, 10, 12] {
+            for full_range in [true, false] {
+                let decoded = yuv_page(depth, Subsampling::Mono, full_range, Matrix::Bt601);
+                let conversion = page_conversion(&decoded);
+                let (black, white, neutral, storage_max) = quantization_codes(depth, full_range);
+                for (code, expected) in [(black, 0.0), (white, 1.0)] {
+                    let rgb = convert(
+                        &conversion,
+                        [code / storage_max, neutral / storage_max, neutral / storage_max],
+                    );
+                    for (row, channel) in rgb.into_iter().enumerate() {
+                        assert!(
+                            (channel - expected).abs() < 1e-4,
+                            "depth {depth} full {full_range} row {row}: {channel} vs {expected}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The shader id encodings of pixel layout and transfer.
+    #[test]
+    fn shader_ids() {
+        let rgba = Decoded::rgba(1, 1, Format::Png, Transfer::Srgb, vec![0; 4].into_boxed_slice())
+            .expect("rgba page");
+        assert_eq!(mode_id(&rgba.pixels), 0);
+        assert_eq!(mode_id(&yuv_page(8, Subsampling::Mono, true, Matrix::Bt601).pixels), 1);
+        assert_eq!(transfer_id(Transfer::Srgb), 0);
+        assert_eq!(transfer_id(Transfer::Pq), 1);
+    }
+
+    /// Entry cost sums the plane bytes (alpha included, stub otherwise)
+    /// and counts the mip chain only where one exists.
     #[expect(
         clippy::integer_division,
         reason = "mirrors entry_cost_bytes' truncated mip-chain cost"
     )]
     #[test]
     fn entry_cost_counts_the_mip_chain_where_present() {
-        let rgba =
-            Decoded::rgba(4, 4, Format::Png, vec![0_u8; 64].into_boxed_slice()).expect("rgba page");
+        let rgba = Decoded::rgba(
+            4,
+            4,
+            Format::Png,
+            Transfer::Srgb,
+            vec![0_u8; 64].into_boxed_slice(),
+        )
+        .expect("rgba page");
         let yuv420 = Decoded::yuv(
             4,
             4,
             Format::Avif,
+            Transfer::Srgb,
             YuvImage {
                 depth: 8,
                 subsampling: Subsampling::Yuv420,
@@ -963,14 +1288,33 @@ mod tests {
                 luma: Plane::U8(vec![0_u8; 16].into_boxed_slice()),
                 cb: Plane::U8(vec![0_u8; 4].into_boxed_slice()),
                 cr: Plane::U8(vec![0_u8; 4].into_boxed_slice()),
+                alpha: None,
             },
         )
         .expect("yuv page");
+        let with_alpha = Decoded::yuv(
+            4,
+            4,
+            Format::Avif,
+            Transfer::Pq,
+            YuvImage {
+                depth: 8,
+                subsampling: Subsampling::Yuv420,
+                full_range: true,
+                matrix: Matrix::Bt709,
+                luma: Plane::U8(vec![0_u8; 16].into_boxed_slice()),
+                cb: Plane::U8(vec![0_u8; 4].into_boxed_slice()),
+                cr: Plane::U8(vec![0_u8; 4].into_boxed_slice()),
+                alpha: Some(Plane::U8(vec![0_u8; 16].into_boxed_slice())),
+            },
+        )
+        .expect("yuv page with alpha");
         // Mono planes here are R16, unfilterable under GLES: no mip chain.
         let mono = Decoded::yuv(
             2,
             2,
             Format::Avif,
+            Transfer::Srgb,
             YuvImage {
                 depth: 10,
                 subsampling: Subsampling::Mono,
@@ -979,13 +1323,17 @@ mod tests {
                 luma: Plane::U16(vec![0_u16; 4].into_boxed_slice()),
                 cb: Plane::U8(Box::default()),
                 cr: Plane::U8(Box::default()),
+                alpha: None,
             },
         )
         .expect("mono page");
         for (decoded, mips, want) in [
             (&rgba, true, 64 * 4 / 3),
-            (&yuv420, true, (16 + 4 + 4) * 4 / 3),
-            (&mono, false, 4 * 2 + 2 * 2),
+            // the alpha-less yuv page pays a 1x1 opaque stub
+            (&yuv420, true, (16 + 4 + 4 + 1) * 4 / 3),
+            (&with_alpha, true, (16 + 4 + 4 + 16) * 4 / 3),
+            // mono: luma + two chroma stubs + the alpha stub, all wide
+            (&mono, false, 4 * 2 + 2 * 2 + 2),
         ] {
             assert_eq!(entry_cost_bytes(decoded, mips), want);
         }
@@ -1013,27 +1361,6 @@ mod tests {
                 want,
                 "costs {costs:?} seats {seats:?} budget {budget}"
             );
-        }
-    }
-
-    /// Uniform names one shader source declares, in declaration order.
-    fn uniform_names(shader: &str) -> Vec<&str> {
-        shader
-            .lines()
-            .filter_map(|line| line.trim().strip_prefix("uniform "))
-            .filter_map(|decl| decl.split(';').next())
-            .filter_map(|decl| decl.trim().rsplit(' ').next())
-            .collect()
-    }
-
-    /// Each CORE/ES shader pair declares the same uniforms, in the same order.
-    // The ES shaders never compile on desktop, so a uniform added to only
-    // one variant silently breaks the other platform. Declared-name parity
-    // between each CORE/ES pair catches that here.
-    #[test]
-    fn core_and_es_shaders_declare_the_same_uniforms() {
-        for (core, es) in [(VS_CORE, VS_ES), (FS_CORE, FS_ES)] {
-            assert_eq!(uniform_names(core), uniform_names(es));
         }
     }
 }

@@ -89,9 +89,7 @@ impl Window {
             // Without the transparent hint winit marks the whole surface
             // opaque, so compositors may skip blending and background
             // effects behind it even though the buffer has alpha.
-            .with_transparent(translucent)
-            // Hidden at creation, revealed after the first presented frame.
-            .with_visible(false);
+            .with_transparent(translucent);
 
         let window = glutin_winit::finalize_window(event_loop, attrs, &gl_config)?;
         let raw_window = window.window_handle()?.as_raw();

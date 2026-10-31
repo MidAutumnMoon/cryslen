@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::decode::{Decoded, Format};
+use crate::decode::{Decoded, Format, Transfer};
 use crate::worker::SeatView;
 
 fn encode(img: &image::DynamicImage, format: image::ImageFormat) -> Vec<u8> {
@@ -57,6 +57,7 @@ pub fn ready_seat(width: u32, height: u32) -> SeatView {
             width,
             height,
             Format::Png,
+            Transfer::Srgb,
             vec![0_u8; width as usize * height as usize * 4].into_boxed_slice(),
         )
         .expect("valid rgba page"),

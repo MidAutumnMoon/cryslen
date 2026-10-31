@@ -20,7 +20,18 @@ pub struct Decoded {
     pub width: u32,
     pub height: u32,
     pub pixels: Pixels,
+    /// Sample encoding the renderer must undo before the framebuffer.
+    pub transfer: Transfer,
     pub format: Format,
+}
+
+/// Opto-electronic transfer of decoded samples. SDR pages carry
+/// sRGB-class gamma, which the sRGB framebuffer displays by passthrough;
+/// PQ pages carry absolute-luminance HDR, tone-mapped to SDR in the shader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transfer {
+    Srgb,
+    Pq,
 }
 
 impl Decoded {
@@ -28,6 +39,7 @@ impl Decoded {
         width: u32,
         height: u32,
         format: Format,
+        transfer: Transfer,
         bytes: Box<[u8]>,
     ) -> Result<Self, DecodeError> {
         check_dims(width, height)?;
@@ -35,13 +47,14 @@ impl Decoded {
         if bytes.len() != want {
             return Err(DecodeError::Corrupt("rgba extent"));
         }
-        Ok(Self { width, height, pixels: Pixels::Rgba8(bytes), format })
+        Ok(Self { width, height, pixels: Pixels::Rgba8(bytes), transfer, format })
     }
 
     pub(crate) fn yuv(
         width: u32,
         height: u32,
         format: Format,
+        transfer: Transfer,
         yuv: YuvImage,
     ) -> Result<Self, DecodeError> {
         check_dims(width, height)?;
@@ -51,13 +64,14 @@ impl Decoded {
             Plane::U16(bytes) => bytes.len(),
         };
         if samples(&yuv.luma) != width as usize * height as usize
+            || yuv.alpha.as_ref().is_some_and(|alpha| samples(alpha) != width as usize * height as usize)
             || (yuv.subsampling != Subsampling::Mono
                 && (samples(&yuv.cb) != cw as usize * ch as usize
                     || samples(&yuv.cr) != cw as usize * ch as usize))
         {
             return Err(DecodeError::Corrupt("yuv plane extent"));
         }
-        Ok(Self { width, height, pixels: Pixels::Yuv(yuv), format })
+        Ok(Self { width, height, pixels: Pixels::Yuv(yuv), transfer, format })
     }
 
     /// Approximate resident size, for cache budget accounting.
@@ -70,7 +84,12 @@ impl Decoded {
         }
         match &self.pixels {
             Pixels::Rgba8(bytes) => bytes.len(),
-            Pixels::Yuv(yuv) => plane(&yuv.luma) + plane(&yuv.cb) + plane(&yuv.cr),
+            Pixels::Yuv(yuv) => {
+                plane(&yuv.luma)
+                    + plane(&yuv.cb)
+                    + plane(&yuv.cr)
+                    + yuv.alpha.as_ref().map_or(0, plane)
+            }
         }
     }
 }
@@ -139,7 +158,8 @@ impl Format {
 /// 8-bit planes are one byte per sample. Deeper planes are `u16` samples
 /// with `depth` significant bits. Dimensions ride on [`Decoded`]. Plane
 /// sizes follow [`plane_dims`]. Mono carries luma only, so its chroma
-/// planes stay empty.
+/// planes stay empty. Alpha, when the file carries one, is a luma-sized
+/// full-range plane.
 #[derive(Clone)]
 pub struct YuvImage {
     pub depth: u8,
@@ -150,6 +170,7 @@ pub struct YuvImage {
     pub luma: Plane,
     pub cb: Plane,
     pub cr: Plane,
+    pub alpha: Option<Plane>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,6 +213,100 @@ pub fn plane_bytes(plane: &Plane) -> &[u8] {
         Plane::U8(bytes) => bytes,
         Plane::U16(words) => bytemuck::cast_slice(words),
     }
+}
+
+/// The AVIF irot/imir display transform: quarter turns counter-clockwise
+/// plus an optional mirror, applied at decode so the renderer and the
+/// layout see upright pixels with plain dimensions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DisplayTransform {
+    /// Quarter-turns counter-clockwise, 0..=3 (the `irot` angle).
+    pub quarters: u8,
+    /// The `imir` axis: 0 exchanges top and bottom, 1 exchanges left and
+    /// right.
+    pub mirror_axis: Option<u8>,
+}
+
+impl DisplayTransform {
+    pub const UPRIGHT: Self = Self { quarters: 0, mirror_axis: None };
+
+    pub fn is_upright(self) -> bool {
+        self == Self::UPRIGHT
+    }
+
+    /// Whether applying the transform swaps the plane axes.
+    pub fn swaps_dims(self) -> bool {
+        self.quarters % 2 == 1
+    }
+}
+
+/// Apply `transform` to one plane, returning the plane and its new dims.
+/// Empty planes (mono's chroma stubs) pass through untouched.
+fn transform_plane(
+    plane: Plane,
+    dims: (u32, u32),
+    transform: DisplayTransform,
+) -> (Plane, (u32, u32)) {
+    if transform.is_upright() {
+        return (plane, dims);
+    }
+    match plane {
+        Plane::U8(bytes) => {
+            let (samples, dims) = transform_samples(bytes, dims, transform);
+            (Plane::U8(samples), dims)
+        }
+        Plane::U16(words) => {
+            let (samples, dims) = transform_samples(words, dims, transform);
+            (Plane::U16(samples), dims)
+        }
+    }
+}
+
+/// Mirror-then-rotate resampling by sample index. Mirroring runs first,
+/// matching the property order HEIF writers use.
+fn transform_samples<T>(
+    samples: Box<[T]>,
+    (width, height): (u32, u32),
+    transform: DisplayTransform,
+) -> (Box<[T]>, (u32, u32))
+where
+    T: Copy,
+{
+    if samples.is_empty() {
+        return (samples, (width, height));
+    }
+    let (out_width, out_height) = if transform.swaps_dims() {
+        (height, width)
+    } else {
+        (width, height)
+    };
+    let (width, height) = (width as usize, height as usize);
+    let source_index = |x: usize, y: usize| {
+        let (mut sx, mut sy) = match transform.quarters {
+            1 => (width - 1 - y, x),
+            2 => (width - 1 - x, height - 1 - y),
+            3 => (y, height - 1 - x),
+            _ => (x, y),
+        };
+        match transform.mirror_axis {
+            Some(1) => sx = width - 1 - sx,
+            Some(_) => sy = height - 1 - sy,
+            None => {}
+        }
+        sy * width + sx
+    };
+    let mut out = Vec::with_capacity(samples.len());
+    for y in 0..out_height as usize {
+        for x in 0..out_width as usize {
+            let index = source_index(x, y);
+            #[expect(
+                clippy::indexing_slicing,
+                reason = "the transform maps inside the plane: out dims keep the sample count and coordinates stay in range"
+            )]
+            out.push(samples[index]);
+        }
+    }
+    (out.into_boxed_slice(), (out_width, out_height))
 }
 
 #[derive(Debug)]
@@ -344,7 +459,7 @@ fn decode_image(bytes: &[u8], format: Format) -> Result<Decoded, DecodeError> {
         .map_err(|error| DecodeError::Image(format, error))?;
     oriented.apply_orientation(orientation);
     let rgba = oriented.into_rgba8();
-    Decoded::rgba(rgba.width(), rgba.height(), format, rgba.into_raw().into_boxed_slice())
+    Decoded::rgba(rgba.width(), rgba.height(), format, Transfer::Srgb, rgba.into_raw().into_boxed_slice())
 }
 
 /// libavif FFI: decoder over the in-memory file, YUV planes copied out
@@ -371,9 +486,13 @@ mod avif {
     use libavif_sys::AVIF_PIXEL_FORMAT_YUV444;
     use libavif_sys::AVIF_RANGE_FULL;
     use libavif_sys::AVIF_RESULT_OK;
+    use libavif_sys::AVIF_TRANSFER_CHARACTERISTICS_HLG;
+    use libavif_sys::AVIF_TRANSFER_CHARACTERISTICS_SMPTE2084;
+    use libavif_sys::AVIF_TRANSFORM_IMIR;
+    use libavif_sys::AVIF_TRANSFORM_IROT;
     use std::marker::PhantomData;
 
-    use super::{DecodeError, Decoded, Format, Matrix, Plane, Subsampling, YuvImage};
+    use super::{transform_plane, DecodeError, Decoded, DisplayTransform, Format, Matrix, Plane, Subsampling, Transfer, YuvImage};
 
     /// dav1d parallelism saturates quickly on stills, so the thread count
     /// is capped.
@@ -414,6 +533,21 @@ mod avif {
             | AVIF_MATRIX_COEFFICIENTS_BT601 => Matrix::Bt601,
             _ => return Err(DecodeError::Unsupported("avif: matrix coefficients")),
         };
+        // HLG has no fixed SDR map; a wrong render is worse than a
+        // refused page.
+        let transfer = match u32::from(frame.transferCharacteristics) {
+            AVIF_TRANSFER_CHARACTERISTICS_SMPTE2084 => Transfer::Pq,
+            AVIF_TRANSFER_CHARACTERISTICS_HLG => {
+                return Err(DecodeError::Unsupported("avif: HLG transfer"));
+            }
+            _ => Transfer::Srgb,
+        };
+        let transform = display_transform(frame);
+        // A quarter turn makes 4:2:2 subsample vertically instead of
+        // horizontally, which no plane geometry in the model expresses.
+        if transform.swaps_dims() && subsampling == Subsampling::Yuv422 {
+            return Err(DecodeError::Unsupported("avif: rotated 4:2:2"));
+        }
 
         let (chroma_width, chroma_height) = match subsampling {
             Subsampling::Mono => (0, 0),
@@ -439,11 +573,27 @@ mod avif {
                 }?,
             )
         };
+        // SAFETY: same contract as the luma plane, at luma dimensions.
+        let alpha_plane = unsafe {
+            (!frame.alphaPlane.is_null())
+                .then(|| copy_plane(frame.alphaPlane, frame.alphaRowBytes, width, height, u32::from(depth)))
+                .transpose()?
+        };
+
+        // The display transform applies to every plane alike; chroma
+        // dimensions rotate coherently with the luma grid.
+        let (luma_plane, _) = transform_plane(luma_plane, (width, height), transform);
+        let (blue_plane, _) = transform_plane(blue_plane, (chroma_width, chroma_height), transform);
+        let (red_plane, _) = transform_plane(red_plane, (chroma_width, chroma_height), transform);
+        let alpha_plane = alpha_plane
+            .map(|alpha| transform_plane(alpha, (width, height), transform).0);
+        let (width, height) = if transform.swaps_dims() { (height, width) } else { (width, height) };
 
         super::Decoded::yuv(
             width,
             height,
             Format::Avif,
+            transfer,
             YuvImage {
                 depth,
                 subsampling,
@@ -452,8 +602,21 @@ mod avif {
                 luma: luma_plane,
                 cb: blue_plane,
                 cr: red_plane,
+                alpha: alpha_plane,
             },
         )
+    }
+
+    /// The irot/imir transform the file declares.
+    fn display_transform(frame: &avifImage) -> DisplayTransform {
+        let flags = frame.transformFlags;
+        let quarters = if flags & AVIF_TRANSFORM_IROT != 0 {
+            frame.irot.angle % 4
+        } else {
+            0
+        };
+        let mirror_axis = (flags & AVIF_TRANSFORM_IMIR != 0).then_some(frame.imir.axis);
+        DisplayTransform { quarters, mirror_axis }
     }
 
     #[expect(
@@ -555,6 +718,11 @@ mod avif {
             }
             let guard = Self { ptr, _bytes: PhantomData };
             (*guard.ptr).maxThreads = threads();
+            // The decoder's own caps run before the pixel decode, so an
+            // oversized hostile file fails at parse instead of funding a
+            // multi-gigabyte dav1d picture first.
+            (*guard.ptr).imageSizeLimit = super::MAX_PIXELS;
+            (*guard.ptr).imageDimensionLimit = super::MAX_TEXTURE_EDGE;
             avifDecoderSetIOMemory(guard.ptr, bytes.as_ptr(), bytes.len());
             check(avifDecoderParse(guard.ptr), "avif parse")?;
             check(avifDecoderNextImage(guard.ptr), "avif image")?;
@@ -598,7 +766,7 @@ mod jxl {
     use jxl::error::Error as JxlError;
     use jxl::error::Result as JxlResult;
 
-    use super::{DecodeError, Decoded, Format};
+    use super::{DecodeError, Decoded, Format, Transfer};
 
     const MAX_THREADS: usize = 16;
 
@@ -667,7 +835,9 @@ mod jxl {
             }
         }
 
-        Decoded::rgba(width, height, Format::Jxl, rgba.into_boxed_slice())
+        // The crate either converts to sRGB or emits simple PQ values its
+        // API does not distinguish, so jxl pages ride the sRGB path.
+        Decoded::rgba(width, height, Format::Jxl, Transfer::Srgb, rgba.into_boxed_slice())
     }
 
     fn threads() -> usize {
@@ -814,6 +984,7 @@ mod tests {
             MAX_TEXTURE_EDGE,
             1,
             Format::Png,
+            Transfer::Srgb,
             vec![0_u8; 4 * MAX_TEXTURE_EDGE as usize].into_boxed_slice(),
         )
         .expect("page at the edge cap constructs");
@@ -822,13 +993,14 @@ mod tests {
             MAX_TEXTURE_EDGE + 1,
             1,
             Format::Png,
+            Transfer::Srgb,
             vec![0_u8; 4 * (MAX_TEXTURE_EDGE + 1) as usize].into_boxed_slice(),
         );
         assert!(matches!(over, Err(DecodeError::Unsupported(_))));
         // Dims inside the edge cap can still exceed the pixel-count cap,
         // which must reject the page before any buffer is sized for it.
         assert!(matches!(
-            Decoded::rgba(MAX_TEXTURE_EDGE, MAX_TEXTURE_EDGE, Format::Png, Box::default()),
+            Decoded::rgba(MAX_TEXTURE_EDGE, MAX_TEXTURE_EDGE, Format::Png, Transfer::Srgb, Box::default()),
             Err(DecodeError::Corrupt("bad dimensions"))
         ));
     }
@@ -842,8 +1014,9 @@ mod tests {
         assert_eq!(plane_dims((5, 3), Subsampling::Yuv422), ((5, 3), (3, 3)));
         assert_eq!(plane_dims((5, 3), Subsampling::Yuv444), ((5, 3), (5, 3)));
 
-        // a well-sized mono page constructs; an empty luma plane does not
-        let mono = |luma: Plane| YuvImage {
+        // a well-sized mono page constructs; an empty luma plane does not;
+        // a short alpha plane does not either
+        let mono = |luma: Plane, alpha: Option<Plane>| YuvImage {
             depth: 10,
             subsampling: Subsampling::Mono,
             full_range: true,
@@ -851,14 +1024,23 @@ mod tests {
             luma,
             cb: Plane::U8(Box::new([])),
             cr: Plane::U8(Box::new([])),
+            alpha,
         };
-        let real = mono(Plane::U16(vec![0; 32 * 16].into_boxed_slice()));
-        let page = Decoded::yuv(32, 16, Format::Avif, real).expect("mono yuv page constructs");
+        let real = mono(Plane::U16(vec![0; 32 * 16].into_boxed_slice()), None);
+        let page = Decoded::yuv(32, 16, Format::Avif, Transfer::Srgb, real).expect("mono yuv page constructs");
         // The worker's book budget consumes this count.
         assert_eq!(page.resident_bytes(), 32 * 16 * 2);
-        let empty = mono(Plane::U16(Box::new([])));
+        let empty = mono(Plane::U16(Box::new([])), None);
         assert!(matches!(
-            Decoded::yuv(32, 16, Format::Avif, empty),
+            Decoded::yuv(32, 16, Format::Avif, Transfer::Srgb, empty),
+            Err(DecodeError::Corrupt("yuv plane extent"))
+        ));
+        let short_alpha = mono(
+            Plane::U16(vec![0; 32 * 16].into_boxed_slice()),
+            Some(Plane::U16(vec![0; 5].into_boxed_slice())),
+        );
+        assert!(matches!(
+            Decoded::yuv(32, 16, Format::Avif, Transfer::Srgb, short_alpha),
             Err(DecodeError::Corrupt("yuv plane extent"))
         ));
         // A 420 image whose chroma planes are stubs: a 4x2 image needs
@@ -871,11 +1053,52 @@ mod tests {
             luma: Plane::U8(vec![0; 4 * 2].into_boxed_slice()),
             cb: Plane::U8(Box::new([])),
             cr: Plane::U8(Box::new([])),
+            alpha: None,
         };
         assert!(matches!(
-            Decoded::yuv(4, 2, Format::Avif, undersized),
+            Decoded::yuv(4, 2, Format::Avif, Transfer::Srgb, undersized),
             Err(DecodeError::Corrupt("yuv plane extent"))
         ));
+    }
+
+    /// The display transform maps sample indices per quarter turn and
+    /// mirror, and empty planes pass through.
+    #[test]
+    fn display_transform_maps_samples() {
+        /// Transform `samples` laid out at `dims` and pin the whole result.
+        fn check(
+            samples: &[u8],
+            dims: (u32, u32),
+            transform: DisplayTransform,
+            want_dims: (u32, u32),
+            want_samples: &[u8],
+        ) {
+            let plane = Plane::U8(samples.to_vec().into_boxed_slice());
+            let (plane, dims) = transform_plane(plane, dims, transform);
+            assert_eq!((dims, plane_bytes(&plane)), (want_dims, want_samples));
+        }
+        // A 2x1 plane [A B]: 90° CCW stands B above A.
+        let quarters = |quarters: u8| DisplayTransform { quarters, mirror_axis: None };
+        check(b"AB", (2, 1), quarters(1), (1, 2), b"BA");
+        // 180° reads the row backwards.
+        check(b"AB", (2, 1), quarters(2), (2, 1), b"BA");
+        // 270° CCW keeps [A B] standing: A above B.
+        check(b"AB", (2, 1), quarters(3), (1, 2), b"AB");
+        // 360° is identity.
+        check(b"AB", (2, 1), quarters(0), (2, 1), b"AB");
+        // A 2x2 mirror, both axes: axis 0 exchanges rows, axis 1 columns.
+        let mirror =
+            |axis: u8| DisplayTransform { quarters: 0, mirror_axis: Some(axis) };
+        check(b"ABCD", (2, 2), mirror(0), (2, 2), b"CDAB");
+        check(b"ABCD", (2, 2), mirror(1), (2, 2), b"BADC");
+        // Mirror runs before rotate: a horizontal mirror then a 90° turn
+        // transposes the grid.
+        let mirrored_then_turned = DisplayTransform { quarters: 1, mirror_axis: Some(1) };
+        check(b"ABCD", (2, 2), mirrored_then_turned, (2, 2), b"ACBD");
+        // Empty planes (mono chroma stubs) pass through.
+        let (empty, dims) = transform_plane(Plane::U8(Box::new([])), (0, 0), quarters(1));
+        assert!(matches!(empty, Plane::U8(bytes) if bytes.is_empty()));
+        assert_eq!(dims, (0, 0));
     }
 
     /// The mono AVIF fixture decodes to a 10-bit u16 luma plane with empty chroma and the gradient intact.

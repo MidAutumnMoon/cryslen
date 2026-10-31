@@ -190,6 +190,19 @@ pub struct Placement {
     pub offset: (f32, f32),
 }
 
+/// How a spread fits the viewport when the view is not user-placed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FitMode {
+    /// The whole spread inside the viewport.
+    Page,
+    /// The spread width fills the viewport.
+    Width,
+    /// The spread height fills the viewport.
+    Height,
+    /// One image px to one screen px.
+    Actual,
+}
+
 /// A page's rect inside the composed spread, in image-pixel space.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PageRect {
@@ -235,17 +248,39 @@ pub fn layout(dims: [Option<(u32, u32)>; 2]) -> SpreadLayout {
     }
 }
 
-/// Placement that fits `total` into the viewport, centered.
-pub fn fit(total: (f32, f32), viewport: Viewport) -> Placement {
+/// Placement of one fit mode, centered on both axes. `Page` fits both
+/// axes, `Width` and `Height` fill their axis, `Actual` maps one image px
+/// to one screen px. Degenerate inputs are inert.
+pub fn fit_as(mode: FitMode, total: (f32, f32), viewport: Viewport) -> Placement {
     let size = viewport.size();
     if total.0 <= 0.0 || total.1 <= 0.0 || size.0 <= 0.0 || size.1 <= 0.0 {
         return Placement { scale: 1.0, offset: (0.0, 0.0) };
     }
-    let scale = (size.0 / total.0).min(size.1 / total.1);
+    let scale = match mode {
+        FitMode::Page => (size.0 / total.0).min(size.1 / total.1),
+        FitMode::Width => size.0 / total.0,
+        FitMode::Height => size.1 / total.1,
+        FitMode::Actual => 1.0,
+    };
     Placement {
         scale,
         offset: (total.0.mul_add(-scale, size.0) / 2.0, total.1.mul_add(-scale, size.1) / 2.0),
     }
+}
+
+/// The book's first spread: the cover.
+pub fn first_spread() -> usize {
+    0
+}
+
+/// The last spread's start under `mode`.
+pub fn last_spread(mode: ViewMode, len: usize) -> usize {
+    let len = len.max(1);
+    if !mode.pairs() {
+        return len - 1;
+    }
+    let spreads = 1 + (len - 1).div_ceil(2);
+    spread_start(spreads - 1)
 }
 
 /// Zoom scale bounds on `scale`, which is screen px per image px. The
@@ -488,7 +523,7 @@ mod tests {
             ((100.0, 100.0), Viewport::default()),               // empty viewport is inert
         ] {
             let size = viewport.size();
-            let got = fit(total, viewport);
+            let got = fit_as(FitMode::Page, total, viewport);
             if total.0 <= 0.0 || total.1 <= 0.0 || size.0 <= 0.0 || size.1 <= 0.0 {
                 assert_eq!(got, Placement { scale: 1.0, offset: (0.0, 0.0) }, "total {total:?} size {size:?}");
                 continue;
@@ -501,6 +536,57 @@ mod tests {
             );
             assert!((got.offset.0 - want_offset.0).abs() < 1e-6, "total {total:?} size {size:?}");
             assert!((got.offset.1 - want_offset.1).abs() < 1e-6, "total {total:?} size {size:?}");
+        }
+    }
+
+    /// Width fills the width axis, Height the height axis, Actual is 1:1;
+    /// every mode centers both axes.
+    #[test]
+    fn fit_modes_fill_their_axis() {
+        let total = (2000.0_f32, 1000.0);
+        let viewport = full_window((500.0, 500.0));
+        let width = fit_as(FitMode::Width, total, viewport);
+        assert_eq!(width.scale, 0.25);
+        assert!((width.offset.1 - 125.0).abs() < 1e-6, "the fitting height centers");
+        let height = fit_as(FitMode::Height, total, viewport);
+        assert_eq!(height.scale, 0.5);
+        assert!((height.offset.0 + 250.0).abs() < 1e-6, "the oversized width centers");
+        let actual = fit_as(FitMode::Actual, total, viewport);
+        assert_eq!(actual.scale, 1.0);
+        assert!((actual.offset.0 + 750.0).abs() < 1e-6);
+        assert!((actual.offset.1 + 250.0).abs() < 1e-6);
+        // Degenerate totals stay inert in every mode.
+        for mode in [FitMode::Page, FitMode::Width, FitMode::Height, FitMode::Actual] {
+            assert_eq!(
+                fit_as(mode, (0.0, 100.0), viewport),
+                Placement { scale: 1.0, offset: (0.0, 0.0) },
+                "{mode:?}"
+            );
+        }
+    }
+
+    /// First is always the cover; last lands on the final spread's start
+    /// under every mode and length.
+    #[test]
+    fn first_and_last_spreads() {
+        assert_eq!(first_spread(), 0);
+        // Single page: both ends are the cover.
+        for mode in ViewMode::ALL {
+            assert_eq!(last_spread(mode, 1), 0);
+            assert_eq!(last_spread(mode, 0), 0, "a zero-length book tolerates");
+        }
+        // Pairs: the final spread starts on the last odd page.
+        assert_eq!(last_spread(ViewMode::Manga, 10), 9);
+        assert_eq!(last_spread(ViewMode::Comic, 11), 9);
+        // An odd tail ends alone on the previous pair start.
+        assert_eq!(last_spread(ViewMode::Manga, 12), 11);
+        // Normal: the last page.
+        assert_eq!(last_spread(ViewMode::Normal, 10), 9);
+        for len in 1_usize..=12 {
+            for &mode in &ViewMode::ALL {
+                let last = last_spread(mode, len);
+                assert_eq!(spread_for(last, mode, len).first, last, "len {len} {mode:?}");
+            }
         }
     }
 
@@ -558,7 +644,7 @@ mod tests {
 
         // A fully-fitted spread dragged away returns to its centered placement.
         let total = (400.0, 300.0);
-        let fitted = fit(total, viewport);
+        let fitted = fit_as(FitMode::Page, total, viewport);
         let dragged = pan(fitted, (300.0, -200.0));
         let recentered = clamp(dragged, total, viewport);
         assert!((recentered.offset.0 - fitted.offset.0).abs() < 1e-4);

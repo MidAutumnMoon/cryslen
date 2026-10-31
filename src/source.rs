@@ -5,6 +5,7 @@
 //! keeps reading files, which the OS page cache serves.
 
 use std::any::Any;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
@@ -141,6 +142,8 @@ enum Backend {
 pub struct Source {
     names: Vec<String>,
     backend: Backend,
+    /// The opened path; book switching enumerates its siblings.
+    path: PathBuf,
 }
 
 impl Source {
@@ -163,6 +166,11 @@ impl Source {
         }
     }
 
+    /// The path this source was opened from.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     fn open_dir(dir: &Path) -> Result<Self, SourceError> {
         #[expect(
             clippy::filetype_is_file,
@@ -176,7 +184,7 @@ impl Source {
             .filter(|name| format_from_name(name).is_some())
             .collect();
         sort_pages(&mut names);
-        Self::from_names(Backend::Directory(dir.to_path_buf()), names)
+        Self::from_names(Backend::Directory(dir.to_path_buf()), names, dir.to_path_buf())
     }
 
     /// Listing reads the central directory, so a damaged local header
@@ -196,7 +204,7 @@ impl Source {
                 listed.push((name, entry.size()));
             }
         }
-        Self::open_archive(listed, |names, fill| spawn_zip_fill(zip, names, &fill))
+        Self::open_archive(path, listed, |names, fill| spawn_zip_fill(zip, names, &fill))
     }
 
     /// No password: a 7z with encrypted headers fails to open, and the
@@ -211,10 +219,11 @@ impl Source {
             .filter(|entry| !entry.is_directory() && format_from_name(&entry.name).is_some())
             .map(|entry| (entry.name.clone(), entry.size()))
             .collect();
-        Self::open_archive(listed, |names, fill| spawn_sevenzip_fill(archive, &names, &fill))
+        Self::open_archive(path, listed, |names, fill| spawn_sevenzip_fill(archive, &names, &fill))
     }
 
     fn open_archive(
+        path: &Path,
         listed: Vec<(String, u64)>,
         spawn_fill: impl FnOnce(Vec<String>, Arc<Mutex<Fill>>),
     ) -> Result<Self, SourceError> {
@@ -233,14 +242,14 @@ impl Source {
         guard_memory(unpacked_bytes, mem_available_bytes())?;
         let fill = Arc::new(Mutex::new(Fill::empty()));
         spawn_fill(names.clone(), Arc::clone(&fill));
-        Self::from_names(Backend::Archive(fill), names)
+        Self::from_names(Backend::Archive(fill), names, path.to_path_buf())
     }
 
-    fn from_names(backend: Backend, names: Vec<String>) -> Result<Self, SourceError> {
+    fn from_names(backend: Backend, names: Vec<String>, path: PathBuf) -> Result<Self, SourceError> {
         if names.is_empty() {
             return Err(SourceError::Empty);
         }
-        Ok(Self { names, backend })
+        Ok(Self { names, backend, path })
     }
 
     pub fn len(&self) -> usize {
@@ -313,7 +322,71 @@ fn duplicate_name(sorted: &[String]) -> Option<String> {
 }
 
 fn sort_pages(names: &mut [String]) {
-    names.sort_by(|left, right| natord::compare(left, right));
+    names.sort_by(|left, right| compare_names(left, right));
+}
+
+/// Natural page order: digit runs compare by numeric value, so padding
+/// width ("010" vs "10") and mixed widths ("9" vs "10") both order by
+/// number; everything else compares byte-wise, keeping case and spaces
+/// significant like an archive listing.
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "pub(crate) is the crate's visibility style for crate-wide items, even inside private modules"
+)]
+pub(crate) fn compare_names(left: &str, right: &str) -> Ordering {
+    let (mut left, mut right) = (left.as_bytes(), right.as_bytes());
+    loop {
+        match (left.first(), right.first()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(&left_byte), Some(&right_byte)) => {
+                if left_byte.is_ascii_digit() && right_byte.is_ascii_digit() {
+                    let (left_run, left_rest) = leading_digits(left);
+                    let (right_run, right_rest) = leading_digits(right);
+                    let order = number_order(left_run, right_run);
+                    if order != Ordering::Equal {
+                        return order;
+                    }
+                    left = left_rest;
+                    right = right_rest;
+                } else {
+                    let order = left_byte.cmp(&right_byte);
+                    if order == Ordering::Equal {
+                        // Both sides hold a byte here, so the split
+                        // cannot go out of range.
+                        left = left.split_at(1).1;
+                        right = right.split_at(1).1;
+                    } else {
+                        return order;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn leading_digits(bytes: &[u8]) -> (&[u8], &[u8]) {
+    let end = bytes.iter().position(|byte| !byte.is_ascii_digit()).unwrap_or(bytes.len());
+    bytes.split_at(end)
+}
+
+/// The digits of a run without their leading zeros; all-zero runs empty.
+fn value_digits(digits: &[u8]) -> &[u8] {
+    let start = digits.iter().position(|&byte| byte != b'0').unwrap_or(digits.len());
+    digits.split_at(start).1
+}
+
+/// Numeric order of ASCII digit runs: by value, then fewer leading zeros
+/// first, so "010" sorts after "9" (its value is 10) and beside only
+/// "10".
+fn number_order(left: &[u8], right: &[u8]) -> Ordering {
+    let (left_value, right_value) = (value_digits(left), value_digits(right));
+    left_value
+        .len()
+        .cmp(&right_value.len())
+        .then_with(|| left_value.cmp(right_value))
+        .then_with(|| left.len().cmp(&right.len()))
 }
 
 /// One member's bytes, with its read error as the message. A failed
@@ -451,9 +524,13 @@ fn mem_available_bytes() -> Option<u64> {
     parse_mem_available_bytes(&fs::read_to_string("/proc/meminfo").ok()?)
 }
 
+/// Kept free of the archive's unpacked pages: the decode book, texture
+/// uploads, and the rest of the system also live in `MemAvailable`.
+const MEM_RESERVE_BYTES: u64 = 1024 * 1024 * 1024;
+
 fn guard_memory(unpacked: u64, available: Option<u64>) -> Result<(), SourceError> {
     match available {
-        Some(available) if unpacked > available => {
+        Some(available) if unpacked > available.saturating_sub(MEM_RESERVE_BYTES) => {
             Err(SourceError::TooBig { unpacked, available })
         }
         _ => Ok(()),
@@ -509,6 +586,31 @@ mod tests {
     }
 
     #[test]
+    fn natural_order_compares_digit_runs_by_value() {
+        use std::cmp::Ordering;
+
+        // Mixed padding widths order by value, not byte-wise.
+        let mut names = vec!["9.png".to_owned(), "010.png".to_owned(), "1.png".to_owned()];
+        sort_pages(&mut names);
+        assert_eq!(names, ["1.png", "9.png", "010.png"]);
+        // Same-width padding was already right; both still are.
+        let mut padded = vec!["page10.png".to_owned(), "page09.png".to_owned()];
+        sort_pages(&mut padded);
+        assert_eq!(padded, ["page09.png", "page10.png"]);
+        // Equal values keep a deterministic order: fewer zeros first.
+        assert_eq!(compare_names("10.png", "010.png"), Ordering::Less);
+        assert_eq!(compare_names("010.png", "10.png"), Ordering::Greater);
+        assert_eq!(compare_names("10.png", "10.png"), Ordering::Equal);
+        // Non-digits compare byte-wise; case and spaces stay significant.
+        assert_eq!(compare_names("Page2.png", "page3.png"), Ordering::Less);
+        assert_eq!(compare_names("page 2.png", "page2.png"), Ordering::Less);
+        assert_eq!(compare_names("page.png", "page2.png"), Ordering::Less);
+        assert_eq!(compare_names("b", "a"), Ordering::Greater);
+        assert_eq!(compare_names("", ""), Ordering::Equal);
+        assert_eq!(compare_names("", "a"), Ordering::Less);
+    }
+
+    #[test]
     fn meminfo_parsing() {
         let meminfo = "MemTotal:       100 kB\nMemAvailable:   4096 kB\nSwapTotal:      2 kB\n";
         assert_eq!(parse_mem_available_bytes(meminfo), Some(4096 * 1024));
@@ -522,10 +624,24 @@ mod tests {
             guard_memory(100, Some(50)),
             Err(SourceError::TooBig { unpacked: 100, available: 50 })
         ));
-        guard_memory(50, Some(100)).unwrap();
+        guard_memory(50, Some(MEM_RESERVE_BYTES + 100)).unwrap();
         guard_memory(u64::MAX, None).unwrap();
+        // The guard keeps a reserve free: an archive that would leave
+        // less than it is refused even though it still fits.
+        let available = 4 * 1024 * 1024 * 1024;
+        guard_memory(available - MEM_RESERVE_BYTES, Some(available)).unwrap();
+        // One byte into the reserve refuses.
+        #[expect(
+            clippy::rest_pattern_accessible_field,
+            reason = "binding the ignored field as `_` instead trips unneeded_field_pattern"
+        )]
+        let Err(SourceError::TooBig { unpacked, .. }) =
+            guard_memory(available - MEM_RESERVE_BYTES + 1, Some(available))
+        else {
+            panic!("an archive eating the reserve must refuse");
+        };
+        assert_eq!(unpacked, available - MEM_RESERVE_BYTES + 1);
     }
-
     #[test]
     fn settle_pass_outcomes() {
         let whole = Arc::new(Mutex::new(Fill::empty()));
@@ -548,7 +664,7 @@ mod tests {
             clippy::rest_pattern_accessible_field,
             reason = "binding the ignored field as `_` instead trips unneeded_field_pattern"
         )]
-        match Source::open_archive(listed, |_, _| {}) {
+        match Source::open_archive(Path::new("book.cbz"), listed, |_, _| {}) {
             Err(SourceError::TooBig { unpacked: u64::MAX, .. }) => {}
             Err(other) => panic!("liar sizes settled as {other}"),
             Ok(source) => panic!("liar sizes opened as {} pages", source.len()),
@@ -563,7 +679,7 @@ mod tests {
             ("a.png".to_owned(), 8),
         ];
         assert!(matches!(
-            Source::open_archive(listed, |_, _| {}),
+            Source::open_archive(Path::new("book.cbz"), listed, |_, _| {}),
             Err(SourceError::Duplicate(name)) if name == "a.png"
         ));
     }

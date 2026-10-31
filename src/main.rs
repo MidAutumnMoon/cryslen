@@ -119,8 +119,8 @@ fn run(open_path: &Path, land_on: Option<&str>) -> eros::Result<()> {
 
     // The seed must be the spread App::new opens on (Normal mode).
     let spread = view::spread_for(index, ViewMode::Normal, source.len());
-    let worker = Worker::spawn(Arc::clone(&source), spread, move || {
-        app::post(&proxy, UserEvent::PagesUpdated);
+    let worker = Worker::spawn(Arc::clone(&source), spread, move |page| {
+        app::post(&proxy, UserEvent::PagesUpdated(page));
     })?;
 
     let mut app = App::new(source, worker, index, event_loop.create_proxy());

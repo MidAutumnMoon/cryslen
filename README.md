@@ -44,11 +44,13 @@ Proper CLI handling later.
 
 - `←/→` arrow keys switch pages
 - `space`/`shift+space` page forward/backward by reading order
+- `home`/`end` first/last spread
 - `n`/`m`/`c` normal, manga, comic mode (first letter of each mode)
-- `f` toggle fullscreen
+- `f` toggle fullscreen (`esc` leaves fullscreen first, then quits)
 - `mouse wheel` zoom
-- `r` reset zoom level
+- `r` reset zoom level; `w`/`h` fit width/height; `1` actual size
 - `drag` move/pan
+- `b`/`shift+b` next/previous book (sibling archive or folder)
 - `q` or `esc` quit
 
 ## License and disclosure

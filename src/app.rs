@@ -1,5 +1,6 @@
 //! App: winit event handling, state transitions, frame composition.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -19,7 +20,7 @@ use crate::keys::Action;
 use crate::render::PageTextures;
 use crate::source::Source;
 use crate::view;
-use crate::view::{Placement, Seat, Spread, ViewMode, Viewport};
+use crate::view::{FitMode, Placement, Seat, Spread, ViewMode, Viewport};
 use crate::window::Window;
 use crate::worker::{SeatView, SpreadView, Worker};
 
@@ -27,7 +28,9 @@ use crate::worker::{SeatView, SpreadView, Worker};
 pub enum UserEvent {
     /// Arms a wake; `new_events` requests the redraw at the deadline.
     Repaint(Duration),
-    PagesUpdated,
+    /// The worker decided `page`. The handler redraws only when the
+    /// decision changes the screen or its staged prefetch.
+    PagesUpdated(usize),
 }
 
 /// A failed send means the loop is gone, leaving the event with no consumer.
@@ -42,12 +45,14 @@ pub(crate) fn post(proxy: &EventLoopProxy<UserEvent>, event: UserEvent) {
 struct State {
     index: usize,
     mode: ViewMode,
+    fit_mode: FitMode,
     placement: Placement,
 }
 
 const DEFAULT_STATE: State = State {
     index: 0,
     mode: ViewMode::Normal,
+    fit_mode: FitMode::Page,
     placement: Placement { scale: 1.0, offset: (0.0, 0.0) },
 };
 
@@ -236,7 +241,9 @@ pub struct App {
     /// Cursor position in viewport px, same as window px.
     cursor: (f32, f32),
     dragging: bool,
-    /// Last `ModifiersChanged` state; winit 0.30 key events carry none.
+    /// An error the status line must show that no page owns: a texture upload
+    /// the GPU refused, a book switch that failed.
+    screen_error: Option<String>,
     modifiers: ModifiersState,
     waiting_since: Option<Instant>,
     mode_toast_since: Option<Instant>,
@@ -268,6 +275,7 @@ impl App {
             retuned_spread: spread,
             cursor: (0.0, 0.0),
             dragging: false,
+            screen_error: None,
             modifiers: ModifiersState::empty(),
             waiting_since: None,
             mode_toast_since: None,
@@ -292,16 +300,32 @@ impl App {
         view::spread_for(self.state.index, self.state.mode, self.source.len())
     }
 
+    /// Whether `page`'s decision changes the screen: a wanted seat's
+    /// arrival commits or ends a hold, and a next-spread page becomes
+    /// texture-staged. Everything else is prefetch the screen never shows.
+    fn page_watched(&self, page: usize) -> bool {
+        let spread = self.spread();
+        if spread.contains(page) {
+            return true;
+        }
+        let next = view::advance(spread.first, true, self.state.mode, self.source.len());
+        view::spread_for(next, self.state.mode, self.source.len()).contains(page)
+    }
+
     fn seat_dims(&self) -> [Option<(u32, u32)>; 2] {
         self.shown_seats.each_ref().map(|seat| seat.map(|show| show.dims))
     }
 
-    /// Fit `total` into `viewport` when due. A user zoom or pan wins over
-    /// the shape-triggered refit.
+    /// Fit `total` into `viewport` when due. A user-placed view keeps its
+    /// zoom and only clamps its pan into the new shape or viewport;
+    /// otherwise the fit mode places the spread.
     fn refit_into(&mut self, total: (f32, f32), viewport: Viewport) {
         if self.fit.should_refit(total) {
-            if !self.fit.user_moved {
-                self.state.placement = view::fit(total, viewport);
+            if self.fit.user_moved {
+                self.state.placement = view::clamp(self.state.placement, total, viewport);
+            } else {
+                self.state.placement =
+                    view::fit_as(self.state.fit_mode, total, viewport);
             }
             self.fit.settle(total);
         }
@@ -324,7 +348,10 @@ impl App {
             match step {
                 SeatStep::Show { page, decoded } => {
                     if let Some(gl) = self.gl.as_mut() {
-                        gl.pages.bind(seat, page, decoded);
+                        match gl.pages.bind(seat, page, decoded) {
+                            Ok(()) => self.screen_error = None,
+                            Err(error) => self.screen_error = Some(error.to_string()),
+                        }
                     }
                     *shown = Some(SeatShow { page, dims: (decoded.width, decoded.height) });
                 }
@@ -339,12 +366,43 @@ impl App {
         }
         if let Some((page, decoded)) = plan.stage {
             if let Some(gl) = self.gl.as_mut() {
-                gl.pages.stage(page, decoded);
+                if let Err(error) = gl.pages.stage(page, decoded) {
+                    self.screen_error = Some(error.to_string());
+                }
             }
         }
         self.shown = plan.shown_after;
         if plan.committed {
             self.fit.committed();
+        }
+    }
+
+    /// Upload the next spread's decided pages ahead of the turn, so an
+    /// ordinary commit is a pure rebind: the multi-megabyte upload lands
+    /// on this frame, which redraws anyway, instead of the turn's first
+    /// visible one. Reading runs forward, so only the forward spread is
+    /// staged.
+    fn stage_next_spread(&mut self, spread: Spread) {
+        let next = view::advance(spread.first, true, self.state.mode, self.source.len());
+        let next_spread = view::spread_for(next, self.state.mode, self.source.len());
+        if next_spread == spread {
+            return;
+        }
+        let snapshot = self.worker.snapshot(&next_spread);
+        for (page, seat) in [
+            (Some(next_spread.first), Some(&snapshot.first)),
+            (next_spread.second, snapshot.second.as_ref()),
+        ]
+        .into_iter()
+        .filter_map(|(page, seat)| page.zip(seat))
+        {
+            if let SeatView::Ready(decoded) = seat {
+                if let Some(gl) = self.gl.as_mut() {
+                    if let Err(error) = gl.pages.stage(page, decoded) {
+                        self.screen_error = Some(error.to_string());
+                    }
+                }
+            }
         }
     }
 
@@ -365,6 +423,7 @@ impl App {
 
         let snapshot = self.worker.snapshot(&spread);
         self.display(spread, &snapshot);
+        self.stage_next_spread(spread);
 
         // Refit before the status line reads the scale, so the bar does
         // not show a superseded zoom.
@@ -412,15 +471,18 @@ impl App {
             page,
             zoom: self.state.placement.scale,
             waiting,
-            error: folded.error,
+            error: folded.error.or_else(|| self.screen_error.clone()),
         };
 
         // `EguiGlow::run` only records shapes, so egui lays out before
         // pages are placed; `paint` later draws the bar above them.
+        // Fullscreen is chrome-free: the bar hides and the viewport is
+        // the whole window.
         let viewport = {
             let Some(gl) = self.gl.as_mut() else { return Ok(()) };
+            let bar = gl.window.winit().fullscreen().is_none();
             let mut content = egui::Rect::NOTHING;
-            gl.egui.run(gl.window.winit(), |ui| content = ui::show(ui, &status));
+            gl.egui.run(gl.window.winit(), |ui| content = ui::show(ui, &status, bar));
             content_viewport(size, content, gl.egui.egui_ctx.pixels_per_point())
         };
         // The bar's height changes without a winit resize, so diff every
@@ -438,8 +500,6 @@ impl App {
         gl.pages.draw((size.width, size.height), viewport, &layout, &self.state.placement);
         gl.egui.paint(gl.window.winit());
         gl.window.pre_present_and_swap()?;
-        // Reveal after presenting, so the window never maps empty.
-        gl.window.winit().set_visible(true);
         Ok(())
     }
 
@@ -466,6 +526,21 @@ impl App {
     fn dispatch(&mut self, act: Action, event_loop: &ActiveEventLoop) {
         match act {
             Action::Quit => event_loop.exit(),
+            Action::Escape => {
+                // Esc steps out of fullscreen first; quitting is the
+                // bare-window case.
+                let fullscreen = self
+                    .gl
+                    .as_ref()
+                    .is_some_and(|gl| gl.window.winit().fullscreen().is_some());
+                if fullscreen {
+                    if let Some(gl) = self.gl.as_ref() {
+                        gl.window.winit().set_fullscreen(None);
+                    }
+                } else {
+                    event_loop.exit();
+                }
+            }
             Action::SelectMode(mode) => {
                 let switch = view::switch_mode(
                     self.state.mode,
@@ -492,8 +567,25 @@ impl App {
                 }
             }
             Action::ResetView => {
+                self.state.fit_mode = FitMode::Page;
                 self.fit.reset_view();
                 self.request_redraw();
+            }
+            Action::SelectFit(mode) => {
+                self.state.fit_mode = mode;
+                self.fit.reset_view();
+                self.request_redraw();
+            }
+            Action::First | Action::Last => {
+                self.state.index = if matches!(act, Action::First) {
+                    view::first_spread()
+                } else {
+                    view::last_spread(self.state.mode, self.source.len())
+                };
+                self.after_page_change();
+            }
+            Action::NextBook | Action::PrevBook => {
+                self.switch_book(matches!(act, Action::NextBook));
             }
             Action::Right | Action::Left | Action::Forward | Action::Back => {
                 let forward = act.is_forward(self.state.mode);
@@ -506,6 +598,89 @@ impl App {
                 self.after_page_change();
             }
         }
+    }
+
+    /// Open the next (`forward`) or previous sibling book of the same
+    /// kind in this book's parent directory, landing on its cover. A
+    /// failed switch shows the error in the status line and keeps the
+    /// current book.
+    fn switch_book(&mut self, forward: bool) {
+        let Some(path) = self.sibling_book(forward) else { return };
+        let source = match Source::open(&path) {
+            Ok(source) => Arc::new(source),
+            Err(error) => {
+                self.screen_error = Some(error.to_string());
+                self.request_redraw();
+                return;
+            }
+        };
+        let spread = view::spread_for(view::first_spread(), self.state.mode, source.len());
+        let proxy = self.proxy.clone();
+        let worker = match Worker::spawn(Arc::clone(&source), spread, move |page| {
+            post(&proxy, UserEvent::PagesUpdated(page));
+        }) {
+            Ok(worker) => worker,
+            Err(error) => {
+                self.screen_error = Some(error.to_string());
+                self.request_redraw();
+                return;
+            }
+        };
+        // The old worker may sit mid-decode on the old book; detaching
+        // keeps the switch instant.
+        self.worker.detach();
+        self.worker = worker;
+        self.source = source;
+        self.state.index = view::first_spread();
+        self.shown = None;
+        self.retuned_spread = spread;
+        self.shown_seats = [None, None];
+        self.screen_error = None;
+        if let Some(gl) = self.gl.as_mut() {
+            gl.pages.clear_all();
+        }
+        self.after_page_change();
+    }
+
+    /// The next or previous sibling book of the same kind in this book's
+    /// parent directory, in natural order: archives beside archives,
+    /// directories beside directories.
+    fn sibling_book(&self, forward: bool) -> Option<PathBuf> {
+        use std::ffi::OsStr;
+        use std::fs;
+
+        use crate::source::{compare_names, is_archive};
+
+        let path = self.source.path();
+        let parent = path.parent()?;
+        let current = path.file_name()?;
+        let archive = is_archive(path);
+        let mut siblings: Vec<(String, PathBuf)> = fs::read_dir(parent)
+            .ok()?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|entry| {
+                if archive {
+                    entry.is_file() && is_archive(entry)
+                } else {
+                    entry.is_dir()
+                }
+            })
+            .filter_map(|entry| {
+                let name = entry.file_name()?.to_string_lossy().into_owned();
+                Some((name, entry))
+            })
+            .collect();
+        siblings.sort_by(|left, right| compare_names(&left.0, &right.0));
+        let position = siblings
+            .iter()
+            .position(|(name, _)| OsStr::new(name.as_str()) == current)?;
+        let next = if forward {
+            position.checked_add(1)?
+        } else {
+            position.checked_sub(1)?
+        };
+        siblings.get(next).map(|(_, sibling)| sibling.clone())
     }
 
     fn after_page_change(&mut self) {
@@ -571,7 +746,11 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
             }
-            UserEvent::PagesUpdated => self.request_redraw(),
+            UserEvent::PagesUpdated(page) => {
+                if self.page_watched(page) {
+                    self.request_redraw();
+                }
+            }
         }
     }
 
@@ -582,6 +761,8 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // Quit must not wait out an in-flight decode; Drop would join it.
+        self.worker.detach();
         self.gl = None;
     }
 
@@ -599,7 +780,13 @@ impl ApplicationHandler<UserEvent> for App {
         }
         let Some(gl) = self.gl.as_mut() else { return };
 
-        let egui_wants_pointer = {
+        let egui_wants_pointer = if matches!(event, WindowEvent::RedrawRequested) {
+            // RedrawRequested carries nothing for egui, and egui-winit
+            // answers it with `repaint: true`; honoring that answer would
+            // re-request the redraw and self-sustain the loop at
+            // compositor refresh while idle.
+            gl.egui.egui_ctx.egui_wants_pointer_input()
+        } else {
             let response = gl.egui.on_window_event(gl.window.winit(), &event);
             let wants = gl.egui.egui_ctx.egui_wants_pointer_input();
             if response.repaint {
