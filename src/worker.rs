@@ -647,10 +647,6 @@ mod tests {
         // suite rather than failing an assert.
     }
 
-    /// The worker naps through an unpack instead of failing or
-    /// hanging: seeded on the page the zip fill reaches last, the seat
-    /// settles once that page lands, and a retune afterwards settles
-    /// the first page from the fill.
     #[test]
     fn worker_waits_out_an_unpack() {
         use std::fs::File;

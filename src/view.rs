@@ -1,7 +1,6 @@
 //! View math: the view modes, the spread-pairing model, and the
 //! placement of a composed spread in the viewport. Pure data, no GL.
 
-/// A way of laying out and reading pages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewMode {
     /// One page per screen, left to right.
@@ -90,12 +89,10 @@ pub fn advance(current: usize, forward: bool, mode: ViewMode, len: usize) -> usi
     spread_start(next)
 }
 
-/// The outcome of a mode switch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModeSwitch {
     /// The spread start to land on.
     pub index: usize,
-    /// Whether the pairing changed, demanding the page-turn treatment.
     pub pairing_changed: bool,
 }
 
@@ -150,7 +147,6 @@ pub fn seating<T>(first: T, second: Option<T>, mode: ViewMode) -> [Option<T>; 2]
 }
 
 impl Spread {
-    /// A lone-page spread.
     #[cfg(test)]
     pub const fn lone(first: usize) -> Self {
         Self { first, second: None }
@@ -283,12 +279,10 @@ pub fn fit_as(mode: FitMode, total: (f32, f32), viewport: Viewport) -> Placement
     }
 }
 
-/// The book's first spread: the cover.
 pub fn first_spread() -> usize {
     0
 }
 
-/// The last spread's start under `mode`.
 pub fn last_spread(mode: ViewMode, len: usize) -> usize {
     let len = len.max(1);
     if !mode.pairs() {
@@ -318,7 +312,6 @@ pub fn zoom_at(mut placement: Placement, cursor: (f32, f32), factor: f32) -> Pla
     placement
 }
 
-/// Pan by `delta` viewport px.
 pub fn pan(placement: Placement, delta: (f32, f32)) -> Placement {
     Placement {
         scale: placement.scale,
@@ -362,7 +355,6 @@ pub struct Fit {
     placement: Placement,
     /// The spread total the placement was computed for.
     settled: Option<(f32, f32)>,
-    /// A user zoom or pan owns the placement until discarded.
     user_moved: bool,
 }
 
@@ -384,15 +376,13 @@ impl Fit {
     }
 
     /// Zoom by `factor` around `cursor` (viewport px), clamped so the
-    /// spread stays reachable. A user move pins the placement against
-    /// later refits.
+    /// spread stays reachable.
     pub fn zoom(&mut self, factor: f32, cursor: (f32, f32), total: (f32, f32), viewport: Viewport) {
         self.placement = clamp(zoom_at(self.placement, cursor, factor), total, viewport);
         self.user_moved = true;
     }
 
     /// Pan by `delta` viewport px, clamped so the spread stays reachable.
-    /// A user move pins the placement against later refits.
     pub fn pan(&mut self, delta: (f32, f32), total: (f32, f32), viewport: Viewport) {
         self.placement = clamp(pan(self.placement, delta), total, viewport);
         self.user_moved = true;
@@ -430,7 +420,6 @@ impl Fit {
 mod tests {
     use super::*;
 
-    /// `spread_for`: mode flags, the lone cover, odd-start pairs, clamping at the source.
     #[test]
     fn spread_structure() {
         for (mode, pairs, rtl) in [
@@ -468,7 +457,6 @@ mod tests {
         }
     }
 
-    /// advance steps between spread starts and wraps; a step and its inverse return to the spread start.
     #[test]
     fn advance_steps_between_spread_starts() {
         for len in [0_usize, 1, 2, 3, 6, 9, 10] {
@@ -499,14 +487,12 @@ mod tests {
         assert_eq!(advance(0, true, ViewMode::Manga, 0), 0);
     }
 
-    /// A mode switch relands on the new spread's start only when the pairing changes; a direction-only or repeated selection keeps the page.
     #[test]
     fn mode_switch_relands_only_on_pairing_change() {
         assert_eq!(
             switch_mode(ViewMode::Normal, ViewMode::Manga, 2, 10),
             ModeSwitch { index: 1, pairing_changed: true }
         );
-        // The cover stays the cover.
         assert_eq!(
             switch_mode(ViewMode::Normal, ViewMode::Comic, 0, 10),
             ModeSwitch { index: 0, pairing_changed: true }
@@ -515,14 +501,12 @@ mod tests {
             switch_mode(ViewMode::Manga, ViewMode::Comic, 5, 10),
             ModeSwitch { index: 5, pairing_changed: false }
         );
-        // So does re-selecting the mode.
         assert_eq!(
             switch_mode(ViewMode::Manga, ViewMode::Manga, 5, 10),
             ModeSwitch { index: 5, pairing_changed: false }
         );
     }
 
-    /// Seating follows the reading direction: rtl mirrors the seats and parks a lone page on the right, ltr keeps [first, second].
     #[test]
     fn seats_follow_reading_direction() {
         let spread = Spread { first: 1, second: Some(2) };
@@ -536,7 +520,6 @@ mod tests {
         assert_eq!(lone.seats(ViewMode::Manga), [None, Some(5)]);
     }
 
-    /// The viewport spans the window above the bar top, degenerating to the whole window or nothing at the bar's extremes.
     #[test]
     fn above_bottom_bar_sizes_and_clamps() {
         let viewport = Viewport::above_bottom_bar((1000.0, 800.0), 740.0);
@@ -549,7 +532,6 @@ mod tests {
         assert_eq!(negative.size(), (100.0, 0.0));
     }
 
-    /// layout composes present seats side by side, top-aligned.
     #[test]
     fn layout_places_seats() {
         let left = (100_u32, 300);
@@ -570,7 +552,6 @@ mod tests {
             [Some(left), Some(right)],   // asymmetric pair
         ] {
             let spread_layout = layout(dims);
-            // A present seat gets a rect at the accumulated x, top-aligned.
             let mut next_seat_x = 0.0_f32;
             for (rect, seat_dims) in spread_layout.rects.iter().zip(dims.iter()) {
                 match seat_dims {
@@ -586,7 +567,6 @@ mod tests {
                     _ => assert_eq!(rect, &None, "seats {dims:?}"),
                 }
             }
-            // total is the width sum by the height max
             let widths = dims.iter().flatten().map(|&seat| px_f32(seat).0).sum::<f32>();
             let heights = dims.iter().flatten().map(|&seat| px_f32(seat).1).fold(0.0_f32, f32::max);
             assert!((spread_layout.total().0 - widths).abs() < 1e-4, "seats {dims:?}");
@@ -594,12 +574,10 @@ mod tests {
         }
     }
 
-    /// The whole window as a viewport, for tests with no bottom bar.
     fn full_window(win: (f32, f32)) -> Viewport {
         Viewport::above_bottom_bar(win, win.1)
     }
 
-    /// fit scales to the smaller axis ratio and centers each axis in the viewport; degenerate inputs are inert.
     #[test]
     fn fit_centers_and_scales() {
         for (total, viewport) in [
@@ -627,8 +605,6 @@ mod tests {
         }
     }
 
-    /// Width fills the width axis, Height the height axis, Actual is 1:1;
-    /// every mode centers both axes.
     #[test]
     fn fit_modes_fill_their_axis() {
         let total = (2000.0_f32, 1000.0);
@@ -653,8 +629,6 @@ mod tests {
         }
     }
 
-    /// First is always the cover; last lands on the final spread's start
-    /// under every mode and length.
     #[test]
     fn first_and_last_spreads() {
         assert_eq!(first_spread(), 0);
@@ -678,7 +652,6 @@ mod tests {
         }
     }
 
-    /// `zoom_at` anchors the image point under the cursor with the factor actually applied, and clamps the scale.
     #[expect(
         clippy::float_cmp_const,
         reason = "clamping to the bound yields the bound exactly"
@@ -711,7 +684,6 @@ mod tests {
         assert_eq!(zoom_at(Placement { scale: 0.1, offset: (0.0, 0.0) }, (0.0, 0.0), 0.001).scale, MIN_SCALE);
     }
 
-    /// clamp pins fitting axes centered and keeps every oversized axis edge-reachable.
     #[test]
     fn clamp_keeps_spread_reachable() {
         let viewport = full_window((500.0, 500.0));
@@ -739,31 +711,22 @@ mod tests {
         assert!((recentered.offset.1 - fitted.offset.1).abs() < 1e-4);
     }
 
-    /// The fit lifecycle: `resolve` places by the mode when due and
-    /// returns the settled placement otherwise; a user zoom or pan pins
-    /// the placement; a turn discards the pin while the held spread
-    /// stays frozen; a commit re-arms the fit but keeps hold-time moves.
     #[test]
     fn fit_lifecycle() {
         let viewport = full_window((500.0, 500.0));
         let total = (100.0, 200.0);
         let mut fit = Fit::default();
 
-        // A fresh fit places the spread by the mode; the settled total
-        // returns the same placement.
         let fitted = fit_as(FitMode::Page, total, viewport);
         assert_eq!(fit.resolve(total, viewport), fitted, "a fresh fit places by the mode");
         assert_eq!(fit.resolve(total, viewport), fitted, "the settled total keeps the placement");
 
-        // A user zoom pins the placement: a later total change clamps
-        // instead of refitting, so the zoom survives.
         fit.zoom(2.0, (10.0, 10.0), total, viewport);
         let zoomed = fit.placement.scale;
         assert!(zoomed > fitted.scale, "the zoom zooms in");
         fit.resolve((120.0, 200.0), viewport);
         assert_eq!(fit.placement.scale, zoomed, "a user zoom survives a later settle");
 
-        // A pan pins the placement the same way and keeps the zoom.
         let wide = (2000.0, 1000.0);
         let mut zoomed_view = Fit::default();
         let wide_fitted = zoomed_view.resolve(wide, viewport);
@@ -777,7 +740,6 @@ mod tests {
         );
         assert!(wide_fitted.scale < before.scale, "the zoom zoomed in");
 
-        // select discards the pin: the next resolve places by the mode.
         let mut select_view = Fit::default();
         select_view.resolve(total, viewport);
         select_view.zoom(2.0, (10.0, 10.0), total, viewport);
@@ -788,8 +750,6 @@ mod tests {
             "select refits by the mode"
         );
 
-        // begin_turn discards pre-turn moves but keeps the held spread's
-        // placement frozen.
         let mut turn_view = Fit::default();
         turn_view.resolve(total, viewport);
         turn_view.zoom(2.0, (0.0, 0.0), total, viewport);
@@ -797,15 +757,12 @@ mod tests {
         turn_view.begin_turn();
         assert_eq!(turn_view.resolve(total, viewport), held, "begin_turn keeps the held frame frozen");
 
-        // commit re-arms the fit and keeps hold-time moves: a zoom made
-        // during the hold carries into the new spread as a clamp.
         turn_view.zoom(2.0, (0.0, 0.0), total, viewport);
         let hold_zoom = turn_view.placement.scale;
         turn_view.commit();
         turn_view.resolve((200.0, 400.0), viewport);
         assert_eq!(turn_view.placement.scale, hold_zoom, "commit keeps hold-time moves");
 
-        // refit discards both the settle and the pin.
         turn_view.refit();
         assert_eq!(
             turn_view.resolve((200.0, 400.0), viewport),

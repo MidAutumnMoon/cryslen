@@ -748,8 +748,6 @@ mod tests {
         assert!(matches!(source.bytes(1), PageRead::Ready(_)));
     }
 
-    /// A non-page member in the same solid block is drained, so the
-    /// later page still decodes.
     #[test]
     fn sevenz_drains_non_page_members() {
         let source = Source::open(Path::new(MIXED_SEVENZ_FIXTURE)).expect("7z opens");
@@ -891,8 +889,6 @@ mod tests {
         );
     }
 
-    /// A damaged local header must not refuse the book: the central
-    /// directory still lists the page, and the fill fails only that member.
     #[test]
     fn zip_corrupt_local_header_keeps_the_book_open() {
         use zip::write::SimpleFileOptions;
@@ -978,10 +974,6 @@ mod tests {
         ));
     }
 
-    /// A book's siblings are the same kind in its parent directory, in
-    /// natural order: directories step between directories, archives
-    /// between archives, and the other kind and plain files never
-    /// interleave. The ends of the shelf answer `None`.
     #[test]
     fn sibling_books_step_between_their_own_kind() {
         let parent = TempDir::new("siblings");

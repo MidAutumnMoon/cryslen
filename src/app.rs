@@ -33,8 +33,8 @@ use crate::worker::Worker;
 pub enum UserEvent {
     /// Arms a wake; `new_events` requests the redraw at the deadline.
     Repaint(Duration),
-    /// The worker decided `page`. The handler redraws only when the
-    /// decision changes the screen or its staged prefetch.
+    /// The handler redraws only when the decision changes the screen or
+    /// its staged prefetch.
     PageDecided(usize),
 }
 
@@ -58,18 +58,16 @@ fn spawn_worker(
     })
 }
 
-/// The window owns the surface and context, so it is declared last to
-/// outlive pages and egui.
 struct Gl {
     pages: PageTextures,
     egui: egui_glow::EguiGlow,
+    // Must drop last: owns the GL context used by the fields above.
     window: Window,
 }
 
 impl Drop for Gl {
     fn drop(&mut self) {
-        // egui's GL objects must be destroyed while the window's context is
-        // alive; egui_glow reports leaked resources if destroy never runs.
+        // egui_glow reports leaked resources if destroy never runs.
         self.egui.destroy();
     }
 }
@@ -79,12 +77,9 @@ pub struct App {
     worker: Worker,
     gl: Option<Gl>,
     fatal_error: Option<eros::ErrorUnion>,
-    /// Reading position: the spread start index and the pairing mode.
     index: usize,
     mode: ViewMode,
-    /// The spread's placement in the viewport, with its fit lifecycle.
     fit: view::Fit,
-    /// What each seat shows, under the hold and commit policy.
     screen: Screen,
     /// The spread the worker was last tuned to; the screen's shown lags
     /// until the plan commits it.
@@ -222,7 +217,7 @@ impl App {
             .is_some_and(|since| since.elapsed() >= WAIT_GRACE)
             .then(|| if self.source.unpacking() { Wait::Unpacking } else { Wait::Decoding });
         let status = StatusLine {
-            total: self.source.len(),
+            page_count: self.source.len(),
             spread,
             mode: self.mode,
             toast: self.mode_toast_since.is_some(),
@@ -235,17 +230,15 @@ impl App {
 
         // `EguiGlow::run` only records shapes, so egui lays out before
         // pages are placed; `paint` later draws the bar above them.
-        // Fullscreen is chrome-free: the bar hides and the viewport is
-        // the whole window.
         let viewport = {
-            let bar = !self.is_fullscreen();
+            let show_bar = !self.is_fullscreen();
             let Some(gl) = self.gl.as_mut() else { return Ok(()) };
             let mut content = egui::Rect::NOTHING;
-            gl.egui.run(gl.window.winit(), |ui| content = ui::show(ui, &status, bar));
+            gl.egui.run(gl.window.winit(), |ui| content = ui::show(ui, &status, show_bar));
             content_viewport(size, content, gl.egui.egui_ctx.pixels_per_point())
         };
-        // The bar's height changes without a winit resize, so diff every
-        // frame; the status line used the old scale, so redraw once.
+        // The bar's height changes without a winit resize; the status
+        // line used the old scale, so redraw once.
         if viewport != self.last_viewport {
             self.fit.refit();
             self.last_viewport = viewport;
@@ -262,8 +255,6 @@ impl App {
         Ok(())
     }
 
-    /// Bring the GL surface up to the window's current size and report
-    /// it; None while the window is zero-sized (minimized).
     fn sync_surface_size(&mut self) -> Option<PhysicalSize<u32>> {
         let gl = self.gl.as_mut()?;
         let size = gl.window.winit().inner_size();
@@ -304,7 +295,7 @@ impl App {
                 if switch.pairing_changed {
                     self.after_page_change();
                 } else {
-                    self.request_redraw(); // same pairing: no page turn
+                    self.request_redraw();
                 }
             }
             Action::ToggleFullscreen => {
@@ -342,9 +333,6 @@ impl App {
         }
     }
 
-    /// Open [`Source::sibling`]'s book and land on its cover. A failed
-    /// switch shows the error in the status line and keeps the current
-    /// book.
     fn switch_book(&mut self, forward: bool) {
         let Some(path) = self.source.sibling(forward) else { return };
         let source = match Source::open(&path) {
@@ -420,7 +408,6 @@ impl ApplicationHandler<UserEvent> for App {
                 post(&proxy.lock(), UserEvent::Repaint(info.delay));
             });
         }
-        // Opaque mode keeps egui's default panel fill.
         if window.translucent() {
             egui.egui_ctx.all_styles_mut(|style| style.visuals.panel_fill = glass_fill());
         }
@@ -432,8 +419,6 @@ impl ApplicationHandler<UserEvent> for App {
         match event {
             UserEvent::Repaint(delay) => {
                 let Some(deadline) = Instant::now().checked_add(delay) else { return };
-                // Never delay an earlier armed wake: keep the sooner
-                // deadline.
                 if let ControlFlow::WaitUntil(armed) = event_loop.control_flow() {
                     if armed <= deadline {
                         return;
@@ -567,7 +552,6 @@ const MODE_TOAST: Duration = Duration::from_millis(1500);
 /// Window background color, straight channels.
 const BACKGROUND: [f32; 3] = [0.08, 0.08, 0.09];
 
-/// Background opacity when the window is translucent.
 const GLASS_ALPHA: f32 = 0.7;
 
 /// Framebuffer clear color, premultiplied because Wayland composites

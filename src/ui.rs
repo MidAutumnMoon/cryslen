@@ -11,7 +11,7 @@ use crate::worker::SpreadView;
 
 /// Everything the status bar shows, built by the app each frame.
 pub struct StatusLine {
-    pub total: usize,
+    pub page_count: usize,
     pub spread: Spread,
     pub mode: ViewMode,
     /// The mode-switch toast is showing.
@@ -77,7 +77,6 @@ pub fn fold_status(spread: Spread, snapshot: &SpreadView) -> FoldedStatus {
     folded
 }
 
-/// The decoded page as the status line sees it.
 pub struct PageFacts {
     /// Format the decoder identified, the content truth.
     pub decoded: Format,
@@ -92,8 +91,8 @@ pub struct PageFacts {
 /// bar (`fullscreen`) consumes nothing, so the rect is the whole window.
 /// egui 0.37 panels show into the `&mut Ui` that `EguiGlow::run` hands
 /// over, not into a context.
-pub fn show(ui: &mut egui::Ui, status: &StatusLine, bar: bool) -> egui::Rect {
-    if !bar {
+pub fn show(ui: &mut egui::Ui, status: &StatusLine, show_bar: bool) -> egui::Rect {
+    if !show_bar {
         return ui.available_rect_before_wrap();
     }
     egui::Panel::bottom("status").show(ui, |ui| {
@@ -164,7 +163,7 @@ fn line(style: &egui::Style, status: &StatusLine) -> LayoutJob {
         |second| format!("{}-{}", status.spread.first + 1, second + 1),
     );
     section(&mut job, &head, HEAD_COLOR);
-    section(&mut job, &format!("/{}", status.total), plain);
+    section(&mut job, &format!("/{}", status.page_count), plain);
 
     section(&mut job, " · ", plain);
     if let Some(parent) = &status.name.parent {
@@ -238,7 +237,7 @@ mod tests {
 
     fn status() -> StatusLine {
         StatusLine {
-            total: 214,
+            page_count: 214,
             spread: Spread { first: 11, second: Some(12) },
             mode: ViewMode::Manga,
             toast: false,

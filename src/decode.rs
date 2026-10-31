@@ -487,8 +487,6 @@ fn decode_image(bytes: &[u8], format: Format) -> Result<Decoded, DecodeError> {
     Decoded::rgba(rgba.width(), rgba.height(), format, Transfer::Srgb, rgba.into_raw().into_boxed_slice())
 }
 
-/// libavif FFI: decoder over the in-memory file, YUV planes copied out
-/// directly.
 mod avif {
     use libavif_sys::avifDecoder;
     use libavif_sys::avifDecoderCreate;
@@ -639,7 +637,6 @@ mod avif {
         )
     }
 
-    /// The irot/imir transform the file declares.
     fn display_transform(frame: &avifImage) -> DisplayTransform {
         let flags = frame.transformFlags;
         let quarters = if flags & AVIF_TRANSFORM_IROT != 0 {
@@ -934,7 +931,6 @@ mod tests {
     use super::*;
     use crate::testkit;
 
-    /// `decode()` dispatches on magic bytes, then the filename extension; anything else is `NotAnImage`.
     #[test]
     fn format_detection() {
         // sniff: one row per magic
@@ -969,12 +965,10 @@ mod tests {
         assert!(matches!(decode(&[], "x"), Err(DecodeError::NotAnImage)));
     }
 
-    /// The in-tree encoders produce pages `decode()` reads back.
     // The encoder cannot write EXIF orientation tags, so orientation
     // handling has no testable fixture.
     #[test]
     fn encoder_roundtrips() {
-        // png: format, dims, extent, and the first pixel
         let png = testkit::tiny_png(4, 3, [10, 20, 30, 255]);
         let png_page = decode(&png, "p.png").expect("png decodes");
         assert_eq!((png_page.width, png_page.height), (4, 3));
@@ -987,32 +981,27 @@ mod tests {
             Pixels::Yuv(_) => panic!("png must decode to rgba"),
         }
 
-        // jpeg: format and dims
         let jpeg = testkit::tiny_jpeg(5, 2, [200, 100, 50]);
         let jpeg_page = decode(&jpeg, "p.jpg").expect("jpeg decodes");
         assert_eq!(jpeg_page.format, Format::Jpeg);
         assert_eq!((jpeg_page.width, jpeg_page.height), (5, 2));
 
-        // gif: format and dims
         let gif = testkit::tiny_gif(3, 2, [200, 100, 50]);
         let gif_page = decode(&gif, "p.gif").expect("gif decodes");
         assert_eq!(gif_page.format, Format::Gif);
         assert_eq!((gif_page.width, gif_page.height), (3, 2));
 
-        // bmp: format and dims
         let bmp = testkit::tiny_bmp(2, 3, [200, 100, 50]);
         let bmp_page = decode(&bmp, "p.bmp").expect("bmp decodes");
         assert_eq!(bmp_page.format, Format::Bmp);
         assert_eq!((bmp_page.width, bmp_page.height), (2, 3));
 
-        // tiff: format and dims
         let tiff = testkit::tiny_tiff(3, 1, [200, 100, 50]);
         let tiff_page = decode(&tiff, "p.tiff").expect("tiff decodes");
         assert_eq!(tiff_page.format, Format::Tiff);
         assert_eq!((tiff_page.width, tiff_page.height), (3, 1));
     }
 
-    /// Decoded constructors cap page edges at the GPU texture limit and pixel counts at the allocation ceiling.
     #[test]
     fn constructor_caps() {
         Decoded::rgba(
@@ -1040,7 +1029,6 @@ mod tests {
         ));
     }
 
-    /// `plane_dims` rounds chroma up on odd edges; `Decoded::yuv` rejects wrong plane extents and counts resident bytes with u16 samples double.
     #[test]
     fn yuv_planes() {
         // odd edges round chroma up. Mono carries a 1x1 chroma stub.
@@ -1096,11 +1084,8 @@ mod tests {
         ));
     }
 
-    /// The display transform maps sample indices per quarter turn and
-    /// mirror, and empty planes pass through.
     #[test]
     fn display_transform_maps_samples() {
-        /// Transform `samples` laid out at `dims` and pin the whole result.
         fn check(
             samples: &[u8],
             dims: (u32, u32),
@@ -1136,7 +1121,6 @@ mod tests {
         assert_eq!(dims, (0, 0));
     }
 
-    /// The mono AVIF fixture decodes to a 10-bit u16 luma plane with empty chroma and the gradient intact.
     // 32x16 10-bit 4:0:0 fixture, a black-to-white grayscale gradient.
     #[test]
     fn avif_fixture_decodes() {
@@ -1156,7 +1140,6 @@ mod tests {
         assert!(matches!(&yuv.cr, Plane::U8(bytes) if bytes.is_empty()));
     }
 
-    /// The jxl fixtures decode to RGBA: gray/alpha pixel content, wide row-stride order, an animated first frame.
     // wide.jxl and animated.jxl are verbatim copies of exif.jxl and
     // 5_frames_numbered_jxli.jxl from jxl 0.8.0's tests/testdata.
     #[test]
@@ -1210,7 +1193,6 @@ mod tests {
         );
     }
 
-    /// Every truncation point of a jxl page ends the decode with the matching "truncated" error instead of hanging.
     // A truncation bug would hang the decode instead of failing it, hence
     // the watchdog thread. The cuts cover the header, the frame header, and
     // the pixels. A decode panic closes the channel and fails the recv, so
@@ -1244,7 +1226,6 @@ mod tests {
         }
     }
 
-    /// The pool reports the first failing task, and every task stays reachable under the chunk partition.
     // The fixtures are single-group, so only this test exercises the
     // runner's parallel path.
     #[test]

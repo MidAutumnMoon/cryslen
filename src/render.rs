@@ -1071,8 +1071,6 @@ fn page_conversion(decoded: &Decoded) -> Conversion {
                 quantization.chroma_neutral,
             )
         };
-    // Scale each column (storage is column-major), then fold the anchored
-    // columns into the offset.
     let mut matrix = base;
     for (column, matrix_column) in matrix.as_chunks_mut::<3>().0.iter_mut().enumerate() {
         let scale = if column == 0 { luma_scale } else { chroma_scale } * norm;
@@ -1216,8 +1214,6 @@ mod tests {
         (codes.0, codes.1, codes.2, storage_max)
     }
 
-    /// Studio-swing black and diffuse white land at exactly 0.0 and 1.0 on
-    /// every luma row, at every depth: the depth-scaled anchors hold.
     #[test]
     fn conversion_anchors_black_and_white_at_every_depth() {
         for depth in [8_u8, 10, 12, 16] {
@@ -1242,8 +1238,6 @@ mod tests {
         }
     }
 
-    /// Identity pages: the GBR planes permute into RGB with luma anchors,
-    /// and mono identity repeats luma to all channels.
     #[test]
     fn identity_pages_permute_gbr() {
         let color = page_conversion(&yuv_page(8, Subsampling::Yuv444, true, Matrix::Identity));
@@ -1275,9 +1269,6 @@ mod tests {
         }
     }
 
-    /// The mono chroma stub (the neutral code) cancels the folded anchor
-    /// exactly, at every depth and range: a black mono page reads 0 and a
-    /// white one reads 1 with no chroma residue.
     #[test]
     fn mono_stub_cancels_exactly() {
         for depth in [8_u8, 10, 12] {
@@ -1301,9 +1292,6 @@ mod tests {
         }
     }
 
-    /// The shader id encodings the draw path sends: the two `u_mode`
-    /// values are distinct and match the shader's RGBA/YUV branches,
-    /// and `u_transfer` encodes the transfer.
     #[test]
     fn shader_ids() {
         assert_ne!(MODE_RGBA, MODE_YUV, "the mode uniform must pick a branch");
@@ -1313,8 +1301,6 @@ mod tests {
         assert_eq!(transfer_id(Transfer::Pq), 1);
     }
 
-    /// Entry cost sums the plane bytes (alpha included, stub otherwise)
-    /// and counts the mip chain only where one exists.
     #[expect(
         clippy::integer_division,
         reason = "mirrors entry_cost_bytes' truncated mip-chain cost"
@@ -1393,7 +1379,6 @@ mod tests {
         }
     }
 
-    /// `eviction_victims`: unbound pages go farthest-first, ties to the higher page; bound pages never go.
     #[test]
     fn eviction_victims_table() {
         let far = [(3_usize, 10_usize), (19, 10), (10, 10), (20, 10)];

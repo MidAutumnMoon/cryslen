@@ -38,9 +38,9 @@ fn seat_step(seat: Option<(usize, &SeatView)>, bound: Option<usize>) -> SeatStep
     }
 }
 
-/// The screen policy (see the module doc). Before anything has been
-/// shown, ready seats appear as they arrive instead of waiting for the
-/// whole spread. `bound[i]` is the page seat i currently shows.
+/// Before anything has been shown, ready seats appear as they arrive
+/// instead of waiting for the whole spread. `bound[i]` is the page seat
+/// i currently shows.
 fn plan_screen(
     shown: Option<Spread>,
     wanted: Spread,
@@ -101,7 +101,6 @@ pub(crate) fn page_watched(page: usize, spread: Spread, mode: ViewMode, len: usi
     spread.contains(page) || forward_spread(spread, mode, len).contains(page)
 }
 
-/// The page one seat shows, with the dims the layout composes.
 #[derive(Clone, Copy)]
 struct SeatShow {
     page: usize,
@@ -217,14 +216,11 @@ impl Screen {
         self.seats.each_ref().map(|seat| seat.map(|show| show.dims))
     }
 
-    /// An error the status line must show that no page owns: a noted
-    /// failure first, else the refused upload.
+    /// An error the status line must show that no page owns.
     pub(crate) fn error(&self) -> Option<&str> {
         self.noted_error.as_deref().or(self.upload_error.as_deref())
     }
 
-    /// Record a failure the status line must show that no page owns and
-    /// no frame retries, e.g. a book switch that failed.
     pub(crate) fn note_error(&mut self, message: String) {
         self.noted_error = Some(message);
     }

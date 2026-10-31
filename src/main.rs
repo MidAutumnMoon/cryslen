@@ -32,8 +32,6 @@ use rustfs_mimalloc::MiMalloc;
 #[global_allocator]
 static ALLOC: MiMalloc = MiMalloc;
 
-/// An image file opens its parent directory at that image. A directory or
-/// archive opens as itself.
 enum Arg {
     Open(PathBuf),
     Image { dir: PathBuf, name: String },
@@ -72,11 +70,7 @@ fn main() -> ExitCode {
     }
 }
 
-/// A file argument must be an image by extension, or it is a startup
-/// error.
 fn classify(path: &Path) -> eros::Result<Arg> {
-    // A path with no file-name component cannot be a file argument,
-    // so it opens as a source.
     let Some(name) = path.file_name() else {
         return Ok(Arg::Open(path.to_path_buf()));
     };
@@ -95,8 +89,6 @@ fn classify(path: &Path) -> eros::Result<Arg> {
     Ok(Arg::Image { dir: dir.to_path_buf(), name })
 }
 
-/// Page index to open on: the entry matching `want` case-insensitively,
-/// or the cover on a miss.
 fn landing<'entries>(
     mut entries: impl Iterator<Item = &'entries str>,
     want: &str,
@@ -130,7 +122,6 @@ mod tests {
     use super::*;
     use crate::testkit::TempDir;
 
-    /// A path argument classifies to an image in its parent, a source, or an error.
     #[test]
     fn classify_argument_kinds() {
         // classify never reads the content, only the extension.
@@ -140,13 +131,9 @@ mod tests {
         dir.write("notes.txt", b"not a page");
 
         let rows = [
-            // image file: the parent directory opened at that image.
             (dir.path().join("page.png"), Ok(Some("page.png"))),
-            // archive file: opens as itself.
             (dir.path().join("book.cbz"), Ok(None)),
-            // the directory itself: opens as itself.
             (dir.path().to_path_buf(), Ok(None)),
-            // any other file: a startup error.
             (dir.path().join("notes.txt"), Err("unsupported")),
         ];
         for (path, want) in rows {
@@ -167,7 +154,6 @@ mod tests {
         }
     }
 
-    /// `landing` resolves the image argument: an exact or case-mismatched name finds its entry, a miss opens the cover.
     #[test]
     fn landing_resolves_the_image_argument() {
         let entries = ["cover.png", "Page2.png", "p3.png"];

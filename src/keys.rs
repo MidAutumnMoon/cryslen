@@ -119,7 +119,6 @@ impl Action {
 mod tests {
     use super::*;
 
-    /// The baked key map: every bound physical key maps to its action, nothing else does.
     #[test]
     fn key_map() {
         let bindings: &[(KeyCode, Option<Action>)] = &[
@@ -151,8 +150,6 @@ mod tests {
         }
     }
 
-    /// Shift reverses Space and pages books backward; every other
-    /// modifier combo belongs to the desktop, not the viewer.
     #[test]
     fn modifier_interactions() {
         let bindings: &[(KeyCode, ModifiersState, Option<Action>)] = &[
@@ -177,7 +174,6 @@ mod tests {
         }
     }
 
-    /// Only the paging actions repeat on hold; forward follows the reading direction.
     #[test]
     fn action_semantics() {
         assert!(Action::Right.repeats());
@@ -205,18 +201,14 @@ mod tests {
             assert!(!action.repeats(), "{action:?} is one-shot");
         }
         let forwards: &[(Action, ViewMode, bool)] = &[
-            // Left to right, the rightward arrow advances. The
-            // reading-order keys never flip.
             (Action::Right, ViewMode::Normal, true),
             (Action::Left, ViewMode::Normal, false),
             (Action::Forward, ViewMode::Normal, true),
             (Action::Back, ViewMode::Normal, false),
-            // Manga flips the arrows but never the reading-order keys.
             (Action::Right, ViewMode::Manga, false),
             (Action::Left, ViewMode::Manga, true),
             (Action::Forward, ViewMode::Manga, true),
             (Action::Back, ViewMode::Manga, false),
-            // Comic reads like Normal.
             (Action::Right, ViewMode::Comic, true),
             (Action::Left, ViewMode::Comic, false),
             (Action::Forward, ViewMode::Comic, true),
