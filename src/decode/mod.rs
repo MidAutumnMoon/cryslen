@@ -376,8 +376,6 @@ where
 /// Decode one page. `name` is the page filename, used as the extension
 /// fallback. Animated images show their first frame.
 pub fn decode(bytes: &[u8], name: &str) -> Result<Decoded, DecodeError> {
-    use ::image::ImageFormat;
-
     let Some(format) = sniff(bytes).or_else(|| format_from_name(name))
     else {
         return Err(ErrorUnion::new(DecodeRefusal::NotAnImage));
@@ -385,12 +383,12 @@ pub fn decode(bytes: &[u8], name: &str) -> Result<Decoded, DecodeError> {
     match format {
         Format::Avif => avif::decode(bytes),
         Format::Jxl => jxl::decode(bytes),
-        Format::Jpeg => image::decode(bytes, ImageFormat::Jpeg),
-        Format::Png => image::decode(bytes, ImageFormat::Png),
-        Format::Gif => image::decode(bytes, ImageFormat::Gif),
-        Format::Webp => image::decode(bytes, ImageFormat::WebP),
-        Format::Bmp => image::decode(bytes, ImageFormat::Bmp),
-        Format::Tiff => image::decode(bytes, ImageFormat::Tiff),
+        Format::Jpeg
+        | Format::Png
+        | Format::Gif
+        | Format::Webp
+        | Format::Bmp
+        | Format::Tiff => image::decode(bytes, format),
     }
 }
 
@@ -490,7 +488,6 @@ fn ftyp_brands(bytes: &[u8]) -> Option<&[u8]> {
 )]
 mod tests {
     use super::*;
-    use ::jxl::error::Error as JxlError;
 
     /// The refusal a decode returned, for tests that assert on the
     /// verdict rather than its message.
@@ -840,45 +837,5 @@ mod tests {
                 "cut {cut} reported the wrong truncation"
             );
         }
-    }
-
-    // The fixtures are single-group, so only this test exercises the
-    // runner's parallel path.
-    #[test]
-    fn jxl_pool_reports_the_first_task_error() {
-        use ::jxl::api::JxlParallelRunner as _;
-
-        use super::jxl::Pool;
-
-        let mut pool = Pool::new(4);
-        let failing = |task: usize| {
-            if task == 1 {
-                Err(JxlError::InvalidSignature)
-            } else {
-                Ok(())
-            }
-        };
-        assert!(matches!(
-            pool.run(4, &failing),
-            Err(JxlError::InvalidSignature)
-        ));
-
-        let passing = |_: usize| Ok(());
-        pool.run(4, &passing).expect("every passing task succeeds");
-
-        // Two threads over four tasks pin the chunk partition. A range
-        // that drops the last task would leave the failure unreported.
-        let mut two_threads = Pool::new(2);
-        let failing_last = |task: usize| {
-            if task == 3 {
-                Err(JxlError::InvalidSignature)
-            } else {
-                Ok(())
-            }
-        };
-        assert!(matches!(
-            two_threads.run(4, &failing_last),
-            Err(JxlError::InvalidSignature)
-        ));
     }
 }

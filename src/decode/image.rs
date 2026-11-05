@@ -11,25 +11,22 @@ use super::Transfer;
 
 /// Decode with a concrete decoder so EXIF orientation is readable, then
 /// apply it.
-#[expect(
-    clippy::wildcard_enum_match_arm,
-    reason = "image's other ImageFormat variants never arrive: decode dispatches only the six formats the crate enables"
-)]
 pub(super) fn decode(
     bytes: &[u8],
-    image_format: image::ImageFormat,
+    format: Format,
 ) -> Result<Decoded, DecodeError> {
     use image::ImageDecoder as _;
+    use image::ImageFormat;
     use std::io::Cursor;
 
-    let format = match image_format {
-        image::ImageFormat::Jpeg => Format::Jpeg,
-        image::ImageFormat::Png => Format::Png,
-        image::ImageFormat::Gif => Format::Gif,
-        image::ImageFormat::WebP => Format::Webp,
-        image::ImageFormat::Bmp => Format::Bmp,
-        image::ImageFormat::Tiff => Format::Tiff,
-        _ => {
+    let image_format = match format {
+        Format::Jpeg => ImageFormat::Jpeg,
+        Format::Png => ImageFormat::Png,
+        Format::Gif => ImageFormat::Gif,
+        Format::Webp => ImageFormat::WebP,
+        Format::Bmp => ImageFormat::Bmp,
+        Format::Tiff => ImageFormat::Tiff,
+        Format::Avif | Format::Jxl => {
             return Err(ErrorUnion::new(DecodeRefusal::Unsupported(
                 "internal dispatch",
             )))

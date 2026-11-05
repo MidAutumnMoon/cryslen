@@ -128,14 +128,7 @@ fn threads() -> usize {
 /// how the crate's driver expects a broken codestream to be reported.
 /// The driver invokes this only with two or more threads, so no
 /// sequential path is needed.
-pub(super) struct Pool(usize);
-
-impl Pool {
-    #[cfg(test)]
-    pub(super) fn new(threads: usize) -> Self {
-        Self(threads)
-    }
-}
+struct Pool(usize);
 
 impl JxlParallelRunner for Pool {
     fn run(
@@ -170,5 +163,53 @@ impl JxlParallelRunner for Pool {
     }
     fn num_threads(&self) -> usize {
         self.0
+    }
+}
+
+#[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "a panic in test code is inconsequential"
+)]
+mod tests {
+    use super::Pool;
+
+    use jxl::api::JxlParallelRunner as _;
+    use jxl::error::Error as JxlError;
+
+    // The fixtures are single-group, so only this test exercises the
+    // runner's parallel path.
+    #[test]
+    fn pool_reports_the_first_task_error() {
+        let mut pool = Pool(4);
+        let failing = |task: usize| {
+            if task == 1 {
+                Err(JxlError::InvalidSignature)
+            } else {
+                Ok(())
+            }
+        };
+        assert!(matches!(
+            pool.run(4, &failing),
+            Err(JxlError::InvalidSignature)
+        ));
+
+        let passing = |_: usize| Ok(());
+        pool.run(4, &passing).expect("every passing task succeeds");
+
+        // Two threads over four tasks pin the chunk partition. A range
+        // that drops the last task would leave the failure unreported.
+        let mut two_threads = Pool(2);
+        let failing_last = |task: usize| {
+            if task == 3 {
+                Err(JxlError::InvalidSignature)
+            } else {
+                Ok(())
+            }
+        };
+        assert!(matches!(
+            two_threads.run(4, &failing_last),
+            Err(JxlError::InvalidSignature)
+        ));
     }
 }
