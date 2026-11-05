@@ -42,15 +42,15 @@ Proper CLI handling later.
 
 ## Shortcuts
 
-- `←/→` arrow keys switch pages
-- `space`/`shift+space` page forward/backward by reading order
+- `←/→` switch pages
+- `space`/`shift+space` forward/backward by reading order
 - `home`/`end` first/last spread
 - `n`/`m`/`c` normal, manga, comic mode (first letter of each mode)
-- `f` toggle fullscreen (`esc` leaves fullscreen first, then quits)
+- `f` toggle fullscreen
 - `mouse wheel` zoom
 - `r` reset zoom level; `w`/`h` fit width/height; `1` actual size
 - `drag` move/pan
-- `b`/`shift+b` next/previous book (sibling archive or folder)
+- `b`/`shift+b` next/previous sibling archive/folder
 - `q` or `esc` quit
 
 ## License and disclosure
