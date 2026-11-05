@@ -750,9 +750,15 @@ mod tests {
 
         let broke = Arc::new(Mutex::new(Fill::empty()));
         settle_pass(&broke, |_| Err(failed_reason("stream broke")));
-        assert!(
-            matches!(&broke.lock().pass, Some(Err(reason)) if reason.to_string().contains("broke"))
+        let settled = broke.lock();
+        let Some(Err(reason)) = &settled.pass else {
+            panic!("the broken pass must settle as an error");
+        };
+        assert_eq!(
+            reason.downcast_inner_ref::<DecodeRefusal>(),
+            Some(&DecodeRefusal::Corrupt("stream broke"))
         );
+        drop(settled);
 
         let boom = Arc::new(Mutex::new(Fill::empty()));
         settle_pass(&boom, |_| panic!("boom"));
@@ -826,7 +832,7 @@ mod tests {
         // the decoder is the oracle for the fixture's dims
         let page = decode::decode(&bytes, "p1.png")
             .expect("fixture page decodes");
-        assert_eq!((page.width, page.height), (40, 30));
+        assert_eq!((page.width(), page.height()), (40, 30));
 
         eventually(20, "pass never ended", || {
             (!source.unpacking()).then_some(())
@@ -845,7 +851,7 @@ mod tests {
             let bytes = eventually_ready(&source, index);
             let page = decode::decode(&bytes, name)
                 .expect("fixture page decodes");
-            assert_eq!(page.format, decode::Format::Png);
+            assert_eq!(page.format(), decode::Format::Png);
             pages.push(bytes);
         }
         let [first, second] = pages.as_slice() else {

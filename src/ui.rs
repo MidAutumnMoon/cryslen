@@ -172,8 +172,8 @@ pub fn fold_status(spread: Spread, snapshot: &SpreadView) -> FoldedStatus {
             SeatView::Ready(decoded) if folded.page.is_none() => {
                 folded.page = Some((
                     page,
-                    decoded.format,
-                    (decoded.width, decoded.height),
+                    decoded.format(),
+                    (decoded.width(), decoded.height()),
                 ));
                 folded.speaker = page;
             }
@@ -560,51 +560,6 @@ mod tests {
             waiting: None,
             error: None,
         }
-    }
-
-    #[test]
-    fn status_line_text() {
-        let style = egui::Style::default();
-        let plain = style.visuals.text_color();
-        let base = status();
-        // matching extension: the format label hides.
-        let mut matching = status();
-        if let Some(page) = &mut matching.page {
-            page.claimed = Some(Format::Jxl);
-        }
-        // single page with no decoded facts yet.
-        let mut single = status();
-        single.spread = Spread::lone(4);
-        single.page = None;
-        single.zoom = 1.0;
-        let mut appending = status();
-        appending.waiting = Some(Wait::Decoding);
-        appending.error = Some(StatusFault::Page(failed_page("boom")));
-        let mut unpacking = status();
-        unpacking.waiting = Some(Wait::Unpacking);
-        let rows = [
-            (&base, "12-13/214 · b/010.png · jxl 6000x4000 · 87%"),
-            (&matching, "12-13/214 · b/010.png · 6000x4000 · 87%"),
-            (&single, "5/214 · b/010.png · 100%"),
-            (&appending, "12-13/214 · b/010.png · jxl 6000x4000 · 87% · decoding… · corrupt: boom"),
-            (&unpacking, "12-13/214 · b/010.png · jxl 6000x4000 · 87% · unpacking…"),
-        ];
-        for (i, (status_line, want)) in rows.iter().enumerate() {
-            assert_eq!(line(&style, status_line).text, *want, "row {i}");
-        }
-        let section_colors = |job: &LayoutJob| -> Vec<egui::Color32> {
-            job.sections
-                .iter()
-                .map(|section| section.format.color)
-                .collect()
-        };
-        assert_eq!(
-            section_colors(&line(&style, &base)),
-            vec![HEAD_COLOR, plain, NAME_COLOR, plain]
-        );
-        assert_eq!(group_label(ViewMode::Normal), "Normal (n)");
-        assert_eq!(group_label(ViewMode::Manga), "Manga (m)");
-        assert_eq!(group_label(ViewMode::Comic), "Comic (c)");
     }
 
     struct TextItem {

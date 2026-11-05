@@ -758,7 +758,7 @@ mod tests {
         let SeatView::Ready(page) = worker.snapshot(&ok).first else {
             panic!("ok page not Ready");
         };
-        assert_eq!((page.width, page.height), (3, 2));
+        assert_eq!((page.width(), page.height()), (3, 2));
         assert!(*updates.lock() > 0);
 
         let bad = Spread::lone(0);

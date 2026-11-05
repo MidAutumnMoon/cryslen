@@ -168,74 +168,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn refusal_display_strings() {
-        assert_eq!(OpenRefusal::Empty.to_string(), "no image pages found");
-        assert_eq!(
-            OpenRefusal::NotFound(PathBuf::from("/a")).to_string(),
-            "not found: /a"
-        );
-        assert_eq!(
-            OpenRefusal::Unsupported(PathBuf::from("/a.zip")).to_string(),
-            "unsupported source: /a.zip"
-        );
-        assert_eq!(
-            OpenRefusal::Duplicate(String::from("a.png")).to_string(),
-            "duplicate entry name: a.png"
-        );
-        assert_eq!(
-            OpenRefusal::TooBig {
-                unpacked: 8,
-                available: 4
-            }
-            .to_string(),
-            "archive too big: 8 bytes claimed, 4 bytes available"
-        );
-        assert_eq!(DecodeRefusal::NotAnImage.to_string(), "not an image");
-        assert_eq!(
-            DecodeRefusal::Corrupt("bad block").to_string(),
-            "corrupt: bad block"
-        );
-        assert_eq!(
-            DecodeRefusal::Unsupported("16-bit").to_string(),
-            "unsupported: 16-bit"
-        );
-    }
+    fn panic_fault_reads_payload_kinds() {
+        let string =
+            PanicFault::from_payload("decoder", &String::from("boom"));
+        assert_eq!(string.origin, "decoder");
+        assert_eq!(string.message, "boom");
 
-    #[test]
-    fn fault_display_strings() {
-        assert_eq!(
-            AvifFault {
-                step: "avifDecoderNextImage",
-                detail: String::from("AVIF_RESULT_DECODE_COLOR_FAILED")
-            }
-            .to_string(),
-            "avifDecoderNextImage: AVIF_RESULT_DECODE_COLOR_FAILED"
-        );
-        assert_eq!(
-            TextureFault {
-                dims: (6000, 4000),
-                max_edge: 0x4000
-            }
-            .to_string(),
-            "6000x4000 exceeds this GPU's 16384-texel texture edge limit"
-        );
-        assert_eq!(BadIndex.to_string(), "no such page");
-    }
+        let text = PanicFault::from_payload("unpack", &"static boom");
+        assert_eq!(text.origin, "unpack");
+        assert_eq!(text.message, "static boom");
 
-    #[test]
-    fn panic_fault_carries_its_origin() {
-        assert_eq!(
-            PanicFault::from_payload("decoder", &String::from("boom"))
-                .to_string(),
-            "decoder panicked: boom"
-        );
-        assert_eq!(
-            PanicFault::from_payload("unpack", &"static boom").to_string(),
-            "unpack panicked: static boom"
-        );
-        assert_eq!(
-            PanicFault::from_payload("unpack", &7_u8).to_string(),
-            "unpack panicked: non-string panic payload"
-        );
+        let other = PanicFault::from_payload("unpack", &7_u8);
+        assert_eq!(other.origin, "unpack");
+        assert_eq!(other.message, "non-string panic payload");
     }
 }

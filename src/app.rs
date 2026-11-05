@@ -714,15 +714,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn background_glass() {
+    fn clear_color_premultiplies_the_glass() {
+        assert_eq!(clear_color(false), [0.08, 0.08, 0.09, 1.0]);
         let [red, green, blue, alpha] = clear_color(true);
-        assert!((alpha - GLASS_ALPHA).abs() < 1e-6);
-        for (channel, straight) in
-            [red, green, blue].into_iter().zip(BACKGROUND)
+        assert!((alpha - 0.7).abs() < 1e-6, "{alpha}");
+        for (channel, want) in
+            [(red, 0.056), (green, 0.056), (blue, 0.063)]
         {
-            assert!(
-                (straight.mul_add(GLASS_ALPHA, -channel)).abs() < 1e-6
-            );
+            assert!((channel - want).abs() < 1e-6, "{channel} vs {want}");
         }
     }
 

@@ -274,7 +274,7 @@ impl PageTextures {
         if self.textures.contains_key(&page) {
             return Ok(());
         }
-        let (width, height) = (decoded.width, decoded.height);
+        let (width, height) = (decoded.width(), decoded.height());
         if width == 0
             || height == 0
             || width > self.max_texture_edge
@@ -592,9 +592,12 @@ unsafe fn begin_frame(
     gl.uniform_2_f32(Some(&pipeline.locations.win), win.0, win.1);
 }
 
-const MODE_RGBA: i32 = 0;
-
-const MODE_YUV: i32 = 1;
+#[derive(Debug, Clone, Copy)]
+#[repr(i32)]
+enum ShaderMode {
+    Rgba = 0,
+    Yuv = 1,
+}
 
 /// Draw one seat's quad. The shader's `u_mode` branch guards the
 /// mode-specific uniforms, so each variant sets only its own.
@@ -631,7 +634,10 @@ unsafe fn draw_page(
             transfer,
             ..
         } => {
-            gl.uniform_1_i32(Some(&locations.mode), MODE_RGBA);
+            gl.uniform_1_i32(
+                Some(&locations.mode),
+                ShaderMode::Rgba as i32,
+            );
             gl.uniform_1_i32(
                 Some(&locations.transfer),
                 transfer_id(*transfer),
@@ -655,7 +661,10 @@ unsafe fn draw_page(
             transfer,
             ..
         } => {
-            gl.uniform_1_i32(Some(&locations.mode), MODE_YUV);
+            gl.uniform_1_i32(
+                Some(&locations.mode),
+                ShaderMode::Yuv as i32,
+            );
             gl.uniform_1_i32(
                 Some(&locations.transfer),
                 transfer_id(*transfer),
@@ -872,8 +881,8 @@ unsafe fn upload_plane(
     reason = "Cb and Cr are the YUV plane names the two textures hold"
 )]
 unsafe fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> Entry {
-    let (width, height) = (decoded.width, decoded.height);
-    match &decoded.pixels {
+    let (width, height) = (decoded.width(), decoded.height());
+    match &decoded.pixels() {
         Pixels::Rgba8(rgba_bytes) => {
             assert_eq!(
                 rgba_bytes.len(),
@@ -883,7 +892,7 @@ unsafe fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> Entry {
             Entry::Rgba {
                 texture: upload_rgba(gl, rgba_bytes, (width, height)),
                 lmap_base: lmap_base((width, height)),
-                transfer: decoded.transfer,
+                transfer: decoded.transfer(),
                 // RGBA always filters, so its upload always builds the
                 // mip chain.
                 cost: with_mips(rgba_bytes.len(), true),
@@ -1023,7 +1032,7 @@ unsafe fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> Entry {
                 cmap_base: cmap_base((width, height), yuv.subsampling),
                 conversion: page_conversion(decoded),
                 norm: depth_norm(depth, wide),
-                transfer: decoded.transfer,
+                transfer: decoded.transfer(),
                 cost: with_mips(base, filterable),
             }
         }
@@ -1195,7 +1204,7 @@ fn quantization(depth: u8, full_range: bool) -> Quantization {
 /// the GBR permutation of an identity page); the stored offset is that
 /// matrix times the anchor codes.
 fn page_conversion(decoded: &Decoded) -> Conversion {
-    let Pixels::Yuv(yuv) = &decoded.pixels else {
+    let Pixels::Yuv(yuv) = &decoded.pixels() else {
         return Conversion {
             matrix: IDENTITY3,
             offset: [0.0; 3],
@@ -1491,13 +1500,14 @@ mod tests {
 
     #[test]
     fn shader_ids() {
-        assert_ne!(
-            MODE_RGBA, MODE_YUV,
-            "the mode uniform must pick a branch"
-        );
-        assert_eq!(MODE_RGBA, 0, "the shader samples RGBA at u_mode 0");
         assert_eq!(
-            MODE_YUV, 1,
+            ShaderMode::Rgba as i32,
+            0,
+            "the shader samples RGBA at u_mode 0"
+        );
+        assert_eq!(
+            ShaderMode::Yuv as i32,
+            1,
             "the shader samples the plane set at u_mode 1"
         );
         assert_eq!(transfer_id(Transfer::Srgb), 0);

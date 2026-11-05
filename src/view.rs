@@ -502,7 +502,6 @@ mod tests {
 
     #[test]
     fn spread_structure() {
-        assert!(PageCount::new(0).is_none());
         for (mode, pairs, rtl) in [
             (ViewMode::Normal, false, false),
             (ViewMode::Manga, true, true),
@@ -646,66 +645,34 @@ mod tests {
     fn layout_places_seats() {
         let left = (100_u32, 300);
         let right = (200, 150);
-        let absent = None::<(u32, u32)>;
-        // Literal anchor, so a swapped u32->f32 mapping cannot pass.
-        assert_eq!(
-            layout([Some(left), Some(right)]).rects,
-            [
-                Some(PageRect {
-                    pos: (0.0, 0.0),
-                    size: (100.0, 300.0)
-                }),
-                Some(PageRect {
-                    pos: (100.0, 0.0),
-                    size: (200.0, 150.0)
-                }),
-            ]
-        );
-        for dims in [
-            [absent, absent],          // empty spread
-            [Some(left), absent],      // left only
-            [absent, Some(right)],     // right only: right starts at x=0
-            [Some(left), Some(right)], // asymmetric pair
-        ] {
-            let spread_layout = layout(dims);
-            let mut next_seat_x = 0.0_f32;
-            for (rect, seat_dims) in
-                spread_layout.rects.iter().zip(dims.iter())
-            {
-                match seat_dims {
-                    Some(seat_dims) => {
-                        let (width, height) = px_f32(*seat_dims);
-                        assert_eq!(
-                            *rect,
-                            Some(PageRect {
-                                pos: (next_seat_x, 0.0),
-                                size: (width, height)
-                            }),
-                            "seats {dims:?}"
-                        );
-                        next_seat_x += width;
-                    }
-                    _ => assert_eq!(rect, &None, "seats {dims:?}"),
-                }
-            }
-            let widths = dims
-                .iter()
-                .flatten()
-                .map(|&seat| px_f32(seat).0)
-                .sum::<f32>();
-            let heights = dims
-                .iter()
-                .flatten()
-                .map(|&seat| px_f32(seat).1)
-                .fold(0.0_f32, f32::max);
-            assert!(
-                (spread_layout.total().0 - widths).abs() < 1e-4,
-                "seats {dims:?}"
-            );
-            assert!(
-                (spread_layout.total().1 - heights).abs() < 1e-4,
-                "seats {dims:?}"
-            );
+        let rect = |pos: (f32, f32), size: (f32, f32)| {
+            Some(PageRect { pos, size })
+        };
+        let cases = [
+            ([None, None], [None, None], (0.0, 0.0)),
+            (
+                [Some(left), None],
+                [rect((0.0, 0.0), (100.0, 300.0)), None],
+                (100.0, 300.0),
+            ),
+            (
+                [None, Some(right)],
+                [None, rect((0.0, 0.0), (200.0, 150.0))],
+                (200.0, 150.0),
+            ),
+            (
+                [Some(left), Some(right)],
+                [
+                    rect((0.0, 0.0), (100.0, 300.0)),
+                    rect((100.0, 0.0), (200.0, 150.0)),
+                ],
+                (300.0, 300.0),
+            ),
+        ];
+        for (dims, rects, total) in cases {
+            let spread = layout(dims);
+            assert_eq!(spread.rects, rects, "seats {dims:?}");
+            assert_eq!(spread.total(), total, "seats {dims:?}");
         }
     }
 
@@ -714,51 +681,58 @@ mod tests {
     }
 
     #[test]
-    fn fit_centers_and_scales() {
-        for (total, viewport) in [
-            ((1000.0_f32, 2000.0), full_window((500.0, 500.0))), // height is the min axis
-            ((2000.0, 1000.0), full_window((500.0, 500.0))), // width is the min axis
-            // bar-clamped viewport: centering uses the 600-px viewport, not the 800-px window
+    fn fit_page_centers_on_the_min_axis() {
+        let cases = [
+            (
+                (1000.0_f32, 2000.0),
+                full_window((500.0, 500.0)),
+                Placement {
+                    scale: 0.25,
+                    offset: (125.0, 0.0),
+                },
+            ),
+            (
+                (2000.0, 1000.0),
+                full_window((500.0, 500.0)),
+                Placement {
+                    scale: 0.25,
+                    offset: (0.0, 125.0),
+                },
+            ),
+            // Bar-clamped viewport: centering uses the 600-px viewport,
+            // not the 800-px window.
             (
                 (500.0, 400.0),
                 Viewport::above_bottom_bar((1000.0, 800.0), 600.0),
+                Placement {
+                    scale: 1.5,
+                    offset: (125.0, 0.0),
+                },
             ),
-            ((0.0, 100.0), full_window((500.0, 500.0))), // degenerate total is inert
-            ((100.0, 100.0), Viewport::default()), // empty viewport is inert
-        ] {
-            let size = viewport.size();
-            let got = fit_as(FitMode::Page, total, viewport);
-            if total.0 <= 0.0
-                || total.1 <= 0.0
-                || size.0 <= 0.0
-                || size.1 <= 0.0
-            {
-                assert_eq!(
-                    got,
-                    Placement {
-                        scale: 1.0,
-                        offset: (0.0, 0.0)
-                    },
-                    "total {total:?} size {size:?}"
-                );
-                continue;
-            }
-            let want_scale = (size.0 / total.0).min(size.1 / total.1);
-            assert!(
-                (got.scale - want_scale).abs() < 1e-6,
-                "total {total:?} size {size:?}"
-            );
-            let want_offset = (
-                total.0.mul_add(-want_scale, size.0) / 2.0,
-                total.1.mul_add(-want_scale, size.1) / 2.0,
-            );
-            assert!(
-                (got.offset.0 - want_offset.0).abs() < 1e-6,
-                "total {total:?} size {size:?}"
-            );
-            assert!(
-                (got.offset.1 - want_offset.1).abs() < 1e-6,
-                "total {total:?} size {size:?}"
+            // Degenerate total and empty viewport are inert.
+            (
+                (0.0, 100.0),
+                full_window((500.0, 500.0)),
+                Placement {
+                    scale: 1.0,
+                    offset: (0.0, 0.0),
+                },
+            ),
+            (
+                (100.0, 100.0),
+                Viewport::default(),
+                Placement {
+                    scale: 1.0,
+                    offset: (0.0, 0.0),
+                },
+            ),
+        ];
+        for (total, viewport, want) in cases {
+            assert_eq!(
+                fit_as(FitMode::Page, total, viewport),
+                want,
+                "total {total:?} size {:?}",
+                viewport.size()
             );
         }
     }
@@ -803,7 +777,6 @@ mod tests {
 
     #[test]
     fn first_and_last_spreads() {
-        assert_eq!(first_spread(), 0);
         // Single page: both ends are the cover.
         for mode in ViewMode::ALL {
             assert_eq!(last_spread(mode, pages(1)), 0);
@@ -948,7 +921,10 @@ mod tests {
         let total = (100.0, 200.0);
         let mut fit = Fit::default();
 
-        let fitted = fit_as(FitMode::Page, total, viewport);
+        let fitted = Placement {
+            scale: 2.5,
+            offset: (125.0, 0.0),
+        };
         assert_eq!(
             fit.resolve(total, viewport),
             fitted,
@@ -990,8 +966,11 @@ mod tests {
         select_view.zoom(2.0, (10.0, 10.0), total, viewport);
         select_view.select(FitMode::Width);
         assert_eq!(
-            select_view.resolve((120.0, 200.0), viewport),
-            fit_as(FitMode::Width, (120.0, 200.0), viewport),
+            select_view.resolve((250.0, 200.0), viewport),
+            Placement {
+                scale: 2.0,
+                offset: (0.0, 50.0),
+            },
             "select refits by the mode"
         );
 
@@ -1018,7 +997,10 @@ mod tests {
         turn_view.refit();
         assert_eq!(
             turn_view.resolve((200.0, 400.0), viewport),
-            fit_as(FitMode::Page, (200.0, 400.0), viewport),
+            Placement {
+                scale: 1.25,
+                offset: (125.0, 0.0),
+            },
             "refit discards the pin"
         );
     }

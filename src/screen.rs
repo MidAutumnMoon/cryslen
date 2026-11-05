@@ -210,7 +210,7 @@ impl Screen {
                     // while the next frame retries the stage.
                     *shown = Some(SeatShow {
                         page,
-                        dims: (decoded.width, decoded.height),
+                        dims: (decoded.width(), decoded.height()),
                     });
                 }
                 SeatStep::Hold => {}
@@ -322,7 +322,7 @@ mod tests {
             match step {
                 SeatStep::Show { page, decoded } => (
                     StepKind::Show,
-                    Some((*page, (decoded.width, decoded.height))),
+                    Some((*page, (decoded.width(), decoded.height()))),
                 ),
                 SeatStep::Hold => (StepKind::Hold, None),
                 SeatStep::Clear => (StepKind::Clear, None),
@@ -519,7 +519,7 @@ mod tests {
             assert_eq!(
                 plan.stage.map(|(page, decoded)| (
                     page,
-                    (decoded.width, decoded.height)
+                    (decoded.width(), decoded.height())
                 )),
                 stage,
                 "{name}: stage"
