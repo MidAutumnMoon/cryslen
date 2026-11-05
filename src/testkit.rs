@@ -3,10 +3,12 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use crate::decode::Decoded;
 use crate::decode::Format;
 use crate::decode::Transfer;
+use crate::fault::PageError;
 use crate::worker::SeatView;
 
 fn encode(
@@ -63,8 +65,6 @@ pub fn tiny_tiff(width: u32, height: u32, rgb: [u8; 3]) -> Vec<u8> {
 }
 
 pub fn ready_seat(width: u32, height: u32) -> SeatView {
-    use std::sync::Arc;
-
     SeatView::Ready(Arc::new(
         Decoded::rgba(
             width,
@@ -76,6 +76,26 @@ pub fn ready_seat(width: u32, height: u32) -> SeatView {
         )
         .expect("valid rgba page"),
     ))
+}
+
+/// A page error carrying just `message`, for seeding failure cells.
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "pub(crate) is the crate's visibility style for crate-wide items, even inside private modules"
+)]
+pub(crate) fn failed_page(message: &str) -> Arc<PageError> {
+    Arc::new(eros::ErrorUnion::new(eros::MsgError::from_owned(
+        message.to_owned(),
+    )))
+}
+
+/// A seat failed with `message`, for seeding fold and seating tests.
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "pub(crate) is the crate's visibility style for crate-wide items, even inside private modules"
+)]
+pub(crate) fn failed_seat(message: &str) -> SeatView {
+    SeatView::Failed(failed_page(message))
 }
 
 /// Poll `probe` until it returns `Some`, or `secs` seconds pass.

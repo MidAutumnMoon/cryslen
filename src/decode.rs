@@ -7,10 +7,12 @@
 //! panicking. The FFI `unsafe` for AVIF is confined to the `avif`
 //! submodule.
 
-use std::error::Error;
-use std::fmt;
+use eros::ErrorUnion;
+use eros::IntoUnion as _;
 
-use ::jxl::error::Error as JxlError;
+use crate::fault::AvifFault;
+use crate::fault::DecodeError;
+use crate::fault::DecodeRefusal;
 
 /// Decoded page. Construct via [`Decoded::rgba`] / [`Decoded::yuv`], which
 /// validate the pixel extents against the dimensions. A wrong extent then
@@ -41,11 +43,11 @@ impl Decoded {
         format: Format,
         transfer: Transfer,
         bytes: Box<[u8]>,
-    ) -> Result<Self, DecodeError> {
+    ) -> Result<Self, DecodeRefusal> {
         check_dims(width, height)?;
         let want = checked_extent(width, height, 4)?;
         if bytes.len() != want {
-            return Err(DecodeError::Corrupt("rgba extent"));
+            return Err(DecodeRefusal::Corrupt("rgba extent"));
         }
         Ok(Self {
             width,
@@ -62,7 +64,7 @@ impl Decoded {
         format: Format,
         transfer: Transfer,
         yuv: YuvImage,
-    ) -> Result<Self, DecodeError> {
+    ) -> Result<Self, DecodeRefusal> {
         check_dims(width, height)?;
         let (_, (cw, ch)) = plane_dims((width, height), yuv.subsampling);
         if yuv.luma.sample_count() != width as usize * height as usize
@@ -73,7 +75,7 @@ impl Decoded {
                 && (yuv.cb.sample_count() != cw as usize * ch as usize
                     || yuv.cr.sample_count() != cw as usize * ch as usize))
         {
-            return Err(DecodeError::Corrupt("yuv plane extent"));
+            return Err(DecodeRefusal::Corrupt("yuv plane extent"));
         }
         Ok(Self {
             width,
@@ -103,18 +105,18 @@ fn checked_pixels(
     width: u32,
     height: u32,
     what: &'static str,
-) -> Result<u32, DecodeError> {
+) -> Result<u32, DecodeRefusal> {
     width
         .checked_mul(height)
         .filter(|&count| (1..=MAX_PIXELS).contains(&count))
-        .ok_or(DecodeError::Corrupt(what))
+        .ok_or(DecodeRefusal::Corrupt(what))
 }
 
 fn checked_extent(
     width: u32,
     height: u32,
     bytes_per_pixel: usize,
-) -> Result<usize, DecodeError> {
+) -> Result<usize, DecodeRefusal> {
     Ok(checked_pixels(width, height, "bad dimensions")? as usize
         * bytes_per_pixel)
 }
@@ -130,9 +132,9 @@ const MAX_PIXELS: u32 = (512 << 20) / 4;
 /// desktop limit.
 const MAX_TEXTURE_EDGE: u32 = 0x4000;
 
-fn check_dims(width: u32, height: u32) -> Result<(), DecodeError> {
+fn check_dims(width: u32, height: u32) -> Result<(), DecodeRefusal> {
     if width > MAX_TEXTURE_EDGE || height > MAX_TEXTURE_EDGE {
-        return Err(DecodeError::Unsupported(
+        return Err(DecodeRefusal::Unsupported(
             "page edge over the GPU texture limit",
         ));
     }
@@ -371,40 +373,12 @@ where
     (out.into_boxed_slice(), (out_width, out_height))
 }
 
-#[derive(Debug)]
-pub enum DecodeError {
-    NotAnImage,
-    Corrupt(&'static str),
-    Unsupported(&'static str),
-    Image(Format, image::ImageError),
-    Jxl(JxlError),
-    /// libavif call failure with its step and avifResult detail.
-    Avif(&'static str, String),
-}
-
-impl fmt::Display for DecodeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NotAnImage => write!(f, "not an image"),
-            Self::Corrupt(what) => write!(f, "corrupt: {what}"),
-            Self::Unsupported(what) => write!(f, "unsupported: {what}"),
-            Self::Image(format, error) => {
-                write!(f, "{}: {error}", format.label())
-            }
-            Self::Jxl(error) => write!(f, "jxl: {error}"),
-            Self::Avif(what, detail) => write!(f, "{what}: {detail}"),
-        }
-    }
-}
-
-impl Error for DecodeError {}
-
 /// Decode one page. `name` is the page filename, used as the extension
 /// fallback. Animated images show their first frame.
 pub fn decode(bytes: &[u8], name: &str) -> Result<Decoded, DecodeError> {
     let Some(format) = sniff(bytes).or_else(|| format_from_name(name))
     else {
-        return Err(DecodeError::NotAnImage);
+        return Err(ErrorUnion::new(DecodeRefusal::NotAnImage));
     };
     match format {
         Format::Avif => avif::decode(bytes),
@@ -528,23 +502,21 @@ fn decode_image(
         Format::Bmp => image::ImageFormat::Bmp,
         Format::Tiff => image::ImageFormat::Tiff,
         Format::Avif | Format::Jxl => {
-            return Err(DecodeError::Unsupported("internal dispatch"))
+            return Err(ErrorUnion::new(DecodeRefusal::Unsupported(
+                "internal dispatch",
+            )))
         }
     };
     let reader =
         image::ImageReader::with_format(Cursor::new(bytes), image_format);
-    let mut decoder = reader
-        .into_decoder()
-        .map_err(|error| DecodeError::Image(format, error))?;
+    let mut decoder = reader.into_decoder().union()?;
     // Orientation only swaps w and h, and the cap checks both, so this
     // pre-orientation check catches rotated pages too.
     let (width, height) = decoder.dimensions();
-    check_dims(width, height)?;
-    let orientation = decoder
-        .orientation()
-        .map_err(|error| DecodeError::Image(format, error))?;
-    let mut oriented = image::DynamicImage::from_decoder(decoder)
-        .map_err(|error| DecodeError::Image(format, error))?;
+    check_dims(width, height).union()?;
+    let orientation = decoder.orientation().union()?;
+    let mut oriented =
+        image::DynamicImage::from_decoder(decoder).union()?;
     oriented.apply_orientation(orientation);
     let rgba = oriented.into_rgba8();
     Decoded::rgba(
@@ -554,6 +526,7 @@ fn decode_image(
         Transfer::Srgb,
         rgba.into_raw().into_boxed_slice(),
     )
+    .union()
 }
 
 mod avif {
@@ -584,9 +557,14 @@ mod avif {
     use libavif_sys::AVIF_TRANSFORM_IROT;
     use std::marker::PhantomData;
 
+    use eros::ErrorUnion;
+    use eros::IntoUnion as _;
+
     use super::plane_dims;
     use super::transform_plane;
+    use super::AvifFault;
     use super::DecodeError;
+    use super::DecodeRefusal;
     use super::Decoded;
     use super::DisplayTransform;
     use super::Format;
@@ -613,17 +591,24 @@ mod avif {
             10 => 10,
             12 => 12,
             16 => 16,
-            _ => return Err(DecodeError::Corrupt("avif: bad depth")),
+            _ => {
+                return Err(ErrorUnion::new(DecodeRefusal::Corrupt(
+                    "avif: bad depth",
+                )))
+            }
         };
-        super::checked_pixels(width, height, "avif: bad dimensions")?;
-        super::check_dims(width, height)?;
+        super::checked_pixels(width, height, "avif: bad dimensions")
+            .union()?;
+        super::check_dims(width, height).union()?;
         let subsampling = match frame.yuvFormat {
             AVIF_PIXEL_FORMAT_YUV444 => Subsampling::Yuv444,
             AVIF_PIXEL_FORMAT_YUV422 => Subsampling::Yuv422,
             AVIF_PIXEL_FORMAT_YUV420 => Subsampling::Yuv420,
             AVIF_PIXEL_FORMAT_YUV400 => Subsampling::Mono,
             _ => {
-                return Err(DecodeError::Unsupported("avif: pixel format"))
+                return Err(ErrorUnion::new(DecodeRefusal::Unsupported(
+                    "avif: pixel format",
+                )))
             }
         };
         let full_range = frame.yuvRange == AVIF_RANGE_FULL;
@@ -636,9 +621,9 @@ mod avif {
             | AVIF_MATRIX_COEFFICIENTS_BT470BG
             | AVIF_MATRIX_COEFFICIENTS_BT601 => Matrix::Bt601,
             _ => {
-                return Err(DecodeError::Unsupported(
+                return Err(ErrorUnion::new(DecodeRefusal::Unsupported(
                     "avif: matrix coefficients",
-                ))
+                )))
             }
         };
         // HLG has no fixed SDR map; a wrong render is worse than a
@@ -646,9 +631,9 @@ mod avif {
         let transfer = match u32::from(frame.transferCharacteristics) {
             AVIF_TRANSFER_CHARACTERISTICS_SMPTE2084 => Transfer::Pq,
             AVIF_TRANSFER_CHARACTERISTICS_HLG => {
-                return Err(DecodeError::Unsupported(
+                return Err(ErrorUnion::new(DecodeRefusal::Unsupported(
                     "avif: HLG transfer",
-                ));
+                )));
             }
             _ => Transfer::Srgb,
         };
@@ -656,7 +641,9 @@ mod avif {
         // A quarter turn makes 4:2:2 subsample vertically instead of
         // horizontally, which no plane geometry in the model expresses.
         if transform.swaps_dims() && subsampling == Subsampling::Yuv422 {
-            return Err(DecodeError::Unsupported("avif: rotated 4:2:2"));
+            return Err(ErrorUnion::new(DecodeRefusal::Unsupported(
+                "avif: rotated 4:2:2",
+            )));
         }
 
         // Mono skips the chroma copy below, so its 1x1 stub dims from
@@ -754,6 +741,7 @@ mod avif {
                 alpha: alpha_plane,
             },
         )
+        .union()
     }
 
     fn display_transform(frame: &avifImage) -> DisplayTransform {
@@ -788,7 +776,7 @@ mod avif {
     unsafe fn check(
         code: avifResult,
         what: &'static str,
-    ) -> Result<(), DecodeError> {
+    ) -> Result<(), AvifFault> {
         use std::ffi::CStr;
 
         if code == AVIF_RESULT_OK {
@@ -796,7 +784,10 @@ mod avif {
         }
         let detail =
             CStr::from_ptr(avifResultToString(code)).to_string_lossy();
-        Err(DecodeError::Avif(what, detail.into_owned()))
+        Err(AvifFault {
+            step: what,
+            detail: detail.into_owned(),
+        })
     }
 
     /// Copies one plane row by row. libavif pads rows to `stride`.
@@ -815,13 +806,17 @@ mod avif {
         use std::slice;
 
         if plane_ptr.is_null() {
-            return Err(DecodeError::Corrupt("avif: missing plane"));
+            return Err(ErrorUnion::new(DecodeRefusal::Corrupt(
+                "avif: missing plane",
+            )));
         }
         let (width, height) = (width as usize, height as usize);
         let row_stride = row_stride as usize;
         if depth == 8 {
             if row_stride < width {
-                return Err(DecodeError::Corrupt("avif: bad stride"));
+                return Err(ErrorUnion::new(DecodeRefusal::Corrupt(
+                    "avif: bad stride",
+                )));
             }
             let mut out = Vec::with_capacity(width * height);
             for row in 0..height {
@@ -835,7 +830,9 @@ mod avif {
         } else {
             let bytes = width * 2;
             if row_stride < bytes {
-                return Err(DecodeError::Corrupt("avif: bad stride"));
+                return Err(ErrorUnion::new(DecodeRefusal::Corrupt(
+                    "avif: bad stride",
+                )));
             }
             let mut raw = Vec::with_capacity(bytes * height);
             for row in 0..height {
@@ -878,9 +875,9 @@ mod avif {
         unsafe fn new(bytes: &'bytes [u8]) -> Result<Self, DecodeError> {
             let ptr = avifDecoderCreate();
             if ptr.is_null() {
-                return Err(DecodeError::Unsupported(
+                return Err(ErrorUnion::new(DecodeRefusal::Unsupported(
                     "avif: decoder create",
-                ));
+                )));
             }
             let guard = Self {
                 ptr,
@@ -893,8 +890,9 @@ mod avif {
             (*guard.ptr).imageSizeLimit = super::MAX_PIXELS;
             (*guard.ptr).imageDimensionLimit = super::MAX_TEXTURE_EDGE;
             avifDecoderSetIOMemory(guard.ptr, bytes.as_ptr(), bytes.len());
-            check(avifDecoderParse(guard.ptr), "avif parse")?;
-            check(avifDecoderNextImage(guard.ptr), "avif image")?;
+            check(avifDecoderParse(guard.ptr), "avif parse").union()?;
+            check(avifDecoderNextImage(guard.ptr), "avif image")
+                .union()?;
             Ok(guard)
         }
 
@@ -909,7 +907,9 @@ mod avif {
         unsafe fn image(&self) -> Result<&avifImage, DecodeError> {
             let frame = (*self.ptr).image;
             if frame.is_null() {
-                return Err(DecodeError::Corrupt("avif: no image"));
+                return Err(ErrorUnion::new(DecodeRefusal::Corrupt(
+                    "avif: no image",
+                )));
             }
             Ok(&*frame)
         }
@@ -937,7 +937,11 @@ mod jxl {
     use jxl::error::Error as JxlError;
     use jxl::error::Result as JxlResult;
 
+    use eros::ErrorUnion;
+    use eros::IntoUnion as _;
+
     use super::DecodeError;
+    use super::DecodeRefusal;
     use super::Decoded;
     use super::Format;
     use super::Transfer;
@@ -956,42 +960,51 @@ mod jxl {
         loop {
             let event = decoder
                 .process(&mut input, None, Some(&mut runner))
-                .map_err(DecodeError::Jxl)?;
+                .union()?;
             if event == Event::BasicInfo {
                 break;
             }
             if let Event::NeedMoreInput { size_hint } = event {
                 tracing::debug!(size_hint, "truncated jxl header");
-                return Err(DecodeError::Corrupt("jxl: truncated header"));
+                return Err(ErrorUnion::new(DecodeRefusal::Corrupt(
+                    "jxl: truncated header",
+                )));
             }
             // A fresh decoder emits BasicInfo or NeedMoreInput before all else.
         }
 
-        let info = decoder
-            .basic_info()
-            .ok_or(DecodeError::Corrupt("jxl: missing basic info"))?;
+        let info = decoder.basic_info().ok_or_else(|| {
+            ErrorUnion::new(DecodeRefusal::Corrupt(
+                "jxl: missing basic info",
+            ))
+        })?;
         #[expect(
             clippy::map_err_ignore,
             reason = "the conversion error only says the value does not fit, which the message already states"
         )]
         let (width, height) = (
             u32::try_from(info.size.0).map_err(|_| {
-                DecodeError::Corrupt("jxl: bad dimensions")
+                ErrorUnion::new(DecodeRefusal::Corrupt(
+                    "jxl: bad dimensions",
+                ))
             })?,
             u32::try_from(info.size.1).map_err(|_| {
-                DecodeError::Corrupt("jxl: bad dimensions")
+                ErrorUnion::new(DecodeRefusal::Corrupt(
+                    "jxl: bad dimensions",
+                ))
             })?,
         );
         let pixel_count =
-            super::checked_pixels(width, height, "jxl: bad dimensions")?;
-        super::check_dims(width, height)?;
+            super::checked_pixels(width, height, "jxl: bad dimensions")
+                .union()?;
+        super::check_dims(width, height).union()?;
 
         // Files without their own alpha still get opaque alpha from the
         // decoder.
         let extra_channels = info.extra_channels.len();
         decoder
             .set_pixel_format(JxlPixelFormat::rgba8(extra_channels))
-            .map_err(DecodeError::Jxl)?;
+            .union()?;
 
         let mut rgba = vec![0_u8; pixel_count as usize * 4];
         loop {
@@ -1006,7 +1019,7 @@ mod jxl {
                     Some(slice::from_mut(&mut output)),
                     Some(&mut runner),
                 )
-                .map_err(DecodeError::Jxl)?
+                .union()?
             {
                 Event::FrameComplete { has_more_frames } => {
                     if has_more_frames {
@@ -1018,9 +1031,9 @@ mod jxl {
                 }
                 Event::NeedMoreInput { size_hint } => {
                     tracing::debug!(size_hint, "truncated jxl image");
-                    return Err(DecodeError::Corrupt(
+                    return Err(ErrorUnion::new(DecodeRefusal::Corrupt(
                         "jxl: truncated image",
-                    ));
+                    )));
                 }
                 Event::BasicInfo
                 | Event::FrameHeader
@@ -1037,6 +1050,7 @@ mod jxl {
             Transfer::Srgb,
             rgba.into_boxed_slice(),
         )
+        .union()
     }
 
     fn threads() -> usize {
@@ -1107,6 +1121,20 @@ mod jxl {
 mod tests {
     use super::*;
     use crate::testkit;
+    use ::jxl::error::Error as JxlError;
+
+    /// The refusal a decode returned, for tests that assert on the
+    /// verdict rather than its message.
+    fn refusal(
+        result: Result<Decoded, DecodeError>,
+    ) -> Option<DecodeRefusal> {
+        match result {
+            Ok(_) => None,
+            Err(error) => {
+                error.downcast_inner_ref::<DecodeRefusal>().cloned()
+            }
+        }
+    }
 
     #[test]
     fn format_detection() {
@@ -1140,15 +1168,18 @@ mod tests {
         assert_eq!(format_from_name("noext"), None);
 
         // garbage: no magic and no usable extension is NotAnImage
-        assert!(matches!(
-            decode(b"hello world", "noext"),
-            Err(DecodeError::NotAnImage)
-        ));
-        assert!(matches!(
-            decode(b"hello world", "note.txt"),
-            Err(DecodeError::NotAnImage)
-        ));
-        assert!(matches!(decode(&[], "x"), Err(DecodeError::NotAnImage)));
+        assert_eq!(
+            refusal(decode(b"hello world", "noext")),
+            Some(DecodeRefusal::NotAnImage)
+        );
+        assert_eq!(
+            refusal(decode(b"hello world", "note.txt")),
+            Some(DecodeRefusal::NotAnImage)
+        );
+        assert_eq!(
+            refusal(decode(&[], "x")),
+            Some(DecodeRefusal::NotAnImage)
+        );
     }
 
     // The encoder cannot write EXIF orientation tags, so orientation
@@ -1207,7 +1238,7 @@ mod tests {
             vec![0_u8; 4 * (MAX_TEXTURE_EDGE + 1) as usize]
                 .into_boxed_slice(),
         );
-        assert!(matches!(over, Err(DecodeError::Unsupported(_))));
+        assert!(matches!(over, Err(DecodeRefusal::Unsupported(_))));
         // Dims inside the edge cap can still exceed the pixel-count cap,
         // which must reject the page before any buffer is sized for it.
         assert!(matches!(
@@ -1218,7 +1249,7 @@ mod tests {
                 Transfer::Srgb,
                 Box::default()
             ),
-            Err(DecodeError::Corrupt("bad dimensions"))
+            Err(DecodeRefusal::Corrupt("bad dimensions"))
         ));
     }
 
@@ -1264,7 +1295,7 @@ mod tests {
         let empty = mono(Plane::U16(Box::new([])), None);
         assert!(matches!(
             Decoded::yuv(32, 16, Format::Avif, Transfer::Srgb, empty),
-            Err(DecodeError::Corrupt("yuv plane extent"))
+            Err(DecodeRefusal::Corrupt("yuv plane extent"))
         ));
         let short_alpha = mono(
             Plane::U16(vec![0; 32 * 16].into_boxed_slice()),
@@ -1278,7 +1309,7 @@ mod tests {
                 Transfer::Srgb,
                 short_alpha
             ),
-            Err(DecodeError::Corrupt("yuv plane extent"))
+            Err(DecodeRefusal::Corrupt("yuv plane extent"))
         ));
         // A 420 image whose chroma planes are stubs: a 4x2 image needs
         // 2x1 chroma samples.
@@ -1294,7 +1325,7 @@ mod tests {
         };
         assert!(matches!(
             Decoded::yuv(4, 2, Format::Avif, Transfer::Srgb, undersized),
-            Err(DecodeError::Corrupt("yuv plane extent"))
+            Err(DecodeRefusal::Corrupt("yuv plane extent"))
         ));
     }
 
@@ -1470,8 +1501,9 @@ mod tests {
             let (cut, message, result) = rx
                 .recv_timeout(Duration::from_secs(5))
                 .expect("truncated jxl decode finishes");
-            assert!(
-                matches!(result, Err(DecodeError::Corrupt(actual)) if actual == message),
+            assert_eq!(
+                refusal(result),
+                Some(DecodeRefusal::Corrupt(message)),
                 "cut {cut} reported the wrong truncation"
             );
         }

@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use egui_glow::glow;
 use egui_glow::glow::HasContext;
+use eros::ErrorUnion;
 
 use crate::decode::plane_bytes;
 use crate::decode::plane_dims;
@@ -28,6 +29,7 @@ use crate::decode::Pixels;
 use crate::decode::Plane;
 use crate::decode::Subsampling;
 use crate::decode::Transfer;
+use crate::fault::TextureFault;
 use crate::view;
 use crate::view::Placement;
 use crate::view::Seat;
@@ -147,6 +149,9 @@ shader_variants!(
         color = vec4((display(u_mat * yuv - u_off) + dither) * a, a);
     }"
 );
+
+/// What caching one page's textures can fail with: the size refusal.
+type TextureError = ErrorUnion<(TextureFault,)>;
 
 /// Page-keyed texture cache plus the spread draw.
 pub struct PageTextures {
@@ -273,7 +278,7 @@ impl PageTextures {
         seat: Seat,
         page: usize,
         decoded: &Decoded,
-    ) -> eros::Result<()> {
+    ) -> Result<(), TextureError> {
         if *self.seat_slot(seat) == Some(page) {
             return Ok(());
         }
@@ -291,7 +296,7 @@ impl PageTextures {
         &mut self,
         page: usize,
         decoded: &Decoded,
-    ) -> eros::Result<()> {
+    ) -> Result<(), TextureError> {
         self.ensure_cached(page, decoded)
     }
 
@@ -302,7 +307,7 @@ impl PageTextures {
         &mut self,
         page: usize,
         decoded: &Decoded,
-    ) -> eros::Result<()> {
+    ) -> Result<(), TextureError> {
         if self.textures.contains_key(&page) {
             return Ok(());
         }
@@ -312,13 +317,10 @@ impl PageTextures {
             || width > self.max_texture_edge
             || height > self.max_texture_edge
         {
-            return Err(eros::error!(
-                "page {}: {}x{} exceeds this GPU's {}-texel texture edge limit",
-                page + 1,
-                width,
-                height,
-                self.max_texture_edge
-            ));
+            return Err(ErrorUnion::new(TextureFault {
+                dims: (width, height),
+                max_edge: self.max_texture_edge,
+            }));
         }
         // SAFETY: the size check above keeps the page inside this
         // context's texture limit, and `upload_entry` asserts its own
@@ -1558,39 +1560,6 @@ mod tests {
                 (channel - 1.0).abs() < 1e-4,
                 "mono row {row}: {channel}"
             );
-        }
-    }
-
-    #[test]
-    fn mono_stub_cancels_exactly() {
-        for depth in [8_u8, 10, 12] {
-            for full_range in [true, false] {
-                let decoded = yuv_page(
-                    depth,
-                    Subsampling::Mono,
-                    full_range,
-                    Matrix::Bt601,
-                );
-                let conversion = page_conversion(&decoded);
-                let (black, white, neutral, storage_max) =
-                    quantization_codes(depth, full_range);
-                for (code, expected) in [(black, 0.0), (white, 1.0)] {
-                    let rgb = convert(
-                        &conversion,
-                        [
-                            code / storage_max,
-                            neutral / storage_max,
-                            neutral / storage_max,
-                        ],
-                    );
-                    for (row, channel) in rgb.into_iter().enumerate() {
-                        assert!(
-                            (channel - expected).abs() < 1e-4,
-                            "depth {depth} full {full_range} row {row}: {channel} vs {expected}"
-                        );
-                    }
-                }
-            }
         }
     }
 

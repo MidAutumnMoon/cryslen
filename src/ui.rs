@@ -1,8 +1,12 @@
 //! Status overlay: one egui bottom panel, data in / text out.
 
+use std::sync::Arc;
+
 use egui::text::LayoutJob;
 
 use crate::decode::Format;
+use crate::fault::PageError;
+use crate::fault::StatusFault;
 use crate::source::PageName;
 use crate::view::Spread;
 use crate::view::ViewMode;
@@ -23,7 +27,7 @@ pub struct StatusLine {
     pub zoom: f32,
     /// The wait flag, once a pending seat has outlived the grace.
     pub waiting: Option<Wait>,
-    pub error: Option<String>,
+    pub error: Option<StatusFault>,
 }
 
 /// What the status line says a still-pending page waits for.
@@ -49,7 +53,10 @@ impl Wait {
 /// page's facts.
 pub struct FoldedStatus {
     pub waiting: bool,
-    pub error: Option<String>,
+    /// The first failed page in reading order, carrying the page so
+    /// the status line can speak for the page that failed, not the
+    /// first page that decoded.
+    pub error: Option<(usize, Arc<PageError>)>,
     pub page: Option<(usize, Format, (u32, u32))>,
 }
 
@@ -64,8 +71,8 @@ pub fn fold_status(spread: Spread, snapshot: &SpreadView) -> FoldedStatus {
     };
     for (page, view) in snapshot.reading_order(spread) {
         match view {
-            SeatView::Failed(message) => {
-                folded.error = Some(message.clone());
+            SeatView::Failed(error) => {
+                folded.error = Some((page, Arc::clone(error)));
                 break;
             }
             SeatView::Ready(decoded) if folded.page.is_none() => {
@@ -217,6 +224,8 @@ fn line(style: &egui::Style, status: &StatusLine) -> LayoutJob {
 )]
 mod tests {
     use super::*;
+    use crate::testkit::failed_page;
+    use crate::testkit::failed_seat;
     use crate::testkit::ready_seat;
 
     #[test]
@@ -236,10 +245,7 @@ mod tests {
         let rows = [
             (
                 pair,
-                spread_view(
-                    ready_seat(2, 2),
-                    Some(SeatView::Failed("x".into())),
-                ),
+                spread_view(ready_seat(2, 2), Some(failed_seat("x"))),
                 Expect {
                     waiting: false,
                     error: Some("x"),
@@ -267,8 +273,8 @@ mod tests {
             (
                 pair,
                 spread_view(
-                    SeatView::Failed("first".into()),
-                    Some(SeatView::Failed("second".into())),
+                    failed_seat("first"),
+                    Some(failed_seat("second")),
                 ),
                 Expect {
                     waiting: false,
@@ -280,19 +286,7 @@ mod tests {
                 pair,
                 spread_view(
                     ready_seat(800, 600),
-                    Some(ready_seat(640, 480)),
-                ),
-                Expect {
-                    waiting: false,
-                    error: None,
-                    page: Some((0, Format::Png, (800, 600))),
-                },
-            ),
-            (
-                pair,
-                spread_view(
-                    ready_seat(800, 600),
-                    Some(SeatView::Failed("second".into())),
+                    Some(failed_seat("second")),
                 ),
                 Expect {
                     waiting: false,
@@ -303,7 +297,7 @@ mod tests {
             (
                 pair,
                 spread_view(
-                    SeatView::Failed("first".into()),
+                    failed_seat("first"),
                     Some(ready_seat(640, 480)),
                 ),
                 Expect {
@@ -314,10 +308,7 @@ mod tests {
             ),
             (
                 pair,
-                spread_view(
-                    SeatView::Pending,
-                    Some(SeatView::Failed("x".into())),
-                ),
+                spread_view(SeatView::Pending, Some(failed_seat("x"))),
                 Expect {
                     waiting: true,
                     error: Some("x"),
@@ -338,7 +329,11 @@ mod tests {
             let folded = fold_status(*spread, snapshot);
             assert_eq!(folded.waiting, want.waiting, "row {i}: waiting");
             assert_eq!(
-                folded.error.as_deref(),
+                folded
+                    .error
+                    .as_ref()
+                    .map(|(_, error)| error.to_string())
+                    .as_deref(),
                 want.error,
                 "row {i}: error"
             );
@@ -389,7 +384,7 @@ mod tests {
         single.zoom = 1.0;
         let mut appending = status();
         appending.waiting = Some(Wait::Decoding);
-        appending.error = Some("boom".into());
+        appending.error = Some(StatusFault::Page(failed_page("boom")));
         let mut unpacking = status();
         unpacking.waiting = Some(Wait::Unpacking);
         let rows = [

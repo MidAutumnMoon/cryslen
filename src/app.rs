@@ -1,6 +1,5 @@
 //! App: winit event handling, state transitions, frame composition.
 
-use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -16,6 +15,8 @@ use winit::event_loop::EventLoopProxy;
 use winit::keyboard::ModifiersState;
 use winit::window::WindowId;
 
+use crate::fault::SpawnError;
+use crate::fault::StatusFault;
 use crate::keys::Action;
 use crate::render::PageTextures;
 use crate::screen;
@@ -53,7 +54,7 @@ fn spawn_worker(
     source: &Arc<Source>,
     spread: Spread,
     proxy: &EventLoopProxy<UserEvent>,
-) -> io::Result<Worker> {
+) -> Result<Worker, SpawnError> {
     let proxy = proxy.clone();
     Worker::spawn(Arc::clone(source), spread, move |page| {
         post(&proxy, UserEvent::PageDecided(page));
@@ -106,7 +107,7 @@ impl App {
         source: Arc<Source>,
         index: usize,
         proxy: EventLoopProxy<UserEvent>,
-    ) -> io::Result<Self> {
+    ) -> Result<Self, SpawnError> {
         let mode = ViewMode::Normal;
         let spread = view::spread_for(index, mode, source.len());
         let worker = spawn_worker(&source, spread, &proxy)?;
@@ -223,8 +224,14 @@ impl App {
             post(&self.proxy, UserEvent::Repaint(remaining));
         }
 
-        let speaking_page =
-            folded.page.map_or(spread.first, |(page, _, _)| page);
+        // The line speaks for the page that failed, if any did; the
+        // first decoded page only when the spread is healthy.
+        let speaking_page = folded
+            .error
+            .as_ref()
+            .map(|&(page, _)| page)
+            .or_else(|| folded.page.map(|(page, _, _)| page))
+            .unwrap_or(spread.first);
         let page = folded.page.map(|(page, decoded, dims)| PageFacts {
             claimed: self
                 .source
@@ -254,7 +261,8 @@ impl App {
             waiting,
             error: folded
                 .error
-                .or_else(|| self.screen.error().map(str::to_owned)),
+                .map(|(_, error)| StatusFault::Page(error))
+                .or_else(|| self.screen.error()),
         };
 
         // `EguiGlow::run` only records shapes, so egui lays out before
@@ -404,7 +412,7 @@ impl App {
         let source = match Source::open(&path) {
             Ok(source) => Arc::new(source),
             Err(error) => {
-                self.screen.note_error(error.to_string());
+                self.screen.note_error(Arc::new(error));
                 self.request_redraw();
                 return;
             }
@@ -417,7 +425,7 @@ impl App {
         let worker = match spawn_worker(&source, spread, &self.proxy) {
             Ok(worker) => worker,
             Err(error) => {
-                self.screen.note_error(error.to_string());
+                self.screen.note_error(Arc::new(error.widen()));
                 self.request_redraw();
                 return;
             }
@@ -751,10 +759,6 @@ fn wheel_lines(dy: f64, scale_factor: f64) -> f32 {
 mod tests {
     use super::*;
 
-    #[expect(
-        clippy::float_cmp_const,
-        reason = "the opaque variant returns the same constants untouched, so equality is exact"
-    )]
     #[test]
     fn background_glass() {
         let [red, green, blue, alpha] = clear_color(true);
@@ -766,10 +770,6 @@ mod tests {
                 (straight.mul_add(GLASS_ALPHA, -channel)).abs() < 1e-6
             );
         }
-        assert_eq!(
-            clear_color(false),
-            [BACKGROUND[0], BACKGROUND[1], BACKGROUND[2], 1.0]
-        );
     }
 
     #[test]

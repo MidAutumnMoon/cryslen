@@ -2,6 +2,7 @@
 
 mod app;
 mod decode;
+mod fault;
 mod keys;
 mod render;
 mod screen;
@@ -37,6 +38,10 @@ enum Arg {
     Image { dir: PathBuf, name: String },
 }
 
+#[expect(
+    clippy::use_debug,
+    reason = "the fatal exit prints the error's Debug on purpose: the full report with location, source chain, and backtrace status"
+)]
 fn main() -> ExitCode {
     use std::env;
 
@@ -64,13 +69,15 @@ fn main() -> ExitCode {
     match run(open_path, land_on) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("cy: {error}");
+            // The full report: root fault, creation location, source
+            // chain, backtrace status. `RUST_BACKTRACE` arms the trace.
+            eprintln!("cy: {error:?}");
             ExitCode::FAILURE
         }
     }
 }
 
-fn classify(path: &Path) -> eros::Result<Arg> {
+fn classify(path: &Path) -> Result<Arg, fault::OpenRefusal> {
     let Some(name) = path.file_name() else {
         return Ok(Arg::Open(path.to_path_buf()));
     };
@@ -79,10 +86,7 @@ fn classify(path: &Path) -> eros::Result<Arg> {
     }
     let name = name.to_string_lossy().into_owned();
     if decode::format_from_name(&name).is_none() {
-        return Err(eros::error!(
-            "unsupported file type: {}",
-            path.display()
-        ));
+        return Err(fault::OpenRefusal::Unsupported(path.to_path_buf()));
     }
     // Path::parent() yields Some("") for bare relative names ("pic.jpg").
     let dir = path
@@ -148,7 +152,12 @@ mod tests {
             (dir.path().join("page.png"), Ok(Some("page.png"))),
             (dir.path().join("book.cbz"), Ok(None)),
             (dir.path().to_path_buf(), Ok(None)),
-            (dir.path().join("notes.txt"), Err("unsupported")),
+            (
+                dir.path().join("notes.txt"),
+                Err(fault::OpenRefusal::Unsupported(
+                    dir.path().join("notes.txt"),
+                )),
+            ),
         ];
         for (path, want) in rows {
             match (classify(&path), want) {
@@ -177,11 +186,11 @@ mod tests {
                         path.display()
                     );
                 }
-                (Err(error), Err(want_text)) => {
-                    let message = error.to_string();
-                    assert!(
-                        message.contains(want_text),
-                        "{}: {message}",
+                (Err(error), Err(want_refusal)) => {
+                    assert_eq!(
+                        error,
+                        want_refusal,
+                        "{}: open refusal",
                         path.display()
                     );
                 }

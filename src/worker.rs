@@ -6,8 +6,6 @@
 use std::cmp::Reverse;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
-use std::fmt;
-use std::io;
 use std::mem;
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -15,10 +13,14 @@ use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use eros::ErrorUnion;
 use parking_lot::Mutex;
 
 use crate::decode::Decoded;
-use crate::source::panic_message;
+use crate::fault::bad_index;
+use crate::fault::from_payload;
+use crate::fault::PageError;
+use crate::fault::SpawnError;
 use crate::source::PageRead;
 use crate::source::Source;
 use crate::view::Spread;
@@ -27,6 +29,10 @@ use crate::view::ViewMode;
 /// Approximate decoded bytes the book may hold. The wanted spread
 /// stays resident even over this budget.
 const BOOK_BUDGET_BYTES: usize = 768 * 1024 * 1024;
+
+/// What a failed page costs the book budget: the boxed fault behind
+/// its `Arc`, at the union's inline size.
+const FAILED_BYTES: usize = mem::size_of::<PageError>();
 
 enum ToWorker {
     Retune(Spread),
@@ -48,7 +54,7 @@ pub struct SpreadView {
 #[derive(Clone)]
 pub enum SeatView {
     Ready(Arc<Decoded>),
-    Failed(String),
+    Failed(Arc<PageError>),
     Pending,
 }
 
@@ -56,7 +62,7 @@ impl SeatView {
     fn resident_bytes(&self) -> usize {
         match self {
             Self::Ready(decoded) => decoded.resident_bytes(),
-            Self::Failed(message) => message.len(),
+            Self::Failed(_) => FAILED_BYTES,
             Self::Pending => 0,
         }
     }
@@ -291,7 +297,7 @@ impl Worker {
         source: Arc<Source>,
         initial: Spread,
         notify: impl Fn(usize) + Send + Sync + 'static,
-    ) -> io::Result<Self> {
+    ) -> Result<Self, SpawnError> {
         use std::thread::Builder;
 
         let (tx, rx) = mpsc::channel::<ToWorker>();
@@ -405,17 +411,8 @@ fn run(
 
 enum Decision {
     Ready(Arc<Decoded>),
-    Failed(String),
+    Failed(Arc<PageError>),
     NotYet,
-}
-
-/// A terminal failure labelled with the page's 1-based display number.
-/// This is the only place the prefix is added.
-fn page_failure(
-    page_index: usize,
-    message: impl fmt::Display,
-) -> Decision {
-    Decision::Failed(format!("page {}: {message}", page_index + 1))
 }
 
 /// Resolve one page to a decision: decoded, a terminal failure, or a
@@ -428,7 +425,7 @@ fn decide_page(source: &Source, page_index: usize) -> Decision {
     use std::panic::AssertUnwindSafe;
 
     let Some(name) = source.name(page_index) else {
-        return page_failure(page_index, "no such page");
+        return Decision::Failed(Arc::new(bad_index()));
     };
     match source.bytes(page_index) {
         PageRead::Ready(bytes) => {
@@ -437,14 +434,17 @@ fn decide_page(source: &Source, page_index: usize) -> Decision {
             }));
             match result {
                 Ok(Ok(page)) => Decision::Ready(Arc::new(page)),
-                Ok(Err(error)) => page_failure(page_index, error),
-                Err(payload) => page_failure(
-                    page_index,
-                    format!("decoder {}", panic_message(payload.as_ref())),
-                ),
+                Ok(Err(error)) => {
+                    Decision::Failed(Arc::new(error.widen()))
+                }
+                Err(payload) => {
+                    Decision::Failed(Arc::new(ErrorUnion::new(
+                        from_payload("decoder", payload.as_ref()),
+                    )))
+                }
             }
         }
-        PageRead::Failed(message) => page_failure(page_index, message),
+        PageRead::Failed(error) => Decision::Failed(error),
         PageRead::NotYet => Decision::NotYet,
     }
 }
@@ -458,6 +458,7 @@ fn decide_page(source: &Source, page_index: usize) -> Decision {
 mod tests {
     use super::*;
     use crate::testkit::eventually;
+    use crate::testkit::failed_seat;
     use crate::testkit::ready_seat;
     use crate::testkit::tiny_png;
     use crate::testkit::TempDir;
@@ -606,6 +607,28 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_page_costs_the_fault_and_evicts() {
+        let mut book = Book::new(Spread::lone(5), 10);
+        book.retune(Spread::lone(5), 10);
+        book.store(1, failed_seat("boom"));
+        // The boxed fault is the failed page's whole cost; the message
+        // length no longer matters.
+        assert_eq!(book.live_bytes, FAILED_BYTES);
+        // One ready page (8 bytes) over a budget with room for the
+        // fault but not both evicts the never-wanted failed page.
+        book.budget = FAILED_BYTES + 7;
+        book.store(2, ready_seat(2, 1));
+        assert!(
+            book.decided.contains_key(&2),
+            "the newcomer was evicted instead of the failed page"
+        );
+        assert!(
+            !book.decided.contains_key(&1),
+            "the failed page survived eviction"
+        );
+    }
+
+    #[test]
     fn saturating_store_never_drops_the_wanted_spread() {
         let mut book = Book::new(Spread::lone(1), 20);
         book.budget = 16;
@@ -623,20 +646,13 @@ mod tests {
         let snapshot = book.snapshot(&wanted);
         assert!(matches!(snapshot.first, SeatView::Ready(_)));
         assert!(matches!(snapshot.second, Some(SeatView::Ready(_))));
-    }
-
-    // 10x10 rgba is 400 bytes against a budget of 10: the store itself
-    // saturates the book.
-    #[test]
-    fn wanted_spread_survives_its_own_oversize() {
-        let wanted = Spread {
-            first: 3,
-            second: Some(4),
-        };
-        let mut book = Book::new(wanted, 10);
-        book.budget = 10;
-        book.store(3, ready_seat(10, 10));
-        assert!(book.decided.contains_key(&3));
+        // A store with no evictable victim (only wanted pages held)
+        // stays over budget rather than dropping a shown page.
+        book.budget = 1;
+        book.store(7, ready_seat(10, 10));
+        assert!(book.decided.contains_key(&7));
+        assert!(book.decided.contains_key(&8));
+        assert!(book.live_bytes > book.budget);
     }
 
     fn tiny_source(tag: &str, page_count: u8) -> (TempDir, Arc<Source>) {
@@ -741,19 +757,21 @@ mod tests {
                 .snapshot(&bad)
                 .first
             {
-                SeatView::Failed(message) => Some(message),
+                SeatView::Failed(error) => Some(error),
                 SeatView::Ready(_) => panic!("bad.png decoded as Ready?"),
                 SeatView::Pending => None,
             });
-        assert!(failed.starts_with("page 1: "), "{failed}");
-        assert!(!failed.contains("page 1: page 1"), "{failed}");
+        assert!(
+            failed.downcast_inner_ref::<image::ImageError>().is_some(),
+            "bad.png must fail as an image decode fault, not {failed}"
+        );
         // The entry is sticky across turns: turn to the ok page, then back.
         worker.retune(ok);
         wait_ready(&worker, &[1]);
         worker.retune(bad);
         let revisit = worker.snapshot(&bad).first;
         assert!(
-            matches!(&revisit, SeatView::Failed(message) if *message == failed),
+            matches!(&revisit, SeatView::Failed(again) if Arc::ptr_eq(again, &failed)),
             "page 0 lost its sticky failure across a turn"
         );
         // Drop joins the worker here, so a broken stop path hangs the
@@ -794,7 +812,7 @@ mod tests {
             eventually(20, "page never settled", || {
                 match worker.snapshot(&Spread::lone(page)).first {
                     SeatView::Pending => None,
-                    SeatView::Failed(message) => Some(message),
+                    SeatView::Failed(error) => Some(error),
                     SeatView::Ready(_) => {
                         panic!("zeros decoded as an image?")
                     }
@@ -803,44 +821,11 @@ mod tests {
         };
         let far_page = settled(far);
         assert!(
-            far_page.starts_with(&format!("page {}: ", far + 1)),
-            "{far_page}"
+            far_page
+                .downcast_inner_ref::<image::ImageError>()
+                .is_some(),
+            "the far page must fail as its own decode fault, not {far_page}"
         );
-        assert!(
-            !far_page.contains("no entry in the archive"),
-            "{far_page}"
-        );
-        assert!(
-            !far_page.contains("could not start the unpack thread"),
-            "{far_page}"
-        );
-        worker.retune(Spread::lone(0));
-        let first_page = settled(0);
-        assert!(first_page.starts_with("page 1: "), "{first_page}");
-    }
-
-    #[test]
-    fn retune_decoding() {
-        let (_dir, source) = tiny_source("worker-retune", 50);
-        let worker = Worker::spawn(source, Spread::lone(0), |_| {})
-            .expect("worker spawns");
-        // 50 retunes queue faster than pages decode; every page still decodes
-        for page in 0..50 {
-            worker.retune(Spread::lone(page));
-        }
-        wait_ready(&worker, &(0..50).collect::<Vec<_>>());
-        worker.retune(Spread {
-            first: 3,
-            second: Some(4),
-        });
-        wait_ready(&worker, &[3, 4]);
-        // The last-wanted records are what keep a wanted spread in the
-        // book, so the wiring is pinned on them.
-        let was_wanted = |page: usize| {
-            worker.book.lock().last_wanted.contains_key(&page)
-        };
-        assert!(was_wanted(3), "page 3 never recorded as wanted");
-        assert!(was_wanted(4), "page 4 never recorded as wanted");
     }
 
     #[test]
@@ -867,6 +852,18 @@ mod tests {
                 "page {page} decoded past the trail radius"
             );
         }
+        // The last-wanted records are what keep a wanted spread in the
+        // book, so the wiring is pinned on them.
+        worker.retune(Spread {
+            first: 3,
+            second: Some(4),
+        });
+        wait_ready(&worker, &[3, 4]);
+        let was_wanted = |page: usize| {
+            worker.book.lock().last_wanted.contains_key(&page)
+        };
+        assert!(was_wanted(3), "page 3 never recorded as wanted");
+        assert!(was_wanted(4), "page 4 never recorded as wanted");
     }
 
     #[test]

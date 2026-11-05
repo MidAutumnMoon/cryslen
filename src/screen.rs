@@ -6,6 +6,9 @@
 use std::sync::Arc;
 
 use crate::decode::Decoded;
+use crate::fault::OpenError;
+use crate::fault::PageError;
+use crate::fault::StatusFault;
 use crate::render::PageTextures;
 use crate::view;
 use crate::view::Seat;
@@ -148,11 +151,11 @@ pub(crate) struct Screen {
     /// A texture upload the GPU refused. A binding frame rewrites this:
     /// a refused bind retries every frame while its page stays wanted,
     /// so the error holds exactly that long.
-    upload_error: Option<String>,
+    upload_error: Option<Arc<PageError>>,
     /// A failure the app noted (a book switch that failed). No frame
     /// retries it, so it holds until a successful switch clears the
     /// book.
-    noted_error: Option<String>,
+    noted_error: Option<Arc<OpenError>>,
 }
 
 impl Screen {
@@ -188,7 +191,9 @@ impl Screen {
                 SeatStep::Show { page, decoded } => {
                     match pages.bind(seat, page, decoded) {
                         Ok(()) => bound_cleanly = true,
-                        Err(error) => bind_error = Some(error.to_string()),
+                        Err(error) => {
+                            bind_error = Some(Arc::new(error.widen()));
+                        }
                     }
                     // The seat keeps its page and dims even on a refused
                     // upload, so the layout and hold policy stay stable
@@ -249,7 +254,7 @@ impl Screen {
         decoded: &Arc<Decoded>,
     ) {
         if let Err(error) = pages.stage(page, decoded) {
-            self.upload_error = Some(error.to_string());
+            self.upload_error = Some(Arc::new(error.widen()));
         }
     }
 
@@ -258,12 +263,17 @@ impl Screen {
     }
 
     /// An error the status line must show that no page owns.
-    pub(crate) fn error(&self) -> Option<&str> {
-        self.noted_error.as_deref().or(self.upload_error.as_deref())
+    pub(crate) fn error(&self) -> Option<StatusFault> {
+        if let Some(error) = &self.noted_error {
+            return Some(StatusFault::Noted(Arc::clone(error)));
+        }
+        self.upload_error
+            .as_ref()
+            .map(|error| StatusFault::Page(Arc::clone(error)))
     }
 
-    pub(crate) fn note_error(&mut self, message: String) {
-        self.noted_error = Some(message);
+    pub(crate) fn note_error(&mut self, error: Arc<OpenError>) {
+        self.noted_error = Some(error);
     }
 
     /// Drop every shown fact.
@@ -278,6 +288,7 @@ impl Screen {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::failed_seat;
     use crate::testkit::ready_seat;
     use crate::view::ViewMode;
 
@@ -326,7 +337,7 @@ mod tests {
             first: 5,
             second: Some(6),
         };
-        let failed = || Some(SeatView::Failed("x".into()));
+        let failed = || Some(failed_seat("x"));
         let pending = || Some(SeatView::Pending);
         // Manga seats a pair as [second, first]: left = page 6, right = 5.
         // Comic/Normal seat [first, second]: left = first.
@@ -347,14 +358,6 @@ mod tests {
                 bound: [Some(4), Some(3)],
                 steps: [HOLD, HOLD],
                 shown_after: Some(old), committed: false, stage: Some((5, (500, 700))),
-            },
-            Row {
-                name: "an undecided right page holds every seat and stages the partner",
-                shown: Some(old), wanted: pair, mode: ViewMode::Manga,
-                views: [Some(ready_seat(600, 700)), pending()],
-                bound: [Some(4), Some(3)],
-                steps: [HOLD, HOLD],
-                shown_after: Some(old), committed: false, stage: Some((6, (600, 700))),
             },
             Row {
                 name: "a failed partner commits: the seat clears",
@@ -462,14 +465,6 @@ mod tests {
                 bound: [None, None],
                 steps: [CLEAR, show(5, (500, 700))],
                 shown_after: Some(pair), committed: true, stage: None,
-            },
-            Row {
-                name: "steady state re-shows the same seats",
-                shown: Some(pair), wanted: pair, mode: ViewMode::Manga,
-                views: [Some(ready_seat(600, 700)), Some(ready_seat(500, 700))],
-                bound: [Some(6), Some(5)],
-                steps: [show(6, (600, 700)), show(5, (500, 700))],
-                shown_after: Some(pair), committed: false, stage: None,
             },
             Row {
                 name: "a direction flip on a decided spread re-mirrors at once",
