@@ -69,7 +69,11 @@ pub fn fold_status(spread: Spread, snapshot: &SpreadView) -> FoldedStatus {
                 break;
             }
             SeatView::Ready(decoded) if folded.page.is_none() => {
-                folded.page = Some((page, decoded.format, (decoded.width, decoded.height)));
+                folded.page = Some((
+                    page,
+                    decoded.format,
+                    (decoded.width, decoded.height),
+                ));
             }
             SeatView::Ready(_) | SeatView::Pending => {}
         }
@@ -91,7 +95,11 @@ pub struct PageFacts {
 /// bar (`fullscreen`) consumes nothing, so the rect is the whole window.
 /// egui 0.37 panels show into the `&mut Ui` that `EguiGlow::run` hands
 /// over, not into a context.
-pub fn show(ui: &mut egui::Ui, status: &StatusLine, show_bar: bool) -> egui::Rect {
+pub fn show(
+    ui: &mut egui::Ui,
+    status: &StatusLine,
+    show_bar: bool,
+) -> egui::Rect {
     if !show_bar {
         return ui.available_rect_before_wrap();
     }
@@ -117,8 +125,11 @@ pub fn show(ui: &mut egui::Ui, status: &StatusLine, show_bar: bool) -> egui::Rec
 fn right_end(ui: &mut egui::Ui, status: &StatusLine) {
     for (mode_index, &mode) in ViewMode::ALL.iter().enumerate().rev() {
         let text = egui::RichText::new(group_label(mode)).monospace();
-        let text =
-            if mode == status.mode { text.color(mode_color(mode)).strong() } else { text.weak() };
+        let text = if mode == status.mode {
+            text.color(mode_color(mode)).strong()
+        } else {
+            text.weak()
+        };
         ui.label(text);
         if mode_index > 0 {
             ui.label(egui::RichText::new("·").weak().monospace());
@@ -143,9 +154,11 @@ fn mode_color(mode: ViewMode) -> egui::Color32 {
 
 /// Muted hue for the spread range, quieter than the mode colors so the
 /// group keeps the bar's strongest accent.
-const HEAD_COLOR: egui::Color32 = egui::Color32::from_rgb(0xc2, 0x9e, 0x6f);
+const HEAD_COLOR: egui::Color32 =
+    egui::Color32::from_rgb(0xc2, 0x9e, 0x6f);
 
-const NAME_COLOR: egui::Color32 = egui::Color32::from_rgb(0xa2, 0x92, 0xc5);
+const NAME_COLOR: egui::Color32 =
+    egui::Color32::from_rgb(0xa2, 0x92, 0xc5);
 
 /// The left-side facts as one job of colored sections, separate so they
 /// are directly testable. One job, one label: the whole line keeps
@@ -153,9 +166,14 @@ const NAME_COLOR: egui::Color32 = egui::Color32::from_rgb(0xa2, 0x92, 0xc5);
 fn line(style: &egui::Style, status: &StatusLine) -> LayoutJob {
     let font = egui::TextStyle::Monospace.resolve(style);
     let plain = style.visuals.text_color();
-    let section = |job: &mut LayoutJob, text: &str, color: egui::Color32| {
-        job.append(text, 0.0, egui::TextFormat::simple(font.clone(), color));
-    };
+    let section =
+        |job: &mut LayoutJob, text: &str, color: egui::Color32| {
+            job.append(
+                text,
+                0.0,
+                egui::TextFormat::simple(font.clone(), color),
+            );
+        };
     let mut job = LayoutJob::default();
 
     let head = status.spread.second.map_or_else(
@@ -193,7 +211,10 @@ fn line(style: &egui::Style, status: &StatusLine) -> LayoutJob {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used, reason = "a panic in test code is inconsequential")]
+#[expect(
+    clippy::expect_used,
+    reason = "a panic in test code is inconsequential"
+)]
 mod tests {
     use super::*;
     use crate::testkit::ready_seat;
@@ -205,32 +226,122 @@ mod tests {
             error: Option<&'static str>,
             page: Option<(usize, Format, (u32, u32))>,
         }
-        let pair = Spread { first: 0, second: Some(1) };
-        let spread_view = |first: SeatView, second: Option<SeatView>| SpreadView { first, second };
+        let pair = Spread {
+            first: 0,
+            second: Some(1),
+        };
+        let spread_view = |first: SeatView, second: Option<SeatView>| {
+            SpreadView { first, second }
+        };
         let rows = [
-            (pair, spread_view(ready_seat(2, 2), Some(SeatView::Failed("x".into()))),
-                Expect { waiting: false, error: Some("x"), page: Some((0, Format::Png, (2, 2))) }),
-            (pair, spread_view(SeatView::Pending, Some(ready_seat(2, 2))),
-                Expect { waiting: true, error: None, page: Some((1, Format::Png, (2, 2))) }),
-            (Spread::lone(0), spread_view(ready_seat(2, 2), None),
-                Expect { waiting: false, error: None, page: Some((0, Format::Png, (2, 2))) }),
-            (pair, spread_view(SeatView::Failed("first".into()), Some(SeatView::Failed("second".into()))),
-                Expect { waiting: false, error: Some("first"), page: None }),
-            (pair, spread_view(ready_seat(800, 600), Some(ready_seat(640, 480))),
-                Expect { waiting: false, error: None, page: Some((0, Format::Png, (800, 600))) }),
-            (pair, spread_view(ready_seat(800, 600), Some(SeatView::Failed("second".into()))),
-                Expect { waiting: false, error: Some("second"), page: Some((0, Format::Png, (800, 600))) }),
-            (pair, spread_view(SeatView::Failed("first".into()), Some(ready_seat(640, 480))),
-                Expect { waiting: false, error: Some("first"), page: None }),
-            (pair, spread_view(SeatView::Pending, Some(SeatView::Failed("x".into()))),
-                Expect { waiting: true, error: Some("x"), page: None }),
-            (Spread::lone(0), spread_view(SeatView::Pending, None),
-                Expect { waiting: true, error: None, page: None }),
+            (
+                pair,
+                spread_view(
+                    ready_seat(2, 2),
+                    Some(SeatView::Failed("x".into())),
+                ),
+                Expect {
+                    waiting: false,
+                    error: Some("x"),
+                    page: Some((0, Format::Png, (2, 2))),
+                },
+            ),
+            (
+                pair,
+                spread_view(SeatView::Pending, Some(ready_seat(2, 2))),
+                Expect {
+                    waiting: true,
+                    error: None,
+                    page: Some((1, Format::Png, (2, 2))),
+                },
+            ),
+            (
+                Spread::lone(0),
+                spread_view(ready_seat(2, 2), None),
+                Expect {
+                    waiting: false,
+                    error: None,
+                    page: Some((0, Format::Png, (2, 2))),
+                },
+            ),
+            (
+                pair,
+                spread_view(
+                    SeatView::Failed("first".into()),
+                    Some(SeatView::Failed("second".into())),
+                ),
+                Expect {
+                    waiting: false,
+                    error: Some("first"),
+                    page: None,
+                },
+            ),
+            (
+                pair,
+                spread_view(
+                    ready_seat(800, 600),
+                    Some(ready_seat(640, 480)),
+                ),
+                Expect {
+                    waiting: false,
+                    error: None,
+                    page: Some((0, Format::Png, (800, 600))),
+                },
+            ),
+            (
+                pair,
+                spread_view(
+                    ready_seat(800, 600),
+                    Some(SeatView::Failed("second".into())),
+                ),
+                Expect {
+                    waiting: false,
+                    error: Some("second"),
+                    page: Some((0, Format::Png, (800, 600))),
+                },
+            ),
+            (
+                pair,
+                spread_view(
+                    SeatView::Failed("first".into()),
+                    Some(ready_seat(640, 480)),
+                ),
+                Expect {
+                    waiting: false,
+                    error: Some("first"),
+                    page: None,
+                },
+            ),
+            (
+                pair,
+                spread_view(
+                    SeatView::Pending,
+                    Some(SeatView::Failed("x".into())),
+                ),
+                Expect {
+                    waiting: true,
+                    error: Some("x"),
+                    page: None,
+                },
+            ),
+            (
+                Spread::lone(0),
+                spread_view(SeatView::Pending, None),
+                Expect {
+                    waiting: true,
+                    error: None,
+                    page: None,
+                },
+            ),
         ];
         for (i, (spread, snapshot, want)) in rows.iter().enumerate() {
             let folded = fold_status(*spread, snapshot);
             assert_eq!(folded.waiting, want.waiting, "row {i}: waiting");
-            assert_eq!(folded.error.as_deref(), want.error, "row {i}: error");
+            assert_eq!(
+                folded.error.as_deref(),
+                want.error,
+                "row {i}: error"
+            );
             assert_eq!(folded.page, want.page, "row {i}: page");
         }
     }
@@ -238,10 +349,16 @@ mod tests {
     fn status() -> StatusLine {
         StatusLine {
             page_count: 214,
-            spread: Spread { first: 11, second: Some(12) },
+            spread: Spread {
+                first: 11,
+                second: Some(12),
+            },
             mode: ViewMode::Manga,
             toast: false,
-            name: PageName { parent: Some("b".into()), file: "010.png".into() },
+            name: PageName {
+                parent: Some("b".into()),
+                file: "010.png".into(),
+            },
             // The name claims png and the page decodes as jxl, so the
             // format label prefixes the dims.
             page: Some(PageFacts {
@@ -286,9 +403,15 @@ mod tests {
             assert_eq!(line(&style, status_line).text, *want, "row {i}");
         }
         let section_colors = |job: &LayoutJob| -> Vec<egui::Color32> {
-            job.sections.iter().map(|section| section.format.color).collect()
+            job.sections
+                .iter()
+                .map(|section| section.format.color)
+                .collect()
         };
-        assert_eq!(section_colors(&line(&style, &base)), vec![HEAD_COLOR, plain, NAME_COLOR, plain]);
+        assert_eq!(
+            section_colors(&line(&style, &base)),
+            vec![HEAD_COLOR, plain, NAME_COLOR, plain]
+        );
         assert_eq!(group_label(ViewMode::Normal), "Normal (n)");
         assert_eq!(group_label(ViewMode::Manga), "Manga (m)");
         assert_eq!(group_label(ViewMode::Comic), "Comic (c)");
@@ -313,7 +436,10 @@ mod tests {
                     .iter()
                     .map(|row| row.text())
                     .collect::<String>(),
-                rect: text_shape.galley.rect.translate(text_shape.pos.to_vec2()),
+                rect: text_shape
+                    .galley
+                    .rect
+                    .translate(text_shape.pos.to_vec2()),
                 elided: text_shape.galley.elided,
             }),
             egui::Shape::Vec(shapes) => {
@@ -330,7 +456,10 @@ mod tests {
     /// sizing settles one frame late, so a settle pass runs first.
     /// Only the texture upload needs a GPU, and
     /// `drop_without_applying_deltas` skips it.
-    fn render(width: f32, status: &StatusLine) -> (Vec<TextItem>, egui::Rect) {
+    fn render(
+        width: f32,
+        status: &StatusLine,
+    ) -> (Vec<TextItem>, egui::Rect) {
         use std::mem;
 
         let ctx = egui::Context::default();
@@ -341,9 +470,13 @@ mod tests {
             )),
             ..Default::default()
         };
-        ctx.run_ui(input(), |ui| { show(ui, status, true); }).drop_without_applying_deltas();
+        ctx.run_ui(input(), |ui| {
+            show(ui, status, true);
+        })
+        .drop_without_applying_deltas();
         let mut content = egui::Rect::NOTHING;
-        let mut out = ctx.run_ui(input(), |ui| content = show(ui, status, true));
+        let mut out =
+            ctx.run_ui(input(), |ui| content = show(ui, status, true));
         let shapes = mem::take(&mut out.shapes);
         out.drop_without_applying_deltas();
         let mut items = Vec::new();
@@ -353,8 +486,14 @@ mod tests {
         (items, content)
     }
 
-    fn find<'items>(items: &'items [TextItem], prefix: &str) -> &'items TextItem {
-        items.iter().find(|item| item.text.starts_with(prefix)).expect(prefix)
+    fn find<'items>(
+        items: &'items [TextItem],
+        prefix: &str,
+    ) -> &'items TextItem {
+        items
+            .iter()
+            .find(|item| item.text.starts_with(prefix))
+            .expect(prefix)
     }
 
     /// The panel frame's inner margin is the flush-left and
@@ -377,22 +516,53 @@ mod tests {
 
         assert!(wide_rect.min.x.abs() < ROUND, "{}", wide_rect.min.x);
         assert!(wide_rect.min.y.abs() < ROUND, "{}", wide_rect.min.y);
-        assert!((wide_rect.width() - WIDE).abs() < ROUND, "{}", wide_rect.width());
-        assert!(wide_rect.max.y > 400.0, "content must span most of the window: {}", wide_rect.max.y);
-        assert!(wide_rect.max.y < SCREEN_HEIGHT, "content must exclude the bar strip: {}", wide_rect.max.y);
+        assert!(
+            (wide_rect.width() - WIDE).abs() < ROUND,
+            "{}",
+            wide_rect.width()
+        );
+        assert!(
+            wide_rect.max.y > 400.0,
+            "content must span most of the window: {}",
+            wide_rect.max.y
+        );
+        assert!(
+            wide_rect.max.y < SCREEN_HEIGHT,
+            "content must exclude the bar strip: {}",
+            wide_rect.max.y
+        );
 
-        assert!((narrow_rect.width() - NARROW).abs() < ROUND, "{}", narrow_rect.width());
+        assert!(
+            (narrow_rect.width() - NARROW).abs() < ROUND,
+            "{}",
+            narrow_rect.width()
+        );
         // 8.0 tolerates a text line of bar-height difference across widths,
         // unlike ROUND's sub-pixel rounding.
-        assert!((narrow_rect.max.y - wide_rect.max.y).abs() < 8.0, "{narrow_rect:?} vs {wide_rect:?}");
+        assert!(
+            (narrow_rect.max.y - wide_rect.max.y).abs() < 8.0,
+            "{narrow_rect:?} vs {wide_rect:?}"
+        );
 
-        assert!((find(&plain, "12-13/214").rect.left() - PANEL_MARGIN).abs() < ROUND);
-        assert_eq!(find(&plain, "12-13/214").rect.left(), find(&toast, "12-13/214").rect.left());
+        assert!(
+            (find(&plain, "12-13/214").rect.left() - PANEL_MARGIN).abs()
+                < ROUND
+        );
+        assert_eq!(
+            find(&plain, "12-13/214").rect.left(),
+            find(&toast, "12-13/214").rect.left()
+        );
 
         for items in [&plain, &toast] {
             let comic = find(items, "Comic (c)");
-            let rightmost = items.iter().map(|item| item.rect.right()).fold(f32::MIN, f32::max);
-            assert!((rightmost - comic.rect.right()).abs() < ROUND, "group must be rightmost");
+            let rightmost = items
+                .iter()
+                .map(|item| item.rect.right())
+                .fold(f32::MIN, f32::max);
+            assert!(
+                (rightmost - comic.rect.right()).abs() < ROUND,
+                "group must be rightmost"
+            );
             assert!(
                 (comic.rect.right() - (WIDE - PANEL_MARGIN)).abs() < ROUND,
                 "group must be flush right"
@@ -404,13 +574,20 @@ mod tests {
             "the group must not move when the toast appears"
         );
 
-        assert!(find(&toast, "right to left").rect.right() < find(&toast, "Comic (c)").rect.left());
-        assert!(plain.iter().all(|item| !item.text.contains(status().mode.effect())));
+        assert!(
+            find(&toast, "right to left").rect.right()
+                < find(&toast, "Comic (c)").rect.left()
+        );
+        assert!(plain
+            .iter()
+            .all(|item| !item.text.contains(status().mode.effect())));
 
         let facts = find(&narrow, "12-13");
         assert!(facts.elided, "facts must elide on a narrow screen");
         assert!(facts.text.ends_with('…'));
-        assert!(facts.rect.right() <= find(&narrow, "Comic (c)").rect.left());
+        assert!(
+            facts.rect.right() <= find(&narrow, "Comic (c)").rect.left()
+        );
         assert!(!find(&plain, "12-13").elided);
     }
 }

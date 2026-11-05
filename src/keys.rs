@@ -45,7 +45,10 @@ impl Action {
         clippy::wildcard_enum_match_arm,
         reason = "winit's unmapped KeyCode variants map to no action"
     )]
-    pub(crate) fn from_key(code: KeyCode, modifiers: ModifiersState) -> Option<Self> {
+    pub(crate) fn from_key(
+        code: KeyCode,
+        modifiers: ModifiersState,
+    ) -> Option<Self> {
         let bare_shift = modifiers.shift_key()
             && !modifiers.control_key()
             && !modifiers.alt_key()
@@ -88,7 +91,10 @@ impl Action {
 
     /// Whether a held key keeps firing this action.
     pub(crate) fn repeats(self) -> bool {
-        matches!(self, Self::Right | Self::Left | Self::Forward | Self::Back)
+        matches!(
+            self,
+            Self::Right | Self::Left | Self::Forward | Self::Back
+        )
     }
 
     /// Whether this action advances reading order in `mode`. Manga
@@ -145,7 +151,11 @@ mod tests {
             (KeyCode::ArrowUp, None),
         ];
         for (code, action) in bindings {
-            assert_eq!(Action::from_key(*code, ModifiersState::empty()), *action, "{code:?}");
+            assert_eq!(
+                Action::from_key(*code, ModifiersState::empty()),
+                *action,
+                "{code:?}"
+            );
         }
     }
 
@@ -168,7 +178,11 @@ mod tests {
             (KeyCode::PageUp, ModifiersState::SHIFT, None),
         ];
         for (code, modifiers, action) in bindings {
-            assert_eq!(Action::from_key(*code, *modifiers), *action, "{code:?} {modifiers:?}");
+            assert_eq!(
+                Action::from_key(*code, *modifiers),
+                *action,
+                "{code:?} {modifiers:?}"
+            );
         }
     }
 
@@ -213,7 +227,11 @@ mod tests {
             (Action::Back, ViewMode::Comic, false),
         ];
         for &(action, mode, want) in forwards {
-            assert_eq!(action.is_forward(mode), want, "{action:?} in {mode:?}");
+            assert_eq!(
+                action.is_forward(mode),
+                want,
+                "{action:?} in {mode:?}"
+            );
         }
     }
 }

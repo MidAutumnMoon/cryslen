@@ -9,7 +9,10 @@ use crate::decode::Format;
 use crate::decode::Transfer;
 use crate::worker::SeatView;
 
-fn encode(img: &image::DynamicImage, format: image::ImageFormat) -> Vec<u8> {
+fn encode(
+    img: &image::DynamicImage,
+    format: image::ImageFormat,
+) -> Vec<u8> {
     use std::io::Cursor;
 
     let mut buf = Vec::new();
@@ -19,28 +22,44 @@ fn encode(img: &image::DynamicImage, format: image::ImageFormat) -> Vec<u8> {
 }
 
 pub fn tiny_png(width: u32, height: u32, rgba: [u8; 4]) -> Vec<u8> {
-    let img = image::RgbaImage::from_pixel(width, height, image::Rgba(rgba));
-    encode(&image::DynamicImage::ImageRgba8(img), image::ImageFormat::Png)
+    let img =
+        image::RgbaImage::from_pixel(width, height, image::Rgba(rgba));
+    encode(
+        &image::DynamicImage::ImageRgba8(img),
+        image::ImageFormat::Png,
+    )
 }
 
 pub fn tiny_jpeg(width: u32, height: u32, rgb: [u8; 3]) -> Vec<u8> {
     let img = image::RgbImage::from_pixel(width, height, image::Rgb(rgb));
-    encode(&image::DynamicImage::ImageRgb8(img), image::ImageFormat::Jpeg)
+    encode(
+        &image::DynamicImage::ImageRgb8(img),
+        image::ImageFormat::Jpeg,
+    )
 }
 
 pub fn tiny_gif(width: u32, height: u32, rgb: [u8; 3]) -> Vec<u8> {
     let img = image::RgbImage::from_pixel(width, height, image::Rgb(rgb));
-    encode(&image::DynamicImage::ImageRgb8(img), image::ImageFormat::Gif)
+    encode(
+        &image::DynamicImage::ImageRgb8(img),
+        image::ImageFormat::Gif,
+    )
 }
 
 pub fn tiny_bmp(width: u32, height: u32, rgb: [u8; 3]) -> Vec<u8> {
     let img = image::RgbImage::from_pixel(width, height, image::Rgb(rgb));
-    encode(&image::DynamicImage::ImageRgb8(img), image::ImageFormat::Bmp)
+    encode(
+        &image::DynamicImage::ImageRgb8(img),
+        image::ImageFormat::Bmp,
+    )
 }
 
 pub fn tiny_tiff(width: u32, height: u32, rgb: [u8; 3]) -> Vec<u8> {
     let img = image::RgbImage::from_pixel(width, height, image::Rgb(rgb));
-    encode(&image::DynamicImage::ImageRgb8(img), image::ImageFormat::Tiff)
+    encode(
+        &image::DynamicImage::ImageRgb8(img),
+        image::ImageFormat::Tiff,
+    )
 }
 
 pub fn ready_seat(width: u32, height: u32) -> SeatView {
@@ -52,7 +71,8 @@ pub fn ready_seat(width: u32, height: u32) -> SeatView {
             height,
             Format::Png,
             Transfer::Srgb,
-            vec![0_u8; width as usize * height as usize * 4].into_boxed_slice(),
+            vec![0_u8; width as usize * height as usize * 4]
+                .into_boxed_slice(),
         )
         .expect("valid rgba page"),
     ))
@@ -63,7 +83,11 @@ pub fn ready_seat(width: u32, height: u32) -> SeatView {
 /// # Panics
 ///
 /// Panics with `what` on timeout.
-pub fn eventually<T>(secs: u64, what: &str, mut probe: impl FnMut() -> Option<T>) -> T {
+pub fn eventually<T>(
+    secs: u64,
+    what: &str,
+    mut probe: impl FnMut() -> Option<T>,
+) -> T {
     use std::thread;
     use std::time::Duration;
     use std::time::Instant;
@@ -112,6 +136,8 @@ impl TempDir {
 impl Drop for TempDir {
     fn drop(&mut self) {
         // A failed removal is a leaked scratch dir, never a test failure.
-        let Ok(()) = fs::remove_dir_all(&self.0) else { return; };
+        let Ok(()) = fs::remove_dir_all(&self.0) else {
+            return;
+        };
     }
 }

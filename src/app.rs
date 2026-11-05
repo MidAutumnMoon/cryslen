@@ -44,7 +44,9 @@ pub enum UserEvent {
     reason = "pub(crate) is the crate's visibility style for crate-wide items, even inside private modules"
 )]
 pub(crate) fn post(proxy: &EventLoopProxy<UserEvent>, event: UserEvent) {
-    let Ok(()) = proxy.send_event(event) else { return; };
+    let Ok(()) = proxy.send_event(event) else {
+        return;
+    };
 }
 
 fn spawn_worker(
@@ -130,7 +132,11 @@ impl App {
 
     /// Store `error` and exit so `main` can report it after `run_app`
     /// returns.
-    fn fail(&mut self, error: eros::ErrorUnion, event_loop: &ActiveEventLoop) {
+    fn fail(
+        &mut self,
+        error: eros::ErrorUnion,
+        event_loop: &ActiveEventLoop,
+    ) {
         self.fatal_error = Some(error);
         event_loop.exit();
     }
@@ -168,7 +174,12 @@ impl App {
 
         let snapshot = self.worker.snapshot(&spread);
         if let Some(gl) = self.gl.as_mut() {
-            let committed = self.screen.display(&mut gl.pages, spread, self.mode, &snapshot);
+            let committed = self.screen.display(
+                &mut gl.pages,
+                spread,
+                self.mode,
+                &snapshot,
+            );
             self.screen.stage_forward(
                 &mut gl.pages,
                 spread,
@@ -195,29 +206,43 @@ impl App {
         if let Some(since) = self.waiting_since {
             let elapsed = since.elapsed();
             if elapsed < WAIT_GRACE {
-                post(&self.proxy, UserEvent::Repaint(WAIT_GRACE.saturating_sub(elapsed)));
+                post(
+                    &self.proxy,
+                    UserEvent::Repaint(WAIT_GRACE.saturating_sub(elapsed)),
+                );
             }
         }
 
         // Arm a wake at expiry so the toast disappears without other
         // traffic.
-        self.mode_toast_since =
-            self.mode_toast_since.filter(|&since| since.elapsed() < MODE_TOAST);
+        self.mode_toast_since = self
+            .mode_toast_since
+            .filter(|&since| since.elapsed() < MODE_TOAST);
         if let Some(since) = self.mode_toast_since {
             let remaining = MODE_TOAST.saturating_sub(since.elapsed());
             post(&self.proxy, UserEvent::Repaint(remaining));
         }
 
-        let speaking_page = folded.page.map_or(spread.first, |(page, _, _)| page);
+        let speaking_page =
+            folded.page.map_or(spread.first, |(page, _, _)| page);
         let page = folded.page.map(|(page, decoded, dims)| PageFacts {
-            claimed: self.source.name(page).and_then(decode::format_from_name),
+            claimed: self
+                .source
+                .name(page)
+                .and_then(decode::format_from_name),
             decoded,
             dims,
         });
         let waiting = self
             .waiting_since
             .is_some_and(|since| since.elapsed() >= WAIT_GRACE)
-            .then(|| if self.source.unpacking() { Wait::Unpacking } else { Wait::Decoding });
+            .then(|| {
+                if self.source.unpacking() {
+                    Wait::Unpacking
+                } else {
+                    Wait::Decoding
+                }
+            });
         let status = StatusLine {
             page_count: self.source.len(),
             spread,
@@ -227,17 +252,27 @@ impl App {
             page,
             zoom: placed.scale,
             waiting,
-            error: folded.error.or_else(|| self.screen.error().map(str::to_owned)),
+            error: folded
+                .error
+                .or_else(|| self.screen.error().map(str::to_owned)),
         };
 
         // `EguiGlow::run` only records shapes, so egui lays out before
         // pages are placed; `paint` later draws the bar above them.
         let viewport = {
             let show_bar = !self.is_fullscreen();
-            let Some(gl) = self.gl.as_mut() else { return Ok(()) };
+            let Some(gl) = self.gl.as_mut() else {
+                return Ok(());
+            };
             let mut content = egui::Rect::NOTHING;
-            gl.egui.run(gl.window.winit(), |ui| content = ui::show(ui, &status, show_bar));
-            content_viewport(size, content, gl.egui.egui_ctx.pixels_per_point())
+            gl.egui.run(gl.window.winit(), |ui| {
+                content = ui::show(ui, &status, show_bar);
+            });
+            content_viewport(
+                size,
+                content,
+                gl.egui.egui_ctx.pixels_per_point(),
+            )
         };
         // The bar's height changes without a winit resize; the status
         // line used the old scale, so redraw once.
@@ -248,10 +283,20 @@ impl App {
         }
         let drawn = self.fit.resolve(spread_size, viewport);
 
-        let Some(gl) = self.gl.as_mut() else { return Ok(()) };
+        let Some(gl) = self.gl.as_mut() else {
+            return Ok(());
+        };
 
-        gl.egui.painter.clear([size.width, size.height], clear_color(gl.window.translucent()));
-        gl.pages.draw((size.width, size.height), viewport, &layout, &drawn);
+        gl.egui.painter.clear(
+            [size.width, size.height],
+            clear_color(gl.window.translucent()),
+        );
+        gl.pages.draw(
+            (size.width, size.height),
+            viewport,
+            &layout,
+            &drawn,
+        );
         gl.egui.paint(gl.window.winit());
         gl.window.pre_present_and_swap()?;
         Ok(())
@@ -274,7 +319,10 @@ impl App {
     }
 
     fn geometry(&self) -> ((f32, f32), Viewport) {
-        (view::layout(self.screen.seat_dims()).total(), self.last_viewport)
+        (
+            view::layout(self.screen.seat_dims()).total(),
+            self.last_viewport,
+        )
     }
 
     fn dispatch(&mut self, action: Action, event_loop: &ActiveEventLoop) {
@@ -290,7 +338,12 @@ impl App {
                 }
             }
             Action::SelectMode(mode) => {
-                let switch = view::switch_mode(self.mode, mode, self.index, self.source.len());
+                let switch = view::switch_mode(
+                    self.mode,
+                    mode,
+                    self.index,
+                    self.source.len(),
+                );
                 self.mode = mode;
                 self.index = switch.index;
                 self.mode_toast_since = Some(Instant::now());
@@ -304,7 +357,8 @@ impl App {
                 use winit::window::Fullscreen;
 
                 if let Some(gl) = self.gl.as_ref() {
-                    let request = (!self.is_fullscreen()).then_some(Fullscreen::Borderless(None));
+                    let request = (!self.is_fullscreen())
+                        .then_some(Fullscreen::Borderless(None));
                     gl.window.winit().set_fullscreen(request);
                 }
             }
@@ -327,16 +381,26 @@ impl App {
             Action::NextBook | Action::PrevBook => {
                 self.switch_book(matches!(action, Action::NextBook));
             }
-            Action::Right | Action::Left | Action::Forward | Action::Back => {
+            Action::Right
+            | Action::Left
+            | Action::Forward
+            | Action::Back => {
                 let forward = action.is_forward(self.mode);
-                self.index = view::advance(self.index, forward, self.mode, self.source.len());
+                self.index = view::advance(
+                    self.index,
+                    forward,
+                    self.mode,
+                    self.source.len(),
+                );
                 self.after_page_change();
             }
         }
     }
 
     fn switch_book(&mut self, forward: bool) {
-        let Some(path) = self.source.sibling(forward) else { return };
+        let Some(path) = self.source.sibling(forward) else {
+            return;
+        };
         let source = match Source::open(&path) {
             Ok(source) => Arc::new(source),
             Err(error) => {
@@ -345,7 +409,11 @@ impl App {
                 return;
             }
         };
-        let spread = view::spread_for(view::first_spread(), self.mode, source.len());
+        let spread = view::spread_for(
+            view::first_spread(),
+            self.mode,
+            source.len(),
+        );
         let worker = match spawn_worker(&source, spread, &self.proxy) {
             Ok(worker) => worker,
             Err(error) => {
@@ -400,10 +468,17 @@ impl ApplicationHandler<UserEvent> for App {
             }
         };
         // `EguiGlow::new` panics if its painter cannot initialize; accepted upstream risk.
-        let egui = egui_glow::EguiGlow::new(event_loop, Arc::clone(&gl), None, None, true);
+        let egui = egui_glow::EguiGlow::new(
+            event_loop,
+            Arc::clone(&gl),
+            None,
+            None,
+            true,
+        );
         // System fonts cover filename characters the built-in fonts cannot render.
-        egui.egui_ctx
-            .add_font_provider(Arc::new(egui_system_font_provider::SystemFontProvider::new()));
+        egui.egui_ctx.add_font_provider(Arc::new(
+            egui_system_font_provider::SystemFontProvider::new(),
+        ));
         {
             use parking_lot::Mutex;
 
@@ -413,32 +488,57 @@ impl ApplicationHandler<UserEvent> for App {
             });
         }
         if window.translucent() {
-            egui.egui_ctx.all_styles_mut(|style| style.visuals.panel_fill = glass_fill());
+            egui.egui_ctx.all_styles_mut(|style| {
+                style.visuals.panel_fill = glass_fill();
+            });
         }
         window.winit().request_redraw();
-        self.gl = Some(Gl { pages, egui, window });
+        self.gl = Some(Gl {
+            pages,
+            egui,
+            window,
+        });
     }
 
-    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
+    fn user_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        event: UserEvent,
+    ) {
         match event {
             UserEvent::Repaint(delay) => {
-                let Some(deadline) = Instant::now().checked_add(delay) else { return };
-                if let ControlFlow::WaitUntil(armed) = event_loop.control_flow() {
+                let Some(deadline) = Instant::now().checked_add(delay)
+                else {
+                    return;
+                };
+                if let ControlFlow::WaitUntil(armed) =
+                    event_loop.control_flow()
+                {
                     if armed <= deadline {
                         return;
                     }
                 }
-                event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+                event_loop
+                    .set_control_flow(ControlFlow::WaitUntil(deadline));
             }
             UserEvent::PageDecided(page) => {
-                if screen::page_watched(page, self.spread(), self.mode, self.source.len()) {
+                if screen::page_watched(
+                    page,
+                    self.spread(),
+                    self.mode,
+                    self.source.len(),
+                ) {
                     self.request_redraw();
                 }
             }
         }
     }
 
-    fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: StartCause) {
+    fn new_events(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        cause: StartCause,
+    ) {
         if let StartCause::ResumeTimeReached { .. } = cause {
             self.request_redraw();
         }
@@ -454,32 +554,42 @@ impl ApplicationHandler<UserEvent> for App {
         clippy::wildcard_enum_match_arm,
         reason = "winit's unhandled WindowEvent variants need no work"
     )]
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        _id: WindowId,
+        event: WindowEvent,
+    ) {
         use winit::event::ElementState;
         use winit::event::MouseButton;
         use winit::event::MouseScrollDelta;
         use winit::event::WindowEvent;
         use winit::keyboard::PhysicalKey;
 
-        if matches!(event, WindowEvent::CloseRequested | WindowEvent::Destroyed) {
+        if matches!(
+            event,
+            WindowEvent::CloseRequested | WindowEvent::Destroyed
+        ) {
             event_loop.exit();
         }
         let Some(gl) = self.gl.as_mut() else { return };
 
-        let egui_wants_pointer = if matches!(event, WindowEvent::RedrawRequested) {
-            // RedrawRequested carries nothing for egui, and egui-winit
-            // answers it with `repaint: true`; honoring that answer would
-            // re-request the redraw and self-sustain the loop at
-            // compositor refresh while idle.
-            gl.egui.egui_ctx.egui_wants_pointer_input()
-        } else {
-            let response = gl.egui.on_window_event(gl.window.winit(), &event);
-            let wants = gl.egui.egui_ctx.egui_wants_pointer_input();
-            if response.repaint {
-                gl.window.winit().request_redraw();
-            }
-            wants
-        };
+        let egui_wants_pointer =
+            if matches!(event, WindowEvent::RedrawRequested) {
+                // RedrawRequested carries nothing for egui, and egui-winit
+                // answers it with `repaint: true`; honoring that answer would
+                // re-request the redraw and self-sustain the loop at
+                // compositor refresh while idle.
+                gl.egui.egui_ctx.egui_wants_pointer_input()
+            } else {
+                let response =
+                    gl.egui.on_window_event(gl.window.winit(), &event);
+                let wants = gl.egui.egui_ctx.egui_wants_pointer_input();
+                if response.repaint {
+                    gl.window.winit().request_redraw();
+                }
+                wants
+            };
 
         match &event {
             WindowEvent::Resized(_) => {
@@ -495,7 +605,9 @@ impl ApplicationHandler<UserEvent> for App {
                     && !gl.egui.egui_ctx.egui_wants_keyboard_input()
                 {
                     if let PhysicalKey::Code(code) = key.physical_key {
-                        if let Some(action) = Action::from_key(code, self.modifiers) {
+                        if let Some(action) =
+                            Action::from_key(code, self.modifiers)
+                        {
                             if !key.repeat || action.repeats() {
                                 self.dispatch(action, event_loop);
                             }
@@ -503,21 +615,30 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
             }
-            WindowEvent::MouseWheel { delta, .. } if !egui_wants_pointer => {
+            WindowEvent::MouseWheel { delta, .. }
+                if !egui_wants_pointer =>
+            {
                 let wheel_delta_y = match delta {
                     MouseScrollDelta::LineDelta(_, lines) => *lines,
-                    MouseScrollDelta::PixelDelta(pixels) => {
-                        wheel_lines(pixels.y, gl.window.winit().scale_factor())
-                    }
+                    MouseScrollDelta::PixelDelta(pixels) => wheel_lines(
+                        pixels.y,
+                        gl.window.winit().scale_factor(),
+                    ),
                 };
                 let (total, viewport) = self.geometry();
                 // Scroll up (positive dy) zooms in.
-                let zoom_factor = (wheel_delta_y * WHEEL_ZOOM_SENSITIVITY).exp();
+                let zoom_factor =
+                    (wheel_delta_y * WHEEL_ZOOM_SENSITIVITY).exp();
                 self.fit.zoom(zoom_factor, self.cursor, total, viewport);
                 self.request_redraw();
             }
-            WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
-                self.dragging = *state == ElementState::Pressed && !egui_wants_pointer;
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left,
+                ..
+            } => {
+                self.dragging =
+                    *state == ElementState::Pressed && !egui_wants_pointer;
             }
             WindowEvent::CursorMoved { position, .. } => {
                 #[expect(
@@ -527,8 +648,10 @@ impl ApplicationHandler<UserEvent> for App {
                 let cursor_pos = (position.x as f32, position.y as f32);
                 if self.dragging && !egui_wants_pointer {
                     let (total, viewport) = self.geometry();
-                    let pan_delta =
-                        (cursor_pos.0 - self.cursor.0, cursor_pos.1 - self.cursor.1);
+                    let pan_delta = (
+                        cursor_pos.0 - self.cursor.0,
+                        cursor_pos.1 - self.cursor.1,
+                    );
                     self.fit.pan(pan_delta, total, viewport);
                     self.request_redraw();
                 }
@@ -563,7 +686,12 @@ const GLASS_ALPHA: f32 = 0.7;
 fn clear_color(translucent: bool) -> [f32; 4] {
     let [red, green, blue] = BACKGROUND;
     if translucent {
-        [red * GLASS_ALPHA, green * GLASS_ALPHA, blue * GLASS_ALPHA, GLASS_ALPHA]
+        [
+            red * GLASS_ALPHA,
+            green * GLASS_ALPHA,
+            blue * GLASS_ALPHA,
+            GLASS_ALPHA,
+        ]
     } else {
         [red, green, blue, 1.0]
     }
@@ -572,7 +700,11 @@ fn clear_color(translucent: bool) -> [f32; 4] {
 /// The page viewport from the chrome egui just laid out: the full-width
 /// window area above the status bar, in physical px. Uses egui's
 /// `pixels_per_point`, not the window's scale factor.
-fn content_viewport(window: PhysicalSize<u32>, content: egui::Rect, pixels_per_point: f32) -> Viewport {
+fn content_viewport(
+    window: PhysicalSize<u32>,
+    content: egui::Rect,
+    pixels_per_point: f32,
+) -> Viewport {
     let win = view::px_f32((window.width, window.height));
     // The bar's top edge rounds to a whole physical px, matching the
     // painter's clip-rect rounding.
@@ -590,7 +722,12 @@ fn content_viewport(window: PhysicalSize<u32>, content: egui::Rect, pixels_per_p
 fn glass_fill() -> egui::Color32 {
     let [red, green, blue, alpha] = clear_color(true);
     let channel = |value: f32| value.mul_add(255.0, 0.5) as u8;
-    egui::Color32::from_rgba_premultiplied(channel(red), channel(green), channel(blue), channel(alpha))
+    egui::Color32::from_rgba_premultiplied(
+        channel(red),
+        channel(green),
+        channel(blue),
+        channel(alpha),
+    )
 }
 
 /// One wheel notch zooms ~×1.16, three notches ~×1.6.
@@ -622,20 +759,32 @@ mod tests {
     fn background_glass() {
         let [red, green, blue, alpha] = clear_color(true);
         assert!((alpha - GLASS_ALPHA).abs() < 1e-6);
-        for (channel, straight) in [red, green, blue].into_iter().zip(BACKGROUND) {
-            assert!((straight.mul_add(GLASS_ALPHA, -channel)).abs() < 1e-6);
+        for (channel, straight) in
+            [red, green, blue].into_iter().zip(BACKGROUND)
+        {
+            assert!(
+                (straight.mul_add(GLASS_ALPHA, -channel)).abs() < 1e-6
+            );
         }
-        assert_eq!(clear_color(false), [BACKGROUND[0], BACKGROUND[1], BACKGROUND[2], 1.0]);
+        assert_eq!(
+            clear_color(false),
+            [BACKGROUND[0], BACKGROUND[1], BACKGROUND[2], 1.0]
+        );
     }
 
     #[test]
     fn content_viewport_subtracts_the_bar_in_physical_px() {
-        let content = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1280.0, 772.0));
-        let integer = content_viewport(PhysicalSize::new(1280, 800), content, 1.0);
+        let content = egui::Rect::from_min_max(
+            egui::Pos2::ZERO,
+            egui::pos2(1280.0, 772.0),
+        );
+        let integer =
+            content_viewport(PhysicalSize::new(1280, 800), content, 1.0);
         assert_eq!(integer.size(), (1280.0, 772.0));
         // Fractional output scale: 772 pt at 1.25 pixels per point leaves
         // 965 physical px of content in a 1000 px window.
-        let fractional = content_viewport(PhysicalSize::new(1600, 1000), content, 1.25);
+        let fractional =
+            content_viewport(PhysicalSize::new(1600, 1000), content, 1.25);
         assert_eq!(fractional.size(), (1600.0, 965.0));
     }
 

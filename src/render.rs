@@ -234,7 +234,11 @@ struct Conversion {
 
 impl PageTextures {
     pub fn new(gl: Arc<glow::Context>) -> eros::Result<Self> {
-        let (vs, fs) = if gl.version().is_embedded { (VS_ES, FS_ES) } else { (VS_CORE, FS_CORE) };
+        let (vs, fs) = if gl.version().is_embedded {
+            (VS_ES, FS_ES)
+        } else {
+            (VS_CORE, FS_CORE)
+        };
         // SAFETY: the returned names land in Self, whose Drop deletes
         // them. The error path below leaks them into the process-fatal
         // exit.
@@ -244,8 +248,12 @@ impl PageTextures {
             reason = "the dropped conversion error says only that the value is out of range, which the message states"
         )]
         // SAFETY: MAX_TEXTURE_SIZE is a pure query with no object names.
-        let max_texture_edge = u32::try_from(unsafe { gl.get_parameter_i32(glow::MAX_TEXTURE_SIZE) })
-            .map_err(|_| eros::error!("GL MAX_TEXTURE_SIZE is not a positive GLint"))?;
+        let max_texture_edge = u32::try_from(unsafe {
+            gl.get_parameter_i32(glow::MAX_TEXTURE_SIZE)
+        })
+        .map_err(|_| {
+            eros::error!("GL MAX_TEXTURE_SIZE is not a positive GLint")
+        })?;
         Ok(Self {
             gl,
             pipeline,
@@ -260,7 +268,12 @@ impl PageTextures {
     /// drawing. An upload the GPU refuses leaves the seat unbound
     /// (nothing draws) and returns as the page's error; the next bind
     /// retries, so the error holds exactly while the page stays wanted.
-    pub fn bind(&mut self, seat: Seat, page: usize, decoded: &Decoded) -> eros::Result<()> {
+    pub fn bind(
+        &mut self,
+        seat: Seat,
+        page: usize,
+        decoded: &Decoded,
+    ) -> eros::Result<()> {
         if *self.seat_slot(seat) == Some(page) {
             return Ok(());
         }
@@ -274,19 +287,31 @@ impl PageTextures {
 
     /// Ensure `page`'s textures are cached without binding any seat, so
     /// the frame that later shows the page is a pure rebind.
-    pub fn stage(&mut self, page: usize, decoded: &Decoded) -> eros::Result<()> {
+    pub fn stage(
+        &mut self,
+        page: usize,
+        decoded: &Decoded,
+    ) -> eros::Result<()> {
         self.ensure_cached(page, decoded)
     }
 
     /// Upload `page` into the cache on a miss. A page over this context's
     /// `MAX_TEXTURE_SIZE` would upload as silently black, so it is refused
     /// as the page's error instead.
-    fn ensure_cached(&mut self, page: usize, decoded: &Decoded) -> eros::Result<()> {
+    fn ensure_cached(
+        &mut self,
+        page: usize,
+        decoded: &Decoded,
+    ) -> eros::Result<()> {
         if self.textures.contains_key(&page) {
             return Ok(());
         }
         let (width, height) = (decoded.width, decoded.height);
-        if width == 0 || height == 0 || width > self.max_texture_edge || height > self.max_texture_edge {
+        if width == 0
+            || height == 0
+            || width > self.max_texture_edge
+            || height > self.max_texture_edge
+        {
             return Err(eros::error!(
                 "page {}: {}x{} exceeds this GPU's {}-texel texture edge limit",
                 page + 1,
@@ -314,7 +339,9 @@ impl PageTextures {
         for entry in mem::take(&mut self.textures).into_values() {
             // SAFETY: the take empties the map, so this loop holds the
             // only reference to each entry.
-            unsafe { delete_entry(&self.gl, &entry); }
+            unsafe {
+                delete_entry(&self.gl, &entry);
+            }
         }
         self.seats = [None, None];
     }
@@ -330,14 +357,18 @@ impl PageTextures {
     /// Drop cached pages until the map fits [`TEXTURE_BUDGET_BYTES`].
     fn evict_over_budget(&mut self) {
         let victims = eviction_victims(
-            self.textures.iter().map(|(page, entry)| (*page, entry.cost())),
+            self.textures
+                .iter()
+                .map(|(page, entry)| (*page, entry.cost())),
             self.seats,
             TEXTURE_BUDGET_BYTES,
         );
         self.textures.retain(|page, entry| {
             if victims.contains(page) {
                 // SAFETY: the entry leaves the map in this same step, so this is its only deletion.
-                unsafe { delete_entry(&self.gl, entry); }
+                unsafe {
+                    delete_entry(&self.gl, entry);
+                }
                 false
             } else {
                 true
@@ -361,7 +392,9 @@ impl PageTextures {
             return;
         }
         // SAFETY: the pipeline is Self's field, live until Drop.
-        unsafe { begin_frame(&self.gl, &self.pipeline, size); }
+        unsafe {
+            begin_frame(&self.gl, &self.pipeline, size);
+        }
         // GL scissor is bottom-origin and the viewport hugs the window's
         // top-left, so only the height converts.
         #[expect(
@@ -369,9 +402,12 @@ impl PageTextures {
             clippy::cast_sign_loss,
             reason = "viewport size is whole physical px carried as f32"
         )]
-        let (width, height) = (viewport.size().0 as u32, viewport.size().1 as u32);
+        let (width, height) =
+            (viewport.size().0 as u32, viewport.size().1 as u32);
         // SAFETY: the context is current. This only toggles scissor state.
-        unsafe { self.gl.enable(glow::SCISSOR_TEST); }
+        unsafe {
+            self.gl.enable(glow::SCISSOR_TEST);
+        }
         // SAFETY: same contract as above, setting the scissor box.
         unsafe {
             self.gl.scissor(
@@ -384,14 +420,25 @@ impl PageTextures {
         for (rect, page) in layout.rects.iter().zip(self.seats.iter()) {
             let Some(rect) = rect else { continue };
             let Some(page) = page else { continue };
-            let Some(entry) = self.textures.get(page) else { continue };
+            let Some(entry) = self.textures.get(page) else {
+                continue;
+            };
             // Whole-pixel rect origin: at 1:1 zoom a fractional origin
             // makes NEAREST draw uneven texel rows.
             let screen_origin = (
-                rect.pos.0.mul_add(placement.scale, placement.offset.0).round(),
-                rect.pos.1.mul_add(placement.scale, placement.offset.1).round(),
+                rect.pos
+                    .0
+                    .mul_add(placement.scale, placement.offset.0)
+                    .round(),
+                rect.pos
+                    .1
+                    .mul_add(placement.scale, placement.offset.1)
+                    .round(),
             );
-            let screen_size = (rect.size.0 * placement.scale, rect.size.1 * placement.scale);
+            let screen_size = (
+                rect.size.0 * placement.scale,
+                rect.size.1 * placement.scale,
+            );
             if screen_size.0 <= 0.0 || screen_size.1 <= 0.0 {
                 continue;
             }
@@ -409,7 +456,9 @@ impl PageTextures {
         }
         // SAFETY: the context is current. This restores unclipped raster
         // state.
-        unsafe { self.gl.disable(glow::SCISSOR_TEST); }
+        unsafe {
+            self.gl.disable(glow::SCISSOR_TEST);
+        }
     }
 }
 
@@ -420,11 +469,15 @@ impl Drop for PageTextures {
         for entry in mem::take(&mut self.textures).into_values() {
             // SAFETY: the take empties the map, so this loop holds the
             // only reference to each entry.
-            unsafe { delete_entry(&self.gl, &entry); }
+            unsafe {
+                delete_entry(&self.gl, &entry);
+            }
         }
         // SAFETY: the context outlives this drop. These names are
         // deleted once, here.
-        unsafe { delete_pipeline(&self.gl, &self.pipeline); }
+        unsafe {
+            delete_pipeline(&self.gl, &self.pipeline);
+        }
     }
 }
 
@@ -438,9 +491,9 @@ unsafe fn compile_shader(
     kind: u32,
     src: &str,
 ) -> eros::Result<<glow::Context as HasContext>::Shader> {
-    let shader = gl
-        .create_shader(kind)
-        .map_err(|error| eros::error!("GL shader object creation failed: {error}"))?;
+    let shader = gl.create_shader(kind).map_err(|error| {
+        eros::error!("GL shader object creation failed: {error}")
+    })?;
     gl.shader_source(shader, src);
     gl.compile_shader(shader);
     if !gl.get_shader_compile_status(shader) {
@@ -469,16 +522,20 @@ struct Pipeline {
 /// # Safety
 ///
 /// The context must be current. The returned names are live until deleted.
-unsafe fn create_pipeline(gl: &glow::Context, vs: &str, fs: &str) -> eros::Result<Pipeline> {
-    let program = gl
-        .create_program()
-        .map_err(|error| eros::error!("GL program object creation failed: {error}"))?;
-    let vbo = gl
-        .create_buffer()
-        .map_err(|error| eros::error!("GL buffer object creation failed: {error}"))?;
-    let vao = gl
-        .create_vertex_array()
-        .map_err(|error| eros::error!("GL vertex array object creation failed: {error}"))?;
+unsafe fn create_pipeline(
+    gl: &glow::Context,
+    vs: &str,
+    fs: &str,
+) -> eros::Result<Pipeline> {
+    let program = gl.create_program().map_err(|error| {
+        eros::error!("GL program object creation failed: {error}")
+    })?;
+    let vbo = gl.create_buffer().map_err(|error| {
+        eros::error!("GL buffer object creation failed: {error}")
+    })?;
+    let vao = gl.create_vertex_array().map_err(|error| {
+        eros::error!("GL vertex array object creation failed: {error}")
+    })?;
 
     let vertex_shader = compile_shader(gl, glow::VERTEX_SHADER, vs)?;
     gl.attach_shader(program, vertex_shader);
@@ -497,7 +554,9 @@ unsafe fn create_pipeline(gl: &glow::Context, vs: &str, fs: &str) -> eros::Resul
     gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
     gl.buffer_data_u8_slice(
         glow::ARRAY_BUFFER,
-        bytemuck::cast_slice(&[-1.0_f32, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0]),
+        bytemuck::cast_slice(&[
+            -1.0_f32, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0,
+        ]),
         glow::STATIC_DRAW,
     );
 
@@ -506,7 +565,9 @@ unsafe fn create_pipeline(gl: &glow::Context, vs: &str, fs: &str) -> eros::Resul
         clippy::expect_used,
         reason = "the attribute is declared and used in this file's in-tree shader sources, so failure means an in-tree regression"
     )]
-    let loc = gl.get_attrib_location(program, "pos").expect("pos attribute in page shader");
+    let loc = gl
+        .get_attrib_location(program, "pos")
+        .expect("pos attribute in page shader");
     gl.enable_vertex_attrib_array(loc);
     gl.vertex_attrib_pointer_f32(loc, 2, glow::FLOAT, false, 8, 0);
 
@@ -519,9 +580,15 @@ unsafe fn create_pipeline(gl: &glow::Context, vs: &str, fs: &str) -> eros::Resul
             clippy::expect_used,
             reason = "the uniform is declared and statically used by this file's in-tree shader sources, so a missing location means an in-tree regression"
         )]
-        gl.get_uniform_location(program, name).expect("uniform location in page shader")
+        gl.get_uniform_location(program, name)
+            .expect("uniform location in page shader")
     };
-    for (unit, name) in [(0_i32, "u_tex0"), (1, "u_tex1"), (2, "u_tex2"), (3, "u_tex3")] {
+    for (unit, name) in [
+        (0_i32, "u_tex0"),
+        (1, "u_tex1"),
+        (2, "u_tex2"),
+        (3, "u_tex3"),
+    ] {
         gl.uniform_1_i32(Some(&location(name)), unit);
     }
     let locations = Locations {
@@ -537,7 +604,12 @@ unsafe fn create_pipeline(gl: &glow::Context, vs: &str, fs: &str) -> eros::Resul
         transfer: location("u_transfer"),
     };
 
-    Ok(Pipeline { program, locations, vao, vbo })
+    Ok(Pipeline {
+        program,
+        locations,
+        vao,
+        vbo,
+    })
 }
 
 /// Set the frame state the page draws depend on: the viewport, the
@@ -547,7 +619,11 @@ unsafe fn create_pipeline(gl: &glow::Context, vs: &str, fs: &str) -> eros::Resul
 /// # Safety
 ///
 /// The context must be current. `pipeline`'s names are live.
-unsafe fn begin_frame(gl: &glow::Context, pipeline: &Pipeline, size: (u32, u32)) {
+unsafe fn begin_frame(
+    gl: &glow::Context,
+    pipeline: &Pipeline,
+    size: (u32, u32),
+) {
     gl.viewport(0, 0, gl_int(size.0), gl_int(size.1));
     gl.enable(glow::BLEND);
     gl.blend_func_separate(
@@ -593,13 +669,25 @@ unsafe fn draw_page(
 ) {
     let locations = &pipeline.locations;
     gl.use_program(Some(pipeline.program));
-    gl.uniform_2_f32(Some(&locations.offset), screen_origin.0, screen_origin.1);
+    gl.uniform_2_f32(
+        Some(&locations.offset),
+        screen_origin.0,
+        screen_origin.1,
+    );
     gl.uniform_2_f32(Some(&locations.size), screen_size.0, screen_size.1);
     gl.active_texture(glow::TEXTURE0);
     match entry {
-        Entry::Rgba { texture, lmap_base, transfer, .. } => {
+        Entry::Rgba {
+            texture,
+            lmap_base,
+            transfer,
+            ..
+        } => {
             gl.uniform_1_i32(Some(&locations.mode), MODE_RGBA);
-            gl.uniform_1_i32(Some(&locations.transfer), transfer_id(*transfer));
+            gl.uniform_1_i32(
+                Some(&locations.transfer),
+                transfer_id(*transfer),
+            );
             gl.uniform_2_f32(
                 Some(&locations.lmap),
                 lmap_base.0 / scale,
@@ -620,7 +708,10 @@ unsafe fn draw_page(
             ..
         } => {
             gl.uniform_1_i32(Some(&locations.mode), MODE_YUV);
-            gl.uniform_1_i32(Some(&locations.transfer), transfer_id(*transfer));
+            gl.uniform_1_i32(
+                Some(&locations.transfer),
+                transfer_id(*transfer),
+            );
             gl.uniform_2_f32(
                 Some(&locations.lmap),
                 lmap_base.0 / scale,
@@ -632,7 +723,11 @@ unsafe fn draw_page(
                 cmap_base.1 / scale,
             );
             gl.uniform_1_f32(Some(&locations.norm), *norm);
-            gl.uniform_matrix_3_f32_slice(Some(&locations.mat), false, &conversion.matrix);
+            gl.uniform_matrix_3_f32_slice(
+                Some(&locations.mat),
+                false,
+                &conversion.matrix,
+            );
             gl.uniform_3_f32(
                 Some(&locations.off),
                 conversion.offset[0],
@@ -674,7 +769,13 @@ unsafe fn delete_pipeline(gl: &glow::Context, pipeline: &Pipeline) {
 unsafe fn delete_entry(gl: &glow::Context, entry: &Entry) {
     match entry {
         Entry::Rgba { texture, .. } => gl.delete_texture(*texture),
-        Entry::Yuv { luma, cb, cr, alpha, .. } => {
+        Entry::Yuv {
+            luma,
+            cb,
+            cr,
+            alpha,
+            ..
+        } => {
             gl.delete_texture(*luma);
             gl.delete_texture(*cb);
             gl.delete_texture(*cr);
@@ -715,23 +816,43 @@ impl Mag {
 /// # Safety
 ///
 /// The context must be current. The returned name is live until deleted.
-unsafe fn new_texture(gl: &glow::Context, filterable: bool, mag: Mag) -> <glow::Context as HasContext>::Texture {
+unsafe fn new_texture(
+    gl: &glow::Context,
+    filterable: bool,
+    mag: Mag,
+) -> <glow::Context as HasContext>::Texture {
     #[expect(
         clippy::expect_used,
         reason = "texture-creation failure panics by policy"
     )]
     let texture = gl.create_texture().expect("GL texture object");
     gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, gl_int(glow::CLAMP_TO_EDGE));
-    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, gl_int(glow::CLAMP_TO_EDGE));
+    gl.tex_parameter_i32(
+        glow::TEXTURE_2D,
+        glow::TEXTURE_WRAP_S,
+        gl_int(glow::CLAMP_TO_EDGE),
+    );
+    gl.tex_parameter_i32(
+        glow::TEXTURE_2D,
+        glow::TEXTURE_WRAP_T,
+        gl_int(glow::CLAMP_TO_EDGE),
+    );
     let (min, mag) = if filterable {
         // A fit view of a 50MP page minifies ~8x, where LINEAR-only shimmers.
         (glow::LINEAR_MIPMAP_LINEAR, mag.gl())
     } else {
         (glow::NEAREST, glow::NEAREST)
     };
-    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, gl_int(min));
-    gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, gl_int(mag));
+    gl.tex_parameter_i32(
+        glow::TEXTURE_2D,
+        glow::TEXTURE_MIN_FILTER,
+        gl_int(min),
+    );
+    gl.tex_parameter_i32(
+        glow::TEXTURE_2D,
+        glow::TEXTURE_MAG_FILTER,
+        gl_int(mag),
+    );
     texture
 }
 
@@ -747,9 +868,15 @@ unsafe fn upload_rgba(
     let texture = new_texture(gl, true, Mag::Sharp);
     gl.bind_texture(glow::TEXTURE_2D, Some(texture));
     gl.tex_image_2d(
-        glow::TEXTURE_2D, 0, gl_int(glow::RGBA8),
-        gl_int(dims.0), gl_int(dims.1), 0,
-        glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(Some(data)),
+        glow::TEXTURE_2D,
+        0,
+        gl_int(glow::RGBA8),
+        gl_int(dims.0),
+        gl_int(dims.1),
+        0,
+        glow::RGBA,
+        glow::UNSIGNED_BYTE,
+        glow::PixelUnpackData::Slice(Some(data)),
     );
     gl.generate_mipmap(glow::TEXTURE_2D);
     texture
@@ -768,16 +895,26 @@ unsafe fn upload_plane(
     filterable: bool,
     mag: Mag,
 ) -> <glow::Context as HasContext>::Texture {
-    let (internal, ty) = if wide { (glow::R16, glow::UNSIGNED_SHORT) } else { (glow::R8, glow::UNSIGNED_BYTE) };
+    let (internal, ty) = if wide {
+        (glow::R16, glow::UNSIGNED_SHORT)
+    } else {
+        (glow::R8, glow::UNSIGNED_BYTE)
+    };
     let texture = new_texture(gl, filterable, mag);
     gl.bind_texture(glow::TEXTURE_2D, Some(texture));
     // Odd row widths: GL's default 4-byte unpack alignment would desync
     // every row after the first.
     gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
     gl.tex_image_2d(
-        glow::TEXTURE_2D, 0, gl_int(internal),
-        gl_int(dims.0), gl_int(dims.1), 0,
-        glow::RED, ty, glow::PixelUnpackData::Slice(Some(data)),
+        glow::TEXTURE_2D,
+        0,
+        gl_int(internal),
+        gl_int(dims.0),
+        gl_int(dims.1),
+        0,
+        glow::RED,
+        ty,
+        glow::PixelUnpackData::Slice(Some(data)),
     );
     if filterable {
         gl.generate_mipmap(glow::TEXTURE_2D);
@@ -800,7 +937,11 @@ unsafe fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> Entry {
     let (width, height) = (decoded.width, decoded.height);
     match &decoded.pixels {
         Pixels::Rgba8(rgba_bytes) => {
-            assert_eq!(rgba_bytes.len(), width as usize * height as usize * 4, "rgba byte length");
+            assert_eq!(
+                rgba_bytes.len(),
+                width as usize * height as usize * 4,
+                "rgba byte length"
+            );
             Entry::Rgba {
                 texture: upload_rgba(gl, rgba_bytes, (width, height)),
                 lmap_base: lmap_base((width, height)),
@@ -816,31 +957,107 @@ unsafe fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> Entry {
             // incomplete (samples black).
             let filterable = !(gl.version().is_embedded && wide);
             let depth = yuv.depth.clamp(MIN_PLANE_DEPTH, MAX_PLANE_DEPTH);
-            let expect = |plane: &Plane, want_samples: usize, what: &str| {
+            let expect = |plane: &Plane,
+                          want_samples: usize,
+                          what: &str| {
                 let want_bytes = want_samples * if wide { 2 } else { 1 };
-                assert_eq!(plane.byte_len(), want_bytes, "{what} plane bytes");
+                assert_eq!(
+                    plane.byte_len(),
+                    want_bytes,
+                    "{what} plane bytes"
+                );
             };
             expect(&yuv.luma, luma_w as usize * luma_h as usize, "luma");
-            let luma_texture =
-                upload_plane(gl, plane_bytes(&yuv.luma), (luma_w, luma_h), wide, filterable, Mag::Sharp);
-            let (cb_texture, cr_texture) = if yuv.subsampling == Subsampling::Mono {
-                // 1x1 chroma at the neutral code, which the folded
-                // quantization anchor cancels exactly.
-                let neutral = stub_plane(depth, 1_u32 << (depth - 1));
-                (upload_plane(gl, plane_bytes(&neutral), (1, 1), wide, filterable, Mag::Smooth),
-                 upload_plane(gl, plane_bytes(&neutral), (1, 1), wide, filterable, Mag::Smooth))
-            } else {
-                expect(&yuv.cb, chroma_w as usize * chroma_h as usize, "cb");
-                expect(&yuv.cr, chroma_w as usize * chroma_h as usize, "cr");
-                (upload_plane(gl, plane_bytes(&yuv.cb), (chroma_w, chroma_h), wide, filterable, Mag::Smooth),
-                 upload_plane(gl, plane_bytes(&yuv.cr), (chroma_w, chroma_h), wide, filterable, Mag::Smooth))
-            };
+            let luma_texture = upload_plane(
+                gl,
+                plane_bytes(&yuv.luma),
+                (luma_w, luma_h),
+                wide,
+                filterable,
+                Mag::Sharp,
+            );
+            let (cb_texture, cr_texture) =
+                if yuv.subsampling == Subsampling::Mono {
+                    // 1x1 chroma at the neutral code, which the folded
+                    // quantization anchor cancels exactly.
+                    let neutral = stub_plane(depth, 1_u32 << (depth - 1));
+                    (
+                        upload_plane(
+                            gl,
+                            plane_bytes(&neutral),
+                            (1, 1),
+                            wide,
+                            filterable,
+                            Mag::Smooth,
+                        ),
+                        upload_plane(
+                            gl,
+                            plane_bytes(&neutral),
+                            (1, 1),
+                            wide,
+                            filterable,
+                            Mag::Smooth,
+                        ),
+                    )
+                } else {
+                    expect(
+                        &yuv.cb,
+                        chroma_w as usize * chroma_h as usize,
+                        "cb",
+                    );
+                    expect(
+                        &yuv.cr,
+                        chroma_w as usize * chroma_h as usize,
+                        "cr",
+                    );
+                    (
+                        upload_plane(
+                            gl,
+                            plane_bytes(&yuv.cb),
+                            (chroma_w, chroma_h),
+                            wide,
+                            filterable,
+                            Mag::Smooth,
+                        ),
+                        upload_plane(
+                            gl,
+                            plane_bytes(&yuv.cr),
+                            (chroma_w, chroma_h),
+                            wide,
+                            filterable,
+                            Mag::Smooth,
+                        ),
+                    )
+                };
             let alpha_texture = yuv.alpha.as_ref().map_or_else(
                 // 1x1 opaque: the max code, which `u_norm` maps to 1.0.
-                || upload_plane(gl, plane_bytes(&stub_plane(depth, (1_u32 << depth) - 1)), (1, 1), wide, filterable, Mag::Smooth),
+                || {
+                    upload_plane(
+                        gl,
+                        plane_bytes(&stub_plane(
+                            depth,
+                            (1_u32 << depth) - 1,
+                        )),
+                        (1, 1),
+                        wide,
+                        filterable,
+                        Mag::Smooth,
+                    )
+                },
                 |alpha| {
-                    expect(alpha, width as usize * height as usize, "alpha");
-                    upload_plane(gl, plane_bytes(alpha), (width, height), wide, filterable, Mag::Smooth)
+                    expect(
+                        alpha,
+                        width as usize * height as usize,
+                        "alpha",
+                    );
+                    upload_plane(
+                        gl,
+                        plane_bytes(alpha),
+                        (width, height),
+                        wide,
+                        filterable,
+                        Mag::Smooth,
+                    )
                 },
             );
             Entry::Yuv {
@@ -901,11 +1118,17 @@ fn entry_cost_bytes(decoded: &Decoded, mipmapped: bool) -> usize {
     let base = match &decoded.pixels {
         Pixels::Rgba8(rgba) => rgba.len(),
         Pixels::Yuv(yuv) => {
-            let per_sample = if matches!(yuv.luma, Plane::U16(_)) { 2 } else { 1 };
+            let per_sample = if matches!(yuv.luma, Plane::U16(_)) {
+                2
+            } else {
+                1
+            };
             let chroma = match yuv.subsampling {
                 // Mono uploads a 1x1 midpoint texture per chroma channel.
                 Subsampling::Mono => 2 * per_sample,
-                Subsampling::Yuv420 | Subsampling::Yuv422 | Subsampling::Yuv444 => {
+                Subsampling::Yuv420
+                | Subsampling::Yuv422
+                | Subsampling::Yuv444 => {
                     yuv.cb.byte_len() + yuv.cr.byte_len()
                 }
             };
@@ -919,7 +1142,11 @@ fn entry_cost_bytes(decoded: &Decoded, mipmapped: bool) -> usize {
         clippy::integer_division,
         reason = "the mip chain costs 4/3 of the base levels, rounded down for budgeting"
     )]
-    if mipmapped { base * 4 / 3 } else { base }
+    if mipmapped {
+        base * 4 / 3
+    } else {
+        base
+    }
 }
 
 /// Pages to drop so the cached costs fit `budget` after a fresh insert.
@@ -932,7 +1159,8 @@ fn eviction_victims(
     budget: usize,
 ) -> Vec<usize> {
     let mut candidates: Vec<(usize, usize)> = costs.into_iter().collect();
-    let mut remaining: usize = candidates.iter().map(|&(_, cost)| cost).sum();
+    let mut remaining: usize =
+        candidates.iter().map(|&(_, cost)| cost).sum();
     candidates.retain(|&(page, _)| !bound.contains(&Some(page)));
     let distance = |page: usize| {
         bound
@@ -942,7 +1170,9 @@ fn eviction_victims(
             .min()
             .unwrap_or(usize::MAX)
     };
-    candidates.sort_unstable_by_key(|&(page, _)| Reverse((distance(page), page)));
+    candidates.sort_unstable_by_key(|&(page, _)| {
+        Reverse((distance(page), page))
+    });
     let mut victims = Vec::new();
     for (page, cost) in candidates {
         if remaining <= budget {
@@ -974,7 +1204,9 @@ fn depth_norm(depth: u8, wide: bool) -> f32 {
     if !wide {
         return 1.0;
     }
-    R16_STORAGE_MAX / ((1_u32 << depth.clamp(MIN_PLANE_DEPTH, MAX_PLANE_DEPTH)) - 1) as f32
+    R16_STORAGE_MAX
+        / ((1_u32 << depth.clamp(MIN_PLANE_DEPTH, MAX_PLANE_DEPTH)) - 1)
+            as f32
 }
 
 /// Largest value an R16 (u16) texture sampler can return.
@@ -1035,7 +1267,10 @@ fn quantization(depth: u8, full_range: bool) -> Quantization {
 /// matrix times the anchor codes.
 fn page_conversion(decoded: &Decoded) -> Conversion {
     let Pixels::Yuv(yuv) = &decoded.pixels else {
-        return Conversion { matrix: IDENTITY3, offset: [0.0; 3] };
+        return Conversion {
+            matrix: IDENTITY3,
+            offset: [0.0; 3],
+        };
     };
     let depth = yuv.depth.clamp(MIN_PLANE_DEPTH, MAX_PLANE_DEPTH);
     let quantization = quantization(depth, yuv.full_range);
@@ -1051,7 +1286,13 @@ fn page_conversion(decoded: &Decoded) -> Conversion {
             } else {
                 [0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0]
             };
-            (base, quantization.luma_scale, quantization.luma_scale, quantization.luma_black, quantization.luma_black)
+            (
+                base,
+                quantization.luma_scale,
+                quantization.luma_scale,
+                quantization.luma_black,
+                quantization.luma_black,
+            )
         } else {
             (
                 full_range_yuv_matrix(yuv.matrix),
@@ -1062,8 +1303,14 @@ fn page_conversion(decoded: &Decoded) -> Conversion {
             )
         };
     let mut matrix = base;
-    for (column, matrix_column) in matrix.as_chunks_mut::<3>().0.iter_mut().enumerate() {
-        let scale = if column == 0 { luma_scale } else { chroma_scale } * norm;
+    for (column, matrix_column) in
+        matrix.as_chunks_mut::<3>().0.iter_mut().enumerate()
+    {
+        let scale = if column == 0 {
+            luma_scale
+        } else {
+            chroma_scale
+        } * norm;
         for cell in matrix_column {
             *cell *= scale;
         }
@@ -1074,7 +1321,9 @@ fn page_conversion(decoded: &Decoded) -> Conversion {
         chroma_neutral / quantization.storage_max,
     ];
     let mut offset = [0.0_f32; 3];
-    for (matrix_column, anchor) in matrix.as_chunks::<3>().0.iter().zip(anchors) {
+    for (matrix_column, anchor) in
+        matrix.as_chunks::<3>().0.iter().zip(anchors)
+    {
         for (&cell, slot) in matrix_column.iter().zip(&mut offset) {
             *slot = cell.mul_add(anchor, *slot);
         }
@@ -1100,9 +1349,15 @@ fn full_range_yuv_matrix(matrix: Matrix) -> [f32; 9] {
     let green_from_cb = 2.0 * k_blue * (1.0 - k_blue) / k_green;
     let green_from_cr = 2.0 * k_red * (1.0 - k_red) / k_green;
     [
-        1.0, 1.0, 1.0, //
-        0.0, -green_from_cb, 2.0 * (1.0 - k_blue), //
-        2.0 * (1.0 - k_red), -green_from_cr, 0.0,
+        1.0,
+        1.0,
+        1.0, //
+        0.0,
+        -green_from_cb,
+        2.0 * (1.0 - k_blue), //
+        2.0 * (1.0 - k_red),
+        -green_from_cr,
+        0.0,
     ]
 }
 
@@ -1114,7 +1369,10 @@ const BT2020_KR_KB: (f32, f32) = (0.2627, 0.0593);
 const IDENTITY3: [f32; 9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
 
 #[cfg(test)]
-#[expect(clippy::expect_used, reason = "a panic in test code is inconsequential")]
+#[expect(
+    clippy::expect_used,
+    reason = "a panic in test code is inconsequential"
+)]
 mod tests {
     use super::*;
     use crate::decode::Format;
@@ -1142,7 +1400,8 @@ mod tests {
         matrix: Matrix,
     ) -> Decoded {
         let size = (4_u32, 4);
-        let ((luma_w, luma_h), (chroma_w, chroma_h)) = plane_dims(size, subsampling);
+        let ((luma_w, luma_h), (chroma_w, chroma_h)) =
+            plane_dims(size, subsampling);
         let plane = |samples: usize| {
             if depth > 8 {
                 Plane::U16(vec![0_u16; samples].into_boxed_slice())
@@ -1153,7 +1412,10 @@ mod tests {
         let (cb, cr) = if subsampling == Subsampling::Mono {
             (Plane::U8(Box::new([])), Plane::U8(Box::new([])))
         } else {
-            (plane(chroma_w as usize * chroma_h as usize), plane(chroma_w as usize * chroma_h as usize))
+            (
+                plane(chroma_w as usize * chroma_h as usize),
+                plane(chroma_w as usize * chroma_h as usize),
+            )
         };
         Decoded::yuv(
             size.0,
@@ -1183,7 +1445,9 @@ mod tests {
                 reason = "row and col are 0..3 coordinates into the fixed 3-vectors under test"
             )]
             let converted = (0..3)
-                .map(|col| element(&conversion.matrix, row, col) * samples[col])
+                .map(|col| {
+                    element(&conversion.matrix, row, col) * samples[col]
+                })
                 .sum::<f32>()
                 - conversion.offset[row];
             *slot = converted;
@@ -1193,11 +1457,19 @@ mod tests {
 
     /// Code values of one depth's quantization (black, white, neutral) in
     /// code units, and the largest code the storage layout holds.
-    fn quantization_codes(depth: u8, full_range: bool) -> (f32, f32, f32, f32) {
+    fn quantization_codes(
+        depth: u8,
+        full_range: bool,
+    ) -> (f32, f32, f32, f32) {
         let scale = 2.0_f32.powi(i32::from(depth) - 8);
-        let storage_max = 2.0_f32.powi(if depth > 8 { 16 } else { 8 }) - 1.0;
+        let storage_max =
+            2.0_f32.powi(if depth > 8 { 16 } else { 8 }) - 1.0;
         let codes = if full_range {
-            (0.0, 2.0_f32.powi(i32::from(depth)) - 1.0, 2.0_f32.powi(i32::from(depth) - 1))
+            (
+                0.0,
+                2.0_f32.powi(i32::from(depth)) - 1.0,
+                2.0_f32.powi(i32::from(depth) - 1),
+            )
         } else {
             (16.0 * scale, 235.0 * scale, 128.0 * scale)
         };
@@ -1208,14 +1480,24 @@ mod tests {
     fn conversion_anchors_black_and_white_at_every_depth() {
         for depth in [8_u8, 10, 12, 16] {
             for full_range in [true, false] {
-                let decoded = yuv_page(depth, Subsampling::Yuv444, full_range, Matrix::Bt601);
+                let decoded = yuv_page(
+                    depth,
+                    Subsampling::Yuv444,
+                    full_range,
+                    Matrix::Bt601,
+                );
                 let conversion = page_conversion(&decoded);
-                let (black, white, neutral, storage_max) = quantization_codes(depth, full_range);
+                let (black, white, neutral, storage_max) =
+                    quantization_codes(depth, full_range);
                 for (code, expected) in [(black, 0.0), (white, 1.0)] {
                     // Chroma at its neutral code contributes nothing.
                     let rgb = convert(
                         &conversion,
-                        [code / storage_max, neutral / storage_max, neutral / storage_max],
+                        [
+                            code / storage_max,
+                            neutral / storage_max,
+                            neutral / storage_max,
+                        ],
                     );
                     for (row, channel) in rgb.into_iter().enumerate() {
                         assert!(
@@ -1230,13 +1512,19 @@ mod tests {
 
     #[test]
     fn identity_pages_permute_gbr() {
-        let color = page_conversion(&yuv_page(8, Subsampling::Yuv444, true, Matrix::Identity));
+        let color = page_conversion(&yuv_page(
+            8,
+            Subsampling::Yuv444,
+            true,
+            Matrix::Identity,
+        ));
         // Column j is plane j's contribution: Y->G, U->B, V->R.
         for (col, row) in [(0, 1), (1, 2), (2, 0)] {
             for probe in 0..3 {
                 let want = f32::from(probe == row);
                 assert!(
-                    (element(&color.matrix, probe, col) - want).abs() < 1e-6,
+                    (element(&color.matrix, probe, col) - want).abs()
+                        < 1e-6,
                     "col {col} row {probe}"
                 );
             }
@@ -1244,10 +1532,21 @@ mod tests {
         // Full range anchors everything at black zero.
         assert_eq!(color.offset, [0.0; 3]);
 
-        let mono = page_conversion(&yuv_page(10, Subsampling::Mono, true, Matrix::Identity));
+        let mono = page_conversion(&yuv_page(
+            10,
+            Subsampling::Mono,
+            true,
+            Matrix::Identity,
+        ));
         for row in 0..3 {
-            assert!((element(&mono.matrix, row, 1)).abs() < 1e-6, "mono chroma col must be inert");
-            assert!((element(&mono.matrix, row, 2)).abs() < 1e-6, "mono chroma col must be inert");
+            assert!(
+                (element(&mono.matrix, row, 1)).abs() < 1e-6,
+                "mono chroma col must be inert"
+            );
+            assert!(
+                (element(&mono.matrix, row, 2)).abs() < 1e-6,
+                "mono chroma col must be inert"
+            );
         }
         assert_eq!(mono.offset, [0.0; 3]);
         // The norm-folded luma column still spans the range: white (code
@@ -1255,7 +1554,10 @@ mod tests {
         let white = 1023.0 / 65535.0;
         let rgb = convert(&mono, [white, white, white]);
         for (row, channel) in rgb.into_iter().enumerate() {
-            assert!((channel - 1.0).abs() < 1e-4, "mono row {row}: {channel}");
+            assert!(
+                (channel - 1.0).abs() < 1e-4,
+                "mono row {row}: {channel}"
+            );
         }
     }
 
@@ -1263,13 +1565,23 @@ mod tests {
     fn mono_stub_cancels_exactly() {
         for depth in [8_u8, 10, 12] {
             for full_range in [true, false] {
-                let decoded = yuv_page(depth, Subsampling::Mono, full_range, Matrix::Bt601);
+                let decoded = yuv_page(
+                    depth,
+                    Subsampling::Mono,
+                    full_range,
+                    Matrix::Bt601,
+                );
                 let conversion = page_conversion(&decoded);
-                let (black, white, neutral, storage_max) = quantization_codes(depth, full_range);
+                let (black, white, neutral, storage_max) =
+                    quantization_codes(depth, full_range);
                 for (code, expected) in [(black, 0.0), (white, 1.0)] {
                     let rgb = convert(
                         &conversion,
-                        [code / storage_max, neutral / storage_max, neutral / storage_max],
+                        [
+                            code / storage_max,
+                            neutral / storage_max,
+                            neutral / storage_max,
+                        ],
                     );
                     for (row, channel) in rgb.into_iter().enumerate() {
                         assert!(
@@ -1284,9 +1596,15 @@ mod tests {
 
     #[test]
     fn shader_ids() {
-        assert_ne!(MODE_RGBA, MODE_YUV, "the mode uniform must pick a branch");
+        assert_ne!(
+            MODE_RGBA, MODE_YUV,
+            "the mode uniform must pick a branch"
+        );
         assert_eq!(MODE_RGBA, 0, "the shader samples RGBA at u_mode 0");
-        assert_eq!(MODE_YUV, 1, "the shader samples the plane set at u_mode 1");
+        assert_eq!(
+            MODE_YUV, 1,
+            "the shader samples the plane set at u_mode 1"
+        );
         assert_eq!(transfer_id(Transfer::Srgb), 0);
         assert_eq!(transfer_id(Transfer::Pq), 1);
     }

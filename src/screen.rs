@@ -16,7 +16,10 @@ use crate::worker::SpreadView;
 use crate::worker::Worker;
 
 enum SeatStep<'view> {
-    Show { page: usize, decoded: &'view Arc<Decoded> },
+    Show {
+        page: usize,
+        decoded: &'view Arc<Decoded>,
+    },
     Hold,
     Clear,
 }
@@ -28,13 +31,22 @@ struct ScreenPlan<'view> {
     stage: Option<(usize, &'view Arc<Decoded>)>,
 }
 
-fn seat_step(seat: Option<(usize, &SeatView)>, bound: Option<usize>) -> SeatStep<'_> {
+fn seat_step(
+    seat: Option<(usize, &SeatView)>,
+    bound: Option<usize>,
+) -> SeatStep<'_> {
     match seat {
-        Some((page, SeatView::Ready(decoded))) => SeatStep::Show { page, decoded },
-        Some((page, SeatView::Pending)) if bound.is_none_or(|bound_page| bound_page == page) => {
+        Some((page, SeatView::Ready(decoded))) => {
+            SeatStep::Show { page, decoded }
+        }
+        Some((page, SeatView::Pending))
+            if bound.is_none_or(|bound_page| bound_page == page) =>
+        {
             SeatStep::Hold
         }
-        None | Some((_, SeatView::Failed(_) | SeatView::Pending)) => SeatStep::Clear,
+        None | Some((_, SeatView::Failed(_) | SeatView::Pending)) => {
+            SeatStep::Clear
+        }
     }
 }
 
@@ -53,11 +65,14 @@ fn plan_screen(
     let [bound_left, bound_right] = bound;
     let seats = [wanted_left.zip(view_left), wanted_right.zip(view_right)];
     let [seat_left, seat_right] = seats;
-    let undecided =
-        seats.into_iter().any(|seat| matches!(seat, Some((_, SeatView::Pending))));
+    let undecided = seats
+        .into_iter()
+        .any(|seat| matches!(seat, Some((_, SeatView::Pending))));
     if undecided && shown.is_some_and(|shown| shown != wanted) {
         let stage = seats.into_iter().find_map(|seat| match seat {
-            Some((page, SeatView::Ready(decoded))) => Some((page, decoded)),
+            Some((page, SeatView::Ready(decoded))) => {
+                Some((page, decoded))
+            }
             _ => None,
         });
         return ScreenPlan {
@@ -67,12 +82,17 @@ fn plan_screen(
             stage,
         };
     }
-    let steps = [seat_step(seat_left, bound_left), seat_step(seat_right, bound_right)];
+    let steps = [
+        seat_step(seat_left, bound_left),
+        seat_step(seat_right, bound_right),
+    ];
     #[expect(
         clippy::rest_pattern_accessible_field,
         reason = "the matched fields are unused here, so naming them would trip unneeded_field_pattern"
     )]
-    let any_shown = steps.iter().any(|step| matches!(step, SeatStep::Show { .. }));
+    let any_shown = steps
+        .iter()
+        .any(|step| matches!(step, SeatStep::Show { .. }));
     // An all-failed first spread shows nothing, so `shown` stays None.
     let shown_after = (shown.is_some() || any_shown).then_some(wanted);
     ScreenPlan {
@@ -97,8 +117,14 @@ fn forward_spread(spread: Spread, mode: ViewMode, len: usize) -> Spread {
     clippy::redundant_pub_crate,
     reason = "pub(crate) is the crate's visibility style for crate-wide items, even inside private modules"
 )]
-pub(crate) fn page_watched(page: usize, spread: Spread, mode: ViewMode, len: usize) -> bool {
-    spread.contains(page) || forward_spread(spread, mode, len).contains(page)
+pub(crate) fn page_watched(
+    page: usize,
+    spread: Spread,
+    mode: ViewMode,
+    len: usize,
+) -> bool {
+    spread.contains(page)
+        || forward_spread(spread, mode, len).contains(page)
 }
 
 #[derive(Clone, Copy)]
@@ -139,8 +165,15 @@ impl Screen {
         mode: ViewMode,
         snapshot: &SpreadView,
     ) -> bool {
-        let bound = self.seats.each_ref().map(|seat| seat.map(|show| show.page));
-        let plan = plan_screen(self.shown, wanted, mode, snapshot.seats(mode), bound);
+        let bound =
+            self.seats.each_ref().map(|seat| seat.map(|show| show.page));
+        let plan = plan_screen(
+            self.shown,
+            wanted,
+            mode,
+            snapshot.seats(mode),
+            bound,
+        );
         // The frame's binds are one outcome: a refused upload on either
         // seat must survive the partner's success, and a frame that
         // bound cleanly clears the upload error. A hold frame leaves it.
@@ -160,7 +193,10 @@ impl Screen {
                     // The seat keeps its page and dims even on a refused
                     // upload, so the layout and hold policy stay stable
                     // while the next frame retries the bind.
-                    *shown = Some(SeatShow { page, dims: (decoded.width, decoded.height) });
+                    *shown = Some(SeatShow {
+                        page,
+                        dims: (decoded.width, decoded.height),
+                    });
                 }
                 SeatStep::Hold => {}
                 SeatStep::Clear => {
@@ -206,7 +242,12 @@ impl Screen {
     /// Upload `page`'s textures without binding a seat. A refusal
     /// surfaces in the status line and repeats while staging retries
     /// each frame.
-    fn stage(&mut self, pages: &mut PageTextures, page: usize, decoded: &Arc<Decoded>) {
+    fn stage(
+        &mut self,
+        pages: &mut PageTextures,
+        page: usize,
+        decoded: &Arc<Decoded>,
+    ) {
         if let Err(error) = pages.stage(page, decoded) {
             self.upload_error = Some(error.to_string());
         }
@@ -256,9 +297,10 @@ mod tests {
         const CLEAR: StepFacts = (StepKind::Clear, None);
         fn step_facts(step: &SeatStep<'_>) -> StepFacts {
             match step {
-                SeatStep::Show { page, decoded } => {
-                    (StepKind::Show, Some((*page, (decoded.width, decoded.height))))
-                }
+                SeatStep::Show { page, decoded } => (
+                    StepKind::Show,
+                    Some((*page, (decoded.width, decoded.height))),
+                ),
                 SeatStep::Hold => (StepKind::Hold, None),
                 SeatStep::Clear => (StepKind::Clear, None),
             }
@@ -276,8 +318,14 @@ mod tests {
             committed: bool,
             stage: Option<(usize, (u32, u32))>,
         }
-        let old = Spread { first: 3, second: Some(4) };
-        let pair = Spread { first: 5, second: Some(6) };
+        let old = Spread {
+            first: 3,
+            second: Some(4),
+        };
+        let pair = Spread {
+            first: 5,
+            second: Some(6),
+        };
         let failed = || Some(SeatView::Failed("x".into()));
         let pending = || Some(SeatView::Pending);
         // Manga seats a pair as [second, first]: left = page 6, right = 5.
@@ -440,14 +488,33 @@ mod tests {
                 shown_after: Some(old), committed: false, stage: Some((5, (500, 700))),
             },
         ];
-        for Row { name, shown, wanted, mode, views, bound, steps, shown_after, committed, stage } in rows {
+        for Row {
+            name,
+            shown,
+            wanted,
+            mode,
+            views,
+            bound,
+            steps,
+            shown_after,
+            committed,
+            stage,
+        } in rows
+        {
             let views = views.each_ref().map(Option::as_ref);
             let plan = plan_screen(shown, wanted, mode, views, bound);
-            assert_eq!(plan.steps.each_ref().map(step_facts), steps, "{name}: steps");
+            assert_eq!(
+                plan.steps.each_ref().map(step_facts),
+                steps,
+                "{name}: steps"
+            );
             assert_eq!(plan.shown_after, shown_after, "{name}: shown");
             assert_eq!(plan.committed, committed, "{name}: committed");
             assert_eq!(
-                plan.stage.map(|(page, decoded)| (page, (decoded.width, decoded.height))),
+                plan.stage.map(|(page, decoded)| (
+                    page,
+                    (decoded.width, decoded.height)
+                )),
                 stage,
                 "{name}: stage"
             );

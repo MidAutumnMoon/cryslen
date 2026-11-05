@@ -58,40 +58,45 @@ impl Window {
         // that cannot fail, so using it would force a panic on an empty
         // config list.
         let raw_display = event_loop.display_handle()?.as_raw();
-        let gl_display = Display::new(
-            raw_display,
-            DisplayApiPreference::Egl,
-        )?;
+        let gl_display =
+            Display::new(raw_display, DisplayApiPreference::Egl)?;
         // Prefer a config with alpha so the background can show the
         // desktop through it. A machine with none runs fully opaque,
         // a mode, not an error.
-        let translucent_template = ConfigTemplateBuilder::new().with_alpha_size(8).build();
-        let (gl_config, translucent) =
-            if let Some(config) = gl_display.find_configs(translucent_template)?.next() {
-                (config, true)
-            } else {
-                // The second pass drops the alpha demand. The default
-                // template also demands alpha, which would repeat the
-                // same empty query.
-                let plain = ConfigTemplateBuilder::new().with_alpha_size(0).build();
-                let config = gl_display
-                    .find_configs(plain)?
-                    .next()
-                    .ok_or_else(|| eros::error!("no GL config matched the template"))?;
-                (config, false)
-            };
+        let translucent_template =
+            ConfigTemplateBuilder::new().with_alpha_size(8).build();
+        let (gl_config, translucent) = if let Some(config) =
+            gl_display.find_configs(translucent_template)?.next()
+        {
+            (config, true)
+        } else {
+            // The second pass drops the alpha demand. The default
+            // template also demands alpha, which would repeat the
+            // same empty query.
+            let plain =
+                ConfigTemplateBuilder::new().with_alpha_size(0).build();
+            let config =
+                gl_display.find_configs(plain)?.next().ok_or_else(
+                    || eros::error!("no GL config matched the template"),
+                )?;
+            (config, false)
+        };
 
         let attrs = WindowAttributes::default()
             .with_name("cryslen", "cryslen")
             .with_resizable(true)
-            .with_inner_size(LogicalSize { width: INITIAL_WINDOW_WIDTH, height: INITIAL_WINDOW_HEIGHT })
+            .with_inner_size(LogicalSize {
+                width: INITIAL_WINDOW_WIDTH,
+                height: INITIAL_WINDOW_HEIGHT,
+            })
             .with_title("cryslen")
             // Without the transparent hint winit marks the whole surface
             // opaque, so compositors may skip blending and background
             // effects behind it even though the buffer has alpha.
             .with_transparent(translucent);
 
-        let window = glutin_winit::finalize_window(event_loop, attrs, &gl_config)?;
+        let window =
+            glutin_winit::finalize_window(event_loop, attrs, &gl_config)?;
         let raw_window = window.window_handle()?.as_raw();
         let ctx_attrs =
             ContextAttributesBuilder::new().build(Some(raw_window));
@@ -109,29 +114,39 @@ impl Window {
 
         let (width, height): (u32, u32) = window.inner_size().into();
         let surface_attrs =
-            SurfaceAttributesBuilder::<WindowSurface>::new()
-                .build(
-                    raw_window,
-                    NonZeroU32::new(width).ok_or_else(|| eros::error!("window width is zero"))?,
-                    NonZeroU32::new(height).ok_or_else(|| eros::error!("window height is zero"))?,
-                );
-        let surface = gl_display.create_window_surface(&gl_config, &surface_attrs)?;
+            SurfaceAttributesBuilder::<WindowSurface>::new().build(
+                raw_window,
+                NonZeroU32::new(width)
+                    .ok_or_else(|| eros::error!("window width is zero"))?,
+                NonZeroU32::new(height).ok_or_else(|| {
+                    eros::error!("window height is zero")
+                })?,
+            );
+        let surface = gl_display
+            .create_window_surface(&gl_config, &surface_attrs)?;
         let context = not_current.make_current(&surface)?;
         // Non-blocking present plus pre_present_and_swap's
         // window.pre_present_notify() gives Wayland frame-callback pacing
         // without a blocking eglSwapBuffers owning the event loop.
-        surface
-            .set_swap_interval(&context, SwapInterval::DontWait)?;
+        surface.set_swap_interval(&context, SwapInterval::DontWait)?;
 
         let gl = Arc::new(glow::Context::from_loader_function(|symbol| {
             #[expect(
                 clippy::expect_used,
                 reason = "symbol names are static ASCII GL entry points, NUL-free by construction"
             )]
-            let symbol = CString::new(symbol).expect("GL proc name without interior NUL");
+            let symbol = CString::new(symbol)
+                .expect("GL proc name without interior NUL");
             gl_display.get_proc_address(&symbol)
         }));
-        Ok(Self { winit: window, gl, surface, context, translucent, resized_to: (width, height) })
+        Ok(Self {
+            winit: window,
+            gl,
+            surface,
+            context,
+            translucent,
+            resized_to: (width, height),
+        })
     }
 
     pub fn glow(&self) -> Arc<glow::Context> {
@@ -151,7 +166,8 @@ impl Window {
     pub fn resize(&mut self, size: PhysicalSize<u32>) {
         use glutin::prelude::GlSurface as _;
 
-        let (Some(width), Some(height)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
+        let (Some(width), Some(height)) =
+            (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
         else {
             return;
         };

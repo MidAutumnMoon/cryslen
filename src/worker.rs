@@ -72,7 +72,10 @@ impl SpreadView {
 
     /// Pair the spread's pages with their seat views in reading order:
     /// `spread.first` (the page read first), then its partner.
-    pub fn reading_order(&self, spread: Spread) -> impl Iterator<Item = (usize, &SeatView)> {
+    pub fn reading_order(
+        &self,
+        spread: Spread,
+    ) -> impl Iterator<Item = (usize, &SeatView)> {
         [
             (Some(spread.first), Some(&self.first)),
             (spread.second, self.second.as_ref()),
@@ -119,7 +122,9 @@ impl Book {
     fn retune(&mut self, wanted: Spread, page_count: usize) {
         self.wanted = wanted;
         self.recency_counter += 1;
-        for page in [Some(wanted.first), wanted.second].into_iter().flatten() {
+        for page in
+            [Some(wanted.first), wanted.second].into_iter().flatten()
+        {
             self.last_wanted.insert(page, self.recency_counter);
             self.pending.insert(page);
         }
@@ -158,7 +163,10 @@ impl Book {
     }
 
     fn seat_view(&self, page: usize) -> SeatView {
-        self.decided.get(&page).cloned().unwrap_or(SeatView::Pending)
+        self.decided
+            .get(&page)
+            .cloned()
+            .unwrap_or(SeatView::Pending)
     }
 
     /// Eviction victims are never-wanted pages first, then least
@@ -177,7 +185,10 @@ impl Book {
             .collect();
         victims.sort_unstable_by_key(|&page| {
             (
-                self.last_wanted.get(&page).copied().unwrap_or(NEVER_WANTED_RANK),
+                self.last_wanted
+                    .get(&page)
+                    .copied()
+                    .unwrap_or(NEVER_WANTED_RANK),
                 Reverse(page.abs_diff(wanted.first)),
                 page,
             )
@@ -194,11 +205,19 @@ impl Book {
     }
 
     fn assert_wanted_covered(&self) {
-        let covered =
-            |page: usize| self.decided.contains_key(&page) || self.pending.contains(&page);
-        debug_assert!(covered(self.wanted.first), "first wanted page is decided or pending");
+        let covered = |page: usize| {
+            self.decided.contains_key(&page)
+                || self.pending.contains(&page)
+        };
+        debug_assert!(
+            covered(self.wanted.first),
+            "first wanted page is decided or pending"
+        );
         if let Some(second) = self.wanted.second {
-            debug_assert!(covered(second), "second wanted page is decided or pending");
+            debug_assert!(
+                covered(second),
+                "second wanted page is decided or pending"
+            );
         }
     }
 
@@ -229,7 +248,12 @@ fn neighbors(anchor: usize, page_count: usize) -> Vec<usize> {
     iter::once(anchor)
         .chain(
             (1..=PREFETCH_RADIUS)
-                .flat_map(|distance| [anchor.checked_sub(distance), anchor.checked_add(distance)])
+                .flat_map(|distance| {
+                    [
+                        anchor.checked_sub(distance),
+                        anchor.checked_add(distance),
+                    ]
+                })
                 .flatten(),
         )
         .filter(|&page| page < page_count)
@@ -242,8 +266,14 @@ fn neighbors(anchor: usize, page_count: usize) -> Vec<usize> {
 /// moved on. The wanted spread itself never drops.
 const TRAIL_RADIUS: usize = 64;
 
-fn retain_trail(pending: &mut BTreeSet<usize>, anchor: usize, wanted: &Spread) {
-    pending.retain(|&page| page.abs_diff(anchor) <= TRAIL_RADIUS || wanted.contains(page));
+fn retain_trail(
+    pending: &mut BTreeSet<usize>,
+    anchor: usize,
+    wanted: &Spread,
+) {
+    pending.retain(|&page| {
+        page.abs_diff(anchor) <= TRAIL_RADIUS || wanted.contains(page)
+    });
 }
 
 /// Handle to the worker. `retune` is cheap and never blocks.
@@ -270,13 +300,19 @@ impl Worker {
         let handle = Builder::new()
             .name("cy-decode".into())
             .spawn(move || run(&source, &rx, &thread_book, &notify))?;
-        Ok(Self { tx, book, handle: Some(handle) })
+        Ok(Self {
+            tx,
+            book,
+            handle: Some(handle),
+        })
     }
 
     /// A failed send means the thread already exited, so the message has
     /// no reader left.
     fn tell(&self, message: ToWorker) {
-        let Ok(()) = self.tx.send(message) else { return; };
+        let Ok(()) = self.tx.send(message) else {
+            return;
+        };
     }
 
     pub fn retune(&self, wanted: Spread) {
@@ -333,7 +369,9 @@ fn run(
     let mut retunes: Vec<Spread> = Vec::new();
     loop {
         while let Ok(message) = rx.try_recv() {
-            let ToWorker::Retune(spread) = message else { return };
+            let ToWorker::Retune(spread) = message else {
+                return;
+            };
             retunes.push(spread);
         }
         if !retunes.is_empty() {
@@ -373,7 +411,10 @@ enum Decision {
 
 /// A terminal failure labelled with the page's 1-based display number.
 /// This is the only place the prefix is added.
-fn page_failure(page_index: usize, message: impl fmt::Display) -> Decision {
+fn page_failure(
+    page_index: usize,
+    message: impl fmt::Display,
+) -> Decision {
     Decision::Failed(format!("page {}: {message}", page_index + 1))
 }
 
@@ -391,7 +432,9 @@ fn decide_page(source: &Source, page_index: usize) -> Decision {
     };
     match source.bytes(page_index) {
         PageRead::Ready(bytes) => {
-            let result = panic::catch_unwind(AssertUnwindSafe(|| decode::decode(&bytes, name)));
+            let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                decode::decode(&bytes, name)
+            }));
             match result {
                 Ok(Ok(page)) => Decision::Ready(Arc::new(page)),
                 Ok(Err(error)) => page_failure(page_index, error),
@@ -407,7 +450,11 @@ fn decide_page(source: &Source, page_index: usize) -> Decision {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used, clippy::panic, reason = "a panic in test code is inconsequential")]
+#[expect(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "a panic in test code is inconsequential"
+)]
 mod tests {
     use super::*;
     use crate::testkit::eventually;
@@ -436,8 +483,12 @@ mod tests {
             let mut focus = 0;
             for turn in 0..spreads {
                 let window = neighbors(focus, page_count);
-                let spread = view::spread_for(focus, ViewMode::Manga, page_count);
-                for page in [Some(spread.first), spread.second].into_iter().flatten() {
+                let spread =
+                    view::spread_for(focus, ViewMode::Manga, page_count);
+                for page in [Some(spread.first), spread.second]
+                    .into_iter()
+                    .flatten()
+                {
                     assert!(
                         window.contains(&page),
                         "page count {page_count}: spread page {page} outside focus {focus}"
@@ -446,12 +497,21 @@ mod tests {
                 // The wrap turn jumps across the book, which prefetch
                 // cannot cover.
                 if turn + 1 < spreads {
-                    let next = view::advance(focus, true, ViewMode::Manga, page_count);
-                    let next_spread =
-                        view::spread_for(next, ViewMode::Manga, page_count);
-                    for page in [Some(next_spread.first), next_spread.second]
-                        .into_iter()
-                        .flatten()
+                    let next = view::advance(
+                        focus,
+                        true,
+                        ViewMode::Manga,
+                        page_count,
+                    );
+                    let next_spread = view::spread_for(
+                        next,
+                        ViewMode::Manga,
+                        page_count,
+                    );
+                    for page in
+                        [Some(next_spread.first), next_spread.second]
+                            .into_iter()
+                            .flatten()
                     {
                         assert!(
                             window.contains(&page),
@@ -468,7 +528,13 @@ mod tests {
     fn next_pick_is_nearest_then_ahead() {
         // A page count of 0 admits no neighbours, so the trail starts as
         // the wanted pair alone.
-        let mut book = Book::new(Spread { first: 10, second: Some(11) }, 0);
+        let mut book = Book::new(
+            Spread {
+                first: 10,
+                second: Some(11),
+            },
+            0,
+        );
         book.store(10, ready_seat(2, 1));
         book.pending.extend(8..=12);
         assert_eq!(book.take_next(), Some(11));
@@ -485,11 +551,32 @@ mod tests {
     // kept/dropped checks below also protect release builds.
     #[test]
     fn eviction_rank() {
-        let wanted = Spread { first: 5, second: Some(6) };
+        let wanted = Spread {
+            first: 5,
+            second: Some(6),
+        };
         for (budget, retunes, stores, kept, dropped) in [
-            (8, vec![wanted], vec![1_usize, 3], vec![3_usize], vec![1_usize]),
-            (8, vec![Spread::lone(1), wanted], vec![1, 3], vec![1], vec![3]),
-            (8, vec![Spread::lone(1), Spread::lone(2), wanted], vec![1, 2], vec![2], vec![1]),
+            (
+                8,
+                vec![wanted],
+                vec![1_usize, 3],
+                vec![3_usize],
+                vec![1_usize],
+            ),
+            (
+                8,
+                vec![Spread::lone(1), wanted],
+                vec![1, 3],
+                vec![1],
+                vec![3],
+            ),
+            (
+                8,
+                vec![Spread::lone(1), Spread::lone(2), wanted],
+                vec![1, 2],
+                vec![2],
+                vec![1],
+            ),
         ] {
             let mut book = Book::new(Spread::lone(0), 10);
             book.budget = budget;
@@ -511,7 +598,10 @@ mod tests {
                     "dropped {page} survived: retunes {retunes:?} stores {stores:?}"
                 );
             }
-            assert!(book.live_bytes <= book.budget, "live bytes over budget: {retunes:?} {stores:?}");
+            assert!(
+                book.live_bytes <= book.budget,
+                "live bytes over budget: {retunes:?} {stores:?}"
+            );
         }
     }
 
@@ -519,7 +609,10 @@ mod tests {
     fn saturating_store_never_drops_the_wanted_spread() {
         let mut book = Book::new(Spread::lone(1), 20);
         book.budget = 16;
-        let wanted = Spread { first: 7, second: Some(8) };
+        let wanted = Spread {
+            first: 7,
+            second: Some(8),
+        };
         book.retune(wanted, 20);
         book.store(1, ready_seat(2, 1));
         book.store(7, ready_seat(2, 1));
@@ -536,7 +629,10 @@ mod tests {
     // saturates the book.
     #[test]
     fn wanted_spread_survives_its_own_oversize() {
-        let wanted = Spread { first: 3, second: Some(4) };
+        let wanted = Spread {
+            first: 3,
+            second: Some(4),
+        };
         let mut book = Book::new(wanted, 10);
         book.budget = 10;
         book.store(3, ready_seat(10, 10));
@@ -546,9 +642,13 @@ mod tests {
     fn tiny_source(tag: &str, page_count: u8) -> (TempDir, Arc<Source>) {
         let dir = TempDir::new(tag);
         for page in 0..page_count {
-            dir.write(&format!("p{page:03}.png"), &tiny_png(1, 1, [page, 0, 0, 255]));
+            dir.write(
+                &format!("p{page:03}.png"),
+                &tiny_png(1, 1, [page, 0, 0, 255]),
+            );
         }
-        let source = Arc::new(Source::open(dir.path()).expect("temp source opens"));
+        let source =
+            Arc::new(Source::open(dir.path()).expect("temp source opens"));
         (dir, source)
     }
 
@@ -565,7 +665,13 @@ mod tests {
 
     impl Gate {
         fn new() -> Self {
-            Self(Arc::new((Mutex::new(GateTickets { next: 0, released_through: 0 }), Condvar::new())))
+            Self(Arc::new((
+                Mutex::new(GateTickets {
+                    next: 0,
+                    released_through: 0,
+                }),
+                Condvar::new(),
+            )))
         }
 
         fn hold(&self) {
@@ -592,13 +698,17 @@ mod tests {
 
     fn wait_ready(worker: &Worker, pages: &[usize]) {
         for &page in pages {
-            eventually(20, &format!("page {page} not decoded in time"), || {
-                match worker.snapshot(&Spread::lone(page)).first {
+            eventually(
+                20,
+                &format!("page {page} not decoded in time"),
+                || match worker.snapshot(&Spread::lone(page)).first {
                     SeatView::Ready(seat) => Some(seat),
-                    SeatView::Failed(message) => panic!("page {page} failed: {message}"),
+                    SeatView::Failed(message) => {
+                        panic!("page {page} failed: {message}")
+                    }
                     SeatView::Pending => None,
-                }
-            });
+                },
+            );
         }
     }
 
@@ -607,7 +717,8 @@ mod tests {
         let dir = TempDir::new("worker-e2e");
         dir.write("bad.png", b"not a png at all");
         dir.write("ok.png", &tiny_png(3, 2, [0, 255, 0, 255]));
-        let source = Arc::new(Source::open(dir.path()).expect("temp source opens"));
+        let source =
+            Arc::new(Source::open(dir.path()).expect("temp source opens"));
         let updates = Arc::new(Mutex::new(0_usize));
         let counted = Arc::clone(&updates);
         let ok = Spread::lone(1);
@@ -625,13 +736,15 @@ mod tests {
 
         let bad = Spread::lone(0);
         worker.retune(bad);
-        let failed = eventually(20, "page 0 not decided in time", || {
-            match worker.snapshot(&bad).first {
+        let failed =
+            eventually(20, "page 0 not decided in time", || match worker
+                .snapshot(&bad)
+                .first
+            {
                 SeatView::Failed(message) => Some(message),
                 SeatView::Ready(_) => panic!("bad.png decoded as Ready?"),
                 SeatView::Pending => None,
-            }
-        });
+            });
         assert!(failed.starts_with("page 1: "), "{failed}");
         assert!(!failed.contains("page 1: page 1"), "{failed}");
         // The entry is sticky across turns: turn to the ok page, then back.
@@ -664,29 +777,43 @@ mod tests {
             // for it. Zeros are not a PNG, so the seat settles as a
             // decode failure; the point is that it settles at all.
             for page in 0..32_u32 {
-                zip.start_file(format!("{page:03}.png"), options).expect("entry starts");
-                zip.write_all(&vec![0_u8; 1024 * 1024]).expect("entry writes");
+                zip.start_file(format!("{page:03}.png"), options)
+                    .expect("entry starts");
+                zip.write_all(&vec![0_u8; 1024 * 1024])
+                    .expect("entry writes");
             }
             zip.finish().expect("zip finishes");
         }
         let source = Arc::new(Source::open(&zip_path).expect("zip opens"));
         let far = source.len() - 1;
         let worker =
-            Worker::spawn(Arc::clone(&source), Spread::lone(far), |_| {}).expect("worker spawns");
+            Worker::spawn(Arc::clone(&source), Spread::lone(far), |_| {})
+                .expect("worker spawns");
 
         let settled = |page: usize| {
             eventually(20, "page never settled", || {
                 match worker.snapshot(&Spread::lone(page)).first {
                     SeatView::Pending => None,
                     SeatView::Failed(message) => Some(message),
-                    SeatView::Ready(_) => panic!("zeros decoded as an image?"),
+                    SeatView::Ready(_) => {
+                        panic!("zeros decoded as an image?")
+                    }
                 }
             })
         };
         let far_page = settled(far);
-        assert!(far_page.starts_with(&format!("page {}: ", far + 1)), "{far_page}");
-        assert!(!far_page.contains("no entry in the archive"), "{far_page}");
-        assert!(!far_page.contains("could not start the unpack thread"), "{far_page}");
+        assert!(
+            far_page.starts_with(&format!("page {}: ", far + 1)),
+            "{far_page}"
+        );
+        assert!(
+            !far_page.contains("no entry in the archive"),
+            "{far_page}"
+        );
+        assert!(
+            !far_page.contains("could not start the unpack thread"),
+            "{far_page}"
+        );
         worker.retune(Spread::lone(0));
         let first_page = settled(0);
         assert!(first_page.starts_with("page 1: "), "{first_page}");
@@ -695,13 +822,17 @@ mod tests {
     #[test]
     fn retune_decoding() {
         let (_dir, source) = tiny_source("worker-retune", 50);
-        let worker = Worker::spawn(source, Spread::lone(0), |_| {}).expect("worker spawns");
+        let worker = Worker::spawn(source, Spread::lone(0), |_| {})
+            .expect("worker spawns");
         // 50 retunes queue faster than pages decode; every page still decodes
         for page in 0..50 {
             worker.retune(Spread::lone(page));
         }
         wait_ready(&worker, &(0..50).collect::<Vec<_>>());
-        worker.retune(Spread { first: 3, second: Some(4) });
+        worker.retune(Spread {
+            first: 3,
+            second: Some(4),
+        });
         wait_ready(&worker, &[3, 4]);
         // The last-wanted records are what keep a wanted spread in the
         // book, so the wiring is pinned on them.
@@ -717,8 +848,9 @@ mod tests {
         let (_dir, source) = tiny_source("worker-bound", 140);
         let gate = Gate::new();
         let parked = gate.clone();
-        let worker = Worker::spawn(source, Spread::lone(0), move |_| parked.hold())
-            .expect("worker spawns");
+        let worker =
+            Worker::spawn(source, Spread::lone(0), move |_| parked.hold())
+                .expect("worker spawns");
         wait_ready(&worker, &[0]);
         // All 139 retunes queue while the worker is parked on page 0.
         for page in 1..140 {
@@ -728,7 +860,10 @@ mod tests {
         wait_ready(&worker, &(75..140).collect::<Vec<_>>());
         for page in 1..75 {
             assert!(
-                matches!(worker.snapshot(&Spread::lone(page)).first, SeatView::Pending),
+                matches!(
+                    worker.snapshot(&Spread::lone(page)).first,
+                    SeatView::Pending
+                ),
                 "page {page} decoded past the trail radius"
             );
         }
@@ -739,8 +874,9 @@ mod tests {
         let (_dir, source) = tiny_source("worker-prio", 70);
         let gate = Gate::new();
         let parked = gate.clone();
-        let worker = Worker::spawn(source, Spread::lone(0), move |_| parked.hold())
-            .expect("worker spawns");
+        let worker =
+            Worker::spawn(source, Spread::lone(0), move |_| parked.hold())
+                .expect("worker spawns");
         wait_ready(&worker, &[0]);
         worker.retune(Spread::lone(60));
         gate.release(1);
@@ -749,7 +885,10 @@ mod tests {
         // pages 1 and 2 cannot have been decoded before it.
         for page in [1, 2] {
             assert!(
-                matches!(worker.snapshot(&Spread::lone(page)).first, SeatView::Pending),
+                matches!(
+                    worker.snapshot(&Spread::lone(page)).first,
+                    SeatView::Pending
+                ),
                 "page {page} decoded before the wanted page"
             );
         }

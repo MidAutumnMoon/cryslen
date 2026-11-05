@@ -79,21 +79,29 @@ fn classify(path: &Path) -> eros::Result<Arg> {
     }
     let name = name.to_string_lossy().into_owned();
     if decode::format_from_name(&name).is_none() {
-        return Err(eros::error!("unsupported file type: {}", path.display()));
+        return Err(eros::error!(
+            "unsupported file type: {}",
+            path.display()
+        ));
     }
     // Path::parent() yields Some("") for bare relative names ("pic.jpg").
     let dir = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    Ok(Arg::Image { dir: dir.to_path_buf(), name })
+    Ok(Arg::Image {
+        dir: dir.to_path_buf(),
+        name,
+    })
 }
 
 fn landing<'entries>(
     mut entries: impl Iterator<Item = &'entries str>,
     want: &str,
 ) -> usize {
-    entries.position(|entry| entry.eq_ignore_ascii_case(want)).unwrap_or(0)
+    entries
+        .position(|entry| entry.eq_ignore_ascii_case(want))
+        .unwrap_or(0)
 }
 
 fn run(open_path: &Path, land_on: Option<&str>) -> eros::Result<()> {
@@ -104,7 +112,10 @@ fn run(open_path: &Path, land_on: Option<&str>) -> eros::Result<()> {
     let index = land_on.map_or(0, |name| {
         // Every page index below `len` has a name, so the indices survive
         // the filter.
-        landing((0..source.len()).filter_map(|page| source.name(page)), name)
+        landing(
+            (0..source.len()).filter_map(|page| source.name(page)),
+            name,
+        )
     });
 
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
@@ -117,7 +128,10 @@ fn run(open_path: &Path, land_on: Option<&str>) -> eros::Result<()> {
 }
 
 #[cfg(test)]
-#[expect(clippy::panic, reason = "a panic in test code is inconsequential")]
+#[expect(
+    clippy::panic,
+    reason = "a panic in test code is inconsequential"
+)]
 mod tests {
     use super::*;
     use crate::testkit::TempDir;
@@ -138,18 +152,43 @@ mod tests {
         ];
         for (path, want) in rows {
             match (classify(&path), want) {
-                (Ok(Arg::Image { dir: parent, name }), Ok(Some(want_name))) => {
-                    assert_eq!(parent, dir.path(), "{}: parent dir", path.display());
-                    assert_eq!(name, want_name, "{}: image name", path.display());
+                (
+                    Ok(Arg::Image { dir: parent, name }),
+                    Ok(Some(want_name)),
+                ) => {
+                    assert_eq!(
+                        parent,
+                        dir.path(),
+                        "{}: parent dir",
+                        path.display()
+                    );
+                    assert_eq!(
+                        name,
+                        want_name,
+                        "{}: image name",
+                        path.display()
+                    );
                 }
                 (Ok(Arg::Open(open)), Ok(None)) => {
-                    assert_eq!(open, path, "{}: source path", path.display());
+                    assert_eq!(
+                        open,
+                        path,
+                        "{}: source path",
+                        path.display()
+                    );
                 }
                 (Err(error), Err(want_text)) => {
                     let message = error.to_string();
-                    assert!(message.contains(want_text), "{}: {message}", path.display());
+                    assert!(
+                        message.contains(want_text),
+                        "{}: {message}",
+                        path.display()
+                    );
                 }
-                (_, want) => panic!("{}: wrong kind, wanted {want:?}", path.display()),
+                (_, want) => panic!(
+                    "{}: wrong kind, wanted {want:?}",
+                    path.display()
+                ),
             }
         }
     }

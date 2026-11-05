@@ -35,7 +35,10 @@ pub enum SourceError {
     Duplicate(String),
     /// The sizes the listing claims exceed the memory the machine
     /// reports available.
-    TooBig { unpacked: u64, available: u64 },
+    TooBig {
+        unpacked: u64,
+        available: u64,
+    },
     Zip(ZipError),
     SevenZip(sevenz_rust2::Error),
     Io(IoError),
@@ -120,7 +123,10 @@ struct Fill {
 
 impl Fill {
     fn empty() -> Self {
-        Self { pages: HashMap::new(), pass: None }
+        Self {
+            pages: HashMap::new(),
+            pass: None,
+        }
     }
 
     fn resolve(&self, index: usize) -> PageRead {
@@ -129,7 +135,9 @@ impl Fill {
             Some(Err(message)) => PageRead::Failed(message.clone()),
             None => match &self.pass {
                 None => PageRead::NotYet,
-                Some(Ok(())) => PageRead::Failed(String::from("no entry in the archive")),
+                Some(Ok(())) => PageRead::Failed(String::from(
+                    "no entry in the archive",
+                )),
                 Some(Err(fatal)) => PageRead::Failed(fatal.clone()),
             },
         }
@@ -188,7 +196,8 @@ impl Source {
                 }
             })
             .filter_map(|entry| {
-                let name = entry.file_name()?.to_string_lossy().into_owned();
+                let name =
+                    entry.file_name()?.to_string_lossy().into_owned();
                 Some((name, entry))
             })
             .collect();
@@ -212,12 +221,20 @@ impl Source {
         let mut names: Vec<String> = fs::read_dir(dir)
             .map_err(SourceError::Io)?
             .filter_map(Result::ok)
-            .filter(|entry| entry.file_type().is_ok_and(|file_type| file_type.is_file()))
+            .filter(|entry| {
+                entry
+                    .file_type()
+                    .is_ok_and(|file_type| file_type.is_file())
+            })
             .filter_map(|entry| entry.file_name().into_string().ok())
             .filter(|name| format_from_name(name).is_some())
             .collect();
         sort_pages(&mut names);
-        Self::from_names(Backend::Directory(dir.to_path_buf()), names, dir.to_path_buf())
+        Self::from_names(
+            Backend::Directory(dir.to_path_buf()),
+            names,
+            dir.to_path_buf(),
+        )
     }
 
     /// Listing reads the central directory, so a damaged local header
@@ -225,34 +242,48 @@ impl Source {
     /// reaches it.
     fn open_zip(path: &Path) -> Result<Self, SourceError> {
         let file = File::open(path).map_err(SourceError::Io)?;
-        let zip = zip::ZipArchive::new(BufReader::new(file)).map_err(SourceError::Zip)?;
+        let zip = zip::ZipArchive::new(BufReader::new(file))
+            .map_err(SourceError::Zip)?;
         let mut listed: Vec<(String, u64)> = Vec::new();
         for entry_index in 0..zip.len() {
-            let entry = zip.by_index_data(entry_index).map_err(SourceError::Zip)?;
+            let entry = zip
+                .by_index_data(entry_index)
+                .map_err(SourceError::Zip)?;
             if entry.is_dir() {
                 continue;
             }
-            let name = entry.name().map_err(SourceError::Zip)?.into_owned();
+            let name =
+                entry.name().map_err(SourceError::Zip)?.into_owned();
             if format_from_name(&name).is_some() {
                 listed.push((name, entry.size()));
             }
         }
-        Self::open_archive(path, listed, |names, fill| spawn_zip_fill(zip, names, &fill))
+        Self::open_archive(path, listed, |names, fill| {
+            spawn_zip_fill(zip, names, &fill);
+        })
     }
 
     /// No password: a 7z with encrypted headers fails to open, and the
     /// first encrypted block ends the pass.
     fn open_sevenzip(path: &Path) -> Result<Self, SourceError> {
-        let archive = sevenz_rust2::ArchiveReader::open(path, sevenz_rust2::Password::empty())
-            .map_err(SourceError::SevenZip)?;
+        let archive = sevenz_rust2::ArchiveReader::open(
+            path,
+            sevenz_rust2::Password::empty(),
+        )
+        .map_err(SourceError::SevenZip)?;
         let listed: Vec<(String, u64)> = archive
             .archive()
             .files
             .iter()
-            .filter(|entry| !entry.is_directory() && format_from_name(&entry.name).is_some())
+            .filter(|entry| {
+                !entry.is_directory()
+                    && format_from_name(&entry.name).is_some()
+            })
             .map(|entry| (entry.name.clone(), entry.size()))
             .collect();
-        Self::open_archive(path, listed, |names, fill| spawn_sevenzip_fill(archive, &names, &fill))
+        Self::open_archive(path, listed, |names, fill| {
+            spawn_sevenzip_fill(archive, &names, &fill);
+        })
     }
 
     fn open_archive(
@@ -262,9 +293,12 @@ impl Source {
     ) -> Result<Self, SourceError> {
         // Header sizes are claims, so the sum saturates rather than
         // wraps a liar archive past the guard.
-        let unpacked_bytes: u64 =
-            listed.iter().map(|&(_, size)| size).fold(0, u64::saturating_add);
-        let mut names: Vec<String> = listed.into_iter().map(|(name, _)| name).collect();
+        let unpacked_bytes: u64 = listed
+            .iter()
+            .map(|&(_, size)| size)
+            .fold(0, u64::saturating_add);
+        let mut names: Vec<String> =
+            listed.into_iter().map(|(name, _)| name).collect();
         sort_pages(&mut names);
         if let Some(name) = duplicate_name(&names) {
             return Err(SourceError::Duplicate(name));
@@ -278,11 +312,19 @@ impl Source {
         Self::from_names(Backend::Archive(fill), names, path.to_path_buf())
     }
 
-    fn from_names(backend: Backend, names: Vec<String>, path: PathBuf) -> Result<Self, SourceError> {
+    fn from_names(
+        backend: Backend,
+        names: Vec<String>,
+        path: PathBuf,
+    ) -> Result<Self, SourceError> {
         if names.is_empty() {
             return Err(SourceError::Empty);
         }
-        Ok(Self { names, backend, path })
+        Ok(Self {
+            names,
+            backend,
+            path,
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -303,15 +345,20 @@ impl Source {
         reason = "the page list is non-empty and immutable, and callers pass an index below its length; the debug assert restates it"
     )]
     pub fn page_name(&self, index: usize) -> PageName {
-        debug_assert!(index < self.names.len(), "caller clamps the page index");
+        debug_assert!(
+            index < self.names.len(),
+            "caller clamps the page index"
+        );
         let entry = &self.names[index];
         let file = entry.rsplit('/').next().unwrap_or(entry).to_owned();
         let parent = match &self.backend {
-            Backend::Directory(dir) => {
-                dir.file_name().map(|name| name.to_string_lossy().into_owned())
-            }
+            Backend::Directory(dir) => dir
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned()),
             Backend::Archive(_) => {
-                entry.rsplit_once('/').map(|(path, _)| path.rsplit('/').next().unwrap_or(path).to_owned())
+                entry.rsplit_once('/').map(|(path, _)| {
+                    path.rsplit('/').next().unwrap_or(path).to_owned()
+                })
             }
         };
         PageName { parent, file }
@@ -374,7 +421,9 @@ pub(crate) fn compare_names(left: &str, right: &str) -> Ordering {
             (None, Some(_)) => return Ordering::Less,
             (Some(_), None) => return Ordering::Greater,
             (Some(&left_byte), Some(&right_byte)) => {
-                if left_byte.is_ascii_digit() && right_byte.is_ascii_digit() {
+                if left_byte.is_ascii_digit()
+                    && right_byte.is_ascii_digit()
+                {
                     let (left_run, left_rest) = leading_digits(left);
                     let (right_run, right_rest) = leading_digits(right);
                     let order = number_order(left_run, right_run);
@@ -398,13 +447,19 @@ pub(crate) fn compare_names(left: &str, right: &str) -> Ordering {
 }
 
 fn leading_digits(bytes: &[u8]) -> (&[u8], &[u8]) {
-    let end = bytes.iter().position(|byte| !byte.is_ascii_digit()).unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_digit())
+        .unwrap_or(bytes.len());
     bytes.split_at(end)
 }
 
 /// The digits of a run without their leading zeros; all-zero runs empty.
 fn value_digits(digits: &[u8]) -> &[u8] {
-    let start = digits.iter().position(|&byte| byte != b'0').unwrap_or(digits.len());
+    let start = digits
+        .iter()
+        .position(|&byte| byte != b'0')
+        .unwrap_or(digits.len());
     digits.split_at(start).1
 }
 
@@ -412,7 +467,8 @@ fn value_digits(digits: &[u8]) -> &[u8] {
 /// first, so "010" sorts after "9" (its value is 10) and beside only
 /// "10".
 fn number_order(left: &[u8], right: &[u8]) -> Ordering {
-    let (left_value, right_value) = (value_digits(left), value_digits(right));
+    let (left_value, right_value) =
+        (value_digits(left), value_digits(right));
     left_value
         .len()
         .cmp(&right_value.len())
@@ -423,7 +479,9 @@ fn number_order(left: &[u8], right: &[u8]) -> Ordering {
 /// One member's bytes, with its read error as the message. A failed
 /// member is drained, so the next member of a solid stream decodes
 /// from its true start; an independent entry discards the rest.
-fn read_member(member: &mut (impl Read + ?Sized)) -> Result<Arc<[u8]>, String> {
+fn read_member(
+    member: &mut (impl Read + ?Sized),
+) -> Result<Arc<[u8]>, String> {
     let mut bytes = Vec::new();
     match member.read_to_end(&mut bytes) {
         Ok(_) => Ok(bytes.into()),
@@ -453,7 +511,9 @@ fn spawn_pass(
         .name("cy-unpack".into())
         .spawn(move || settle_pass(&thread_fill, body));
     if let Err(error) = spawned {
-        fill.lock().pass = Some(Err(format!("could not start the unpack thread: {error}")));
+        fill.lock().pass = Some(Err(format!(
+            "could not start the unpack thread: {error}"
+        )));
     }
 }
 
@@ -512,7 +572,10 @@ fn spawn_sevenzip_fill(
     });
 }
 
-fn settle_pass(fill: &Arc<Mutex<Fill>>, body: impl FnOnce(&Arc<Mutex<Fill>>) -> Result<(), String>) {
+fn settle_pass(
+    fill: &Arc<Mutex<Fill>>,
+    body: impl FnOnce(&Arc<Mutex<Fill>>) -> Result<(), String>,
+) {
     use std::panic;
     use std::panic::AssertUnwindSafe;
 
@@ -524,7 +587,9 @@ fn settle_pass(fill: &Arc<Mutex<Fill>>, body: impl FnOnce(&Arc<Mutex<Fill>>) -> 
             tracing::warn!(%reason, "unpack pass ended early");
             Err(reason)
         }
-        Err(payload) => Err(format!("unpack {}", panic_message(payload.as_ref()))),
+        Err(payload) => {
+            Err(format!("unpack {}", panic_message(payload.as_ref())))
+        }
     });
 }
 
@@ -547,7 +612,9 @@ pub(crate) fn panic_message(payload: &(dyn Any + Send)) -> String {
 /// `MemAvailable` from a `/proc/meminfo` text, converted to bytes. The
 /// line counts KiB. `None` when the line is missing or unparsable.
 fn parse_mem_available_bytes(meminfo: &str) -> Option<u64> {
-    let line = meminfo.lines().find(|line| line.starts_with("MemAvailable:"))?;
+    let line = meminfo
+        .lines()
+        .find(|line| line.starts_with("MemAvailable:"))?;
     let kib = line.split_whitespace().nth(1)?.parse::<u64>().ok()?;
     Some(kib * 1024)
 }
@@ -560,10 +627,18 @@ fn mem_available_bytes() -> Option<u64> {
 /// uploads, and the rest of the system also live in `MemAvailable`.
 const MEM_RESERVE_BYTES: u64 = 1024 * 1024 * 1024;
 
-fn guard_memory(unpacked: u64, available: Option<u64>) -> Result<(), SourceError> {
+fn guard_memory(
+    unpacked: u64,
+    available: Option<u64>,
+) -> Result<(), SourceError> {
     match available {
-        Some(available) if unpacked > available.saturating_sub(MEM_RESERVE_BYTES) => {
-            Err(SourceError::TooBig { unpacked, available })
+        Some(available)
+            if unpacked > available.saturating_sub(MEM_RESERVE_BYTES) =>
+        {
+            Err(SourceError::TooBig {
+                unpacked,
+                available,
+            })
         }
         _ => Ok(()),
     }
@@ -606,12 +681,18 @@ mod tests {
         fill.pages.insert(0, Ok(Arc::from(&b"a"[..])));
         fill.pages.insert(1, Err("bad page".into()));
         assert!(matches!(fill.resolve(0), PageRead::Ready(_)));
-        assert!(matches!(fill.resolve(1), PageRead::Failed(message) if message == "bad page"));
+        assert!(
+            matches!(fill.resolve(1), PageRead::Failed(message) if message == "bad page")
+        );
         assert!(matches!(fill.resolve(2), PageRead::NotYet));
 
         fill.pass = Some(Err("stream broke".into()));
-        assert!(matches!(fill.resolve(1), PageRead::Failed(message) if message == "bad page"));
-        assert!(matches!(fill.resolve(2), PageRead::Failed(message) if message == "stream broke"));
+        assert!(
+            matches!(fill.resolve(1), PageRead::Failed(message) if message == "bad page")
+        );
+        assert!(
+            matches!(fill.resolve(2), PageRead::Failed(message) if message == "stream broke")
+        );
 
         fill.pass = Some(Ok(()));
         assert!(
@@ -624,11 +705,16 @@ mod tests {
         use std::cmp::Ordering;
 
         // Mixed padding widths order by value, not byte-wise.
-        let mut names = vec!["9.png".to_owned(), "010.png".to_owned(), "1.png".to_owned()];
+        let mut names = vec![
+            "9.png".to_owned(),
+            "010.png".to_owned(),
+            "1.png".to_owned(),
+        ];
         sort_pages(&mut names);
         assert_eq!(names, ["1.png", "9.png", "010.png"]);
         // Same-width padding was already right; both still are.
-        let mut padded = vec!["page10.png".to_owned(), "page09.png".to_owned()];
+        let mut padded =
+            vec!["page10.png".to_owned(), "page09.png".to_owned()];
         sort_pages(&mut padded);
         assert_eq!(padded, ["page09.png", "page10.png"]);
         // Equal values keep a deterministic order: fewer zeros first.
@@ -636,8 +722,14 @@ mod tests {
         assert_eq!(compare_names("010.png", "10.png"), Ordering::Greater);
         assert_eq!(compare_names("10.png", "10.png"), Ordering::Equal);
         // Non-digits compare byte-wise; case and spaces stay significant.
-        assert_eq!(compare_names("Page2.png", "page3.png"), Ordering::Less);
-        assert_eq!(compare_names("page 2.png", "page2.png"), Ordering::Less);
+        assert_eq!(
+            compare_names("Page2.png", "page3.png"),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_names("page 2.png", "page2.png"),
+            Ordering::Less
+        );
         assert_eq!(compare_names("page.png", "page2.png"), Ordering::Less);
         assert_eq!(compare_names("b", "a"), Ordering::Greater);
         assert_eq!(compare_names("", ""), Ordering::Equal);
@@ -649,29 +741,37 @@ mod tests {
         let meminfo = "MemTotal:       100 kB\nMemAvailable:   4096 kB\nSwapTotal:      2 kB\n";
         assert_eq!(parse_mem_available_bytes(meminfo), Some(4096 * 1024));
         assert_eq!(parse_mem_available_bytes("MemTotal: 1 kB\n"), None);
-        assert_eq!(parse_mem_available_bytes("MemAvailable: notanumber kB\n"), None);
+        assert_eq!(
+            parse_mem_available_bytes("MemAvailable: notanumber kB\n"),
+            None
+        );
     }
 
     #[test]
     fn memory_guard() {
         assert!(matches!(
             guard_memory(100, Some(50)),
-            Err(SourceError::TooBig { unpacked: 100, available: 50 })
+            Err(SourceError::TooBig {
+                unpacked: 100,
+                available: 50
+            })
         ));
         guard_memory(50, Some(MEM_RESERVE_BYTES + 100)).unwrap();
         guard_memory(u64::MAX, None).unwrap();
         // The guard keeps a reserve free: an archive that would leave
         // less than it is refused even though it still fits.
         let available = 4 * 1024 * 1024 * 1024;
-        guard_memory(available - MEM_RESERVE_BYTES, Some(available)).unwrap();
+        guard_memory(available - MEM_RESERVE_BYTES, Some(available))
+            .unwrap();
         // One byte into the reserve refuses.
         #[expect(
             clippy::rest_pattern_accessible_field,
             reason = "binding the ignored field as `_` instead trips unneeded_field_pattern"
         )]
-        let Err(SourceError::TooBig { unpacked, .. }) =
-            guard_memory(available - MEM_RESERVE_BYTES + 1, Some(available))
-        else {
+        let Err(SourceError::TooBig { unpacked, .. }) = guard_memory(
+            available - MEM_RESERVE_BYTES + 1,
+            Some(available),
+        ) else {
             panic!("an archive eating the reserve must refuse");
         };
         assert_eq!(unpacked, available - MEM_RESERVE_BYTES + 1);
@@ -684,24 +784,39 @@ mod tests {
 
         let broke = Arc::new(Mutex::new(Fill::empty()));
         settle_pass(&broke, |_| Err("stream broke".into()));
-        assert!(matches!(&broke.lock().pass, Some(Err(reason)) if reason.contains("broke")));
+        assert!(
+            matches!(&broke.lock().pass, Some(Err(reason)) if reason.contains("broke"))
+        );
 
         let boom = Arc::new(Mutex::new(Fill::empty()));
         settle_pass(&boom, |_| panic!("boom"));
-        assert!(matches!(boom.lock().resolve(0), PageRead::Failed(reason) if reason.contains("boom")));
+        assert!(
+            matches!(boom.lock().resolve(0), PageRead::Failed(reason) if reason.contains("boom"))
+        );
     }
 
     #[test]
     fn liar_sizes_refuse() {
-        let listed = vec![("a.png".to_owned(), u64::MAX), ("b.png".to_owned(), u64::MAX)];
+        let listed = vec![
+            ("a.png".to_owned(), u64::MAX),
+            ("b.png".to_owned(), u64::MAX),
+        ];
         #[expect(
             clippy::rest_pattern_accessible_field,
             reason = "binding the ignored field as `_` instead trips unneeded_field_pattern"
         )]
-        match Source::open_archive(Path::new("book.cbz"), listed, |_, _| {}) {
-            Err(SourceError::TooBig { unpacked: u64::MAX, .. }) => {}
+        match Source::open_archive(
+            Path::new("book.cbz"),
+            listed,
+            |_, _| {},
+        ) {
+            Err(SourceError::TooBig {
+                unpacked: u64::MAX, ..
+            }) => {}
             Err(other) => panic!("liar sizes settled as {other}"),
-            Ok(source) => panic!("liar sizes opened as {} pages", source.len()),
+            Ok(source) => {
+                panic!("liar sizes opened as {} pages", source.len())
+            }
         }
     }
 
@@ -720,45 +835,65 @@ mod tests {
 
     #[test]
     fn sevenz_listing() {
-        let source = Source::open(Path::new(SEVENZ_FIXTURE)).expect("7z opens");
+        let source =
+            Source::open(Path::new(SEVENZ_FIXTURE)).expect("7z opens");
         assert_eq!(source.names, ["p1.png", "p2.png"]);
         assert_eq!(
             source.page_name(0),
-            PageName { parent: None, file: "p1.png".into() }
+            PageName {
+                parent: None,
+                file: "p1.png".into()
+            }
         );
     }
 
     #[test]
     fn sevenz_read_through_fill() {
-        let source = Source::open(Path::new(SEVENZ_FIXTURE)).expect("7z opens");
-        let bytes = eventually(20, "first page never unpacked", || match source.bytes(0) {
-            PageRead::Ready(bytes) => Some(bytes),
-            PageRead::Failed(message) => panic!("page 0 failed: {message}"),
-            PageRead::NotYet => None,
+        let source =
+            Source::open(Path::new(SEVENZ_FIXTURE)).expect("7z opens");
+        let bytes = eventually(20, "first page never unpacked", || {
+            match source.bytes(0) {
+                PageRead::Ready(bytes) => Some(bytes),
+                PageRead::Failed(message) => {
+                    panic!("page 0 failed: {message}")
+                }
+                PageRead::NotYet => None,
+            }
         });
-        assert!(matches!(source.bytes(0), PageRead::Ready(repeat) if repeat.as_ref() == bytes.as_ref()));
+        assert!(
+            matches!(source.bytes(0), PageRead::Ready(repeat) if repeat.as_ref() == bytes.as_ref())
+        );
         assert_eq!(bytes.get(..8), Some(&b"\x89PNG\r\n\x1a\n"[..]));
         // the decoder is the oracle for the fixture's dims
-        let page = decode::decode(&bytes, "p1.png").expect("fixture page decodes");
+        let page = decode::decode(&bytes, "p1.png")
+            .expect("fixture page decodes");
         assert_eq!((page.width, page.height), (40, 30));
 
-        eventually(20, "pass never ended", || (!source.unpacking()).then_some(()));
+        eventually(20, "pass never ended", || {
+            (!source.unpacking()).then_some(())
+        });
         assert!(matches!(source.bytes(1), PageRead::Ready(_)));
     }
 
     #[test]
     fn sevenz_drains_non_page_members() {
-        let source = Source::open(Path::new(MIXED_SEVENZ_FIXTURE)).expect("7z opens");
+        let source = Source::open(Path::new(MIXED_SEVENZ_FIXTURE))
+            .expect("7z opens");
         assert_eq!(source.len(), 2);
         let mut pages = Vec::new();
         for index in 0..source.len() {
             let name = source.name(index).expect("page listed");
-            let bytes = eventually(20, "page never unpacked", || match source.bytes(index) {
-                PageRead::Ready(bytes) => Some(bytes),
-                PageRead::Failed(message) => panic!("{name} failed: {message}"),
-                PageRead::NotYet => None,
+            let bytes = eventually(20, "page never unpacked", || {
+                match source.bytes(index) {
+                    PageRead::Ready(bytes) => Some(bytes),
+                    PageRead::Failed(message) => {
+                        panic!("{name} failed: {message}")
+                    }
+                    PageRead::NotYet => None,
+                }
             });
-            let page = decode::decode(&bytes, name).expect("fixture page decodes");
+            let page = decode::decode(&bytes, name)
+                .expect("fixture page decodes");
             assert_eq!(page.format, decode::Format::Png);
             pages.push(bytes);
         }
@@ -777,18 +912,29 @@ mod tests {
         dir.write("cover.PNG", &tiny_png(1, 1, [0, 0, 0, 255]));
         dir.write("notes.txt", b"not a page");
         let source = Source::open(dir.path()).expect("dir opens");
-        assert_eq!(source.names, ["c1.png", "c2.png", "c10.png", "cover.PNG"]);
+        assert_eq!(
+            source.names,
+            ["c1.png", "c2.png", "c10.png", "cover.PNG"]
+        );
         assert_eq!(source.len(), 4);
         assert_eq!(source.name(2), Some("c10.png"));
         assert_eq!(
             source.page_name(2),
             PageName {
-                parent: Some(dir.path().file_name().unwrap().to_string_lossy().into_owned()),
+                parent: Some(
+                    dir.path()
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned()
+                ),
                 file: "c10.png".into(),
             }
         );
         assert!(!source.unpacking());
-        assert!(matches!(source.bytes(1), PageRead::Ready(read) if read.as_ref() == tiny_png(1, 1, [7, 8, 9, 255]).as_slice()));
+        assert!(
+            matches!(source.bytes(1), PageRead::Ready(read) if read.as_ref() == tiny_png(1, 1, [7, 8, 9, 255]).as_slice())
+        );
     }
 
     #[test]
@@ -802,31 +948,56 @@ mod tests {
             let mut zip = zip::ZipWriter::new(file);
             let options = SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
-            for (name, color) in
-                [("b/010.png", 1_u8), ("b/002.png", 2), ("b/020.png", 3), ("b/deep/005.png", 4)]
-            {
+            for (name, color) in [
+                ("b/010.png", 1_u8),
+                ("b/002.png", 2),
+                ("b/020.png", 3),
+                ("b/deep/005.png", 4),
+            ] {
                 zip.start_file(name, options).unwrap();
-                zip.write_all(&tiny_png(2, 2, [color, 0, 0, 255])).unwrap();
+                zip.write_all(&tiny_png(2, 2, [color, 0, 0, 255]))
+                    .unwrap();
             }
             zip.start_file("b/info.txt", options).unwrap();
             zip.write_all(b"skip me").unwrap();
             zip.finish().unwrap();
         }
         let source = Source::open(&zip_path).expect("zip opens");
-        assert_eq!(source.names, ["b/002.png", "b/010.png", "b/020.png", "b/deep/005.png"]);
-        assert_eq!(source.page_name(1), PageName { parent: Some("b".into()), file: "010.png".into() });
+        assert_eq!(
+            source.names,
+            ["b/002.png", "b/010.png", "b/020.png", "b/deep/005.png"]
+        );
+        assert_eq!(
+            source.page_name(1),
+            PageName {
+                parent: Some("b".into()),
+                file: "010.png".into()
+            }
+        );
         assert_eq!(
             source.page_name(3),
-            PageName { parent: Some("deep".into()), file: "005.png".into() }
+            PageName {
+                parent: Some("deep".into()),
+                file: "005.png".into()
+            }
         );
         // bytes(1) is b/010.png, written with color 1.
-        let page = eventually(20, "zip page never unpacked", || match source.bytes(1) {
-            PageRead::Ready(bytes) => Some(bytes),
-            PageRead::Failed(message) => panic!("page 1 failed: {message}"),
-            PageRead::NotYet => None,
+        let page = eventually(20, "zip page never unpacked", || {
+            match source.bytes(1) {
+                PageRead::Ready(bytes) => Some(bytes),
+                PageRead::Failed(message) => {
+                    panic!("page 1 failed: {message}")
+                }
+                PageRead::NotYet => None,
+            }
         });
-        assert_eq!(page.as_ref(), tiny_png(2, 2, [1, 0, 0, 255]).as_slice());
-        eventually(20, "pass never ended", || (!source.unpacking()).then_some(()));
+        assert_eq!(
+            page.as_ref(),
+            tiny_png(2, 2, [1, 0, 0, 255]).as_slice()
+        );
+        eventually(20, "pass never ended", || {
+            (!source.unpacking()).then_some(())
+        });
     }
 
     #[test]
@@ -835,14 +1006,19 @@ mod tests {
 
         let dir = TempDir::new("pagezipbad");
         let zip_path = dir.path().join("book.cbz");
-        let pages = [tiny_png(2, 2, [1, 0, 0, 255]), tiny_png(2, 2, [2, 0, 0, 255]), tiny_png(2, 2, [3, 0, 0, 255])];
+        let pages = [
+            tiny_png(2, 2, [1, 0, 0, 255]),
+            tiny_png(2, 2, [2, 0, 0, 255]),
+            tiny_png(2, 2, [3, 0, 0, 255]),
+        ];
         {
             let file = File::create(&zip_path).unwrap();
             let mut zip = zip::ZipWriter::new(file);
             let options = SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
             for (index, page) in pages.iter().enumerate() {
-                zip.start_file(format!("{index:03}.png"), options).unwrap();
+                zip.start_file(format!("{index:03}.png"), options)
+                    .unwrap();
                 zip.write_all(page).unwrap();
             }
             zip.finish().unwrap();
@@ -856,31 +1032,43 @@ mod tests {
                 .windows(needle.len())
                 .position(|window| window == needle)
                 .expect("stored payload lies verbatim in the file");
-            *book.get_mut(at).expect("offset points into the file") ^= 0xff;
+            *book.get_mut(at).expect("offset points into the file") ^=
+                0xff;
             fs::write(&zip_path, &book).unwrap();
         }
 
         let source = Source::open(&zip_path).expect("zip opens");
-        let failure = eventually(20, "corrupt page never settled", || match source.bytes(1) {
-            PageRead::Failed(message) => Some(message),
-            PageRead::Ready(_) => panic!("corrupt page unpacked"),
-            PageRead::NotYet => None,
-        });
+        let failure =
+            eventually(20, "corrupt page never settled", || match source
+                .bytes(1)
+            {
+                PageRead::Failed(message) => Some(message),
+                PageRead::Ready(_) => panic!("corrupt page unpacked"),
+                PageRead::NotYet => None,
+            });
         assert!(failure.to_lowercase().contains("checksum"), "{failure}");
         assert_eq!(
-            eventually(20, "page 0 never unpacked", || match source.bytes(0) {
-                PageRead::Ready(bytes) => Some(bytes),
-                PageRead::Failed(message) => panic!("page 0 failed: {message}"),
-                PageRead::NotYet => None,
+            eventually(20, "page 0 never unpacked", || {
+                match source.bytes(0) {
+                    PageRead::Ready(bytes) => Some(bytes),
+                    PageRead::Failed(message) => {
+                        panic!("page 0 failed: {message}")
+                    }
+                    PageRead::NotYet => None,
+                }
             })
             .as_ref(),
             pages[0].as_slice()
         );
         assert_eq!(
-            eventually(20, "page 2 never unpacked", || match source.bytes(2) {
-                PageRead::Ready(bytes) => Some(bytes),
-                PageRead::Failed(message) => panic!("page 2 failed: {message}"),
-                PageRead::NotYet => None,
+            eventually(20, "page 2 never unpacked", || {
+                match source.bytes(2) {
+                    PageRead::Ready(bytes) => Some(bytes),
+                    PageRead::Failed(message) => {
+                        panic!("page 2 failed: {message}")
+                    }
+                    PageRead::NotYet => None,
+                }
             })
             .as_ref(),
             pages[2].as_slice()
@@ -904,7 +1092,8 @@ mod tests {
             let options = SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Stored);
             for (index, page) in pages.iter().enumerate() {
-                zip.start_file(format!("{index:03}.png"), options).unwrap();
+                zip.start_file(format!("{index:03}.png"), options)
+                    .unwrap();
                 zip.write_all(page).unwrap();
             }
             zip.finish().unwrap();
@@ -920,30 +1109,44 @@ mod tests {
                 .map(|(offset, _)| offset);
             headers.next().expect("first local header");
             let second = headers.next().expect("second local header");
-            *book.get_mut(second).expect("offset points into the file") ^= 0xff;
+            *book.get_mut(second).expect("offset points into the file") ^=
+                0xff;
             fs::write(&zip_path, &book).unwrap();
         }
 
-        let source = Source::open(&zip_path).expect("central directory still opens the book");
-        eventually(20, "damaged header never settled", || match source.bytes(1) {
-            PageRead::Failed(message) => Some(message),
-            PageRead::Ready(_) => panic!("damaged local header unpacked"),
-            PageRead::NotYet => None,
+        let source = Source::open(&zip_path)
+            .expect("central directory still opens the book");
+        eventually(20, "damaged header never settled", || {
+            match source.bytes(1) {
+                PageRead::Failed(message) => Some(message),
+                PageRead::Ready(_) => {
+                    panic!("damaged local header unpacked")
+                }
+                PageRead::NotYet => None,
+            }
         });
         assert_eq!(
-            eventually(20, "page 0 never unpacked", || match source.bytes(0) {
-                PageRead::Ready(bytes) => Some(bytes),
-                PageRead::Failed(message) => panic!("page 0 failed: {message}"),
-                PageRead::NotYet => None,
+            eventually(20, "page 0 never unpacked", || {
+                match source.bytes(0) {
+                    PageRead::Ready(bytes) => Some(bytes),
+                    PageRead::Failed(message) => {
+                        panic!("page 0 failed: {message}")
+                    }
+                    PageRead::NotYet => None,
+                }
             })
             .as_ref(),
             pages[0].as_slice()
         );
         assert_eq!(
-            eventually(20, "page 2 never unpacked", || match source.bytes(2) {
-                PageRead::Ready(bytes) => Some(bytes),
-                PageRead::Failed(message) => panic!("page 2 failed: {message}"),
-                PageRead::NotYet => None,
+            eventually(20, "page 2 never unpacked", || {
+                match source.bytes(2) {
+                    PageRead::Ready(bytes) => Some(bytes),
+                    PageRead::Failed(message) => {
+                        panic!("page 2 failed: {message}")
+                    }
+                    PageRead::NotYet => None,
+                }
             })
             .as_ref(),
             pages[2].as_slice()
@@ -957,7 +1160,10 @@ mod tests {
             Err(SourceError::NotFound(_))
         ));
         let empty = TempDir::new("pageempty");
-        assert!(matches!(Source::open(empty.path()), Err(SourceError::Empty)));
+        assert!(matches!(
+            Source::open(empty.path()),
+            Err(SourceError::Empty)
+        ));
         let dir = TempDir::new("pageunsup");
         dir.write("book.rar", b"not really a rar");
         assert!(matches!(
@@ -986,13 +1192,26 @@ mod tests {
         let first = volume("v1");
         let middle = volume("v2");
         let last = volume("v10");
-        fs::write(parent.path().join("notes.txt"), b"not a book").expect("plain file writes");
+        fs::write(parent.path().join("notes.txt"), b"not a book")
+            .expect("plain file writes");
 
         let book = Source::open(&middle).expect("volume opens");
-        assert_eq!(book.sibling(true), Some(last), "forward follows natural order");
-        assert_eq!(book.sibling(false), Some(first.clone()), "backward follows natural order");
+        assert_eq!(
+            book.sibling(true),
+            Some(last),
+            "forward follows natural order"
+        );
+        assert_eq!(
+            book.sibling(false),
+            Some(first.clone()),
+            "backward follows natural order"
+        );
         let cover = Source::open(&first).expect("volume opens");
-        assert_eq!(cover.sibling(false), None, "the shelf's start has no earlier book");
+        assert_eq!(
+            cover.sibling(false),
+            None,
+            "the shelf's start has no earlier book"
+        );
 
         // Archives step between archives only.
         let shelf = TempDir::new("siblings-archives");
@@ -1004,17 +1223,27 @@ mod tests {
             let mut zip = zip::ZipWriter::new(file);
             zip.start_file("p.png", SimpleFileOptions::default())
                 .expect("entry starts");
-            zip.write_all(&tiny_png(1, 1, [0, 0, 0, 255])).expect("entry writes");
+            zip.write_all(&tiny_png(1, 1, [0, 0, 0, 255]))
+                .expect("entry writes");
             zip.finish().expect("zip finishes");
             path
         };
         let before = write_cbz("a.cbz");
         let after = write_cbz("b.cbz");
-        fs::write(shelf.path().join("notes.txt"), b"not a book").expect("plain file writes");
+        fs::write(shelf.path().join("notes.txt"), b"not a book")
+            .expect("plain file writes");
         let archive = Source::open(&before).expect("zip opens");
         // The volumes directory is a sibling entry of the other kind and
         // must not answer.
-        assert_eq!(archive.sibling(true), Some(after), "archives step between archives");
-        assert_eq!(archive.sibling(false), None, "the first archive has no earlier book");
+        assert_eq!(
+            archive.sibling(true),
+            Some(after),
+            "archives step between archives"
+        );
+        assert_eq!(
+            archive.sibling(false),
+            None,
+            "the first archive has no earlier book"
+        );
     }
 }

@@ -47,7 +47,13 @@ impl Decoded {
         if bytes.len() != want {
             return Err(DecodeError::Corrupt("rgba extent"));
         }
-        Ok(Self { width, height, pixels: Pixels::Rgba8(bytes), transfer, format })
+        Ok(Self {
+            width,
+            height,
+            pixels: Pixels::Rgba8(bytes),
+            transfer,
+            format,
+        })
     }
 
     pub(crate) fn yuv(
@@ -60,14 +66,22 @@ impl Decoded {
         check_dims(width, height)?;
         let (_, (cw, ch)) = plane_dims((width, height), yuv.subsampling);
         if yuv.luma.sample_count() != width as usize * height as usize
-            || yuv.alpha.as_ref().is_some_and(|alpha| alpha.sample_count() != width as usize * height as usize)
+            || yuv.alpha.as_ref().is_some_and(|alpha| {
+                alpha.sample_count() != width as usize * height as usize
+            })
             || (yuv.subsampling != Subsampling::Mono
                 && (yuv.cb.sample_count() != cw as usize * ch as usize
                     || yuv.cr.sample_count() != cw as usize * ch as usize))
         {
             return Err(DecodeError::Corrupt("yuv plane extent"));
         }
-        Ok(Self { width, height, pixels: Pixels::Yuv(yuv), transfer, format })
+        Ok(Self {
+            width,
+            height,
+            pixels: Pixels::Yuv(yuv),
+            transfer,
+            format,
+        })
     }
 
     /// Approximate resident size, for cache budget accounting.
@@ -85,15 +99,24 @@ impl Decoded {
 }
 
 /// Pixel count with a hostile-header cap.
-fn checked_pixels(width: u32, height: u32, what: &'static str) -> Result<u32, DecodeError> {
+fn checked_pixels(
+    width: u32,
+    height: u32,
+    what: &'static str,
+) -> Result<u32, DecodeError> {
     width
         .checked_mul(height)
         .filter(|&count| (1..=MAX_PIXELS).contains(&count))
         .ok_or(DecodeError::Corrupt(what))
 }
 
-fn checked_extent(width: u32, height: u32, bytes_per_pixel: usize) -> Result<usize, DecodeError> {
-    Ok(checked_pixels(width, height, "bad dimensions")? as usize * bytes_per_pixel)
+fn checked_extent(
+    width: u32,
+    height: u32,
+    bytes_per_pixel: usize,
+) -> Result<usize, DecodeError> {
+    Ok(checked_pixels(width, height, "bad dimensions")? as usize
+        * bytes_per_pixel)
 }
 
 /// The image crate's 512 MiB allocation ceiling, as RGBA pixels.
@@ -109,7 +132,9 @@ const MAX_TEXTURE_EDGE: u32 = 0x4000;
 
 fn check_dims(width: u32, height: u32) -> Result<(), DecodeError> {
     if width > MAX_TEXTURE_EDGE || height > MAX_TEXTURE_EDGE {
-        return Err(DecodeError::Unsupported("page edge over the GPU texture limit"));
+        return Err(DecodeError::Unsupported(
+            "page edge over the GPU texture limit",
+        ));
     }
     Ok(())
 }
@@ -223,12 +248,19 @@ impl Plane {
 
 /// Plane dims (luma, chroma) for an image size and subsampling. Mono chroma
 /// is 1x1 so renderers can bind a midpoint texture.
-pub fn plane_dims(size: (u32, u32), subsampling: Subsampling) -> ((u32, u32), (u32, u32)) {
+pub fn plane_dims(
+    size: (u32, u32),
+    subsampling: Subsampling,
+) -> ((u32, u32), (u32, u32)) {
     let (width, height) = size;
     match subsampling {
         Subsampling::Mono => ((width, height), (1, 1)),
-        Subsampling::Yuv420 => ((width, height), (width.div_ceil(2), height.div_ceil(2))),
-        Subsampling::Yuv422 => ((width, height), (width.div_ceil(2), height)),
+        Subsampling::Yuv420 => {
+            ((width, height), (width.div_ceil(2), height.div_ceil(2)))
+        }
+        Subsampling::Yuv422 => {
+            ((width, height), (width.div_ceil(2), height))
+        }
         Subsampling::Yuv444 => ((width, height), (width, height)),
     }
 }
@@ -254,7 +286,10 @@ pub struct DisplayTransform {
 }
 
 impl DisplayTransform {
-    pub const UPRIGHT: Self = Self { quarters: 0, mirror_axis: None };
+    pub const UPRIGHT: Self = Self {
+        quarters: 0,
+        mirror_axis: None,
+    };
 
     pub fn is_upright(self) -> bool {
         self == Self::UPRIGHT
@@ -277,11 +312,13 @@ fn transform_plane(
     }
     match plane {
         Plane::U8(bytes) => {
-            let (samples, dims) = transform_samples(bytes, dims, transform);
+            let (samples, dims) =
+                transform_samples(bytes, dims, transform);
             (Plane::U8(samples), dims)
         }
         Plane::U16(words) => {
-            let (samples, dims) = transform_samples(words, dims, transform);
+            let (samples, dims) =
+                transform_samples(words, dims, transform);
             (Plane::U16(samples), dims)
         }
     }
@@ -351,7 +388,9 @@ impl fmt::Display for DecodeError {
             Self::NotAnImage => write!(f, "not an image"),
             Self::Corrupt(what) => write!(f, "corrupt: {what}"),
             Self::Unsupported(what) => write!(f, "unsupported: {what}"),
-            Self::Image(format, error) => write!(f, "{}: {error}", format.label()),
+            Self::Image(format, error) => {
+                write!(f, "{}: {error}", format.label())
+            }
             Self::Jxl(error) => write!(f, "jxl: {error}"),
             Self::Avif(what, detail) => write!(f, "{what}: {detail}"),
         }
@@ -363,7 +402,8 @@ impl Error for DecodeError {}
 /// Decode one page. `name` is the page filename, used as the extension
 /// fallback. Animated images show their first frame.
 pub fn decode(bytes: &[u8], name: &str) -> Result<Decoded, DecodeError> {
-    let Some(format) = sniff(bytes).or_else(|| format_from_name(name)) else {
+    let Some(format) = sniff(bytes).or_else(|| format_from_name(name))
+    else {
         return Err(DecodeError::NotAnImage);
     };
     match format {
@@ -409,24 +449,32 @@ fn sniff(bytes: &[u8]) -> Option<Format> {
     if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
         return Some(Format::Jpeg);
     }
-    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A])
+    {
         return Some(Format::Png);
     }
     if bytes.starts_with(b"GIF8") {
         return Some(Format::Gif);
     }
-    if bytes.starts_with(b"RIFF") && bytes.get(8..12).is_some_and(|tag| tag == b"WEBP") {
+    if bytes.starts_with(b"RIFF")
+        && bytes.get(8..12).is_some_and(|tag| tag == b"WEBP")
+    {
         return Some(Format::Webp);
     }
     if bytes.starts_with(b"BM") {
         return Some(Format::Bmp);
     }
-    if bytes.starts_with(&[0x49, 0x49, 0x2A, 0x00]) || bytes.starts_with(&[0x4D, 0x4D, 0x00, 0x2A]) {
+    if bytes.starts_with(&[0x49, 0x49, 0x2A, 0x00])
+        || bytes.starts_with(&[0x4D, 0x4D, 0x00, 0x2A])
+    {
         return Some(Format::Tiff);
     }
     // Raw codestream or ISOBMFF container signature.
     if bytes.starts_with(&[0xFF, 0x0A])
-        || bytes.starts_with(&[0x00, 0x00, 0x00, 0x0C, b'J', b'X', b'L', b' ', 0x0D, 0x0A, 0x87, 0x0A])
+        || bytes.starts_with(&[
+            0x00, 0x00, 0x00, 0x0C, b'J', b'X', b'L', b' ', 0x0D, 0x0A,
+            0x87, 0x0A,
+        ])
     {
         return Some(Format::Jxl);
     }
@@ -438,7 +486,11 @@ fn sniff(bytes: &[u8]) -> Option<Format> {
 
 fn sniff_ftyp_avif(bytes: &[u8]) -> bool {
     ftyp_brands(bytes).is_some_and(|brands| {
-        brands.as_chunks::<4>().0.iter().any(|brand| brand == b"avif" || brand == b"avis")
+        brands
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|brand| brand == b"avif" || brand == b"avis")
     })
 }
 
@@ -449,7 +501,8 @@ fn ftyp_brands(bytes: &[u8]) -> Option<&[u8]> {
         clippy::big_endian_bytes,
         reason = "the ISOBMFF box length is big-endian by specification"
     )]
-    let box_len = u32::from_be_bytes(bytes.get(..4)?.try_into().ok()?) as usize;
+    let box_len =
+        u32::from_be_bytes(bytes.get(..4)?.try_into().ok()?) as usize;
     let kind: [u8; 4] = bytes.get(4..8)?.try_into().ok()?;
     if kind != *b"ftyp" {
         return None;
@@ -460,9 +513,12 @@ fn ftyp_brands(bytes: &[u8]) -> Option<&[u8]> {
 
 /// image-crate path: decode with a concrete decoder so EXIF orientation is
 /// readable, then apply it.
-fn decode_image(bytes: &[u8], format: Format) -> Result<Decoded, DecodeError> {
-    use std::io::Cursor;
+fn decode_image(
+    bytes: &[u8],
+    format: Format,
+) -> Result<Decoded, DecodeError> {
     use image::ImageDecoder as _;
+    use std::io::Cursor;
 
     let image_format = match format {
         Format::Jpeg => image::ImageFormat::Jpeg,
@@ -471,20 +527,33 @@ fn decode_image(bytes: &[u8], format: Format) -> Result<Decoded, DecodeError> {
         Format::Webp => image::ImageFormat::WebP,
         Format::Bmp => image::ImageFormat::Bmp,
         Format::Tiff => image::ImageFormat::Tiff,
-        Format::Avif | Format::Jxl => return Err(DecodeError::Unsupported("internal dispatch")),
+        Format::Avif | Format::Jxl => {
+            return Err(DecodeError::Unsupported("internal dispatch"))
+        }
     };
-    let reader = image::ImageReader::with_format(Cursor::new(bytes), image_format);
-    let mut decoder = reader.into_decoder().map_err(|error| DecodeError::Image(format, error))?;
+    let reader =
+        image::ImageReader::with_format(Cursor::new(bytes), image_format);
+    let mut decoder = reader
+        .into_decoder()
+        .map_err(|error| DecodeError::Image(format, error))?;
     // Orientation only swaps w and h, and the cap checks both, so this
     // pre-orientation check catches rotated pages too.
     let (width, height) = decoder.dimensions();
     check_dims(width, height)?;
-    let orientation = decoder.orientation().map_err(|error| DecodeError::Image(format, error))?;
+    let orientation = decoder
+        .orientation()
+        .map_err(|error| DecodeError::Image(format, error))?;
     let mut oriented = image::DynamicImage::from_decoder(decoder)
         .map_err(|error| DecodeError::Image(format, error))?;
     oriented.apply_orientation(orientation);
     let rgba = oriented.into_rgba8();
-    Decoded::rgba(rgba.width(), rgba.height(), format, Transfer::Srgb, rgba.into_raw().into_boxed_slice())
+    Decoded::rgba(
+        rgba.width(),
+        rgba.height(),
+        format,
+        Transfer::Srgb,
+        rgba.into_raw().into_boxed_slice(),
+    )
 }
 
 mod avif {
@@ -553,7 +622,9 @@ mod avif {
             AVIF_PIXEL_FORMAT_YUV422 => Subsampling::Yuv422,
             AVIF_PIXEL_FORMAT_YUV420 => Subsampling::Yuv420,
             AVIF_PIXEL_FORMAT_YUV400 => Subsampling::Mono,
-            _ => return Err(DecodeError::Unsupported("avif: pixel format")),
+            _ => {
+                return Err(DecodeError::Unsupported("avif: pixel format"))
+            }
         };
         let full_range = frame.yuvRange == AVIF_RANGE_FULL;
         let matrix = match u32::from(frame.matrixCoefficients) {
@@ -564,14 +635,20 @@ mod avif {
             AVIF_MATRIX_COEFFICIENTS_UNSPECIFIED
             | AVIF_MATRIX_COEFFICIENTS_BT470BG
             | AVIF_MATRIX_COEFFICIENTS_BT601 => Matrix::Bt601,
-            _ => return Err(DecodeError::Unsupported("avif: matrix coefficients")),
+            _ => {
+                return Err(DecodeError::Unsupported(
+                    "avif: matrix coefficients",
+                ))
+            }
         };
         // HLG has no fixed SDR map; a wrong render is worse than a
         // refused page.
         let transfer = match u32::from(frame.transferCharacteristics) {
             AVIF_TRANSFER_CHARACTERISTICS_SMPTE2084 => Transfer::Pq,
             AVIF_TRANSFER_CHARACTERISTICS_HLG => {
-                return Err(DecodeError::Unsupported("avif: HLG transfer"));
+                return Err(DecodeError::Unsupported(
+                    "avif: HLG transfer",
+                ));
             }
             _ => Transfer::Srgb,
         };
@@ -584,40 +661,82 @@ mod avif {
 
         // Mono skips the chroma copy below, so its 1x1 stub dims from
         // `plane_dims` are unused.
-        let (_, (chroma_width, chroma_height)) = plane_dims((width, height), subsampling);
+        let (_, (chroma_width, chroma_height)) =
+            plane_dims((width, height), subsampling);
         // SAFETY: the guard still owns the frame, so the luma plane is live.
         // `copy_plane` rejects null planes and short strides.
-        let luma_plane =
-            unsafe { copy_plane(frame.yuvPlanes[0], frame.yuvRowBytes[0], width, height, u32::from(depth)) }?;
+        let luma_plane = unsafe {
+            copy_plane(
+                frame.yuvPlanes[0],
+                frame.yuvRowBytes[0],
+                width,
+                height,
+                u32::from(depth),
+            )
+        }?;
         let (blue_plane, red_plane) = if subsampling == Subsampling::Mono {
             (Plane::U8(Box::new([])), Plane::U8(Box::new([])))
         } else {
             (
                 // SAFETY: same contract as the luma plane.
                 unsafe {
-                    copy_plane(frame.yuvPlanes[1], frame.yuvRowBytes[1], chroma_width, chroma_height, u32::from(depth))
+                    copy_plane(
+                        frame.yuvPlanes[1],
+                        frame.yuvRowBytes[1],
+                        chroma_width,
+                        chroma_height,
+                        u32::from(depth),
+                    )
                 }?,
                 // SAFETY: same contract as the luma plane.
                 unsafe {
-                    copy_plane(frame.yuvPlanes[2], frame.yuvRowBytes[2], chroma_width, chroma_height, u32::from(depth))
+                    copy_plane(
+                        frame.yuvPlanes[2],
+                        frame.yuvRowBytes[2],
+                        chroma_width,
+                        chroma_height,
+                        u32::from(depth),
+                    )
                 }?,
             )
         };
         // SAFETY: same contract as the luma plane, at luma dimensions.
         let alpha_plane = unsafe {
             (!frame.alphaPlane.is_null())
-                .then(|| copy_plane(frame.alphaPlane, frame.alphaRowBytes, width, height, u32::from(depth)))
+                .then(|| {
+                    copy_plane(
+                        frame.alphaPlane,
+                        frame.alphaRowBytes,
+                        width,
+                        height,
+                        u32::from(depth),
+                    )
+                })
                 .transpose()?
         };
 
         // The display transform applies to every plane alike; chroma
         // dimensions rotate coherently with the luma grid.
-        let (luma_plane, _) = transform_plane(luma_plane, (width, height), transform);
-        let (blue_plane, _) = transform_plane(blue_plane, (chroma_width, chroma_height), transform);
-        let (red_plane, _) = transform_plane(red_plane, (chroma_width, chroma_height), transform);
-        let alpha_plane = alpha_plane
-            .map(|alpha| transform_plane(alpha, (width, height), transform).0);
-        let (width, height) = if transform.swaps_dims() { (height, width) } else { (width, height) };
+        let (luma_plane, _) =
+            transform_plane(luma_plane, (width, height), transform);
+        let (blue_plane, _) = transform_plane(
+            blue_plane,
+            (chroma_width, chroma_height),
+            transform,
+        );
+        let (red_plane, _) = transform_plane(
+            red_plane,
+            (chroma_width, chroma_height),
+            transform,
+        );
+        let alpha_plane = alpha_plane.map(|alpha| {
+            transform_plane(alpha, (width, height), transform).0
+        });
+        let (width, height) = if transform.swaps_dims() {
+            (height, width)
+        } else {
+            (width, height)
+        };
 
         super::Decoded::yuv(
             width,
@@ -644,8 +763,12 @@ mod avif {
         } else {
             0
         };
-        let mirror_axis = (flags & AVIF_TRANSFORM_IMIR != 0).then_some(frame.imir.axis);
-        DisplayTransform { quarters, mirror_axis }
+        let mirror_axis =
+            (flags & AVIF_TRANSFORM_IMIR != 0).then_some(frame.imir.axis);
+        DisplayTransform {
+            quarters,
+            mirror_axis,
+        }
     }
 
     #[expect(
@@ -657,16 +780,22 @@ mod avif {
         use std::num::NonZeroUsize;
         use std::thread;
 
-        thread::available_parallelism().map_or(1, NonZeroUsize::get).min(MAX_THREADS) as i32
+        thread::available_parallelism()
+            .map_or(1, NonZeroUsize::get)
+            .min(MAX_THREADS) as i32
     }
 
-    unsafe fn check(code: avifResult, what: &'static str) -> Result<(), DecodeError> {
+    unsafe fn check(
+        code: avifResult,
+        what: &'static str,
+    ) -> Result<(), DecodeError> {
         use std::ffi::CStr;
 
         if code == AVIF_RESULT_OK {
             return Ok(());
         }
-        let detail = CStr::from_ptr(avifResultToString(code)).to_string_lossy();
+        let detail =
+            CStr::from_ptr(avifResultToString(code)).to_string_lossy();
         Err(DecodeError::Avif(what, detail.into_owned()))
     }
 
@@ -696,7 +825,10 @@ mod avif {
             }
             let mut out = Vec::with_capacity(width * height);
             for row in 0..height {
-                let src = slice::from_raw_parts(plane_ptr.add(row * row_stride), width);
+                let src = slice::from_raw_parts(
+                    plane_ptr.add(row * row_stride),
+                    width,
+                );
                 out.extend_from_slice(src);
             }
             Ok(Plane::U8(out.into_boxed_slice()))
@@ -707,7 +839,10 @@ mod avif {
             }
             let mut raw = Vec::with_capacity(bytes * height);
             for row in 0..height {
-                let src = slice::from_raw_parts(plane_ptr.add(row * row_stride), bytes);
+                let src = slice::from_raw_parts(
+                    plane_ptr.add(row * row_stride),
+                    bytes,
+                );
                 raw.extend_from_slice(src);
             }
             #[expect(
@@ -743,9 +878,14 @@ mod avif {
         unsafe fn new(bytes: &'bytes [u8]) -> Result<Self, DecodeError> {
             let ptr = avifDecoderCreate();
             if ptr.is_null() {
-                return Err(DecodeError::Unsupported("avif: decoder create"));
+                return Err(DecodeError::Unsupported(
+                    "avif: decoder create",
+                ));
             }
-            let guard = Self { ptr, _bytes: PhantomData };
+            let guard = Self {
+                ptr,
+                _bytes: PhantomData,
+            };
             (*guard.ptr).maxThreads = threads();
             // The decoder's own caps run before the pixel decode, so an
             // oversized hostile file fails at parse instead of funding a
@@ -779,7 +919,9 @@ mod avif {
         fn drop(&mut self) {
             // SAFETY: the guard solely owns the decoder from
             // `avifDecoderCreate`, and drop runs exactly once.
-            unsafe { avifDecoderDestroy(self.ptr); }
+            unsafe {
+                avifDecoderDestroy(self.ptr);
+            }
         }
     }
 }
@@ -833,10 +975,15 @@ mod jxl {
             reason = "the conversion error only says the value does not fit, which the message already states"
         )]
         let (width, height) = (
-            u32::try_from(info.size.0).map_err(|_| DecodeError::Corrupt("jxl: bad dimensions"))?,
-            u32::try_from(info.size.1).map_err(|_| DecodeError::Corrupt("jxl: bad dimensions"))?,
+            u32::try_from(info.size.0).map_err(|_| {
+                DecodeError::Corrupt("jxl: bad dimensions")
+            })?,
+            u32::try_from(info.size.1).map_err(|_| {
+                DecodeError::Corrupt("jxl: bad dimensions")
+            })?,
         );
-        let pixel_count = super::checked_pixels(width, height, "jxl: bad dimensions")?;
+        let pixel_count =
+            super::checked_pixels(width, height, "jxl: bad dimensions")?;
         super::check_dims(width, height)?;
 
         // Files without their own alpha still get opaque alpha from the
@@ -848,35 +995,57 @@ mod jxl {
 
         let mut rgba = vec![0_u8; pixel_count as usize * 4];
         loop {
-            let mut output = JxlOutputBuffer::new(&mut rgba, height as usize, width as usize * 4);
+            let mut output = JxlOutputBuffer::new(
+                &mut rgba,
+                height as usize,
+                width as usize * 4,
+            );
             match decoder
-                .process(&mut input, Some(slice::from_mut(&mut output)), Some(&mut runner))
+                .process(
+                    &mut input,
+                    Some(slice::from_mut(&mut output)),
+                    Some(&mut runner),
+                )
                 .map_err(DecodeError::Jxl)?
             {
                 Event::FrameComplete { has_more_frames } => {
                     if has_more_frames {
-                        tracing::debug!("jxl animation: later frames not decoded");
+                        tracing::debug!(
+                            "jxl animation: later frames not decoded"
+                        );
                     }
                     break;
                 }
                 Event::NeedMoreInput { size_hint } => {
                     tracing::debug!(size_hint, "truncated jxl image");
-                    return Err(DecodeError::Corrupt("jxl: truncated image"));
+                    return Err(DecodeError::Corrupt(
+                        "jxl: truncated image",
+                    ));
                 }
-                Event::BasicInfo | Event::FrameHeader | Event::Complete => {}
+                Event::BasicInfo
+                | Event::FrameHeader
+                | Event::Complete => {}
             }
         }
 
         // The crate either converts to sRGB or emits simple PQ values its
         // API does not distinguish, so jxl pages ride the sRGB path.
-        Decoded::rgba(width, height, Format::Jxl, Transfer::Srgb, rgba.into_boxed_slice())
+        Decoded::rgba(
+            width,
+            height,
+            Format::Jxl,
+            Transfer::Srgb,
+            rgba.into_boxed_slice(),
+        )
     }
 
     fn threads() -> usize {
         use std::num::NonZeroUsize;
         use std::thread;
 
-        thread::available_parallelism().map_or(1, NonZeroUsize::get).min(MAX_THREADS)
+        thread::available_parallelism()
+            .map_or(1, NonZeroUsize::get)
+            .min(MAX_THREADS)
     }
 
     /// Scoped-thread runner. A failing task fails the whole run, which is
@@ -893,7 +1062,11 @@ mod jxl {
     }
 
     impl JxlParallelRunner for Pool {
-        fn run(&mut self, num: usize, fun: &JxlParallelRunnerFun<'_>) -> JxlResult<()> {
+        fn run(
+            &mut self,
+            num: usize,
+            fun: &JxlParallelRunnerFun<'_>,
+        ) -> JxlResult<()> {
             use std::thread;
 
             use parking_lot::Mutex;
@@ -926,7 +1099,11 @@ mod jxl {
 }
 
 #[cfg(test)]
-#[expect(clippy::expect_used, clippy::panic, reason = "a panic in test code is inconsequential")]
+#[expect(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "a panic in test code is inconsequential"
+)]
 mod tests {
     use super::*;
     use crate::testkit;
@@ -937,7 +1114,10 @@ mod tests {
         assert_eq!(sniff(&[0xFF, 0xD8, 0xFF, 0xE0]), Some(Format::Jpeg));
         assert_eq!(sniff(b"\x89PNG\r\n\x1a\n"), Some(Format::Png));
         assert_eq!(sniff(b"GIF89a"), Some(Format::Gif));
-        assert_eq!(sniff(b"RIFF\x00\x00\x00\x00WEBPVP8 "), Some(Format::Webp));
+        assert_eq!(
+            sniff(b"RIFF\x00\x00\x00\x00WEBPVP8 "),
+            Some(Format::Webp)
+        );
         assert_eq!(sniff(b"BM\x36\x00"), Some(Format::Bmp));
         assert_eq!(sniff(b"II*\x00"), Some(Format::Tiff));
         assert_eq!(sniff(b"\xff\x0a"), Some(Format::Jxl));
@@ -960,8 +1140,14 @@ mod tests {
         assert_eq!(format_from_name("noext"), None);
 
         // garbage: no magic and no usable extension is NotAnImage
-        assert!(matches!(decode(b"hello world", "noext"), Err(DecodeError::NotAnImage)));
-        assert!(matches!(decode(b"hello world", "note.txt"), Err(DecodeError::NotAnImage)));
+        assert!(matches!(
+            decode(b"hello world", "noext"),
+            Err(DecodeError::NotAnImage)
+        ));
+        assert!(matches!(
+            decode(b"hello world", "note.txt"),
+            Err(DecodeError::NotAnImage)
+        ));
         assert!(matches!(decode(&[], "x"), Err(DecodeError::NotAnImage)));
     }
 
@@ -1018,13 +1204,20 @@ mod tests {
             1,
             Format::Png,
             Transfer::Srgb,
-            vec![0_u8; 4 * (MAX_TEXTURE_EDGE + 1) as usize].into_boxed_slice(),
+            vec![0_u8; 4 * (MAX_TEXTURE_EDGE + 1) as usize]
+                .into_boxed_slice(),
         );
         assert!(matches!(over, Err(DecodeError::Unsupported(_))));
         // Dims inside the edge cap can still exceed the pixel-count cap,
         // which must reject the page before any buffer is sized for it.
         assert!(matches!(
-            Decoded::rgba(MAX_TEXTURE_EDGE, MAX_TEXTURE_EDGE, Format::Png, Transfer::Srgb, Box::default()),
+            Decoded::rgba(
+                MAX_TEXTURE_EDGE,
+                MAX_TEXTURE_EDGE,
+                Format::Png,
+                Transfer::Srgb,
+                Box::default()
+            ),
             Err(DecodeError::Corrupt("bad dimensions"))
         ));
     }
@@ -1032,10 +1225,22 @@ mod tests {
     #[test]
     fn yuv_planes() {
         // odd edges round chroma up. Mono carries a 1x1 chroma stub.
-        assert_eq!(plane_dims((5, 3), Subsampling::Mono), ((5, 3), (1, 1)));
-        assert_eq!(plane_dims((5, 3), Subsampling::Yuv420), ((5, 3), (3, 2)));
-        assert_eq!(plane_dims((5, 3), Subsampling::Yuv422), ((5, 3), (3, 3)));
-        assert_eq!(plane_dims((5, 3), Subsampling::Yuv444), ((5, 3), (5, 3)));
+        assert_eq!(
+            plane_dims((5, 3), Subsampling::Mono),
+            ((5, 3), (1, 1))
+        );
+        assert_eq!(
+            plane_dims((5, 3), Subsampling::Yuv420),
+            ((5, 3), (3, 2))
+        );
+        assert_eq!(
+            plane_dims((5, 3), Subsampling::Yuv422),
+            ((5, 3), (3, 3))
+        );
+        assert_eq!(
+            plane_dims((5, 3), Subsampling::Yuv444),
+            ((5, 3), (5, 3))
+        );
 
         // a well-sized mono page constructs; an empty luma plane does not;
         // a short alpha plane does not either
@@ -1049,8 +1254,11 @@ mod tests {
             cr: Plane::U8(Box::new([])),
             alpha,
         };
-        let real = mono(Plane::U16(vec![0; 32 * 16].into_boxed_slice()), None);
-        let page = Decoded::yuv(32, 16, Format::Avif, Transfer::Srgb, real).expect("mono yuv page constructs");
+        let real =
+            mono(Plane::U16(vec![0; 32 * 16].into_boxed_slice()), None);
+        let page =
+            Decoded::yuv(32, 16, Format::Avif, Transfer::Srgb, real)
+                .expect("mono yuv page constructs");
         // The worker's book budget consumes this count.
         assert_eq!(page.resident_bytes(), 32 * 16 * 2);
         let empty = mono(Plane::U16(Box::new([])), None);
@@ -1063,7 +1271,13 @@ mod tests {
             Some(Plane::U16(vec![0; 5].into_boxed_slice())),
         );
         assert!(matches!(
-            Decoded::yuv(32, 16, Format::Avif, Transfer::Srgb, short_alpha),
+            Decoded::yuv(
+                32,
+                16,
+                Format::Avif,
+                Transfer::Srgb,
+                short_alpha
+            ),
             Err(DecodeError::Corrupt("yuv plane extent"))
         ));
         // A 420 image whose chroma planes are stubs: a 4x2 image needs
@@ -1095,10 +1309,16 @@ mod tests {
         ) {
             let plane = Plane::U8(samples.to_vec().into_boxed_slice());
             let (plane, dims) = transform_plane(plane, dims, transform);
-            assert_eq!((dims, plane_bytes(&plane)), (want_dims, want_samples));
+            assert_eq!(
+                (dims, plane_bytes(&plane)),
+                (want_dims, want_samples)
+            );
         }
         // A 2x1 plane [A B]: 90° CCW stands B above A.
-        let quarters = |quarters: u8| DisplayTransform { quarters, mirror_axis: None };
+        let quarters = |quarters: u8| DisplayTransform {
+            quarters,
+            mirror_axis: None,
+        };
         check(b"AB", (2, 1), quarters(1), (1, 2), b"BA");
         // 180° reads the row backwards.
         check(b"AB", (2, 1), quarters(2), (2, 1), b"BA");
@@ -1107,16 +1327,22 @@ mod tests {
         // 360° is identity.
         check(b"AB", (2, 1), quarters(0), (2, 1), b"AB");
         // A 2x2 mirror, both axes: axis 0 exchanges rows, axis 1 columns.
-        let mirror =
-            |axis: u8| DisplayTransform { quarters: 0, mirror_axis: Some(axis) };
+        let mirror = |axis: u8| DisplayTransform {
+            quarters: 0,
+            mirror_axis: Some(axis),
+        };
         check(b"ABCD", (2, 2), mirror(0), (2, 2), b"CDAB");
         check(b"ABCD", (2, 2), mirror(1), (2, 2), b"BADC");
         // Mirror runs before rotate: a horizontal mirror then a 90° turn
         // transposes the grid.
-        let mirrored_then_turned = DisplayTransform { quarters: 1, mirror_axis: Some(1) };
+        let mirrored_then_turned = DisplayTransform {
+            quarters: 1,
+            mirror_axis: Some(1),
+        };
         check(b"ABCD", (2, 2), mirrored_then_turned, (2, 2), b"ACBD");
         // Empty planes (mono chroma stubs) pass through.
-        let (empty, dims) = transform_plane(Plane::U8(Box::new([])), (0, 0), quarters(1));
+        let (empty, dims) =
+            transform_plane(Plane::U8(Box::new([])), (0, 0), quarters(1));
         assert!(matches!(empty, Plane::U8(bytes) if bytes.is_empty()));
         assert_eq!(dims, (0, 0));
     }
@@ -1124,7 +1350,8 @@ mod tests {
     // 32x16 10-bit 4:0:0 fixture, a black-to-white grayscale gradient.
     #[test]
     fn avif_fixture_decodes() {
-        let page = decode(include_bytes!("testdata/mono.avif"), "a.avif").expect("mono avif decodes");
+        let page = decode(include_bytes!("testdata/mono.avif"), "a.avif")
+            .expect("mono avif decodes");
         assert_eq!(page.format, Format::Avif);
         assert_eq!((page.width, page.height), (32, 16));
         let Pixels::Yuv(yuv) = &page.pixels else {
@@ -1145,23 +1372,37 @@ mod tests {
     #[test]
     fn jxl_fixtures_decode() {
         // gray: solid halves, gray replicated to r=g=b
-        let gray = decode(include_bytes!("testdata/gray.jxl"), "a.jxl").expect("gray jxl decodes");
+        let gray = decode(include_bytes!("testdata/gray.jxl"), "a.jxl")
+            .expect("gray jxl decodes");
         assert_eq!((gray.width, gray.height), (8, 8));
         assert_eq!(gray.format, Format::Jxl);
         match gray.pixels {
             Pixels::Rgba8(bytes) => {
-                assert_eq!(bytes.get(..4), Some(&[0x20, 0x20, 0x20, 0xFF][..]));
-                assert_eq!(bytes.get(128..132), Some(&[0xE0, 0xE0, 0xE0, 0xFF][..]));
+                assert_eq!(
+                    bytes.get(..4),
+                    Some(&[0x20, 0x20, 0x20, 0xFF][..])
+                );
+                assert_eq!(
+                    bytes.get(128..132),
+                    Some(&[0xE0, 0xE0, 0xE0, 0xFF][..])
+                );
             }
             Pixels::Yuv(_) => panic!("jxl must decode to rgba"),
         }
 
         // alpha: the file's own alpha rides in the fourth byte
-        let alpha = decode(include_bytes!("testdata/alpha.jxl"), "a.jxl").expect("alpha jxl decodes");
+        let alpha = decode(include_bytes!("testdata/alpha.jxl"), "a.jxl")
+            .expect("alpha jxl decodes");
         match alpha.pixels {
             Pixels::Rgba8(bytes) => {
-                assert_eq!(bytes.get(..4), Some(&[0x40, 0x80, 0xC0, 0xFF][..]));
-                assert_eq!(bytes.get(128..132), Some(&[0x40, 0x80, 0xC0, 0x80][..]));
+                assert_eq!(
+                    bytes.get(..4),
+                    Some(&[0x40, 0x80, 0xC0, 0xFF][..])
+                );
+                assert_eq!(
+                    bytes.get(128..132),
+                    Some(&[0x40, 0x80, 0xC0, 0x80][..])
+                );
             }
             Pixels::Yuv(_) => panic!("jxl must decode to rgba"),
         }
@@ -1169,28 +1410,32 @@ mod tests {
         // wide: 256x128 pins the row/stride order. Opaque alpha on every
         // pixel proves the decoder wrote all rows of the zero-initialised
         // buffer
-        let wide = decode(include_bytes!("testdata/wide.jxl"), "a.jxl").expect("wide jxl decodes");
+        let wide = decode(include_bytes!("testdata/wide.jxl"), "a.jxl")
+            .expect("wide jxl decodes");
         assert_eq!((wide.width, wide.height), (256, 128));
         let Pixels::Rgba8(wide_rgba) = &wide.pixels else {
             panic!("jxl must decode to rgba")
         };
-        assert!(wide_rgba.as_chunks::<4>().0.iter().all(|px| px[3] == 0xFF));
+        assert!(wide_rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|px| px[3] == 0xFF));
 
         // animated: the numbered frames paint digits, so the first frame
         // carries non-black pixels
         let animated =
-            decode(include_bytes!("testdata/animated.jxl"), "a.jxl").expect("animated jxl decodes");
+            decode(include_bytes!("testdata/animated.jxl"), "a.jxl")
+                .expect("animated jxl decodes");
         assert_eq!((animated.width, animated.height), (256, 256));
         let Pixels::Rgba8(animated_rgba) = &animated.pixels else {
             panic!("jxl must decode to rgba")
         };
-        assert!(
-            animated_rgba
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .any(|px| px[0] != 0 || px[1] != 0 || px[2] != 0)
-        );
+        assert!(animated_rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|px| px[0] != 0 || px[1] != 0 || px[2] != 0));
     }
 
     // A truncation bug would hang the decode instead of failing it, hence
@@ -1212,13 +1457,19 @@ mod tests {
                 (8, "jxl: truncated image"),
                 (35, "jxl: truncated image"),
             ] {
-                let truncated = fixture.get(..cut).expect("cut inside the fixture");
-                let Ok(()) = tx.send((cut, message, decode(truncated, "a.jxl"))) else { return; };
+                let truncated =
+                    fixture.get(..cut).expect("cut inside the fixture");
+                let Ok(()) =
+                    tx.send((cut, message, decode(truncated, "a.jxl")))
+                else {
+                    return;
+                };
             }
         });
         for _ in 0..4 {
-            let (cut, message, result) =
-                rx.recv_timeout(Duration::from_secs(5)).expect("truncated jxl decode finishes");
+            let (cut, message, result) = rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("truncated jxl decode finishes");
             assert!(
                 matches!(result, Err(DecodeError::Corrupt(actual)) if actual == message),
                 "cut {cut} reported the wrong truncation"
@@ -1242,7 +1493,10 @@ mod tests {
                 Ok(())
             }
         };
-        assert!(matches!(pool.run(4, &failing), Err(JxlError::InvalidSignature)));
+        assert!(matches!(
+            pool.run(4, &failing),
+            Err(JxlError::InvalidSignature)
+        ));
 
         let passing = |_: usize| Ok(());
         pool.run(4, &passing).expect("every passing task succeeds");
