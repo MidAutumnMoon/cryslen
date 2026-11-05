@@ -16,12 +16,10 @@ use crate::view::ViewMode;
 use crate::worker::SeatView;
 use crate::worker::SpreadView;
 
-/// Everything the status bar shows, built by the app each frame.
 pub struct StatusLine {
     pub page_count: usize,
     pub spread: Spread,
     pub mode: ViewMode,
-    /// The mode-switch toast is showing.
     pub toast: bool,
     pub name: PageName,
     /// Facts of the page the line speaks for, once it has decoded.
@@ -71,14 +69,11 @@ pub struct Timers {
     toast_since: Option<Instant>,
 }
 
-/// How long a page may stay undecided before the status line says so.
 const WAIT_GRACE: Duration = Duration::from_millis(150);
 
-/// How long a mode switch's toast stays on screen.
 const MODE_TOAST: Duration = Duration::from_millis(1500);
 
 impl Timers {
-    /// Arm a toast at `now`; it expires [`MODE_TOAST`] later.
     pub fn toast(&mut self, now: Instant) {
         self.toast_since = Some(now);
     }
@@ -129,18 +124,14 @@ impl Timers {
             .map(|since| MODE_TOAST.saturating_sub(now - since))
     }
 
-    /// Whether the toast is still showing.
     pub fn toasting(&self) -> bool {
         self.toast_since.is_some()
     }
 }
 
-/// What the status line says a still-pending page waits for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Wait {
-    /// The archive's unpack pass has not ended.
     Unpacking,
-    /// The source is not unpacking; the wait is the decode.
     Decoding,
 }
 
@@ -153,21 +144,16 @@ impl Wait {
     }
 }
 
-/// The status line's view of one spread's snapshot: whether it still
-/// waits, the first failure in reading order, the first decoded
-/// page's facts, and the page the line speaks for.
+/// The status line's view of one spread's snapshot, in reading order.
 pub struct FoldedStatus {
     pub waiting: bool,
-    /// The first failed page in reading order.
     pub error: Option<Arc<PageError>>,
     pub page: Option<(usize, Format, (u32, u32))>,
-    /// The page the line names: the failed one if any page failed,
-    /// else the first decoded page, else the spread's first page.
+    /// The page the line names: the failed one if any page failed, else
+    /// the first decoded page, else the spread's first page.
     pub speaker: usize,
 }
 
-/// Fold the spread's pages into the status line's error, page, and
-/// speaker facts in reading order.
 pub fn fold_status(spread: Spread, snapshot: &SpreadView) -> FoldedStatus {
     let mut folded = FoldedStatus {
         waiting: matches!(snapshot.first, SeatView::Pending)
@@ -209,8 +195,6 @@ pub struct PageFacts {
 /// Render the status bar into `ui` and return the content rect: what
 /// the chrome has not consumed, the only legal page viewport. A hidden
 /// bar (`fullscreen`) consumes nothing, so the rect is the whole window.
-/// egui 0.37 panels show into the `&mut Ui` that `EguiGlow::run` hands
-/// over, not into a context.
 pub fn show(
     ui: &mut egui::Ui,
     status: &StatusLine,

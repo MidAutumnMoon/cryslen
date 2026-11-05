@@ -3,10 +3,9 @@
 //! GL is used from the main thread only and `Window` makes the GL context
 //! current once, so the `# Safety` docs below presuppose a current context.
 //!
-//! Runtime texture-creation failure panics. Recovery is deliberately
-//! not built. An upstream `egui_glow` unwrap can panic at runtime
-//! anyway, so recovery cannot be total. The failure is also rare on
-//! target hardware.
+//! Runtime texture-creation failure panics. Recovery is deliberately not
+//! built: an upstream `egui_glow` unwrap can panic anyway, so recovery
+//! cannot be total.
 //!
 //! Chroma is sampled bilinearly at centered (interstitial) positions,
 //! the JPEG convention and the AVIF default. avifChromaSamplePosition is
@@ -71,14 +70,10 @@ shader_variants!(
 // samplers declare highp too, because ES defaults them to lowp and strict
 // hardware quantizes >8-bit samples to ~8 bits through the return path.
 //
-// One shader, both pixel layouts and both transfers: mode and transfer
-// arrive as uniforms, so there are no per-variant programs. Every
-// per-draw constant (the coordinate maps, the quantization anchors, the
-// color-path depth normalization) is folded CPU-side into
-// `u_lmap`/`u_cmap`, `u_mat`, and `u_off` — alpha's depth normalization
-// rides `u_norm` — leaving the color path one matrix multiply and one
-// subtract per fragment. Output is premultiplied for compositing over
-// the background.
+// One shader covers both pixel layouts and both transfers. Per-draw
+// constants are folded CPU-side into `u_lmap`/`u_cmap`, `u_mat`, `u_off`,
+// and `u_norm`, leaving one matrix multiply and one subtract per
+// fragment. Output is premultiplied.
 shader_variants!(
     FS_CORE,
     FS_ES,
@@ -150,9 +145,9 @@ shader_variants!(
     }"
 );
 
-/// Page-keyed texture cache plus the spread draw. Seat binding — which
-/// page sits where — is the screen's fact; this type only uploads,
-/// caches, evicts by budget, and draws the pages it is handed.
+/// Page-keyed texture cache plus the spread draw. Seat binding (which
+/// page sits where) is the screen's fact; this type uploads, caches,
+/// evicts by budget, and draws the pages it is handed.
 pub struct PageTextures {
     gl: Arc<glow::Context>,
     pipeline: Pipeline,
@@ -160,11 +155,6 @@ pub struct PageTextures {
     max_texture_edge: u32,
 }
 
-/// Uniform locations, resolved once at link time so draws never look
-/// names up by string. Every name is declared and statically used by
-/// this file's in-tree shaders, so a missing location is an in-tree
-/// regression and fails pipeline creation instead of silently skipping
-/// per-draw state.
 struct Locations {
     win: <glow::Context as glow::HasContext>::UniformLocation,
     offset: <glow::Context as glow::HasContext>::UniformLocation,
@@ -179,11 +169,6 @@ struct Locations {
 }
 
 /// One cached page's GPU state, freed by budget eviction and on drop.
-/// The variant is the pixel layout, so an entry carries exactly the
-/// textures and folded maps its draw path samples: an RGBA entry has
-/// no chroma map or conversion to leave stale. Every per-draw constant
-/// is folded here at upload, so the frame path only divides by the
-/// live zoom scale.
 enum Entry {
     Rgba {
         texture: <glow::Context as glow::HasContext>::Texture,
@@ -192,8 +177,7 @@ enum Entry {
         transfer: Transfer,
         cost: usize,
     },
-    /// Luma + Cb + Cr + alpha plane textures. Mono binds 1x1 midpoint
-    /// chroma; a page without alpha binds a 1x1 opaque stub.
+    /// Luma + Cb + Cr + alpha plane textures.
     Yuv {
         luma: <glow::Context as glow::HasContext>::Texture,
         cb: <glow::Context as glow::HasContext>::Texture,
@@ -213,7 +197,6 @@ enum Entry {
 }
 
 impl Entry {
-    /// Approximate GPU bytes, counted against [`TEXTURE_BUDGET_BYTES`].
     #[expect(
         clippy::rest_pattern_accessible_field,
         reason = "both variants carry the budget figure in the same slot, so the others stay unnamed"
@@ -265,13 +248,10 @@ impl PageTextures {
         })
     }
 
-    /// Ensure `page`'s textures are cached, protecting `bound` — the
-    /// pages the seats draw — from eviction. A page's own upload never
-    /// evicts it, so a staged page survives its insert; a later insert
-    /// may still displace it once it is no longer protected. A page
-    /// over this context's `MAX_TEXTURE_SIZE` would upload as silently
-    /// black, so it is refused as the page's error instead; the
-    /// caller's frame cadence decides how long the refusal shows.
+    /// Ensure `page`'s textures are cached, protecting `bound` (the pages the
+    /// seats draw) from eviction. A page's own upload never evicts it; a
+    /// later insert may. A page over `MAX_TEXTURE_SIZE` would upload as
+    /// silently black, so it is refused as the page's error instead.
     #[expect(
         clippy::same_name_method,
         reason = "the screen's PageStage trait mirrors this API on purpose: its impl is plain delegation, and tests substitute a recorder for the GL type"
@@ -285,7 +265,6 @@ impl PageTextures {
         self.ensure_cached(page, decoded, bound)
     }
 
-    /// Upload `page` into the cache on a miss.
     fn ensure_cached(
         &mut self,
         page: usize,
@@ -315,7 +294,6 @@ impl PageTextures {
         Ok(())
     }
 
-    /// Drop every cached page.
     pub fn clear_all(&mut self) {
         for entry in mem::take(&mut self.textures).into_values() {
             // SAFETY: the take empties the map, so this loop holds the
@@ -326,8 +304,6 @@ impl PageTextures {
         }
     }
 
-    /// Drop cached pages until the map fits [`TEXTURE_BUDGET_BYTES`],
-    /// sparing the seats' pages and `inserting`'s own entry.
     fn evict_over_budget(
         &mut self,
         bound: [Option<usize>; 2],
@@ -354,13 +330,12 @@ impl PageTextures {
         });
     }
 
-    /// Draw the spread into `viewport`, laid out by `layout` with
-    /// `placement`. `seat_pages` names the page each visual seat draws;
-    /// a page whose upload was refused is absent from the cache, so
-    /// its seat draws nothing. Scissor-clipped to the viewport, so
-    /// pages never render under chrome even when panned past it.
+    /// Draw the spread into `viewport`, laid out by `layout` and `placement`.
+    /// `seat_pages` names the page each visual seat draws; a page whose
+    /// upload was refused is absent from the cache, so its seat draws
+    /// nothing. The draw is scissor-clipped to the viewport.
     ///
-    /// Does not clear. The app owns the framebuffer clear each frame.
+    /// Does not clear; the app owns the framebuffer clear each frame.
     pub fn draw(
         &self,
         size: (u32, u32),
@@ -462,8 +437,6 @@ impl Drop for PageTextures {
     }
 }
 
-/// Compile `src` as `kind`, failing with the GL info log.
-///
 /// # Safety
 ///
 /// The context must be current. The caller must delete the returned name.
@@ -619,18 +592,12 @@ unsafe fn begin_frame(
     gl.uniform_2_f32(Some(&pipeline.locations.win), win.0, win.1);
 }
 
-/// `u_mode` value of [`Entry::Rgba`]: the fragment shader samples one
-/// RGBA texture.
 const MODE_RGBA: i32 = 0;
 
-/// `u_mode` value of [`Entry::Yuv`]: the fragment shader samples the
-/// plane set.
 const MODE_YUV: i32 = 1;
 
-/// Draw one seat's quad. Every uniform is per-draw constant except the
-/// coordinate maps' zoom-scale divide. The shader's `u_mode` branch
-/// guards the mode-specific uniforms, so each variant sets only its
-/// branch reads and the unused ones stay stale without effect.
+/// Draw one seat's quad. The shader's `u_mode` branch guards the
+/// mode-specific uniforms, so each variant sets only its own.
 ///
 /// # Safety
 ///
@@ -727,8 +694,6 @@ unsafe fn draw_page(
     gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
 }
 
-/// Delete the pipeline objects [`create_pipeline`] returned.
-///
 /// # Safety
 ///
 /// The context must be current. Each name is live and deleted at most once.
@@ -738,8 +703,6 @@ unsafe fn delete_pipeline(gl: &glow::Context, pipeline: &Pipeline) {
     gl.delete_buffer(pipeline.vbo);
 }
 
-/// Delete an entry's texture objects.
-///
 /// # Safety
 ///
 /// The context must be current. The names are live and deleted at most once.
@@ -773,12 +736,9 @@ fn gl_int(value: u32) -> i32 {
     value as i32
 }
 
-/// Magnification policy for one texture.
 #[derive(Clone, Copy)]
 enum Mag {
-    /// Zoomed-in texels stay sharp squares.
     Sharp,
-    /// Bilinear interpolation between texels.
     Smooth,
 }
 
@@ -903,9 +863,6 @@ unsafe fn upload_plane(
     texture
 }
 
-/// Upload one page's textures plus the folded draw state that goes with
-/// them.
-///
 /// # Safety
 ///
 /// The context must be current. The asserts inside enforce the plane
@@ -1021,7 +978,6 @@ unsafe fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> Entry {
                         ),
                     )
                 };
-            // A page without alpha uploads a 1x1 opaque stub instead.
             let (alpha_texture, alpha_bytes) =
                 yuv.alpha.as_ref().map_or_else(
                     // 1x1 opaque: the max code, which `u_norm` maps to 1.0.
@@ -1086,9 +1042,6 @@ fn cmap_base(size: (u32, u32), subsampling: Subsampling) -> (f32, f32) {
     (ratio.0 / chroma.0, ratio.1 / chroma.1)
 }
 
-/// One 1x1 stub plane holding `code` at `depth`: mono's neutral chroma,
-/// the opaque alpha's max code. Uploaded through `plane_bytes` like any
-/// real plane, so the storage layout has one home.
 fn stub_plane(depth: u8, code: u32) -> Plane {
     if depth > 8 {
         #[expect(
@@ -1107,12 +1060,8 @@ fn stub_plane(depth: u8, code: u32) -> Plane {
     }
 }
 
-/// Cache budget: approximate texture bytes the cache may hold.
 const TEXTURE_BUDGET_BYTES: usize = 3 * 1024 * 1024 * 1024;
 
-/// Base upload bytes plus their mip chain, which `generate_mipmap`
-/// builds wherever the texture filters: the chain costs `4/3` of the
-/// base levels, rounded down for budgeting.
 fn with_mips(base: usize, mipmapped: bool) -> usize {
     #[expect(
         clippy::integer_division,
@@ -1125,10 +1074,8 @@ fn with_mips(base: usize, mipmapped: bool) -> usize {
     }
 }
 
-/// The pages an insert's eviction must spare: the seats' pages plus
-/// the page being inserted, whose own upload must not evict itself —
-/// a freshly staged page that died on arrival would re-upload every
-/// frame it stays wanted.
+/// The pages an eviction must spare: the seats' pages plus the page
+/// being inserted.
 fn protected_with(
     bound: [Option<usize>; 2],
     inserting: usize,
@@ -1175,8 +1122,6 @@ fn eviction_victims(
     victims
 }
 
-/// The `u_transfer` value of a page's sample encoding: 0 = sRGB
-/// passthrough, 1 = PQ tone-mapped.
 fn transfer_id(transfer: Transfer) -> i32 {
     match transfer {
         Transfer::Srgb => 0,
@@ -1200,10 +1145,8 @@ fn depth_norm(depth: u8, wide: bool) -> f32 {
             as f32
 }
 
-/// Largest value an R16 (u16) texture sampler can return.
 const R16_STORAGE_MAX: f32 = 65535.0;
 
-/// Plane bit depths the R8/R16 texture paths accept.
 const MIN_PLANE_DEPTH: u8 = 1;
 const MAX_PLANE_DEPTH: u8 = 16;
 
@@ -1212,15 +1155,10 @@ const MAX_PLANE_DEPTH: u8 = 16;
 /// storage capacity. Full range spans 0..2^depth-1 with chroma neutral at
 /// half; limited range scales the BT studio swing by 2^(depth-8).
 struct Quantization {
-    /// Luma black, in code units.
     luma_black: f32,
-    /// Chroma neutral, 2^(depth-1) under both ranges.
     chroma_neutral: f32,
-    /// Slope from a depth-normalized luma sample to RGB.
     luma_scale: f32,
-    /// Slope from a depth-normalized chroma sample to RGB.
     chroma_scale: f32,
-    /// Codes the storage can hold: 255 or 65535.
     storage_max: f32,
 }
 
@@ -1352,7 +1290,6 @@ fn full_range_yuv_matrix(matrix: Matrix) -> [f32; 9] {
     ]
 }
 
-/// Luma coefficients (KR, KB) of each conversion standard.
 const BT601_KR_KB: (f32, f32) = (0.299, 0.114);
 const BT709_KR_KB: (f32, f32) = (0.2126, 0.0722);
 const BT2020_KR_KB: (f32, f32) = (0.2627, 0.0593);

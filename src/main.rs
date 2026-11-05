@@ -70,8 +70,7 @@ fn main() -> ExitCode {
     match run(open_path, land_on) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            // The full report: root fault, creation location, source
-            // chain, backtrace status. `RUST_BACKTRACE` arms the trace.
+            // `RUST_BACKTRACE` arms the backtrace in the Debug report.
             eprintln!("cy: {error:?}");
             ExitCode::FAILURE
         }

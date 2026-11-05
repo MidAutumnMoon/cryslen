@@ -9,8 +9,6 @@ use std::num::NonZeroUsize;
 pub struct PageCount(NonZeroUsize);
 
 impl PageCount {
-    /// `None` for zero: an empty book is refused at open, never
-    /// carried as a count.
     pub fn new(count: usize) -> Option<Self> {
         NonZeroUsize::new(count).map(Self)
     }
@@ -22,16 +20,12 @@ impl PageCount {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewMode {
-    /// One page per screen, left to right.
     Normal,
-    /// Spreads, right to left.
     Manga,
-    /// Spreads, left to right.
     Comic,
 }
 
 impl ViewMode {
-    /// The modes in status-bar display order.
     pub const ALL: [Self; 3] = [Self::Normal, Self::Manga, Self::Comic];
 
     pub fn pairs(self) -> bool {
@@ -42,7 +36,6 @@ impl ViewMode {
         self == Self::Manga
     }
 
-    /// Name shown in the status-bar group.
     pub fn label(self) -> &'static str {
         match self {
             Self::Normal => "Normal",
@@ -51,7 +44,6 @@ impl ViewMode {
         }
     }
 
-    /// The key that selects this mode.
     pub fn shortcut(self) -> &'static str {
         match self {
             Self::Normal => "n",
@@ -60,7 +52,6 @@ impl ViewMode {
         }
     }
 
-    /// One line stating the mode's effect, shown on switch.
     pub fn effect(self) -> &'static str {
         match self {
             Self::Normal => "left to right, single page",
@@ -126,7 +117,6 @@ pub fn advance(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModeSwitch {
-    /// The spread start to land on.
     pub index: usize,
     pub pairing_changed: bool,
 }
@@ -152,13 +142,10 @@ pub fn switch_mode(
     }
 }
 
-/// 0-based spread number of a page. The cover is 0, and pages 1 and 2
-/// share 1.
 fn spread_number(page: usize) -> usize {
     page.div_ceil(2)
 }
 
-/// First page of a double-mode spread number. Pairs start on odd pages.
 fn spread_start(number: usize) -> usize {
     if number > 0 {
         2 * number - 1
@@ -167,8 +154,6 @@ fn spread_start(number: usize) -> usize {
     }
 }
 
-/// How many spreads a book of `len` pages holds: the lone cover, then
-/// the pairs. `len` is at least 1, as every [`PageCount`] unwraps to.
 fn spread_count(len: usize) -> usize {
     1 + (len - 1).div_ceil(2)
 }
@@ -188,8 +173,6 @@ pub fn seating<T>(
 }
 
 impl Spread {
-    /// A one-page spread: the shape every Normal-mode spread has, and
-    /// the cover plus odd tails in the double modes.
     pub const fn lone(first: usize) -> Self {
         Self {
             first,
@@ -197,7 +180,6 @@ impl Spread {
         }
     }
 
-    /// Visual seating as [left, right] under `mode`.
     pub fn seats(&self, mode: ViewMode) -> [Option<usize>; 2] {
         seating(self.first, self.second, mode)
     }
@@ -215,11 +197,9 @@ pub struct Viewport {
 }
 
 impl Viewport {
-    /// A viewport filling the window above a bottom chrome strip whose
-    /// top edge sits `bar_top` physical px from the window top. The only
-    /// sizing constructor, so every non-empty viewport is chrome-aware.
-    /// A whole-window viewport is the visible, greppable
-    /// `above_bottom_bar(win, win.1)`.
+    /// A viewport filling the window above a bottom chrome strip whose top
+    /// edge sits `bar_top` physical px from the window top. The only sizing
+    /// constructor, so every non-empty viewport is chrome-aware.
     pub fn above_bottom_bar(window: (f32, f32), bar_top: f32) -> Self {
         Self {
             size: (
@@ -243,7 +223,6 @@ pub struct Placement {
 }
 
 impl Default for Placement {
-    /// What the first fit or a user move replaces before anything draws.
     fn default() -> Self {
         Self {
             scale: 1.0,
@@ -255,14 +234,10 @@ impl Default for Placement {
 /// How a spread fits the viewport when the view is not user-placed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum FitMode {
-    /// The whole spread inside the viewport.
     #[default]
     Page,
-    /// The spread width fills the viewport.
     Width,
-    /// The spread height fills the viewport.
     Height,
-    /// One image px to one screen px.
     Actual,
 }
 
@@ -291,7 +266,6 @@ impl SpreadLayout {
     }
 }
 
-/// Pixel extents as floats: the view model's integer-to-float boundary.
 #[expect(
     clippy::cast_precision_loss,
     reason = "page edges are capped at 16384 px and window extents are physical-device sized, both far below f32's exact-integer range 2^24"
@@ -377,7 +351,6 @@ pub fn zoom_at(
     let old = placement.scale;
     placement.scale = (old * factor).clamp(MIN_SCALE, MAX_SCALE);
     let applied = placement.scale / old;
-    // keep the image pixel under the cursor fixed: off' = cursor - (cursor-off)*applied
     placement.offset = (
         (cursor.0 - placement.offset.0).mul_add(-applied, cursor.0),
         (cursor.1 - placement.offset.1).mul_add(-applied, cursor.1),
@@ -425,15 +398,14 @@ fn clamp_axis(offset: f32, content: f32, size: f32) -> f32 {
     }
 }
 
-/// The placed view of the current spread: the fit mode, the live
-/// placement, and whether the placement is due for recomputation. A
-/// user zoom or pan pins the placement against refits until a turn
-/// discards the pin; the screen's commit re-arms the fit.
+/// The current spread's fit: the mode, the live placement, and whether
+/// the placement is due for recomputation. A user zoom or pan keeps its
+/// placement until a turn; a commit refits only if the user did not move
+/// during the hold.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Fit {
     mode: FitMode,
     placement: Placement,
-    /// The spread total the placement was computed for.
     settled: Option<(f32, f32)>,
     user_moved: bool,
 }
@@ -524,7 +496,6 @@ impl Fit {
 mod tests {
     use super::*;
 
-    /// A page count for the tables; every row is a real book.
     fn pages(count: usize) -> PageCount {
         PageCount::new(count).expect("test book is non-empty")
     }
@@ -896,7 +867,6 @@ mod tests {
                 );
             }
         }
-        // Both clamp bounds land exactly.
         assert_eq!(
             zoom_at(
                 Placement {

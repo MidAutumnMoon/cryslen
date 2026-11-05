@@ -20,7 +20,6 @@ use super::Transfer;
 
 const MAX_THREADS: usize = 16;
 
-/// The jxl header reported dimensions the desktop caps refuse.
 fn bad_dimensions() -> DecodeError {
     ErrorUnion::new(DecodeRefusal::Corrupt("jxl: bad dimensions"))
 }
@@ -66,8 +65,6 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
             .union()?;
     super::check_dims(width, height).union()?;
 
-    // Files without their own alpha still get opaque alpha from the
-    // decoder.
     let extra_channels = info.extra_channels.len();
     decoder
         .set_pixel_format(JxlPixelFormat::rgba8(extra_channels))

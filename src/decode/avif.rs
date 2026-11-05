@@ -50,6 +50,10 @@ use super::YuvImage;
 /// is capped.
 const MAX_THREADS: usize = 8;
 
+#[expect(
+    clippy::similar_names,
+    reason = "Cb and Cr are the YUV plane names the two locals hold"
+)]
 pub(super) fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
     // SAFETY: `DecoderGuard::new`'s contract leaves callers the `'bytes`
     // borrow, which the signature enforces.
@@ -133,7 +137,7 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
             u32::from(depth),
         )
     }?;
-    let (blue_plane, red_plane) = if subsampling == Subsampling::Mono {
+    let (cb_plane, cr_plane) = if subsampling == Subsampling::Mono {
         (Plane::U8(Box::new([])), Plane::U8(Box::new([])))
     } else {
         (
@@ -178,13 +182,13 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
     // dimensions rotate coherently with the luma grid.
     let (luma_plane, _) =
         transform_plane(luma_plane, (width, height), transform);
-    let (blue_plane, _) = transform_plane(
-        blue_plane,
+    let (cb_plane, _) = transform_plane(
+        cb_plane,
         (chroma_width, chroma_height),
         transform,
     );
-    let (red_plane, _) = transform_plane(
-        red_plane,
+    let (cr_plane, _) = transform_plane(
+        cr_plane,
         (chroma_width, chroma_height),
         transform,
     );
@@ -207,8 +211,8 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
             full_range,
             matrix,
             luma: luma_plane,
-            cb: blue_plane,
-            cr: red_plane,
+            cb: cb_plane,
+            cr: cr_plane,
             alpha: alpha_plane,
         },
     )

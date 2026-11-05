@@ -1,23 +1,15 @@
 //! The fault taxonomy: what can go wrong, as types.
 //!
-//! Refusals ([`OpenRefusal`], [`DecodeRefusal`]) are classification
-//! facts the caller may match on. Faults ([`AvifFault`],
-//! [`PanicFault`], [`BadIndex`], [`TextureFault`]) carry structured
-//! detail; the last two of those name bugs, not bad input. The error
-//! unions ([`PageError`], [`OpenError`], [`DecodeError`],
-//! [`TextureError`], [`SpawnError`]) are the transport: which of
-//! these types a layer can fail with, stated in its signature.
+//! Refusals ([`OpenRefusal`], [`DecodeRefusal`]) are verdicts about the
+//! input that callers may match on. Faults carry structured detail;
+//! [`PanicFault`] and [`BadIndex`] name bugs, not bad input.
 //!
-//! [`PageError`] is the one shared set: it is stored behind `Arc` in
-//! the worker's book and the screen's error cells, and an error
-//! cannot change set after the `Arc` wraps it. The page-side unions
-//! ([`DecodeError`], [`TextureError`]) widen into it where a layer
-//! learns the page is the unit of failure: the worker's decode
-//! verdict, the screen's texture uploads. An open refusal owns no
-//! page, so [`OpenError`] never widens into [`PageError`]: the app
-//! pins it beside the page cells and the status line speaks for it
-//! distinctly. [`SpawnError`] widens into [`OpenError`] at the book
-//! switch.
+//! [`PageError`] is the one shared set, stored behind `Arc` in the
+//! source's fill, the worker's book, and the screen's upload error, so
+//! an error cannot change set once wrapped. [`DecodeError`] and
+//! [`TextureError`] widen into it where the page is the unit of
+//! failure. [`OpenError`] never does, because an open refusal owns no
+//! page; [`SpawnError`] widens into [`OpenError`] at the book switch.
 
 use std::any::Any;
 use std::error::Error;
@@ -30,20 +22,13 @@ use image::ImageError;
 use jxl::error::Error as JxlError;
 use zip::result::ZipError;
 
-/// Why a source refused to open.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpenRefusal {
     NotFound(PathBuf),
     Unsupported(PathBuf),
     Empty,
-    /// The listing names one entry twice.
     Duplicate(String),
-    /// The sizes the listing claims exceed the memory the machine
-    /// reports available.
-    TooBig {
-        unpacked: u64,
-        available: u64,
-    },
+    TooBig { unpacked: u64, available: u64 },
 }
 
 impl fmt::Display for OpenRefusal {
@@ -63,8 +48,6 @@ impl fmt::Display for OpenRefusal {
 
 impl Error for OpenRefusal {}
 
-/// Why bytes refused to decode: a verdict about the content, not a
-/// failure in the decoder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodeRefusal {
     NotAnImage,
@@ -84,7 +67,6 @@ impl fmt::Display for DecodeRefusal {
 
 impl Error for DecodeRefusal {}
 
-/// A libavif call failure with its step and avifResult detail.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AvifFault {
     pub step: &'static str,
@@ -99,11 +81,8 @@ impl fmt::Display for AvifFault {
 
 impl Error for AvifFault {}
 
-/// A panic payload that crossed a thread boundary: the decoder or the
-/// unpack pass died on this page. A bug, not bad input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PanicFault {
-    /// Which boundary caught it, e.g. `"decoder"`.
     pub origin: &'static str,
     pub message: String,
 }
@@ -117,8 +96,6 @@ impl fmt::Display for PanicFault {
 impl Error for PanicFault {}
 
 impl PanicFault {
-    /// Render a panic payload, for the thread panic boundaries: the
-    /// unpack pass in the source and the decoder in the worker.
     pub fn from_payload(
         origin: &'static str,
         payload: &(dyn Any + Send),
@@ -132,9 +109,8 @@ impl PanicFault {
     }
 }
 
-/// The caller asked for a page index the source does not list. A bug,
-/// not bad input: a live source lists at least one page, and every
-/// index below its length has a name.
+/// A live source lists at least one page, so every index below its
+/// length has a name; a miss means a caller bug.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BadIndex;
 
@@ -146,7 +122,6 @@ impl fmt::Display for BadIndex {
 
 impl Error for BadIndex {}
 
-/// A page this GPU cannot texture.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextureFault {
     pub dims: (u32, u32),
@@ -165,8 +140,6 @@ impl fmt::Display for TextureFault {
 
 impl Error for TextureFault {}
 
-/// What one page can fail with, source side and decode side together.
-/// Shared by every `Arc`-pinned error cell in the worker and screen.
 pub type PageError = ErrorUnion<(
     DecodeRefusal,
     AvifFault,
@@ -180,23 +153,14 @@ pub type PageError = ErrorUnion<(
     TextureFault,
 )>;
 
-/// What opening a source can fail with. Never widens into
-/// [`PageError`]: an open refusal owns no page.
 pub type OpenError =
     ErrorUnion<(OpenRefusal, ZipError, sevenz_rust2::Error, io::Error)>;
 
-/// What decoding one page can fail with; widens into [`PageError`]
-/// where the page becomes the unit of failure.
 pub type DecodeError =
     ErrorUnion<(DecodeRefusal, AvifFault, ImageError, JxlError)>;
 
-/// What caching one page's textures can fail with: the size refusal.
-/// Widens into [`PageError`] where the page becomes the unit of
-/// failure.
 pub type TextureError = ErrorUnion<(TextureFault,)>;
 
-/// What spawning a worker or building the app can fail with; widens
-/// into [`OpenError`] at the book switch.
 pub type SpawnError = ErrorUnion<(io::Error,)>;
 
 #[cfg(test)]

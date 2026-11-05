@@ -29,13 +29,9 @@ use crate::fault::PageError;
 use crate::fault::PanicFault;
 use crate::view::PageCount;
 
-/// What the status line calls the current page.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageName {
-    /// Directory shown before the basename, e.g. a volume inside an archive.
-    /// Flat archives and anonymous paths have none.
     pub parent: Option<String>,
-    /// The basename with its extension, e.g. `image001.avif`.
     pub file: String,
 }
 
@@ -67,8 +63,7 @@ pub(crate) fn is_archive(path: &Path) -> bool {
     archive_kind(path).is_some()
 }
 
-/// The answer to one page read. `NotYet` reports an archive still
-/// unpacking; the read never waits for the unpack.
+#[derive(Debug)]
 pub enum PageRead {
     Ready(Arc<[u8]>),
     NotYet,
@@ -121,11 +116,8 @@ enum Backend {
 #[derive(Debug)]
 pub struct Source {
     names: Vec<String>,
-    /// The page count in its nonzero shape: a source lists at least
-    /// one page.
     count: PageCount,
     backend: Backend,
-    /// The opened path; book switching enumerates its siblings.
     path: PathBuf,
 }
 
@@ -233,7 +225,7 @@ impl Source {
                 listed.push((name, entry.size()));
             }
         }
-        let (names, unpacked) = validated_names(listed).union()?;
+        let (names, unpacked) = validated_listing(listed).union()?;
         guard_memory(unpacked, mem_available_bytes()).union()?;
         let fill = Arc::new(Mutex::new(Fill::empty()));
         let source = Self::from_names(
@@ -263,7 +255,7 @@ impl Source {
             })
             .map(|entry| (entry.name.clone(), entry.size()))
             .collect();
-        let (names, unpacked) = validated_names(listed).union()?;
+        let (names, unpacked) = validated_listing(listed).union()?;
         guard_memory(unpacked, mem_available_bytes()).union()?;
         let fill = Arc::new(Mutex::new(Fill::empty()));
         let source = Self::from_names(
@@ -275,8 +267,6 @@ impl Source {
         Ok(source)
     }
 
-    /// A source lists at least one page: the count's nonzero shape is
-    /// the empty refusal's one home.
     fn from_names(
         backend: Backend,
         names: Vec<String>,
@@ -303,9 +293,8 @@ impl Source {
         self.names.get(index).map(String::as_str)
     }
 
-    /// The status line's name segment for one page: the basename plus its
-    /// immediate parent directory. Archive entries carry their inner
-    /// directory; directory pages get the opened directory itself.
+    /// The status line's name segment: the basename plus its immediate parent
+    /// directory.
     #[expect(
         clippy::indexing_slicing,
         reason = "the page list is non-empty and immutable, and callers pass an index below its length; the debug assert restates it"
@@ -330,9 +319,8 @@ impl Source {
         PageName { parent, file }
     }
 
-    /// The encoded bytes of one page. An archive still unpacking
-    /// answers `NotYet`; the caller decides how to wait. A failure
-    /// carries no page number; the reader names the page.
+    /// The encoded bytes of one page. An archive still unpacking answers
+    /// `NotYet` without waiting; the caller decides how to wait.
     pub fn bytes(&self, index: usize) -> PageRead {
         let Some(name) = self.names.get(index) else {
             return PageRead::Failed(Arc::new(ErrorUnion::new(BadIndex)));
@@ -348,8 +336,6 @@ impl Source {
         }
     }
 
-    /// Whether the unpack pass is still running, for the status line's
-    /// wait word. A directory never unpacks.
     pub fn unpacking(&self) -> bool {
         match &self.backend {
             Backend::Directory(_) => false,
@@ -373,10 +359,7 @@ fn sort_pages(names: &mut [String]) {
     names.sort_by(|left, right| compare_names(left, right));
 }
 
-/// The listing a source is built from: natural-sorted and free of
-/// duplicate names. Returns the names and their claimed unpacked
-/// total, which a solid archive's memory guard weighs.
-fn validated_names(
+fn validated_listing(
     listed: Vec<(String, u64)>,
 ) -> Result<(Vec<String>, u64), OpenRefusal> {
     // Header sizes are claims, so the sum saturates rather than wraps
@@ -487,8 +470,7 @@ fn read_member(
 }
 
 /// Fill a zip's pages in reading order. Zip members decode
-/// independently, so each page settles on its own result: one bad
-/// member fails only its page, and the pass always reaches its end.
+/// independently, so each page settles on its own result.
 fn spawn_zip_fill(
     mut zip: zip::ZipArchive<BufReader<File>>,
     names: Vec<String>,
@@ -529,9 +511,7 @@ fn spawn_pass(
 
 /// Fill a 7z's pages in storage order, the only order a solid stream
 /// permits: every member is consumed, page or not, before the next
-/// decodes. A page member that fails to read settles as its own page's
-/// error and the pass continues; a block that cannot decode or a
-/// non-page member that cannot be drained ends the pass.
+/// decodes.
 fn spawn_sevenzip_fill(
     mut reader: sevenz_rust2::ArchiveReader<File>,
     names: &[String],
@@ -644,8 +624,6 @@ mod tests {
     use std::io::Error as IoError;
     use std::io::Write as _;
 
-    /// A pass-level failure carrying just `what`: what a pass body
-    /// hands `settle_pass`, before the `Arc` wrapping.
     fn failed_reason(what: &'static str) -> PageError {
         ErrorUnion::new(DecodeRefusal::Corrupt(what))
     }
@@ -709,7 +687,6 @@ mod tests {
         ];
         sort_pages(&mut names);
         assert_eq!(names, ["1.png", "9.png", "010.png"]);
-        // Same-width padding was already right; both still are.
         let mut padded =
             vec!["page10.png".to_owned(), "page09.png".to_owned()];
         sort_pages(&mut padded);
@@ -760,7 +737,6 @@ mod tests {
         let available = 4 * 1024 * 1024 * 1024;
         guard_memory(available - MEM_RESERVE_BYTES, Some(available))
             .unwrap();
-        // One byte into the reserve refuses.
         #[expect(
             clippy::rest_pattern_accessible_field,
             reason = "binding the ignored field as `_` instead trips unneeded_field_pattern"
@@ -803,9 +779,8 @@ mod tests {
             ("a.png".to_owned(), u64::MAX),
             ("b.png".to_owned(), u64::MAX),
         ];
-        // The saturating sum keeps the guard honest about liars.
         let (names, unpacked) =
-            validated_names(listed).expect("liar names still list");
+            validated_listing(listed).expect("liar names still list");
         assert_eq!(names, ["a.png", "b.png"]);
         assert_eq!(unpacked, u64::MAX);
         #[expect(
@@ -828,7 +803,7 @@ mod tests {
             ("a.png".to_owned(), 8),
         ];
         assert_eq!(
-            validated_names(listed).expect_err("duplicates must refuse"),
+            validated_listing(listed).expect_err("duplicates must refuse"),
             OpenRefusal::Duplicate(String::from("a.png"))
         );
     }

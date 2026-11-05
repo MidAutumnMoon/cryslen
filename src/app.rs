@@ -34,7 +34,6 @@ use crate::view::Viewport;
 use crate::window::Window;
 use crate::worker::Worker;
 
-/// User events that wake the parked loop.
 pub enum UserEvent {
     /// Arms a wake; `new_events` requests the redraw at the deadline.
     Repaint(Duration),
@@ -91,7 +90,6 @@ pub struct App {
     /// A failure the app noted (a book switch that failed). No frame
     /// retries it, so it holds until a successful switch clears it.
     noted_error: Option<Arc<OpenError>>,
-    /// The status line's wait-grace and mode-toast timing.
     timers: ui::Timers,
     /// Cursor position in viewport px, same as window px.
     cursor: (f32, f32),
@@ -101,8 +99,8 @@ pub struct App {
     modifiers: ModifiersState,
     /// The viewport the last frame painted into, read by input between frames.
     last_viewport: Viewport,
-    /// Wakes the parked loop from egui and timed waits; winit 0.30 cannot
-    /// create a proxy from `ActiveEventLoop`.
+    /// Wakes the parked loop from egui and timed waits, which run outside
+    /// the event loop's handlers.
     proxy: EventLoopProxy<UserEvent>,
 }
 
@@ -411,9 +409,7 @@ impl App {
         self.after_page_change();
     }
 
-    /// A page change retunes the worker and restarts the fit: every
-    /// spread mutation flows through here, so the worker conversation
-    /// has one home.
+    /// Every spread mutation retunes the worker and restarts the fit here.
     fn after_page_change(&mut self) {
         self.worker.retune(self.spread());
         self.fit.begin_turn();
@@ -669,8 +665,7 @@ fn clear_color(translucent: bool) -> [f32; 4] {
 }
 
 /// The page viewport from the chrome egui just laid out: the full-width
-/// window area above the status bar, in physical px. Uses egui's
-/// `pixels_per_point`, not the window's scale factor.
+/// window area above the status bar, in physical px.
 fn content_viewport(
     window: PhysicalSize<u32>,
     content: egui::Rect,

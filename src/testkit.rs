@@ -83,12 +83,10 @@ pub fn ready_seat(width: u32, height: u32) -> SeatView {
     ))
 }
 
-/// A page error carrying just `message`, for seeding failure cells.
 pub fn failed_page(message: &'static str) -> Arc<PageError> {
     Arc::new(ErrorUnion::new(DecodeRefusal::Corrupt(message)))
 }
 
-/// A seat failed with `message`, for seeding fold and seating tests.
 pub fn failed_seat(message: &'static str) -> SeatView {
     SeatView::Failed(failed_page(message))
 }

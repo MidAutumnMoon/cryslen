@@ -1,9 +1,8 @@
 //! Screen: what each seat shows. The commit policy holds a spread
-//! change while any of its wanted seats is undecided and changes every
-//! seat in one frame, stages the forward spread's textures ahead of a
-//! turn, and owns the upload error no page owns. Seat binding is this
-//! module's one fact: the pages, their dims, and the uploads they
-//! need all read from it.
+//! change while any wanted seat is undecided (unless nothing has shown
+//! yet), then changes every seat in one frame; it stages the forward
+//! spread's textures ahead of a turn and owns the upload error that no
+//! page owns.
 
 use std::sync::Arc;
 
@@ -19,10 +18,9 @@ use crate::worker::SeatView;
 use crate::worker::SpreadView;
 use crate::worker::Worker;
 
-/// The texture work the screen asks for: stage one page's textures,
-/// protecting `bound` — the pages the seats draw — from eviction.
-/// `PageTextures` implements this against GL; tests drive it with a
-/// recorder.
+/// Stage one page's textures, protecting `bound` (the pages the seats
+/// draw) from eviction. `PageTextures` implements this against GL; tests
+/// substitute a recorder.
 pub trait PageStage {
     fn stage(
         &mut self,
@@ -78,9 +76,8 @@ fn seat_step(
     }
 }
 
-/// Before anything has been shown, ready seats appear as they arrive
-/// instead of waiting for the whole spread. `bound[i]` is the page seat
-/// i currently shows.
+/// Build the frame's seat plan. `bound[i]` is the page seat i currently
+/// shows.
 fn plan_screen(
     shown: Option<Spread>,
     wanted: Spread,
@@ -165,21 +162,14 @@ struct SeatShow {
     dims: (u32, u32),
 }
 
-/// The hold and commit policy and the seat state it tracks have one
-/// owner here, so they cannot drift apart.
 #[derive(Default)]
 #[expect(
     clippy::redundant_pub_crate,
     reason = "pub(crate) is the crate's visibility style for crate-wide items, even inside private modules"
 )]
 pub(crate) struct Screen {
-    /// The last spread the plan committed; None before the first
-    /// commit (cold start).
     shown: Option<Spread>,
     seats: [Option<SeatShow>; 2],
-    /// A texture upload the GPU refused. A staging frame rewrites this:
-    /// a refused upload retries every frame while its page stays wanted,
-    /// so the error holds exactly that long.
     upload_error: Option<Arc<PageError>>,
 }
 
@@ -205,25 +195,22 @@ impl Screen {
             snapshot.seats(mode),
             bound,
         );
-        // The frame's uploads are one outcome: a refused upload on
-        // either seat must survive the partner's success, and a frame
-        // that staged cleanly clears the upload error. A hold frame
-        // leaves it.
-        let mut bind_error = None;
+        // The frame's uploads are one outcome: a refusal on either seat
+        // survives the partner's success, and a staging frame with no
+        // refusal clears the error. A hold frame leaves it.
+        let mut stage_error = None;
         let mut staged_cleanly = false;
         for (i, (shown, step)) in
             self.seats.iter_mut().zip(plan.steps).enumerate()
         {
             match step {
                 SeatStep::Show { page, decoded } => {
-                    // The incoming page joins the protected set before
-                    // the upload, so a fresh destination cannot evict
-                    // itself.
+                    // The incoming page joins the protected set before its upload.
                     bound[i] = Some(page);
                     match pages.stage(page, decoded, bound) {
                         Ok(()) => staged_cleanly = true,
                         Err(error) => {
-                            bind_error = Some(Arc::new(error.widen()));
+                            stage_error = Some(Arc::new(error.widen()));
                         }
                     }
                     // The seat keeps its page and dims even on a refused
@@ -241,8 +228,8 @@ impl Screen {
                 }
             }
         }
-        if bind_error.is_some() || staged_cleanly {
-            self.upload_error = bind_error;
+        if stage_error.is_some() || staged_cleanly {
+            self.upload_error = stage_error;
         }
         if let Some((page, decoded)) = plan.stage {
             self.stage(pages, page, decoded);
@@ -252,9 +239,9 @@ impl Screen {
     }
 
     /// Upload the forward spread's decided pages ahead of the turn, so
-    /// an ordinary commit is a pure restage: the multi-megabyte upload
-    /// lands on this frame, which redraws anyway, instead of the
-    /// turn's first visible one.
+    /// an ordinary commit finds its pages already cached: the
+    /// multi-megabyte upload lands on this frame, which redraws
+    /// anyway, instead of the turn's first visible one.
     pub(crate) fn stage_forward(
         &mut self,
         pages: &mut impl PageStage,
@@ -275,7 +262,6 @@ impl Screen {
         }
     }
 
-    /// The page each seat shows, for staging protection and the draw.
     pub(crate) fn seat_pages(&self) -> [Option<usize>; 2] {
         self.seats.each_ref().map(|seat| seat.map(|show| show.page))
     }
@@ -284,13 +270,11 @@ impl Screen {
         self.seats.each_ref().map(|seat| seat.map(|show| show.dims))
     }
 
-    /// The refused upload the status line must show, if the seats'
-    /// pages are still wanted.
     pub(crate) fn upload_error(&self) -> Option<&Arc<PageError>> {
         self.upload_error.as_ref()
     }
 
-    /// Upload `page`'s textures without binding a seat. A refusal
+    /// Upload `page`'s textures without showing them. A refusal
     /// surfaces in the status line and repeats while staging retries
     /// each frame.
     fn stage(
@@ -304,7 +288,6 @@ impl Screen {
         }
     }
 
-    /// Drop every shown fact.
     pub(crate) fn clear_book(&mut self) {
         self.shown = None;
         self.seats = [None, None];
@@ -359,7 +342,6 @@ mod tests {
             wanted: Spread,
             mode: ViewMode,
             views: [Option<SeatView>; 2],
-            /// The page each seat currently shows, [left, right].
             bound: [Option<usize>; 2],
             steps: [StepFacts; 2],
             shown_after: Option<Spread>,

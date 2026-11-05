@@ -9,13 +9,13 @@ use super::Decoded;
 use super::Format;
 use super::Transfer;
 
-/// image-crate path: decode with a concrete decoder so EXIF orientation is
-/// readable, then apply it.
+/// Decode with a concrete decoder so EXIF orientation is readable, then
+/// apply it.
 #[expect(
     clippy::wildcard_enum_match_arm,
     reason = "image's other ImageFormat variants never arrive: decode dispatches only the six formats the crate enables"
 )]
-pub(super) fn decode_image(
+pub(super) fn decode(
     bytes: &[u8],
     image_format: image::ImageFormat,
 ) -> Result<Decoded, DecodeError> {

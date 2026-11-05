@@ -1,12 +1,9 @@
 //! Decoding: raw page bytes -> `Decoded` (RGBA or YUV planes).
 //!
-//! Dispatch is by magic bytes where possible, then extension. AVIF decodes
-//! to YUV planes and the rest to RGBA. The `avif` submodule holds the
-//! libavif FFI, `jxl` the JPEG XL decoder, and `image` the image-crate
-//! path.
-//!
-//! All functions here return `DecodeError` for corrupt input instead of
-//! panicking.
+//! Dispatch is by magic bytes, then extension; AVIF decodes to YUV
+//! planes and the rest to RGBA. Corrupt input fails as `DecodeError`,
+//! but the decoder libraries can still panic on hostile bytes; the
+//! worker's `catch_unwind` catches that.
 
 #![expect(
     clippy::definition_in_module_root,
@@ -22,9 +19,8 @@ mod avif;
 mod image;
 mod jxl;
 
-/// Decoded page. Construct via [`Decoded::rgba`] / [`Decoded::yuv`], which
-/// validate the pixel extents against the dimensions. A wrong extent then
-/// surfaces as a construction error, not a display-time panic.
+/// Construct via [`Decoded::rgba`] / [`Decoded::yuv`], which validate the
+/// pixel extents against the dimensions.
 #[derive(Clone)]
 pub struct Decoded {
     pub width: u32,
@@ -35,9 +31,9 @@ pub struct Decoded {
     pub format: Format,
 }
 
-/// Opto-electronic transfer of decoded samples. SDR pages carry
-/// sRGB-class gamma, which the sRGB framebuffer displays by passthrough;
-/// PQ pages carry absolute-luminance HDR, tone-mapped to SDR in the shader.
+/// Sample encoding. SDR pages are sRGB-class gamma, passed through to the
+/// sRGB framebuffer; PQ pages are absolute-luminance HDR, tone-mapped to
+/// SDR in the shader.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Transfer {
     Srgb,
@@ -74,14 +70,17 @@ impl Decoded {
         yuv: YuvImage,
     ) -> Result<Self, DecodeRefusal> {
         check_dims(width, height)?;
-        let (_, (cw, ch)) = plane_dims((width, height), yuv.subsampling);
+        let (_, (chroma_width, chroma_height)) =
+            plane_dims((width, height), yuv.subsampling);
         if yuv.luma.sample_count() != width as usize * height as usize
             || yuv.alpha.as_ref().is_some_and(|alpha| {
                 alpha.sample_count() != width as usize * height as usize
             })
             || (yuv.subsampling != Subsampling::Mono
-                && (yuv.cb.sample_count() != cw as usize * ch as usize
-                    || yuv.cr.sample_count() != cw as usize * ch as usize))
+                && (yuv.cb.sample_count()
+                    != chroma_width as usize * chroma_height as usize
+                    || yuv.cr.sample_count()
+                        != chroma_width as usize * chroma_height as usize))
         {
             return Err(DecodeRefusal::Corrupt("yuv plane extent"));
         }
@@ -94,7 +93,6 @@ impl Decoded {
         })
     }
 
-    /// Approximate resident size, for cache budget accounting.
     pub fn resident_bytes(&self) -> usize {
         match &self.pixels {
             Pixels::Rgba8(bytes) => bytes.len(),
@@ -108,7 +106,6 @@ impl Decoded {
     }
 }
 
-/// Pixel count with a hostile-header cap.
 fn checked_pixels(
     width: u32,
     height: u32,
@@ -137,9 +134,9 @@ fn checked_extent(
 const MAX_PIXELS: u32 = (512 << 20) / 4;
 
 /// Decode-time admission cap on a page edge: pages over it fail before
-/// any buffer is funded for them. 0x4000 sits at the texture edge common
-/// desktop GPUs support, not at this GPU's own limit, whose authoritative
-/// check is render's runtime query, reported as `TextureFault`.
+/// any buffer is funded for them. 0x4000 is the texture edge common
+/// desktop GPUs support; the authoritative per-GPU check is the
+/// renderer's runtime query, reported as `TextureFault`.
 const DECODE_EDGE_LIMIT: u32 = 0x4000;
 
 fn check_dims(width: u32, height: u32) -> Result<(), DecodeRefusal> {
@@ -155,8 +152,7 @@ fn check_dims(width: u32, height: u32) -> Result<(), DecodeRefusal> {
 pub enum Pixels {
     /// Interleaved RGBA, `4 * width * height` bytes, row-major, top-first.
     Rgba8(Box<[u8]>),
-    /// Planar YUV, converted to RGB in the renderer's shader. Constructed
-    /// only by the `avif` decoder.
+    /// Planar YUV, converted to RGB in the renderer's shader.
     Yuv(YuvImage),
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,9 +182,8 @@ impl Format {
     }
 }
 
-/// 8-bit planes are one byte per sample. Deeper planes are `u16` samples
-/// with `depth` significant bits. Dimensions ride on [`Decoded`]. Plane
-/// sizes follow [`plane_dims`]. Mono carries luma only, so its chroma
+/// 8-bit planes are one byte per sample; deeper planes are `u16` samples
+/// with `depth` significant bits. Mono carries luma only, so its chroma
 /// planes stay empty. Alpha, when the file carries one, is a luma-sized
 /// full-range plane.
 #[derive(Clone)]
@@ -240,7 +235,6 @@ pub enum Plane {
 }
 
 impl Plane {
-    /// Samples the plane holds: one per texel of its plane dims.
     pub fn sample_count(&self) -> usize {
         match self {
             Self::U8(bytes) => bytes.len(),
@@ -248,8 +242,6 @@ impl Plane {
         }
     }
 
-    /// Storage bytes the plane holds; [`plane_bytes`] slices exactly
-    /// this many.
     pub fn byte_len(&self) -> usize {
         match self {
             Self::U8(bytes) => bytes.len(),
@@ -258,8 +250,7 @@ impl Plane {
     }
 }
 
-/// Plane dims (luma, chroma) for an image size and subsampling. Mono chroma
-/// is 1x1 so renderers can bind a midpoint texture.
+/// Mono's chroma dims are 1x1 so renderers can bind a midpoint texture.
 pub fn plane_dims(
     size: (u32, u32),
     subsampling: Subsampling,
@@ -285,12 +276,11 @@ pub fn plane_bytes(plane: &Plane) -> &[u8] {
     }
 }
 
-/// The AVIF irot/imir display transform: quarter turns counter-clockwise
-/// plus an optional mirror, applied at decode so the renderer and the
-/// layout see upright pixels with plain dimensions.
+/// The AVIF irot/imir display transform, applied at decode so the renderer
+/// and the layout see upright pixels with plain dimensions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DisplayTransform {
-    /// Quarter-turns counter-clockwise, 0..=3 (the `irot` angle).
+    /// Quarter-turns counter-clockwise (the `irot` angle), 0..=3.
     pub quarters: u8,
     /// The `imir` axis: 0 exchanges top and bottom, 1 exchanges left and
     /// right.
@@ -395,12 +385,12 @@ pub fn decode(bytes: &[u8], name: &str) -> Result<Decoded, DecodeError> {
     match format {
         Format::Avif => avif::decode(bytes),
         Format::Jxl => jxl::decode(bytes),
-        Format::Jpeg => image::decode_image(bytes, ImageFormat::Jpeg),
-        Format::Png => image::decode_image(bytes, ImageFormat::Png),
-        Format::Gif => image::decode_image(bytes, ImageFormat::Gif),
-        Format::Webp => image::decode_image(bytes, ImageFormat::WebP),
-        Format::Bmp => image::decode_image(bytes, ImageFormat::Bmp),
-        Format::Tiff => image::decode_image(bytes, ImageFormat::Tiff),
+        Format::Jpeg => image::decode(bytes, ImageFormat::Jpeg),
+        Format::Png => image::decode(bytes, ImageFormat::Png),
+        Format::Gif => image::decode(bytes, ImageFormat::Gif),
+        Format::Webp => image::decode(bytes, ImageFormat::WebP),
+        Format::Bmp => image::decode(bytes, ImageFormat::Bmp),
+        Format::Tiff => image::decode(bytes, ImageFormat::Tiff),
     }
 }
 
@@ -430,7 +420,6 @@ pub(crate) fn format_from_name(name: &str) -> Option<Format> {
     })
 }
 
-/// `None` only means no known signature.
 fn sniff(bytes: &[u8]) -> Option<Format> {
     if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
         return Some(Format::Jpeg);
@@ -576,7 +565,6 @@ mod tests {
             vec![0_u8; 4 * DECODE_EDGE_LIMIT as usize].into_boxed_slice(),
         )
         .expect("page at the edge cap constructs");
-        // An edge over the limit is Unsupported.
         let over = Decoded::rgba(
             DECODE_EDGE_LIMIT + 1,
             1,

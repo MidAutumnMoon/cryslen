@@ -1,7 +1,4 @@
-//! Decode worker: one thread serving the spread the app is showing. One
-//! book holds every decided page and the pending trail. The wanted
-//! spread never leaves the book, and every other page leaves by recency
-//! then distance. Nothing is persisted to disk.
+//! Decode worker: one thread serving the spread the app is showing.
 
 use std::cmp::Reverse;
 use std::collections::BTreeSet;
@@ -31,8 +28,8 @@ use crate::view::ViewMode;
 /// stays resident even over this budget.
 const BOOK_BUDGET_BYTES: usize = 768 * 1024 * 1024;
 
-/// What a failed page costs the book budget: the boxed fault behind
-/// its `Arc`, at the union's inline size.
+/// What a failed page costs the book budget: the error union's inline
+/// size.
 const FAILED_BYTES: usize = mem::size_of::<PageError>();
 
 enum ToWorker {
@@ -49,9 +46,8 @@ pub struct SpreadView {
     pub second: Option<SeatView>,
 }
 
-/// One page's view: decided (`Ready`, `Failed`) or still [`SeatView::Pending`].
-/// The book stores decided views only. A failed page is sticky, so its
-/// error follows the page across turns.
+/// One page's view: decided (`Ready`, `Failed`) or still pending. A
+/// failure is sticky, so its error follows the page across turns.
 #[derive(Clone)]
 pub enum SeatView {
     Ready(Arc<Decoded>),
@@ -70,15 +66,12 @@ impl SeatView {
 }
 
 impl SpreadView {
-    /// Visual seating as [left, right] under `mode`.
     pub fn seats(&self, mode: ViewMode) -> [Option<&SeatView>; 2] {
         use crate::view;
 
         view::seating(&self.first, self.second.as_ref(), mode)
     }
 
-    /// Pair the spread's pages with their seat views in reading order:
-    /// `spread.first` (the page read first), then its partner.
     pub fn reading_order(
         &self,
         spread: Spread,
@@ -92,11 +85,8 @@ impl SpreadView {
     }
 }
 
-/// Decided pages and the pending trail under one lock. The book owns the
-/// newest wanted spread; every transition preserves the invariant that
-/// each of its pages is decided or pending, never neither. A wanted page
-/// joins the trail in `retune` and leaves it only by being decided in
-/// `deliver`, whose eviction cannot take a wanted page.
+/// Decided pages and the pending trail under one lock. Each page of the
+/// wanted spread is decided or pending at every instant.
 struct Book {
     wanted: Spread,
     decided: HashMap<usize, SeatView>,
@@ -148,8 +138,6 @@ impl Book {
             .min_by_key(|&page| next_pick_key(page, self.wanted.first))
     }
 
-    /// The book receives one decided page: ready or failed, both are
-    /// decisions, and a failure stays sticky at its page.
     fn deliver(&mut self, page: usize, seat_view: SeatView) {
         let resident_bytes = seat_view.resident_bytes();
         if let Some(old) = self.decided.insert(page, seat_view) {
@@ -171,15 +159,11 @@ impl Book {
         }
     }
 
-    /// One page's decided view, if the book holds it. Test
-    /// observation of the residency the tables assert on.
     #[cfg(test)]
     fn resident(&self, page: usize) -> Option<&SeatView> {
         self.decided.get(&page)
     }
 
-    /// Bytes the decided pages hold, counted against the budget. Test
-    /// observation of the accounting the tables assert on.
     #[cfg(test)]
     fn live_bytes(&self) -> usize {
         self.live_bytes
@@ -307,10 +291,9 @@ pub struct Worker {
 }
 
 impl Worker {
-    /// Spawn the worker for `source`, opened on `initial`. `notify`
-    /// fires with the page index after the page joins the book and
-    /// before the loop picks the next one, and should send the winit
-    /// user event. The worker itself knows nothing about winit.
+    /// Spawn the worker for `source`, opened on `initial`. `notify` fires
+    /// with the page index after the page joins the book and before the
+    /// loop picks the next one; the worker knows nothing about winit.
     pub fn spawn(
         source: Arc<Source>,
         initial: Spread,
@@ -347,15 +330,12 @@ impl Worker {
         self.tell(ToWorker::Retune(wanted));
     }
 
-    /// The current view for both seats of `wanted`, read under one lock.
     pub fn snapshot(&self, wanted: &Spread) -> SpreadView {
         self.book.lock().snapshot(wanted)
     }
 
-    /// Stop the worker without joining it. Quitting must not wait out an
-    /// in-flight decode (a hostile page can hold the thread for seconds),
-    /// and the process exits regardless. The thread owns its state through
-    /// `Arc`s, so detachment leaks nothing before exit.
+    /// Stop the worker without joining it, so the caller never waits out an
+    /// in-flight decode. The thread owns its state through `Arc`s.
     pub fn detach(&mut self) {
         self.tell(ToWorker::Stop);
         self.handle = None;
@@ -429,10 +409,10 @@ fn run(
     }
 }
 
-/// Resolve one page to its seat view — decided, ready or failed — or
-/// `None` for a nap because the unpack has not reached it. The decoder
-/// runs behind the panic boundary, so a panicking decoder must not
-/// kill the only worker thread.
+/// Resolve one page to a decided `SeatView`, or `None` for a nap
+/// because the unpack has not reached it. The decoder runs behind the
+/// panic boundary, so a panicking decoder must not kill the only
+/// worker thread.
 fn decide_page(source: &Source, page_index: usize) -> Option<SeatView> {
     use crate::decode;
     use std::panic;
@@ -487,7 +467,6 @@ mod tests {
     use std::time::Duration;
     use std::time::Instant;
 
-    /// A page count for the tables; every row is a real book.
     fn pages(count: usize) -> PageCount {
         PageCount::new(count).expect("test book is non-empty")
     }
