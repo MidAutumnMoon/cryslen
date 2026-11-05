@@ -55,11 +55,7 @@ fn archive_kind(path: &Path) -> Option<ArchiveKind> {
     }
 }
 
-#[expect(
-    clippy::redundant_pub_crate,
-    reason = "crate-wide items use pub(crate) as project style"
-)]
-pub(crate) fn is_archive(path: &Path) -> bool {
+pub fn is_archive(path: &Path) -> bool {
     archive_kind(path).is_some()
 }
 
@@ -381,11 +377,7 @@ fn validated_listing(
 /// width ("010" vs "10") and mixed widths ("9" vs "10") both order by
 /// number; everything else compares byte-wise, with case and spaces
 /// significant like an archive listing.
-#[expect(
-    clippy::redundant_pub_crate,
-    reason = "crate-wide items use pub(crate) as project style"
-)]
-pub(crate) fn compare_names(left: &str, right: &str) -> Ordering {
+fn compare_names(left: &str, right: &str) -> Ordering {
     let (mut left, mut right) = (left.as_bytes(), right.as_bytes());
     loop {
         match (left.first(), right.first()) {

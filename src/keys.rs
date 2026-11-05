@@ -7,11 +7,7 @@ use winit::keyboard::KeyCode;
 use winit::keyboard::ModifiersState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[expect(
-    clippy::redundant_pub_crate,
-    reason = "crate-wide items use pub(crate) as project style"
-)]
-pub(crate) enum Action {
+pub enum Action {
     Quit,
     /// Leave fullscreen when fullscreen, quit otherwise.
     Escape,
@@ -45,7 +41,7 @@ impl Action {
         clippy::wildcard_enum_match_arm,
         reason = "winit's unmapped KeyCode variants map to no action"
     )]
-    pub(crate) fn from_key(
+    pub fn from_key(
         code: KeyCode,
         modifiers: ModifiersState,
     ) -> Option<Self> {
@@ -90,7 +86,7 @@ impl Action {
     }
 
     /// Whether a held key keeps firing this action.
-    pub(crate) fn repeats(self) -> bool {
+    pub fn repeats(self) -> bool {
         matches!(
             self,
             Self::Right | Self::Left | Self::Forward | Self::Back
@@ -100,7 +96,7 @@ impl Action {
     /// Whether this action advances reading order in `mode`. Manga
     /// flips the arrows (Left advances). The reading-order keys never
     /// flip.
-    pub(crate) fn is_forward(self, mode: ViewMode) -> bool {
+    pub fn is_forward(self, mode: ViewMode) -> bool {
         match self {
             Self::Forward => true,
             Self::Right => !mode.rtl(),

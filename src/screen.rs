@@ -142,11 +142,7 @@ fn forward_spread(
 /// Whether `page`'s decision changes the screen: a wanted seat's
 /// arrival commits or ends a hold, and a next-spread page becomes
 /// texture-staged. Everything else is prefetch the screen never shows.
-#[expect(
-    clippy::redundant_pub_crate,
-    reason = "crate-wide items use pub(crate) as project style"
-)]
-pub(crate) fn page_watched(
+pub fn page_watched(
     page: usize,
     spread: Spread,
     mode: ViewMode,
@@ -163,11 +159,7 @@ struct SeatShow {
 }
 
 #[derive(Default)]
-#[expect(
-    clippy::redundant_pub_crate,
-    reason = "crate-wide items use pub(crate) as project style"
-)]
-pub(crate) struct Screen {
+pub struct Screen {
     shown: Option<Spread>,
     seats: [Option<SeatShow>; 2],
     upload_error: Option<Arc<PageError>>,
@@ -180,7 +172,7 @@ impl Screen {
         clippy::indexing_slicing,
         reason = "i enumerates two zipped two-seat arrays, so it always indexes within them"
     )]
-    pub(crate) fn display(
+    pub fn display(
         &mut self,
         pages: &mut impl PageStage,
         wanted: Spread,
@@ -242,7 +234,7 @@ impl Screen {
     /// an ordinary commit finds its pages already cached: the
     /// multi-megabyte upload lands on this frame, which redraws
     /// anyway, instead of the turn's first visible one.
-    pub(crate) fn stage_forward(
+    pub fn stage_forward(
         &mut self,
         pages: &mut impl PageStage,
         current: Spread,
@@ -262,15 +254,15 @@ impl Screen {
         }
     }
 
-    pub(crate) fn seat_pages(&self) -> [Option<usize>; 2] {
+    pub fn seat_pages(&self) -> [Option<usize>; 2] {
         self.seats.each_ref().map(|seat| seat.map(|show| show.page))
     }
 
-    pub(crate) fn seat_dims(&self) -> [Option<(u32, u32)>; 2] {
+    pub fn seat_dims(&self) -> [Option<(u32, u32)>; 2] {
         self.seats.each_ref().map(|seat| seat.map(|show| show.dims))
     }
 
-    pub(crate) fn upload_error(&self) -> Option<&Arc<PageError>> {
+    pub fn upload_error(&self) -> Option<&Arc<PageError>> {
         self.upload_error.as_ref()
     }
 
@@ -288,7 +280,7 @@ impl Screen {
         }
     }
 
-    pub(crate) fn clear_book(&mut self) {
+    pub fn clear_book(&mut self) {
         self.shown = None;
         self.seats = [None, None];
         self.upload_error = None;

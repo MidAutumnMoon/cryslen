@@ -41,7 +41,7 @@ pub enum Transfer {
 }
 
 impl Decoded {
-    pub(crate) fn rgba(
+    pub fn rgba(
         width: u32,
         height: u32,
         format: Format,
@@ -62,7 +62,7 @@ impl Decoded {
         })
     }
 
-    pub(crate) fn yuv(
+    pub fn yuv(
         width: u32,
         height: u32,
         format: Format,
@@ -396,11 +396,7 @@ pub fn decode(bytes: &[u8], name: &str) -> Result<Decoded, DecodeError> {
 
 /// Format for a page filename's extension. The same table decides what can
 /// decode and what gets listed as a page.
-#[expect(
-    clippy::redundant_pub_crate,
-    reason = "crate-wide items use pub(crate) as project style"
-)]
-pub(crate) fn format_from_name(name: &str) -> Option<Format> {
+pub fn format_from_name(name: &str) -> Option<Format> {
     use std::path::Path;
 
     let ext = Path::new(name)

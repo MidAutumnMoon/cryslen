@@ -157,7 +157,7 @@ impl Window {
         self.translucent
     }
 
-    pub(crate) fn winit(&self) -> &WinitWindow {
+    pub fn winit(&self) -> &WinitWindow {
         &self.winit
     }
 

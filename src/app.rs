@@ -43,11 +43,7 @@ pub enum UserEvent {
 }
 
 /// A failed send means the loop is gone, leaving the event with no consumer.
-#[expect(
-    clippy::redundant_pub_crate,
-    reason = "crate-wide items use pub(crate) as project style"
-)]
-pub(crate) fn post(proxy: &EventLoopProxy<UserEvent>, event: UserEvent) {
+fn post(proxy: &EventLoopProxy<UserEvent>, event: UserEvent) {
     let Ok(()) = proxy.send_event(event) else {
         return;
     };

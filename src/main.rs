@@ -13,7 +13,7 @@ mod source;
     clippy::panic,
     reason = "a panic in test code is inconsequential"
 )]
-pub(crate) mod testkit;
+mod testkit;
 mod ui;
 mod view;
 mod window;
