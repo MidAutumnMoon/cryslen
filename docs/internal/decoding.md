@@ -62,9 +62,12 @@ Guard against hostile headers: `width.checked_mul(height)` against a
 pixel cap (the image crate's own 512 MiB allocation ceiling) before
 allocating.
 
-Each edge is also capped at the texture limit the renderer accepts
-(`MAX_TEXTURE_EDGE`). The check runs where a decoder first learns its
-dimensions, so an oversized page fails before the costly decode.
+Each edge is also capped at `DECODE_EDGE_LIMIT`, a decode-time
+admission cap set below the common desktop GPU texture limit. The
+check runs where a decoder first learns its dimensions, so an
+oversized page fails before the costly decode; the authoritative
+per-GPU check is the renderer's runtime query, reported as the page's
+texture fault.
 
 ## libavif/dav1d integration essentials
 
@@ -110,18 +113,20 @@ write orientation tags, so fixtures for it must come from real files.
 ## Decode worker pattern
 
 - One worker thread, mpsc retune channel carrying the wanted `Spread`.
-  Every retune joins the spread to a pending trail with its ±3
-  neighborhood. The neighborhood covers the full next spread in the
-  double-page modes. The trail is bounded to ±64 pages of the spread's
-  first page. Past that the reader has moved on, so pages are dropped
-  instead of queued. The wanted spread itself never drops. The next
-  decode is the undecided pending page nearest the spread, with pages
-  ahead of the reader beating pages behind at equal distance. The
-  channel is observed between decodes, so a newer spread overtakes the
-  backlog. One in-flight decode always completes, and no cancellation
-  tokens are needed.
+  The app retunes at the page-change chokepoint, not per frame. Every
+  retune joins the spread to a pending trail with its ±3 neighborhood.
+  The neighborhood covers the full next spread in the double-page
+  modes. The trail is bounded to ±64 pages of the spread's first page.
+  Past that the reader has moved on, so pages are dropped instead of
+  queued. The wanted spread itself never drops. The next decode is the
+  undecided pending page nearest the spread, with pages ahead of the
+  reader beating pages behind at equal distance. The channel is
+  observed between decodes, so a newer spread overtakes the backlog.
+  One in-flight decode always completes, and no cancellation tokens
+  are needed. The decided-page notification fires after the page joins
+  the book and before the next pick.
 - Decided pages and the pending trail live in one book under one lock.
-  Stored views are `SeatView::Ready(Arc<Decoded>) | SeatView::Failed(String)`,
+  Stored views are `SeatView::Ready(Arc<Decoded>) | Failed(Arc<PageError>)`,
   with `Pending` synthesized for snapshots. Failures are
   sticky per page, so an error follows its page across turns.
 - Byte budget in the hundreds of MiB. Eviction victims are never-wanted
@@ -130,17 +135,18 @@ write orientation tags, so fixtures for it must come from real files.
   decided or pending at every instant. An oversized spread stays over
   budget rather than losing a shown page.
 - An archive unpacks once on its own thread; `Source::bytes` answers
-  `NotYet` until the page is filled. The worker naps 15 ms and checks
-  the channel again on `NotYet`, so an unpack wait never blocks a
-  `Stop` or a newer retune.
+  `NotYet` until the page is filled, and the claimed unpacked sizes
+  are guarded against available memory at open. The worker naps 15 ms
+  and checks the channel again on `NotYet`, so an unpack wait never
+  blocks a `Stop` or a newer retune.
 - The app reads one snapshot per frame, giving each seat Ready, Failed,
   or Pending. There is no unknown state.
 - Wrap decode in `catch_unwind`: a panicking decoder must degrade to a
   `Failed` page, not kill the only worker.
 - Per-page latency is decode-bound, so holding the last complete spread
   plus a status word after a short grace period beats any spinner. The
-  word is `unpacking…` while the archive pass runs and `decoding…` after
-  it. A spinner forces repaints of a parked loop.
+  word is `unpacking…` while the archive pass runs and `decoding…`
+  after it. A spinner forces repaints of a parked loop.
 
 ## Thumbnail sources (known, currently unused)
 

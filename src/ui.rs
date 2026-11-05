@@ -1,12 +1,15 @@
 //! Status overlay: one egui bottom panel, data in / text out.
 
+use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
+use std::time::Instant;
 
 use egui::text::LayoutJob;
 
 use crate::decode::Format;
+use crate::fault::OpenError;
 use crate::fault::PageError;
-use crate::fault::StatusFault;
 use crate::source::PageName;
 use crate::view::Spread;
 use crate::view::ViewMode;
@@ -30,8 +33,110 @@ pub struct StatusLine {
     pub error: Option<StatusFault>,
 }
 
+/// What the status line blames: a page's own failure (decode, source,
+/// or a texture the GPU refused), or a book switch that failed.
+pub enum StatusFault {
+    Page(Arc<PageError>),
+    Noted(Arc<OpenError>),
+}
+
+impl fmt::Display for StatusFault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Page(error) => error.fmt(f),
+            Self::Noted(error) => error.fmt(f),
+        }
+    }
+}
+
+/// The one fault the line shows: the page's own failure first, then a
+/// failed book switch, then a texture the GPU refused. Each layer's
+/// cell keeps its own retention; this is only the ordering.
+pub fn fault_to_show(
+    page: Option<Arc<PageError>>,
+    noted: Option<&Arc<OpenError>>,
+    upload: Option<&Arc<PageError>>,
+) -> Option<StatusFault> {
+    page.map(StatusFault::Page)
+        .or_else(|| noted.cloned().map(StatusFault::Noted))
+        .or_else(|| upload.cloned().map(StatusFault::Page))
+}
+
+/// The status line's time-driven facts: how long the spread has waited
+/// undecided, and when the mode toast expires. Pure in the clock the
+/// caller passes, so the timing policy is testable headless.
+#[derive(Default)]
+pub struct Timers {
+    waiting_since: Option<Instant>,
+    toast_since: Option<Instant>,
+}
+
+/// How long a page may stay undecided before the status line says so.
+const WAIT_GRACE: Duration = Duration::from_millis(150);
+
+/// How long a mode switch's toast stays on screen.
+const MODE_TOAST: Duration = Duration::from_millis(1500);
+
+impl Timers {
+    /// Arm a toast at `now`; it expires [`MODE_TOAST`] later.
+    pub fn toast(&mut self, now: Instant) {
+        self.toast_since = Some(now);
+    }
+
+    /// Track the wait flag: armed while `waiting`, cleared otherwise.
+    /// Returns the delay until the grace elapses, for the parked loop
+    /// to arm — without it the loop never wakes to show the flag.
+    pub fn tick_wait(
+        &mut self,
+        now: Instant,
+        waiting: bool,
+    ) -> Option<Duration> {
+        self.waiting_since =
+            waiting.then(|| self.waiting_since.unwrap_or(now));
+        // The checked subtraction is the grace boundary itself: some
+        // of the grace remains, or none does.
+        let since = self.waiting_since?;
+        WAIT_GRACE.checked_sub(now - since)
+    }
+
+    /// The wait word once the grace has elapsed, `None` before. The
+    /// word distinguishes the two waits the app can observe;
+    /// `unpacking` is consulted only when the word will show, so its
+    /// cost stays off every settled frame.
+    pub fn wait_word(
+        &self,
+        now: Instant,
+        unpacking: impl FnOnce() -> bool,
+    ) -> Option<Wait> {
+        let since = self.waiting_since?;
+        if now - since < WAIT_GRACE {
+            return None;
+        }
+        Some(if unpacking() {
+            Wait::Unpacking
+        } else {
+            Wait::Decoding
+        })
+    }
+
+    /// Expire the toast. Returns the delay until it does, for the
+    /// parked loop to arm, so the toast disappears without other
+    /// traffic.
+    pub fn tick_toast(&mut self, now: Instant) -> Option<Duration> {
+        self.toast_since =
+            self.toast_since.filter(|&since| now - since < MODE_TOAST);
+        self.toast_since
+            .map(|since| MODE_TOAST.saturating_sub(now - since))
+    }
+
+    /// Whether the toast is still showing.
+    pub fn toasting(&self) -> bool {
+        self.toast_since.is_some()
+    }
+}
+
 /// What the status line says a still-pending page waits for.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Wait {
     /// The archive's unpack pass has not ended.
     Unpacking,
@@ -49,30 +154,33 @@ impl Wait {
 }
 
 /// The status line's view of one spread's snapshot: whether it still
-/// waits, the first failure in reading order, and the first decoded
-/// page's facts.
+/// waits, the first failure in reading order, the first decoded
+/// page's facts, and the page the line speaks for.
 pub struct FoldedStatus {
     pub waiting: bool,
-    /// The first failed page in reading order, carrying the page so
-    /// the status line can speak for the page that failed, not the
-    /// first page that decoded.
-    pub error: Option<(usize, Arc<PageError>)>,
+    /// The first failed page in reading order.
+    pub error: Option<Arc<PageError>>,
     pub page: Option<(usize, Format, (u32, u32))>,
+    /// The page the line names: the failed one if any page failed,
+    /// else the first decoded page, else the spread's first page.
+    pub speaker: usize,
 }
 
-/// Fold the spread's pages into the status line's error and page facts
-/// in reading order.
+/// Fold the spread's pages into the status line's error, page, and
+/// speaker facts in reading order.
 pub fn fold_status(spread: Spread, snapshot: &SpreadView) -> FoldedStatus {
     let mut folded = FoldedStatus {
         waiting: matches!(snapshot.first, SeatView::Pending)
             || matches!(snapshot.second.as_ref(), Some(SeatView::Pending)),
         error: None,
         page: None,
+        speaker: spread.first,
     };
     for (page, view) in snapshot.reading_order(spread) {
         match view {
             SeatView::Failed(error) => {
-                folded.error = Some((page, Arc::clone(error)));
+                folded.error = Some(Arc::clone(error));
+                folded.speaker = page;
                 break;
             }
             SeatView::Ready(decoded) if folded.page.is_none() => {
@@ -81,6 +189,7 @@ pub fn fold_status(spread: Spread, snapshot: &SpreadView) -> FoldedStatus {
                     decoded.format,
                     (decoded.width, decoded.height),
                 ));
+                folded.speaker = page;
             }
             SeatView::Ready(_) | SeatView::Pending => {}
         }
@@ -224,16 +333,100 @@ fn line(style: &egui::Style, status: &StatusLine) -> LayoutJob {
 )]
 mod tests {
     use super::*;
+    use crate::fault::OpenRefusal;
     use crate::testkit::failed_page;
     use crate::testkit::failed_seat;
     use crate::testkit::ready_seat;
+    use eros::ErrorUnion;
+
+    #[test]
+    fn timers_wait_and_toast_lifecycle() {
+        let start = Instant::now();
+        let mut timers = Timers::default();
+
+        // A pending spread arms the grace; the word appears only after
+        // it elapses, and mid-grace the wake is what remains of it.
+        assert_eq!(timers.tick_wait(start, true), Some(WAIT_GRACE));
+        assert_eq!(
+            timers.tick_wait(start + Duration::from_millis(100), true),
+            Some(Duration::from_millis(50))
+        );
+        let almost_due = (start + WAIT_GRACE)
+            .checked_sub(Duration::from_millis(1))
+            .expect("time moves forward");
+        assert_eq!(
+            timers.wait_word(almost_due, || false),
+            None,
+            "the word appears only once the grace has fully elapsed"
+        );
+        // The grace boundary itself is due: the word shows and the
+        // wake is immediate.
+        assert_eq!(
+            timers.tick_wait(start + WAIT_GRACE, true),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            timers.wait_word(start + WAIT_GRACE, || false),
+            Some(Wait::Decoding)
+        );
+        assert_eq!(
+            timers.wait_word(start + WAIT_GRACE * 2, || true),
+            Some(Wait::Unpacking)
+        );
+        // A decided spread clears the wait; nothing arms.
+        assert_eq!(timers.tick_wait(start + WAIT_GRACE * 2, false), None);
+        assert_eq!(
+            timers.wait_word(start + WAIT_GRACE * 3, || false),
+            None
+        );
+
+        // The toast expires on its own schedule.
+        timers.toast(start);
+        assert!(timers.toasting());
+        let almost_expired = (start + MODE_TOAST)
+            .checked_sub(Duration::from_millis(1))
+            .expect("time moves forward");
+        assert_eq!(
+            timers.tick_toast(almost_expired),
+            Some(Duration::from_millis(1))
+        );
+        assert!(timers.toasting());
+        assert_eq!(timers.tick_toast(start + MODE_TOAST), None);
+        assert!(!timers.toasting());
+    }
+
+    #[test]
+    fn the_line_blames_the_page_before_the_book_before_the_upload() {
+        let page_fault = failed_page("page");
+        let upload_fault = failed_page("upload");
+        let noted: Arc<OpenError> =
+            Arc::new(ErrorUnion::new(OpenRefusal::Empty));
+        assert!(fault_to_show(None, None, None).is_none());
+        assert!(matches!(
+            fault_to_show(None, Some(&noted), Some(&upload_fault)),
+            Some(StatusFault::Noted(error)) if Arc::ptr_eq(&error, &noted)
+        ));
+        assert!(matches!(
+            fault_to_show(None, None, Some(&upload_fault)),
+            Some(StatusFault::Page(error)) if Arc::ptr_eq(&error, &upload_fault)
+        ));
+        assert!(matches!(
+            fault_to_show(
+                Some(Arc::clone(&page_fault)),
+                Some(&noted),
+                Some(&upload_fault)
+            ),
+            Some(StatusFault::Page(error)) if Arc::ptr_eq(&error, &page_fault)
+        ));
+    }
 
     #[test]
     fn fold_status_table() {
         struct Expect {
             waiting: bool,
-            error: Option<&'static str>,
+            error: Option<Arc<PageError>>,
             page: Option<(usize, Format, (u32, u32))>,
+            speaker: usize,
         }
         let pair = Spread {
             first: 0,
@@ -242,102 +435,120 @@ mod tests {
         let spread_view = |first: SeatView, second: Option<SeatView>| {
             SpreadView { first, second }
         };
+        // A failed seat plus the fault it carries, so the row can
+        // expect that exact cell back.
+        let failed = || {
+            let fault = failed_page("x");
+            (SeatView::Failed(Arc::clone(&fault)), fault)
+        };
         let rows = [
+            (pair, {
+                let (second, fault) = failed();
+                (
+                    spread_view(ready_seat(2, 2), Some(second)),
+                    Expect {
+                        waiting: false,
+                        error: Some(fault),
+                        page: Some((0, Format::Png, (2, 2))),
+                        speaker: 1,
+                    },
+                )
+            }),
             (
                 pair,
-                spread_view(ready_seat(2, 2), Some(failed_seat("x"))),
-                Expect {
-                    waiting: false,
-                    error: Some("x"),
-                    page: Some((0, Format::Png, (2, 2))),
-                },
-            ),
-            (
-                pair,
-                spread_view(SeatView::Pending, Some(ready_seat(2, 2))),
-                Expect {
-                    waiting: true,
-                    error: None,
-                    page: Some((1, Format::Png, (2, 2))),
-                },
+                (
+                    spread_view(SeatView::Pending, Some(ready_seat(2, 2))),
+                    Expect {
+                        waiting: true,
+                        error: None,
+                        page: Some((1, Format::Png, (2, 2))),
+                        speaker: 1,
+                    },
+                ),
             ),
             (
                 Spread::lone(0),
-                spread_view(ready_seat(2, 2), None),
-                Expect {
-                    waiting: false,
-                    error: None,
-                    page: Some((0, Format::Png, (2, 2))),
-                },
-            ),
-            (
-                pair,
-                spread_view(
-                    failed_seat("first"),
-                    Some(failed_seat("second")),
+                (
+                    spread_view(ready_seat(2, 2), None),
+                    Expect {
+                        waiting: false,
+                        error: None,
+                        page: Some((0, Format::Png, (2, 2))),
+                        speaker: 0,
+                    },
                 ),
-                Expect {
-                    waiting: false,
-                    error: Some("first"),
-                    page: None,
-                },
             ),
-            (
-                pair,
-                spread_view(
-                    ready_seat(800, 600),
-                    Some(failed_seat("second")),
-                ),
-                Expect {
-                    waiting: false,
-                    error: Some("second"),
-                    page: Some((0, Format::Png, (800, 600))),
-                },
-            ),
-            (
-                pair,
-                spread_view(
-                    failed_seat("first"),
-                    Some(ready_seat(640, 480)),
-                ),
-                Expect {
-                    waiting: false,
-                    error: Some("first"),
-                    page: None,
-                },
-            ),
-            (
-                pair,
-                spread_view(SeatView::Pending, Some(failed_seat("x"))),
-                Expect {
-                    waiting: true,
-                    error: Some("x"),
-                    page: None,
-                },
-            ),
+            (pair, {
+                let (first, fault) = failed();
+                (
+                    spread_view(first, Some(failed_seat("second"))),
+                    Expect {
+                        waiting: false,
+                        error: Some(fault),
+                        page: None,
+                        speaker: 0,
+                    },
+                )
+            }),
+            (pair, {
+                let (second, fault) = failed();
+                (
+                    spread_view(ready_seat(800, 600), Some(second)),
+                    Expect {
+                        waiting: false,
+                        error: Some(fault),
+                        page: Some((0, Format::Png, (800, 600))),
+                        speaker: 1,
+                    },
+                )
+            }),
+            (pair, {
+                let (first, fault) = failed();
+                (
+                    spread_view(first, Some(ready_seat(640, 480))),
+                    Expect {
+                        waiting: false,
+                        error: Some(fault),
+                        page: None,
+                        speaker: 0,
+                    },
+                )
+            }),
+            (pair, {
+                let (second, fault) = failed();
+                (
+                    spread_view(SeatView::Pending, Some(second)),
+                    Expect {
+                        waiting: true,
+                        error: Some(fault),
+                        page: None,
+                        speaker: 1,
+                    },
+                )
+            }),
             (
                 Spread::lone(0),
-                spread_view(SeatView::Pending, None),
-                Expect {
-                    waiting: true,
-                    error: None,
-                    page: None,
-                },
+                (
+                    spread_view(SeatView::Pending, None),
+                    Expect {
+                        waiting: true,
+                        error: None,
+                        page: None,
+                        speaker: 0,
+                    },
+                ),
             ),
         ];
-        for (i, (spread, snapshot, want)) in rows.iter().enumerate() {
+        for (i, (spread, (snapshot, want))) in rows.iter().enumerate() {
             let folded = fold_status(*spread, snapshot);
             assert_eq!(folded.waiting, want.waiting, "row {i}: waiting");
             assert_eq!(
-                folded
-                    .error
-                    .as_ref()
-                    .map(|(_, error)| error.to_string())
-                    .as_deref(),
-                want.error,
+                folded.error.as_ref().map(Arc::as_ptr),
+                want.error.as_ref().map(Arc::as_ptr),
                 "row {i}: error"
             );
             assert_eq!(folded.page, want.page, "row {i}: page");
+            assert_eq!(folded.speaker, want.speaker, "row {i}: speaker");
         }
     }
 
@@ -391,7 +602,7 @@ mod tests {
             (&base, "12-13/214 · b/010.png · jxl 6000x4000 · 87%"),
             (&matching, "12-13/214 · b/010.png · 6000x4000 · 87%"),
             (&single, "5/214 · b/010.png · 100%"),
-            (&appending, "12-13/214 · b/010.png · jxl 6000x4000 · 87% · decoding… · boom"),
+            (&appending, "12-13/214 · b/010.png · jxl 6000x4000 · 87% · decoding… · corrupt: boom"),
             (&unpacking, "12-13/214 · b/010.png · jxl 6000x4000 · 87% · unpacking…"),
         ];
         for (i, (status_line, want)) in rows.iter().enumerate() {

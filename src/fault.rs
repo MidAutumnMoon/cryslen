@@ -2,29 +2,32 @@
 //!
 //! Refusals ([`OpenRefusal`], [`DecodeRefusal`]) are classification
 //! facts the caller may match on. Faults ([`AvifFault`],
-//! [`PanicError`], [`TextureFault`]) carry structured detail. The
-//! error unions ([`PageError`], [`OpenError`], [`DecodeError`]) are
-//! the transport: which of these types a layer can fail with, stated
-//! in its signature.
+//! [`PanicFault`], [`BadIndex`], [`TextureFault`]) carry structured
+//! detail; the last two of those name bugs, not bad input. The error
+//! unions ([`PageError`], [`OpenError`], [`DecodeError`],
+//! [`TextureError`], [`SpawnError`]) are the transport: which of
+//! these types a layer can fail with, stated in its signature.
 //!
 //! [`PageError`] is the one shared set: it is stored behind `Arc` in
 //! the worker's book and the screen's error cells, and an error
-//! cannot change set after the `Arc` wraps it. Narrower unions
-//! ([`DecodeError`], [`OpenError`], `ErrorUnion<(TextureFault,)>`)
-//! widen into it exactly once, at the layer that learns the page is
-//! the unit of failure.
+//! cannot change set after the `Arc` wraps it. The page-side unions
+//! ([`DecodeError`], [`TextureError`]) widen into it where a layer
+//! learns the page is the unit of failure: the worker's decode
+//! verdict, the screen's texture uploads. An open refusal owns no
+//! page, so [`OpenError`] never widens into [`PageError`]: the app
+//! pins it beside the page cells and the status line speaks for it
+//! distinctly. [`SpawnError`] widens into [`OpenError`] at the book
+//! switch.
 
 use std::any::Any;
 use std::error::Error;
 use std::fmt;
 use std::io;
 use std::path::PathBuf;
-use std::sync::Arc;
 
-use ::jxl::error::Error as JxlError;
 use eros::ErrorUnion;
-use eros::MsgError;
 use image::ImageError;
+use jxl::error::Error as JxlError;
 use zip::result::ZipError;
 
 /// Why a source refused to open.
@@ -47,8 +50,8 @@ impl fmt::Display for OpenRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotFound(path) => write!(f, "not found: {}", path.display()),
-            Self::Empty => write!(f, "no image pages found"),
             Self::Unsupported(path) => write!(f, "unsupported source: {}", path.display()),
+            Self::Empty => write!(f, "no image pages found"),
             Self::Duplicate(name) => write!(f, "duplicate entry name: {name}"),
             Self::TooBig { unpacked, available } => write!(
                 f,
@@ -99,19 +102,49 @@ impl Error for AvifFault {}
 /// A panic payload that crossed a thread boundary: the decoder or the
 /// unpack pass died on this page. A bug, not bad input.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PanicError {
+pub struct PanicFault {
     /// Which boundary caught it, e.g. `"decoder"`.
     pub origin: &'static str,
     pub message: String,
 }
 
-impl fmt::Display for PanicError {
+impl fmt::Display for PanicFault {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} panicked: {}", self.origin, self.message)
     }
 }
 
-impl Error for PanicError {}
+impl Error for PanicFault {}
+
+impl PanicFault {
+    /// Render a panic payload, for the thread panic boundaries: the
+    /// unpack pass in the source and the decoder in the worker.
+    pub fn from_payload(
+        origin: &'static str,
+        payload: &(dyn Any + Send),
+    ) -> Self {
+        let message = payload
+            .downcast_ref::<&str>()
+            .map(|text| (*text).to_owned())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| String::from("non-string panic payload"));
+        Self { origin, message }
+    }
+}
+
+/// The caller asked for a page index the source does not list. A bug,
+/// not bad input: a live source lists at least one page, and every
+/// index below its length has a name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BadIndex;
+
+impl fmt::Display for BadIndex {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "no such page")
+    }
+}
+
+impl Error for BadIndex {}
 
 /// A page this GPU cannot texture.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,7 +167,7 @@ impl Error for TextureFault {}
 
 /// What one page can fail with, source side and decode side together.
 /// Shared by every `Arc`-pinned error cell in the worker and screen.
-pub type PageSet = (
+pub type PageError = ErrorUnion<(
     DecodeRefusal,
     AvifFault,
     ImageError,
@@ -142,67 +175,29 @@ pub type PageSet = (
     ZipError,
     sevenz_rust2::Error,
     io::Error,
-    PanicError,
+    PanicFault,
+    BadIndex,
     TextureFault,
-    MsgError,
-);
-pub type PageError = ErrorUnion<PageSet>;
+)>;
 
-/// What opening a source can fail with.
-pub type OpenSet = (OpenRefusal, ZipError, sevenz_rust2::Error, io::Error);
-pub type OpenError = ErrorUnion<OpenSet>;
+/// What opening a source can fail with. Never widens into
+/// [`PageError`]: an open refusal owns no page.
+pub type OpenError =
+    ErrorUnion<(OpenRefusal, ZipError, sevenz_rust2::Error, io::Error)>;
 
 /// What decoding one page can fail with; widens into [`PageError`]
 /// where the page becomes the unit of failure.
-pub type DecodeSet = (DecodeRefusal, AvifFault, ImageError, JxlError);
-pub type DecodeError = ErrorUnion<DecodeSet>;
+pub type DecodeError =
+    ErrorUnion<(DecodeRefusal, AvifFault, ImageError, JxlError)>;
 
-/// What spawning a worker or building the app can fail with.
+/// What caching one page's textures can fail with: the size refusal.
+/// Widens into [`PageError`] where the page becomes the unit of
+/// failure.
+pub type TextureError = ErrorUnion<(TextureFault,)>;
+
+/// What spawning a worker or building the app can fail with; widens
+/// into [`OpenError`] at the book switch.
 pub type SpawnError = ErrorUnion<(io::Error,)>;
-
-/// What the status line blames: a page's own failure (decode, source,
-/// or a texture the GPU refused), or a book switch that failed.
-pub enum StatusFault {
-    Page(Arc<PageError>),
-    Noted(Arc<OpenError>),
-}
-
-impl fmt::Display for StatusFault {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Page(error) => error.fmt(f),
-            Self::Noted(error) => error.fmt(f),
-        }
-    }
-}
-
-/// A panic payload rendered as a fault, for the thread panic
-/// boundaries: the unpack pass and the decoder in the worker.
-#[expect(
-    clippy::redundant_pub_crate,
-    reason = "pub(crate) is the crate's visibility style for crate-wide items, even inside private modules"
-)]
-pub(crate) fn from_payload(
-    origin: &'static str,
-    payload: &(dyn Any + Send),
-) -> PanicError {
-    let message = payload
-        .downcast_ref::<&str>()
-        .map(|text| (*text).to_owned())
-        .or_else(|| payload.downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| String::from("non-string panic payload"));
-    PanicError { origin, message }
-}
-
-/// The caller asked for a page index the source does not list: an
-/// internal invariant, not a content problem.
-#[expect(
-    clippy::redundant_pub_crate,
-    reason = "pub(crate) is the crate's visibility style for crate-wide items, even inside private modules"
-)]
-pub(crate) fn bad_index() -> PageError {
-    ErrorUnion::new(MsgError::from_static("no such page"))
-}
 
 #[cfg(test)]
 mod tests {
@@ -260,22 +255,23 @@ mod tests {
             .to_string(),
             "6000x4000 exceeds this GPU's 16384-texel texture edge limit"
         );
+        assert_eq!(BadIndex.to_string(), "no such page");
     }
 
     #[test]
     fn panic_fault_carries_its_origin() {
         assert_eq!(
-            from_payload("decoder", &String::from("boom")).to_string(),
+            PanicFault::from_payload("decoder", &String::from("boom"))
+                .to_string(),
             "decoder panicked: boom"
         );
         assert_eq!(
-            from_payload("unpack", &"static boom").to_string(),
+            PanicFault::from_payload("unpack", &"static boom").to_string(),
             "unpack panicked: static boom"
         );
         assert_eq!(
-            from_payload("unpack", &7_u8).to_string(),
+            PanicFault::from_payload("unpack", &7_u8).to_string(),
             "unpack panicked: non-string panic payload"
         );
-        assert_eq!(bad_index().to_string(), "no such page");
     }
 }

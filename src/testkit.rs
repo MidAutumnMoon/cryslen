@@ -5,10 +5,15 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+use eros::ErrorUnion;
+
 use crate::decode::Decoded;
 use crate::decode::Format;
 use crate::decode::Transfer;
+use crate::fault::DecodeRefusal;
 use crate::fault::PageError;
+use crate::source::PageRead;
+use crate::source::Source;
 use crate::worker::SeatView;
 
 fn encode(
@@ -79,23 +84,33 @@ pub fn ready_seat(width: u32, height: u32) -> SeatView {
 }
 
 /// A page error carrying just `message`, for seeding failure cells.
-#[expect(
-    clippy::redundant_pub_crate,
-    reason = "pub(crate) is the crate's visibility style for crate-wide items, even inside private modules"
-)]
-pub(crate) fn failed_page(message: &str) -> Arc<PageError> {
-    Arc::new(eros::ErrorUnion::new(eros::MsgError::from_owned(
-        message.to_owned(),
-    )))
+pub fn failed_page(message: &'static str) -> Arc<PageError> {
+    Arc::new(ErrorUnion::new(DecodeRefusal::Corrupt(message)))
 }
 
 /// A seat failed with `message`, for seeding fold and seating tests.
-#[expect(
-    clippy::redundant_pub_crate,
-    reason = "pub(crate) is the crate's visibility style for crate-wide items, even inside private modules"
-)]
-pub(crate) fn failed_seat(message: &str) -> SeatView {
+pub fn failed_seat(message: &'static str) -> SeatView {
     SeatView::Failed(failed_page(message))
+}
+
+/// Poll a source page until its bytes arrive. Panics if the page
+/// fails instead: the caller asked for its content.
+pub fn eventually_ready(source: &Source, index: usize) -> Arc<[u8]> {
+    eventually(20, "page never settled", || match source.bytes(index) {
+        PageRead::Ready(bytes) => Some(bytes),
+        PageRead::Failed(error) => panic!("page {index} failed: {error}"),
+        PageRead::NotYet => None,
+    })
+}
+
+/// Poll a source page until it settles as a failure, returning the
+/// fault. Panics if it unpacks: the caller asked for the failure.
+pub fn eventually_failed(source: &Source, index: usize) -> Arc<PageError> {
+    eventually(20, "page never settled", || match source.bytes(index) {
+        PageRead::Failed(error) => Some(error),
+        PageRead::Ready(_) => panic!("page {index} unpacked"),
+        PageRead::NotYet => None,
+    })
 }
 
 /// Poll `probe` until it returns `Some`, or `secs` seconds pass.

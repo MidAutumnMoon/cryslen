@@ -15,13 +15,17 @@ use winit::event_loop::EventLoopProxy;
 use winit::keyboard::ModifiersState;
 use winit::window::WindowId;
 
+use crate::decode;
+use crate::fault::OpenError;
 use crate::fault::SpawnError;
-use crate::fault::StatusFault;
 use crate::keys::Action;
 use crate::render::PageTextures;
 use crate::screen;
 use crate::screen::Screen;
 use crate::source::Source;
+use crate::ui;
+use crate::ui::PageFacts;
+use crate::ui::StatusLine;
 use crate::view;
 use crate::view::FitMode;
 use crate::view::Spread;
@@ -84,17 +88,17 @@ pub struct App {
     mode: ViewMode,
     fit: view::Fit,
     screen: Screen,
-    /// The spread the worker was last tuned to; the screen's shown lags
-    /// until the plan commits it.
-    retuned_spread: Spread,
+    /// A failure the app noted (a book switch that failed). No frame
+    /// retries it, so it holds until a successful switch clears it.
+    noted_error: Option<Arc<OpenError>>,
+    /// The status line's wait-grace and mode-toast timing.
+    timers: ui::Timers,
     /// Cursor position in viewport px, same as window px.
     cursor: (f32, f32),
     dragging: bool,
     /// Held modifier state; winit 0.30 key events carry none, only
     /// `ModifiersChanged` does.
     modifiers: ModifiersState,
-    waiting_since: Option<Instant>,
-    mode_toast_since: Option<Instant>,
     /// The viewport the last frame painted into, read by input between frames.
     last_viewport: Viewport,
     /// Wakes the parked loop from egui and timed waits; winit 0.30 cannot
@@ -120,12 +124,11 @@ impl App {
             mode,
             fit: view::Fit::default(),
             screen: Screen::default(),
-            retuned_spread: spread,
+            noted_error: None,
+            timers: ui::Timers::default(),
             cursor: (0.0, 0.0),
             dragging: false,
             modifiers: ModifiersState::empty(),
-            waiting_since: None,
-            mode_toast_since: None,
             last_viewport: Viewport::default(),
             proxy,
         })
@@ -157,17 +160,7 @@ impl App {
     }
 
     fn frame(&mut self) -> eros::Result<()> {
-        use crate::decode;
-        use crate::ui;
-        use crate::ui::PageFacts;
-        use crate::ui::StatusLine;
-        use crate::ui::Wait;
-
         let spread = self.spread();
-        if spread != self.retuned_spread {
-            self.retuned_spread = spread;
-            self.worker.retune(spread);
-        }
 
         let Some(size) = self.sync_surface_size() else {
             return Ok(());
@@ -199,39 +192,15 @@ impl App {
         let spread_size = layout.total();
         let placed = self.fit.resolve(spread_size, self.last_viewport);
 
+        let now = Instant::now();
         let folded = ui::fold_status(spread, &snapshot);
-        self.waiting_since = folded
-            .waiting
-            .then(|| self.waiting_since.unwrap_or_else(Instant::now));
-        // The parked loop otherwise never shows the wait flag.
-        if let Some(since) = self.waiting_since {
-            let elapsed = since.elapsed();
-            if elapsed < WAIT_GRACE {
-                post(
-                    &self.proxy,
-                    UserEvent::Repaint(WAIT_GRACE.saturating_sub(elapsed)),
-                );
-            }
+        if let Some(delay) = self.timers.tick_wait(now, folded.waiting) {
+            post(&self.proxy, UserEvent::Repaint(delay));
+        }
+        if let Some(delay) = self.timers.tick_toast(now) {
+            post(&self.proxy, UserEvent::Repaint(delay));
         }
 
-        // Arm a wake at expiry so the toast disappears without other
-        // traffic.
-        self.mode_toast_since = self
-            .mode_toast_since
-            .filter(|&since| since.elapsed() < MODE_TOAST);
-        if let Some(since) = self.mode_toast_since {
-            let remaining = MODE_TOAST.saturating_sub(since.elapsed());
-            post(&self.proxy, UserEvent::Repaint(remaining));
-        }
-
-        // The line speaks for the page that failed, if any did; the
-        // first decoded page only when the spread is healthy.
-        let speaking_page = folded
-            .error
-            .as_ref()
-            .map(|&(page, _)| page)
-            .or_else(|| folded.page.map(|(page, _, _)| page))
-            .unwrap_or(spread.first);
         let page = folded.page.map(|(page, decoded, dims)| PageFacts {
             claimed: self
                 .source
@@ -240,29 +209,22 @@ impl App {
             decoded,
             dims,
         });
-        let waiting = self
-            .waiting_since
-            .is_some_and(|since| since.elapsed() >= WAIT_GRACE)
-            .then(|| {
-                if self.source.unpacking() {
-                    Wait::Unpacking
-                } else {
-                    Wait::Decoding
-                }
-            });
         let status = StatusLine {
-            page_count: self.source.len(),
+            page_count: self.source.len().get(),
             spread,
             mode: self.mode,
-            toast: self.mode_toast_since.is_some(),
-            name: self.source.page_name(speaking_page),
+            toast: self.timers.toasting(),
+            name: self.source.page_name(folded.speaker),
             page,
             zoom: placed.scale,
-            waiting,
-            error: folded
-                .error
-                .map(|(_, error)| StatusFault::Page(error))
-                .or_else(|| self.screen.error()),
+            waiting: self
+                .timers
+                .wait_word(now, || self.source.unpacking()),
+            error: ui::fault_to_show(
+                folded.error,
+                self.noted_error.as_ref(),
+                self.screen.upload_error(),
+            ),
         };
 
         // `EguiGlow::run` only records shapes, so egui lays out before
@@ -303,6 +265,7 @@ impl App {
             (size.width, size.height),
             viewport,
             &layout,
+            self.screen.seat_pages(),
             &drawn,
         );
         gl.egui.paint(gl.window.winit());
@@ -354,10 +317,12 @@ impl App {
                 );
                 self.mode = mode;
                 self.index = switch.index;
-                self.mode_toast_since = Some(Instant::now());
+                self.timers.toast(Instant::now());
                 if switch.pairing_changed {
                     self.after_page_change();
                 } else {
+                    // Same pairing, same spread: the plan re-mirrors the
+                    // seats without a retune.
                     self.request_redraw();
                 }
             }
@@ -412,7 +377,7 @@ impl App {
         let source = match Source::open(&path) {
             Ok(source) => Arc::new(source),
             Err(error) => {
-                self.screen.note_error(Arc::new(error));
+                self.noted_error = Some(Arc::new(error));
                 self.request_redraw();
                 return;
             }
@@ -425,7 +390,7 @@ impl App {
         let worker = match spawn_worker(&source, spread, &self.proxy) {
             Ok(worker) => worker,
             Err(error) => {
-                self.screen.note_error(Arc::new(error.widen()));
+                self.noted_error = Some(Arc::new(error.widen()));
                 self.request_redraw();
                 return;
             }
@@ -436,7 +401,7 @@ impl App {
         self.worker = worker;
         self.source = source;
         self.index = view::first_spread();
-        self.retuned_spread = spread;
+        self.noted_error = None;
         // A book switch renumbers pages from zero, so nothing of the old
         // book can stay.
         self.screen.clear_book();
@@ -446,7 +411,11 @@ impl App {
         self.after_page_change();
     }
 
+    /// A page change retunes the worker and restarts the fit: every
+    /// spread mutation flows through here, so the worker conversation
+    /// has one home.
     fn after_page_change(&mut self) {
+        self.worker.retune(self.spread());
         self.fit.begin_turn();
         self.request_redraw();
     }
@@ -677,12 +646,6 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 }
-
-/// How long a page may stay undecided before the status line says so.
-const WAIT_GRACE: Duration = Duration::from_millis(150);
-
-/// How long a mode switch's toast stays on screen.
-const MODE_TOAST: Duration = Duration::from_millis(1500);
 
 /// Window background color, straight channels.
 const BACKGROUND: [f32; 3] = [0.08, 0.08, 0.09];

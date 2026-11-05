@@ -29,10 +29,10 @@ use crate::decode::Pixels;
 use crate::decode::Plane;
 use crate::decode::Subsampling;
 use crate::decode::Transfer;
+use crate::fault::TextureError;
 use crate::fault::TextureFault;
 use crate::view;
 use crate::view::Placement;
-use crate::view::Seat;
 use crate::view::SpreadLayout;
 use crate::view::Viewport;
 
@@ -150,14 +150,12 @@ shader_variants!(
     }"
 );
 
-/// What caching one page's textures can fail with: the size refusal.
-type TextureError = ErrorUnion<(TextureFault,)>;
-
-/// Page-keyed texture cache plus the spread draw.
+/// Page-keyed texture cache plus the spread draw. Seat binding — which
+/// page sits where — is the screen's fact; this type only uploads,
+/// caches, evicts by budget, and draws the pages it is handed.
 pub struct PageTextures {
     gl: Arc<glow::Context>,
     pipeline: Pipeline,
-    seats: [Option<usize>; 2],
     textures: HashMap<usize, Entry>,
     max_texture_edge: u32,
 }
@@ -262,51 +260,37 @@ impl PageTextures {
         Ok(Self {
             gl,
             pipeline,
-            seats: [None, None],
             textures: HashMap::new(),
             max_texture_edge,
         })
     }
 
-    /// Record that `seat` draws `page`, uploading its textures only on a
-    /// cache miss. A bound page is never evicted, so a held seat keeps
-    /// drawing. An upload the GPU refuses leaves the seat unbound
-    /// (nothing draws) and returns as the page's error; the next bind
-    /// retries, so the error holds exactly while the page stays wanted.
-    pub fn bind(
-        &mut self,
-        seat: Seat,
-        page: usize,
-        decoded: &Decoded,
-    ) -> Result<(), TextureError> {
-        if *self.seat_slot(seat) == Some(page) {
-            return Ok(());
-        }
-        if let Err(error) = self.ensure_cached(page, decoded) {
-            self.clear(seat);
-            return Err(error);
-        }
-        *self.seat_slot(seat) = Some(page);
-        Ok(())
-    }
-
-    /// Ensure `page`'s textures are cached without binding any seat, so
-    /// the frame that later shows the page is a pure rebind.
+    /// Ensure `page`'s textures are cached, protecting `bound` — the
+    /// pages the seats draw — from eviction. A page's own upload never
+    /// evicts it, so a staged page survives its insert; a later insert
+    /// may still displace it once it is no longer protected. A page
+    /// over this context's `MAX_TEXTURE_SIZE` would upload as silently
+    /// black, so it is refused as the page's error instead; the
+    /// caller's frame cadence decides how long the refusal shows.
+    #[expect(
+        clippy::same_name_method,
+        reason = "the screen's PageStage trait mirrors this API on purpose: its impl is plain delegation, and tests substitute a recorder for the GL type"
+    )]
     pub fn stage(
         &mut self,
         page: usize,
         decoded: &Decoded,
+        bound: [Option<usize>; 2],
     ) -> Result<(), TextureError> {
-        self.ensure_cached(page, decoded)
+        self.ensure_cached(page, decoded, bound)
     }
 
-    /// Upload `page` into the cache on a miss. A page over this context's
-    /// `MAX_TEXTURE_SIZE` would upload as silently black, so it is refused
-    /// as the page's error instead.
+    /// Upload `page` into the cache on a miss.
     fn ensure_cached(
         &mut self,
         page: usize,
         decoded: &Decoded,
+        bound: [Option<usize>; 2],
     ) -> Result<(), TextureError> {
         if self.textures.contains_key(&page) {
             return Ok(());
@@ -327,16 +311,11 @@ impl PageTextures {
         // plane byte extents.
         let entry = unsafe { upload_entry(&self.gl, decoded) };
         self.textures.insert(page, entry);
-        self.evict_over_budget();
+        self.evict_over_budget(bound, page);
         Ok(())
     }
 
-    /// Stop drawing `seat`. The page's textures stay cached.
-    pub fn clear(&mut self, seat: Seat) {
-        *self.seat_slot(seat) = None;
-    }
-
-    /// Drop every cached page and unbind both seats.
+    /// Drop every cached page.
     pub fn clear_all(&mut self) {
         for entry in mem::take(&mut self.textures).into_values() {
             // SAFETY: the take empties the map, so this loop holds the
@@ -345,24 +324,21 @@ impl PageTextures {
                 delete_entry(&self.gl, &entry);
             }
         }
-        self.seats = [None, None];
     }
 
-    fn seat_slot(&mut self, seat: Seat) -> &mut Option<usize> {
-        let [left, right] = &mut self.seats;
-        match seat {
-            Seat::Left => left,
-            Seat::Right => right,
-        }
-    }
-
-    /// Drop cached pages until the map fits [`TEXTURE_BUDGET_BYTES`].
-    fn evict_over_budget(&mut self) {
+    /// Drop cached pages until the map fits [`TEXTURE_BUDGET_BYTES`],
+    /// sparing the seats' pages and `inserting`'s own entry.
+    fn evict_over_budget(
+        &mut self,
+        bound: [Option<usize>; 2],
+        inserting: usize,
+    ) {
+        let protected = protected_with(bound, inserting);
         let victims = eviction_victims(
             self.textures
                 .iter()
                 .map(|(page, entry)| (*page, entry.cost())),
-            self.seats,
+            &protected,
             TEXTURE_BUDGET_BYTES,
         );
         self.textures.retain(|page, entry| {
@@ -379,8 +355,10 @@ impl PageTextures {
     }
 
     /// Draw the spread into `viewport`, laid out by `layout` with
-    /// `placement`. Scissor-clipped to the viewport, so pages never
-    /// render under chrome even when panned past it.
+    /// `placement`. `seat_pages` names the page each visual seat draws;
+    /// a page whose upload was refused is absent from the cache, so
+    /// its seat draws nothing. Scissor-clipped to the viewport, so
+    /// pages never render under chrome even when panned past it.
     ///
     /// Does not clear. The app owns the framebuffer clear each frame.
     pub fn draw(
@@ -388,6 +366,7 @@ impl PageTextures {
         size: (u32, u32),
         viewport: Viewport,
         layout: &SpreadLayout,
+        seat_pages: [Option<usize>; 2],
         placement: &Placement,
     ) {
         if size.0 == 0 || size.1 == 0 {
@@ -419,7 +398,7 @@ impl PageTextures {
                 gl_int(height),
             );
         }
-        for (rect, page) in layout.rects.iter().zip(self.seats.iter()) {
+        for (rect, page) in layout.rects.iter().zip(seat_pages.iter()) {
             let Some(rect) = rect else { continue };
             let Some(page) = page else { continue };
             let Some(entry) = self.textures.get(page) else {
@@ -948,7 +927,9 @@ unsafe fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> Entry {
                 texture: upload_rgba(gl, rgba_bytes, (width, height)),
                 lmap_base: lmap_base((width, height)),
                 transfer: decoded.transfer,
-                cost: entry_cost_bytes(decoded, true),
+                // RGBA always filters, so its upload always builds the
+                // mip chain.
+                cost: with_mips(rgba_bytes.len(), true),
             }
         }
         Pixels::Yuv(yuv) => {
@@ -970,9 +951,13 @@ unsafe fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> Entry {
                 );
             };
             expect(&yuv.luma, luma_w as usize * luma_h as usize, "luma");
+            let luma_bytes = plane_bytes(&yuv.luma);
+            // The cost accrues from the exact slices handed to GL, so
+            // the budget cannot drift from what was uploaded.
+            let mut base = luma_bytes.len();
             let luma_texture = upload_plane(
                 gl,
-                plane_bytes(&yuv.luma),
+                luma_bytes,
                 (luma_w, luma_h),
                 wide,
                 filterable,
@@ -983,10 +968,12 @@ unsafe fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> Entry {
                     // 1x1 chroma at the neutral code, which the folded
                     // quantization anchor cancels exactly.
                     let neutral = stub_plane(depth, 1_u32 << (depth - 1));
+                    let neutral_bytes = plane_bytes(&neutral);
+                    base += 2 * neutral_bytes.len();
                     (
                         upload_plane(
                             gl,
-                            plane_bytes(&neutral),
+                            neutral_bytes,
                             (1, 1),
                             wide,
                             filterable,
@@ -994,7 +981,7 @@ unsafe fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> Entry {
                         ),
                         upload_plane(
                             gl,
-                            plane_bytes(&neutral),
+                            neutral_bytes,
                             (1, 1),
                             wide,
                             filterable,
@@ -1012,10 +999,13 @@ unsafe fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> Entry {
                         chroma_w as usize * chroma_h as usize,
                         "cr",
                     );
+                    let cb_bytes = plane_bytes(&yuv.cb);
+                    let cr_bytes = plane_bytes(&yuv.cr);
+                    base += cb_bytes.len() + cr_bytes.len();
                     (
                         upload_plane(
                             gl,
-                            plane_bytes(&yuv.cb),
+                            cb_bytes,
                             (chroma_w, chroma_h),
                             wide,
                             filterable,
@@ -1023,7 +1013,7 @@ unsafe fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> Entry {
                         ),
                         upload_plane(
                             gl,
-                            plane_bytes(&yuv.cr),
+                            cr_bytes,
                             (chroma_w, chroma_h),
                             wide,
                             filterable,
@@ -1031,37 +1021,43 @@ unsafe fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> Entry {
                         ),
                     )
                 };
-            let alpha_texture = yuv.alpha.as_ref().map_or_else(
-                // 1x1 opaque: the max code, which `u_norm` maps to 1.0.
-                || {
-                    upload_plane(
-                        gl,
-                        plane_bytes(&stub_plane(
-                            depth,
-                            (1_u32 << depth) - 1,
-                        )),
-                        (1, 1),
-                        wide,
-                        filterable,
-                        Mag::Smooth,
-                    )
-                },
-                |alpha| {
-                    expect(
-                        alpha,
-                        width as usize * height as usize,
-                        "alpha",
-                    );
-                    upload_plane(
-                        gl,
-                        plane_bytes(alpha),
-                        (width, height),
-                        wide,
-                        filterable,
-                        Mag::Smooth,
-                    )
-                },
-            );
+            // A page without alpha uploads a 1x1 opaque stub instead.
+            let (alpha_texture, alpha_bytes) =
+                yuv.alpha.as_ref().map_or_else(
+                    // 1x1 opaque: the max code, which `u_norm` maps to 1.0.
+                    || {
+                        let opaque =
+                            stub_plane(depth, (1_u32 << depth) - 1);
+                        let bytes = plane_bytes(&opaque);
+                        let texture = upload_plane(
+                            gl,
+                            bytes,
+                            (1, 1),
+                            wide,
+                            filterable,
+                            Mag::Smooth,
+                        );
+                        (texture, bytes.len())
+                    },
+                    |alpha| {
+                        expect(
+                            alpha,
+                            width as usize * height as usize,
+                            "alpha",
+                        );
+                        let bytes = plane_bytes(alpha);
+                        let texture = upload_plane(
+                            gl,
+                            bytes,
+                            (width, height),
+                            wide,
+                            filterable,
+                            Mag::Smooth,
+                        );
+                        (texture, bytes.len())
+                    },
+                );
+            base += alpha_bytes;
             Entry::Yuv {
                 luma: luma_texture,
                 cb: cb_texture,
@@ -1072,7 +1068,7 @@ unsafe fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> Entry {
                 conversion: page_conversion(decoded),
                 norm: depth_norm(depth, wide),
                 transfer: decoded.transfer,
-                cost: entry_cost_bytes(decoded, filterable),
+                cost: with_mips(base, filterable),
             }
         }
     }
@@ -1114,32 +1110,10 @@ fn stub_plane(depth: u8, code: u32) -> Plane {
 /// Cache budget: approximate texture bytes the cache may hold.
 const TEXTURE_BUDGET_BYTES: usize = 3 * 1024 * 1024 * 1024;
 
-/// Approximate texture bytes one page occupies: plane bytes, plus the mip
-/// chain (`4/3` of the base levels) where mips are generated.
-fn entry_cost_bytes(decoded: &Decoded, mipmapped: bool) -> usize {
-    let base = match &decoded.pixels {
-        Pixels::Rgba8(rgba) => rgba.len(),
-        Pixels::Yuv(yuv) => {
-            let per_sample = if matches!(yuv.luma, Plane::U16(_)) {
-                2
-            } else {
-                1
-            };
-            let chroma = match yuv.subsampling {
-                // Mono uploads a 1x1 midpoint texture per chroma channel.
-                Subsampling::Mono => 2 * per_sample,
-                Subsampling::Yuv420
-                | Subsampling::Yuv422
-                | Subsampling::Yuv444 => {
-                    yuv.cb.byte_len() + yuv.cr.byte_len()
-                }
-            };
-            yuv.luma.byte_len()
-                + chroma
-                // A page without alpha uploads a 1x1 opaque stub instead.
-                + yuv.alpha.as_ref().map_or(per_sample, Plane::byte_len)
-        }
-    };
+/// Base upload bytes plus their mip chain, which `generate_mipmap`
+/// builds wherever the texture filters: the chain costs `4/3` of the
+/// base levels, rounded down for budgeting.
+fn with_mips(base: usize, mipmapped: bool) -> usize {
     #[expect(
         clippy::integer_division,
         reason = "the mip chain costs 4/3 of the base levels, rounded down for budgeting"
@@ -1151,24 +1125,39 @@ fn entry_cost_bytes(decoded: &Decoded, mipmapped: bool) -> usize {
     }
 }
 
+/// The pages an insert's eviction must spare: the seats' pages plus
+/// the page being inserted, whose own upload must not evict itself —
+/// a freshly staged page that died on arrival would re-upload every
+/// frame it stays wanted.
+fn protected_with(
+    bound: [Option<usize>; 2],
+    inserting: usize,
+) -> Vec<usize> {
+    let mut protected: Vec<usize> = bound.into_iter().flatten().collect();
+    if !protected.contains(&inserting) {
+        protected.push(inserting);
+    }
+    protected
+}
+
 /// Pages to drop so the cached costs fit `budget` after a fresh insert.
-/// Candidates are unbound pages, farthest from the nearest bound page
-/// first, ties by higher page id. Bound pages never go, so the survivors
-/// can still sit above the budget until the next insert.
+/// Candidates are unprotected pages, farthest from the nearest
+/// protected page first, ties by higher page id. Protected pages never
+/// go, so the survivors can still sit above the budget until the next
+/// insert.
 fn eviction_victims(
     costs: impl IntoIterator<Item = (usize, usize)>,
-    bound: [Option<usize>; 2],
+    protected: &[usize],
     budget: usize,
 ) -> Vec<usize> {
     let mut candidates: Vec<(usize, usize)> = costs.into_iter().collect();
     let mut remaining: usize =
         candidates.iter().map(|&(_, cost)| cost).sum();
-    candidates.retain(|&(page, _)| !bound.contains(&Some(page)));
+    candidates.retain(|&(page, _)| !protected.contains(&page));
     let distance = |page: usize| {
-        bound
+        protected
             .iter()
-            .flatten()
-            .map(|bound_page| page.abs_diff(*bound_page))
+            .map(|&protected_page| page.abs_diff(protected_page))
             .min()
             .unwrap_or(usize::MAX)
     };
@@ -1578,82 +1567,13 @@ mod tests {
         assert_eq!(transfer_id(Transfer::Pq), 1);
     }
 
-    #[expect(
-        clippy::integer_division,
-        reason = "mirrors entry_cost_bytes' truncated mip-chain cost"
-    )]
     #[test]
-    fn entry_cost_counts_the_mip_chain_where_present() {
-        let rgba = Decoded::rgba(
-            4,
-            4,
-            Format::Png,
-            Transfer::Srgb,
-            vec![0_u8; 64].into_boxed_slice(),
-        )
-        .expect("rgba page");
-        let yuv420 = Decoded::yuv(
-            4,
-            4,
-            Format::Avif,
-            Transfer::Srgb,
-            YuvImage {
-                depth: 8,
-                subsampling: Subsampling::Yuv420,
-                full_range: true,
-                matrix: Matrix::Bt709,
-                luma: Plane::U8(vec![0_u8; 16].into_boxed_slice()),
-                cb: Plane::U8(vec![0_u8; 4].into_boxed_slice()),
-                cr: Plane::U8(vec![0_u8; 4].into_boxed_slice()),
-                alpha: None,
-            },
-        )
-        .expect("yuv page");
-        let with_alpha = Decoded::yuv(
-            4,
-            4,
-            Format::Avif,
-            Transfer::Pq,
-            YuvImage {
-                depth: 8,
-                subsampling: Subsampling::Yuv420,
-                full_range: true,
-                matrix: Matrix::Bt709,
-                luma: Plane::U8(vec![0_u8; 16].into_boxed_slice()),
-                cb: Plane::U8(vec![0_u8; 4].into_boxed_slice()),
-                cr: Plane::U8(vec![0_u8; 4].into_boxed_slice()),
-                alpha: Some(Plane::U8(vec![0_u8; 16].into_boxed_slice())),
-            },
-        )
-        .expect("yuv page with alpha");
-        // Mono planes here are R16, unfilterable under GLES: no mip chain.
-        let mono = Decoded::yuv(
-            2,
-            2,
-            Format::Avif,
-            Transfer::Srgb,
-            YuvImage {
-                depth: 10,
-                subsampling: Subsampling::Mono,
-                full_range: true,
-                matrix: Matrix::Identity,
-                luma: Plane::U16(vec![0_u16; 4].into_boxed_slice()),
-                cb: Plane::U8(Box::default()),
-                cr: Plane::U8(Box::default()),
-                alpha: None,
-            },
-        )
-        .expect("mono page");
-        for (decoded, mipmapped, want) in [
-            (&rgba, true, 64 * 4 / 3),
-            // the alpha-less yuv page pays a 1x1 opaque stub
-            (&yuv420, true, (16 + 4 + 4 + 1) * 4 / 3),
-            (&with_alpha, true, (16 + 4 + 4 + 16) * 4 / 3),
-            // mono: luma + two chroma stubs + the alpha stub, all wide
-            (&mono, false, 4 * 2 + 2 * 2 + 2),
-        ] {
-            assert_eq!(entry_cost_bytes(decoded, mipmapped), want);
-        }
+    fn mip_chain_costs_a_third_more() {
+        assert_eq!(with_mips(12, true), 16);
+        // Rounded down, so a liar-small base cannot round past budget.
+        assert_eq!(with_mips(5, true), 6);
+        // Unfilterable planes build no chain.
+        assert_eq!(with_mips(12, false), 12);
     }
 
     #[test]
@@ -1661,22 +1581,44 @@ mod tests {
         let far = [(3_usize, 10_usize), (19, 10), (10, 10), (20, 10)];
         let tied = [(8_usize, 10_usize), (12, 10), (10, 10)];
         let bound = [(10_usize, 10_usize), (11, 10), (12, 10)];
-        for (costs, seats, budget, want) in [
+        for (costs, protected, budget, want) in [
             // 19 sits one page from seat 20, so 3 is the farther victim
-            (&far[..], [Some(10), Some(20)], 35, vec![3_usize]),
-            (&far[..], [Some(10), Some(20)], 25, vec![3_usize, 19]),
+            (&far[..], &[10_usize, 20][..], 35, vec![3_usize]),
+            (&far[..], &[10, 20], 25, vec![3_usize, 19]),
             // an equal distance from the seat breaks the tie to the higher page
-            (&tied[..], [Some(10), None], 25, vec![12]),
-            // bound pages never go, even at budget 0
-            (&bound[..], [Some(10), Some(11)], 0, vec![12]),
+            (&tied[..], &[10], 25, vec![12]),
+            // protected pages never go, even at budget 0
+            (&bound[..], &[10, 11], 0, vec![12]),
             // everything fits: no victims
-            (&bound[..], [Some(10), Some(11)], 30, vec![]),
+            (&bound[..], &[10, 11], 30, vec![]),
+            // the insert's own page survives alongside the seats':
+            // pressure falls on the unprotected bystander
+            (&bound[..], &[10, 11, 12], 0, vec![]),
         ] {
             assert_eq!(
-                eviction_victims(costs.iter().copied(), seats, budget),
+                eviction_victims(costs.iter().copied(), protected, budget),
                 want,
-                "costs {costs:?} seats {seats:?} budget {budget}"
+                "costs {costs:?} protected {protected:?} budget {budget}"
             );
         }
+    }
+
+    #[test]
+    fn an_inserts_protection_spans_the_seats_and_the_newcomer() {
+        assert_eq!(
+            protected_with([Some(10), None], 7),
+            vec![10, 7],
+            "the newcomer joins the seats' pages"
+        );
+        assert_eq!(
+            protected_with([Some(7), Some(10)], 7),
+            vec![7, 10],
+            "a seat's page is not protected twice"
+        );
+        assert_eq!(
+            protected_with([None, None], 3),
+            vec![3],
+            "a cold cache protects the newcomer alone"
+        );
     }
 }

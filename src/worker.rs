@@ -17,12 +17,13 @@ use eros::ErrorUnion;
 use parking_lot::Mutex;
 
 use crate::decode::Decoded;
-use crate::fault::bad_index;
-use crate::fault::from_payload;
+use crate::fault::BadIndex;
 use crate::fault::PageError;
+use crate::fault::PanicFault;
 use crate::fault::SpawnError;
 use crate::source::PageRead;
 use crate::source::Source;
+use crate::view::PageCount;
 use crate::view::Spread;
 use crate::view::ViewMode;
 
@@ -95,7 +96,7 @@ impl SpreadView {
 /// newest wanted spread; every transition preserves the invariant that
 /// each of its pages is decided or pending, never neither. A wanted page
 /// joins the trail in `retune` and leaves it only by being decided in
-/// `store`, whose eviction cannot take a wanted page.
+/// `deliver`, whose eviction cannot take a wanted page.
 struct Book {
     wanted: Spread,
     decided: HashMap<usize, SeatView>,
@@ -111,21 +112,21 @@ struct Book {
 const NEVER_WANTED_RANK: u64 = 0;
 
 impl Book {
-    fn new(initial: Spread, page_count: usize) -> Self {
+    fn new(initial: Spread, page_count: PageCount, budget: usize) -> Self {
         let mut book = Self {
             wanted: initial,
             decided: HashMap::new(),
             pending: BTreeSet::new(),
             last_wanted: HashMap::new(),
             recency_counter: 0,
-            budget: BOOK_BUDGET_BYTES,
+            budget,
             live_bytes: 0,
         };
         book.retune(initial, page_count);
         book
     }
 
-    fn retune(&mut self, wanted: Spread, page_count: usize) {
+    fn retune(&mut self, wanted: Spread, page_count: PageCount) {
         self.wanted = wanted;
         self.recency_counter += 1;
         for page in
@@ -147,7 +148,9 @@ impl Book {
             .min_by_key(|&page| next_pick_key(page, self.wanted.first))
     }
 
-    fn store(&mut self, page: usize, seat_view: SeatView) {
+    /// The book receives one decided page: ready or failed, both are
+    /// decisions, and a failure stays sticky at its page.
+    fn deliver(&mut self, page: usize, seat_view: SeatView) {
         let resident_bytes = seat_view.resident_bytes();
         if let Some(old) = self.decided.insert(page, seat_view) {
             self.live_bytes -= old.resident_bytes();
@@ -166,6 +169,20 @@ impl Book {
             first: self.seat_view(wanted.first),
             second: wanted.second.map(|page| self.seat_view(page)),
         }
+    }
+
+    /// One page's decided view, if the book holds it. Test
+    /// observation of the residency the tables assert on.
+    #[cfg(test)]
+    fn resident(&self, page: usize) -> Option<&SeatView> {
+        self.decided.get(&page)
+    }
+
+    /// Bytes the decided pages hold, counted against the budget. Test
+    /// observation of the accounting the tables assert on.
+    #[cfg(test)]
+    fn live_bytes(&self) -> usize {
+        self.live_bytes
     }
 
     fn seat_view(&self, page: usize) -> SeatView {
@@ -248,7 +265,7 @@ fn next_pick_key(page: usize, anchor: usize) -> (usize, bool) {
 /// the same margin, which the book reclaims first as never-wanted.
 const PREFETCH_RADIUS: usize = 3;
 
-fn neighbors(anchor: usize, page_count: usize) -> Vec<usize> {
+fn neighbors(anchor: usize, page_count: PageCount) -> Vec<usize> {
     use std::iter;
 
     iter::once(anchor)
@@ -262,7 +279,7 @@ fn neighbors(anchor: usize, page_count: usize) -> Vec<usize> {
                 })
                 .flatten(),
         )
-        .filter(|&page| page < page_count)
+        .filter(|&page| page < page_count.get())
         .collect()
 }
 
@@ -291,8 +308,9 @@ pub struct Worker {
 
 impl Worker {
     /// Spawn the worker for `source`, opened on `initial`. `notify`
-    /// fires with the page index after every decided page and should send
-    /// the winit user event. The worker itself knows nothing about winit.
+    /// fires with the page index after the page joins the book and
+    /// before the loop picks the next one, and should send the winit
+    /// user event. The worker itself knows nothing about winit.
     pub fn spawn(
         source: Arc<Source>,
         initial: Spread,
@@ -301,7 +319,11 @@ impl Worker {
         use std::thread::Builder;
 
         let (tx, rx) = mpsc::channel::<ToWorker>();
-        let book = Arc::new(Mutex::new(Book::new(initial, source.len())));
+        let book = Arc::new(Mutex::new(Book::new(
+            initial,
+            source.len(),
+            BOOK_BUDGET_BYTES,
+        )));
         let thread_book = Arc::clone(&book);
         let handle = Builder::new()
             .name("cy-decode".into())
@@ -396,56 +418,54 @@ fn run(
             retunes.push(arrived);
             continue;
         };
-        let seat_view = match decide_page(source, page_index) {
-            Decision::Ready(page) => SeatView::Ready(page),
-            Decision::Failed(message) => SeatView::Failed(message),
-            Decision::NotYet => {
-                thread::sleep(FILL_POLL);
-                continue;
-            }
+        let Some(seat_view) = decide_page(source, page_index) else {
+            // The unpack has not reached the page; the nap is what
+            // keeps Stop and newer retunes answerable meanwhile.
+            thread::sleep(FILL_POLL);
+            continue;
         };
-        book.lock().store(page_index, seat_view);
+        book.lock().deliver(page_index, seat_view);
         notify(page_index);
     }
 }
 
-enum Decision {
-    Ready(Arc<Decoded>),
-    Failed(Arc<PageError>),
-    NotYet,
-}
-
-/// Resolve one page to a decision: decoded, a terminal failure, or a
-/// nap because the unpack has not reached it. The decoder runs behind
-/// the panic boundary, so a panicking decoder must not kill the only
-/// worker thread.
-fn decide_page(source: &Source, page_index: usize) -> Decision {
+/// Resolve one page to its seat view — decided, ready or failed — or
+/// `None` for a nap because the unpack has not reached it. The decoder
+/// runs behind the panic boundary, so a panicking decoder must not
+/// kill the only worker thread.
+fn decide_page(source: &Source, page_index: usize) -> Option<SeatView> {
     use crate::decode;
     use std::panic;
     use std::panic::AssertUnwindSafe;
 
     let Some(name) = source.name(page_index) else {
-        return Decision::Failed(Arc::new(bad_index()));
+        // The pending set only holds listed pages, so this names a
+        // caller bug; `Source::bytes` guards the same invariant as
+        // the public contract.
+        return Some(SeatView::Failed(Arc::new(ErrorUnion::new(
+            BadIndex,
+        ))));
     };
     match source.bytes(page_index) {
         PageRead::Ready(bytes) => {
             let result = panic::catch_unwind(AssertUnwindSafe(|| {
                 decode::decode(&bytes, name)
             }));
-            match result {
-                Ok(Ok(page)) => Decision::Ready(Arc::new(page)),
+            Some(match result {
+                Ok(Ok(page)) => SeatView::Ready(Arc::new(page)),
                 Ok(Err(error)) => {
-                    Decision::Failed(Arc::new(error.widen()))
+                    SeatView::Failed(Arc::new(error.widen()))
                 }
-                Err(payload) => {
-                    Decision::Failed(Arc::new(ErrorUnion::new(
-                        from_payload("decoder", payload.as_ref()),
-                    )))
-                }
-            }
+                Err(payload) => SeatView::Failed(Arc::new(
+                    ErrorUnion::new(PanicFault::from_payload(
+                        "decoder",
+                        payload.as_ref(),
+                    )),
+                )),
+            })
         }
-        PageRead::Failed(error) => Decision::Failed(error),
-        PageRead::NotYet => Decision::NotYet,
+        PageRead::Failed(error) => Some(SeatView::Failed(error)),
+        PageRead::NotYet => None,
     }
 }
 
@@ -467,11 +487,16 @@ mod tests {
     use std::time::Duration;
     use std::time::Instant;
 
+    /// A page count for the tables; every row is a real book.
+    fn pages(count: usize) -> PageCount {
+        PageCount::new(count).expect("test book is non-empty")
+    }
+
     #[test]
     fn neighbors_are_nearest_first() {
-        assert_eq!(neighbors(5, 10), vec![5, 4, 6, 3, 7, 2, 8]);
-        assert_eq!(neighbors(0, 4), vec![0, 1, 2, 3]);
-        assert_eq!(neighbors(9, 10), vec![9, 8, 7, 6]);
+        assert_eq!(neighbors(5, pages(10)), vec![5, 4, 6, 3, 7, 2, 8]);
+        assert_eq!(neighbors(0, pages(4)), vec![0, 1, 2, 3]);
+        assert_eq!(neighbors(9, pages(10)), vec![9, 8, 7, 6]);
     }
 
     // Pins PREFETCH_RADIUS against view's double-mode turn math.
@@ -479,8 +504,9 @@ mod tests {
     fn prefetch_window_covers_double_mode_turns() {
         use crate::view;
 
-        for page_count in [2_usize, 9, 13] {
-            let spreads = 1 + (page_count - 1).div_ceil(2);
+        for count in [2_usize, 9, 13] {
+            let page_count = pages(count);
+            let spreads = 1 + (count - 1).div_ceil(2);
             let mut focus = 0;
             for turn in 0..spreads {
                 let window = neighbors(focus, page_count);
@@ -492,7 +518,7 @@ mod tests {
                 {
                     assert!(
                         window.contains(&page),
-                        "page count {page_count}: spread page {page} outside focus {focus}"
+                        "page count {count}: spread page {page} outside focus {focus}"
                     );
                 }
                 // The wrap turn jumps across the book, which prefetch
@@ -516,7 +542,7 @@ mod tests {
                     {
                         assert!(
                             window.contains(&page),
-                            "page count {page_count}: next spread page {page} outside focus {focus}"
+                            "page count {count}: next spread page {page} outside focus {focus}"
                         );
                     }
                     focus = next;
@@ -527,29 +553,25 @@ mod tests {
 
     #[test]
     fn next_pick_is_nearest_then_ahead() {
-        // A page count of 0 admits no neighbours, so the trail starts as
-        // the wanted pair alone.
-        let mut book = Book::new(
-            Spread {
-                first: 10,
-                second: Some(11),
-            },
-            0,
-        );
-        book.store(10, ready_seat(2, 1));
-        book.pending.extend(8..=12);
+        // The retune seeds the wanted pair plus its ±3 neighborhood;
+        // deciding 10 leaves exactly that trail to order.
+        let mut book = Book::new(Spread::lone(10), pages(13), usize::MAX);
+        assert_eq!(book.take_next(), Some(10));
+        assert_eq!(book.take_next(), Some(10));
+        book.deliver(10, ready_seat(2, 1));
         assert_eq!(book.take_next(), Some(11));
-        assert!(!book.pending.contains(&10));
         let mut order = Vec::new();
         while let Some(page) = book.take_next() {
             order.push(page);
             book.pending.remove(&page);
         }
-        assert_eq!(order, vec![11, 9, 12, 8]);
+        // Ahead of the reader beats behind at equal distance; page 13
+        // does not exist in a 13-page book.
+        assert_eq!(order, vec![11, 9, 12, 8, 7]);
     }
 
-    // store()'s debug asserts guard wanted coverage and live_bytes. The
-    // kept/dropped checks below also protect release builds.
+    // deliver()'s debug asserts guard wanted coverage and live_bytes.
+    // The kept/dropped checks below also protect release builds.
     #[test]
     fn eviction_rank() {
         let wanted = Spread {
@@ -579,28 +601,27 @@ mod tests {
                 vec![1],
             ),
         ] {
-            let mut book = Book::new(Spread::lone(0), 10);
-            book.budget = budget;
+            let mut book = Book::new(Spread::lone(0), pages(10), budget);
             for spread in &retunes {
-                book.retune(*spread, 10);
+                book.retune(*spread, pages(10));
             }
             for &page in &stores {
-                book.store(page, ready_seat(2, 1));
+                book.deliver(page, ready_seat(2, 1));
             }
             for &page in &kept {
                 assert!(
-                    book.decided.contains_key(&page),
+                    book.resident(page).is_some(),
                     "kept {page} evicted: retunes {retunes:?} stores {stores:?}"
                 );
             }
             for &page in &dropped {
                 assert!(
-                    !book.decided.contains_key(&page),
+                    book.resident(page).is_none(),
                     "dropped {page} survived: retunes {retunes:?} stores {stores:?}"
                 );
             }
             assert!(
-                book.live_bytes <= book.budget,
+                book.live_bytes() <= budget,
                 "live bytes over budget: {retunes:?} {stores:?}"
             );
         }
@@ -608,51 +629,50 @@ mod tests {
 
     #[test]
     fn a_failed_page_costs_the_fault_and_evicts() {
-        let mut book = Book::new(Spread::lone(5), 10);
-        book.retune(Spread::lone(5), 10);
-        book.store(1, failed_seat("boom"));
-        // The boxed fault is the failed page's whole cost; the message
-        // length no longer matters.
-        assert_eq!(book.live_bytes, FAILED_BYTES);
+        let mut book =
+            Book::new(Spread::lone(5), pages(10), BOOK_BUDGET_BYTES);
+        book.deliver(1, failed_seat("boom"));
+        // The fault is the failed page's whole cost, whatever its
+        // message says.
+        assert_eq!(book.live_bytes(), FAILED_BYTES);
         // One ready page (8 bytes) over a budget with room for the
         // fault but not both evicts the never-wanted failed page.
         book.budget = FAILED_BYTES + 7;
-        book.store(2, ready_seat(2, 1));
+        book.deliver(2, ready_seat(2, 1));
         assert!(
-            book.decided.contains_key(&2),
+            book.resident(2).is_some(),
             "the newcomer was evicted instead of the failed page"
         );
         assert!(
-            !book.decided.contains_key(&1),
+            book.resident(1).is_none(),
             "the failed page survived eviction"
         );
     }
 
     #[test]
-    fn saturating_store_never_drops_the_wanted_spread() {
-        let mut book = Book::new(Spread::lone(1), 20);
-        book.budget = 16;
+    fn saturating_deliver_never_drops_the_wanted_spread() {
+        let mut book = Book::new(Spread::lone(1), pages(20), 16);
         let wanted = Spread {
             first: 7,
             second: Some(8),
         };
-        book.retune(wanted, 20);
-        book.store(1, ready_seat(2, 1));
-        book.store(7, ready_seat(2, 1));
-        book.store(8, ready_seat(2, 1));
-        assert!(book.decided.contains_key(&7));
-        assert!(book.decided.contains_key(&8));
-        assert!(!book.decided.contains_key(&1));
+        book.retune(wanted, pages(20));
+        book.deliver(1, ready_seat(2, 1));
+        book.deliver(7, ready_seat(2, 1));
+        book.deliver(8, ready_seat(2, 1));
+        assert!(book.resident(7).is_some());
+        assert!(book.resident(8).is_some());
+        assert!(book.resident(1).is_none());
         let snapshot = book.snapshot(&wanted);
         assert!(matches!(snapshot.first, SeatView::Ready(_)));
         assert!(matches!(snapshot.second, Some(SeatView::Ready(_))));
-        // A store with no evictable victim (only wanted pages held)
+        // A deliver with no evictable victim (only wanted pages held)
         // stays over budget rather than dropping a shown page.
         book.budget = 1;
-        book.store(7, ready_seat(10, 10));
-        assert!(book.decided.contains_key(&7));
-        assert!(book.decided.contains_key(&8));
-        assert!(book.live_bytes > book.budget);
+        book.deliver(7, ready_seat(10, 10));
+        assert!(book.resident(7).is_some());
+        assert!(book.resident(8).is_some());
+        assert!(book.live_bytes() > book.budget);
     }
 
     fn tiny_source(tag: &str, page_count: u8) -> (TempDir, Arc<Source>) {
@@ -668,9 +688,9 @@ mod tests {
         (dir, source)
     }
 
-    /// Parks the worker after each store until the test releases that
-    /// store's number. Retunes sent while parked are guaranteed queued
-    /// behind it, which pins the decode order for assertions.
+    /// Parks the worker after each deliver until the test releases
+    /// that deliver's number. Retunes sent while parked are guaranteed
+    /// queued behind it, which pins the decode order for assertions.
     #[derive(Clone)]
     struct Gate(Arc<(Mutex<GateTickets>, Condvar)>);
 
@@ -719,8 +739,8 @@ mod tests {
                 &format!("page {page} not decoded in time"),
                 || match worker.snapshot(&Spread::lone(page)).first {
                     SeatView::Ready(seat) => Some(seat),
-                    SeatView::Failed(message) => {
-                        panic!("page {page} failed: {message}")
+                    SeatView::Failed(error) => {
+                        panic!("page {page} failed: {error}")
                     }
                     SeatView::Pending => None,
                 },
@@ -728,8 +748,20 @@ mod tests {
         }
     }
 
+    fn wait_failed(worker: &Worker, page: usize) -> Arc<PageError> {
+        eventually(20, "page never settled", || {
+            match worker.snapshot(&Spread::lone(page)).first {
+                SeatView::Pending => None,
+                SeatView::Failed(error) => Some(error),
+                SeatView::Ready(_) => {
+                    panic!("page {page} decoded as ready")
+                }
+            }
+        })
+    }
+
     #[test]
-    fn worker_end_to_end() {
+    fn a_pages_failure_survives_a_turn_away() {
         let dir = TempDir::new("worker-e2e");
         dir.write("bad.png", b"not a png at all");
         dir.write("ok.png", &tiny_png(3, 2, [0, 255, 0, 255]));
@@ -752,15 +784,7 @@ mod tests {
 
         let bad = Spread::lone(0);
         worker.retune(bad);
-        let failed =
-            eventually(20, "page 0 not decided in time", || match worker
-                .snapshot(&bad)
-                .first
-            {
-                SeatView::Failed(error) => Some(error),
-                SeatView::Ready(_) => panic!("bad.png decoded as Ready?"),
-                SeatView::Pending => None,
-            });
+        let failed = wait_failed(&worker, 0);
         assert!(
             failed.downcast_inner_ref::<image::ImageError>().is_some(),
             "bad.png must fail as an image decode fault, not {failed}"
@@ -803,23 +827,12 @@ mod tests {
             zip.finish().expect("zip finishes");
         }
         let source = Arc::new(Source::open(&zip_path).expect("zip opens"));
-        let far = source.len() - 1;
+        let far = source.len().get() - 1;
         let worker =
             Worker::spawn(Arc::clone(&source), Spread::lone(far), |_| {})
                 .expect("worker spawns");
 
-        let settled = |page: usize| {
-            eventually(20, "page never settled", || {
-                match worker.snapshot(&Spread::lone(page)).first {
-                    SeatView::Pending => None,
-                    SeatView::Failed(error) => Some(error),
-                    SeatView::Ready(_) => {
-                        panic!("zeros decoded as an image?")
-                    }
-                }
-            })
-        };
-        let far_page = settled(far);
+        let far_page = wait_failed(&worker, far);
         assert!(
             far_page
                 .downcast_inner_ref::<image::ImageError>()
@@ -852,18 +865,12 @@ mod tests {
                 "page {page} decoded past the trail radius"
             );
         }
-        // The last-wanted records are what keep a wanted spread in the
-        // book, so the wiring is pinned on them.
+        // A spread the trail dropped decodes again once wanted.
         worker.retune(Spread {
             first: 3,
             second: Some(4),
         });
         wait_ready(&worker, &[3, 4]);
-        let was_wanted = |page: usize| {
-            worker.book.lock().last_wanted.contains_key(&page)
-        };
-        assert!(was_wanted(3), "page 3 never recorded as wanted");
-        assert!(was_wanted(4), "page 4 never recorded as wanted");
     }
 
     #[test]
@@ -878,7 +885,7 @@ mod tests {
         worker.retune(Spread::lone(60));
         gate.release(1);
         wait_ready(&worker, &[60]);
-        // The worker is parked on page 60's store, so the old window
+        // The worker is parked on page 60's deliver, so the old window
         // pages 1 and 2 cannot have been decoded before it.
         for page in [1, 2] {
             assert!(

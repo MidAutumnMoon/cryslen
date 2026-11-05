@@ -1,6 +1,25 @@
 //! View math: the view modes, the spread-pairing model, and the
 //! placement of a composed spread in the viewport. Pure data, no GL.
 
+use std::num::NonZeroUsize;
+
+/// A book's page count. A live source lists at least one page, so the
+/// count is nonzero by shape and the spread math never clamps it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageCount(NonZeroUsize);
+
+impl PageCount {
+    /// `None` for zero: an empty book is refused at open, never
+    /// carried as a count.
+    pub fn new(count: usize) -> Option<Self> {
+        NonZeroUsize::new(count).map(Self)
+    }
+
+    pub fn get(self) -> usize {
+        self.0.get()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewMode {
     /// One page per screen, left to right.
@@ -61,20 +80,14 @@ pub struct Spread {
 
 /// Spread containing `index` under `mode`, clamped to the book. An
 /// odd tail shows one page (`second: None`).
-pub fn spread_for(index: usize, mode: ViewMode, len: usize) -> Spread {
-    let len = len.max(1);
+pub fn spread_for(index: usize, mode: ViewMode, len: PageCount) -> Spread {
+    let len = len.get();
     let index = index.min(len - 1);
     if !mode.pairs() {
-        return Spread {
-            first: index,
-            second: None,
-        };
+        return Spread::lone(index);
     }
     if index == 0 {
-        return Spread {
-            first: 0,
-            second: None,
-        };
+        return Spread::lone(0);
     }
     let first = spread_start(spread_number(index));
     Spread {
@@ -89,9 +102,9 @@ pub fn advance(
     current: usize,
     forward: bool,
     mode: ViewMode,
-    len: usize,
+    len: PageCount,
 ) -> usize {
-    let len = len.max(1);
+    let len = len.get();
     let current = current.min(len - 1);
     if !mode.pairs() {
         let next = if forward {
@@ -124,7 +137,7 @@ pub fn switch_mode(
     old: ViewMode,
     new: ViewMode,
     index: usize,
-    len: usize,
+    len: PageCount,
 ) -> ModeSwitch {
     if old.pairs() == new.pairs() {
         ModeSwitch {
@@ -155,22 +168,9 @@ fn spread_start(number: usize) -> usize {
 }
 
 /// How many spreads a book of `len` pages holds: the lone cover, then
-/// the pairs.
+/// the pairs. `len` is at least 1, as every [`PageCount`] unwraps to.
 fn spread_count(len: usize) -> usize {
-    let len = len.max(1);
     1 + (len - 1).div_ceil(2)
-}
-
-/// One of the two seats of an on-screen spread.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Seat {
-    Left,
-    Right,
-}
-
-impl Seat {
-    /// The seats in on-screen order.
-    pub const ALL: [Self; 2] = [Self::Left, Self::Right];
 }
 
 /// Seat order as [left, right] under `mode`. Western reads first-left.
@@ -188,7 +188,8 @@ pub fn seating<T>(
 }
 
 impl Spread {
-    #[cfg(test)]
+    /// A one-page spread: the shape every Normal-mode spread has, and
+    /// the cover plus odd tails in the double modes.
     pub const fn lone(first: usize) -> Self {
         Self {
             first,
@@ -352,12 +353,11 @@ pub fn first_spread() -> usize {
     0
 }
 
-pub fn last_spread(mode: ViewMode, len: usize) -> usize {
-    let len = len.max(1);
+pub fn last_spread(mode: ViewMode, len: PageCount) -> usize {
     if !mode.pairs() {
-        return len - 1;
+        return len.get() - 1;
     }
-    spread_start(spread_count(len) - 1)
+    spread_start(spread_count(len.get()) - 1)
 }
 
 /// Zoom scale bounds, in screen px per image px. Applied at zoom time
@@ -517,11 +517,21 @@ impl Fit {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "a panic in test code is inconsequential"
+)]
 mod tests {
     use super::*;
 
+    /// A page count for the tables; every row is a real book.
+    fn pages(count: usize) -> PageCount {
+        PageCount::new(count).expect("test book is non-empty")
+    }
+
     #[test]
     fn spread_structure() {
+        assert!(PageCount::new(0).is_none());
         for (mode, pairs, rtl) in [
             (ViewMode::Normal, false, false),
             (ViewMode::Manga, true, true),
@@ -532,17 +542,17 @@ mod tests {
         }
         // Anchor: page 1 opens the first pair.
         assert_eq!(
-            spread_for(1, ViewMode::Manga, 10),
+            spread_for(1, ViewMode::Manga, pages(10)),
             Spread {
                 first: 1,
                 second: Some(2)
             }
         );
         for &mode in &ViewMode::ALL {
-            for len in 0_usize..=10 {
+            for len in 1_usize..=10 {
                 for page in 0..=(len + 2) {
-                    let clamped = page.min(len.max(1) - 1);
-                    let spread = spread_for(page, mode, len);
+                    let clamped = page.min(len - 1);
+                    let spread = spread_for(page, mode, pages(len));
                     assert!(
                         spread.contains(clamped),
                         "mode {mode:?} len {len} page {page}"
@@ -574,19 +584,20 @@ mod tests {
 
     #[test]
     fn advance_steps_between_spread_starts() {
-        for len in [0_usize, 1, 2, 3, 6, 9, 10] {
+        for len in [1_usize, 2, 3, 6, 9, 10] {
             for &mode in &ViewMode::ALL {
                 for page in 0..=len {
                     for &forward in &[false, true] {
-                        let stepped = advance(page, forward, mode, len);
+                        let stepped =
+                            advance(page, forward, mode, pages(len));
                         assert_eq!(
-                            spread_for(stepped, mode, len).first,
+                            spread_for(stepped, mode, pages(len)).first,
                             stepped,
                             "stepped page must be a spread start: len {len} mode {mode:?} page {page} forward {forward}"
                         );
                         assert_eq!(
-                            advance(stepped, !forward, mode, len),
-                            spread_for(page, mode, len).first,
+                            advance(stepped, !forward, mode, pages(len)),
+                            spread_for(page, mode, pages(len)).first,
                             "step then step back must round-trip: len {len} mode {mode:?} page {page} forward {forward}"
                         );
                     }
@@ -594,39 +605,37 @@ mod tests {
             }
         }
         // Direction anchors: a mid-spread step lands on the neighbor spread's start.
-        assert_eq!(advance(1, true, ViewMode::Manga, 10), 3);
-        assert_eq!(advance(4, true, ViewMode::Normal, 10), 5);
+        assert_eq!(advance(1, true, ViewMode::Manga, pages(10)), 3);
+        assert_eq!(advance(4, true, ViewMode::Normal, pages(10)), 5);
         // The cover's next spread starts at 1, not 2.
-        assert_eq!(advance(0, true, ViewMode::Manga, 10), 1);
-        // A zero-length book never exists, but the math must tolerate it.
-        assert_eq!(advance(0, true, ViewMode::Manga, 0), 0);
+        assert_eq!(advance(0, true, ViewMode::Manga, pages(10)), 1);
     }
 
     #[test]
     fn mode_switch_relands_only_on_pairing_change() {
         assert_eq!(
-            switch_mode(ViewMode::Normal, ViewMode::Manga, 2, 10),
+            switch_mode(ViewMode::Normal, ViewMode::Manga, 2, pages(10)),
             ModeSwitch {
                 index: 1,
                 pairing_changed: true
             }
         );
         assert_eq!(
-            switch_mode(ViewMode::Normal, ViewMode::Comic, 0, 10),
+            switch_mode(ViewMode::Normal, ViewMode::Comic, 0, pages(10)),
             ModeSwitch {
                 index: 0,
                 pairing_changed: true
             }
         );
         assert_eq!(
-            switch_mode(ViewMode::Manga, ViewMode::Comic, 5, 10),
+            switch_mode(ViewMode::Manga, ViewMode::Comic, 5, pages(10)),
             ModeSwitch {
                 index: 5,
                 pairing_changed: false
             }
         );
         assert_eq!(
-            switch_mode(ViewMode::Manga, ViewMode::Manga, 5, 10),
+            switch_mode(ViewMode::Manga, ViewMode::Manga, 5, pages(10)),
             ModeSwitch {
                 index: 5,
                 pairing_changed: false
@@ -826,25 +835,20 @@ mod tests {
         assert_eq!(first_spread(), 0);
         // Single page: both ends are the cover.
         for mode in ViewMode::ALL {
-            assert_eq!(last_spread(mode, 1), 0);
-            assert_eq!(
-                last_spread(mode, 0),
-                0,
-                "a zero-length book tolerates"
-            );
+            assert_eq!(last_spread(mode, pages(1)), 0);
         }
         // Pairs: the final spread starts on the last odd page.
-        assert_eq!(last_spread(ViewMode::Manga, 10), 9);
-        assert_eq!(last_spread(ViewMode::Comic, 11), 9);
+        assert_eq!(last_spread(ViewMode::Manga, pages(10)), 9);
+        assert_eq!(last_spread(ViewMode::Comic, pages(11)), 9);
         // An odd tail ends alone on the previous pair start.
-        assert_eq!(last_spread(ViewMode::Manga, 12), 11);
+        assert_eq!(last_spread(ViewMode::Manga, pages(12)), 11);
         // Normal: the last page.
-        assert_eq!(last_spread(ViewMode::Normal, 10), 9);
+        assert_eq!(last_spread(ViewMode::Normal, pages(10)), 9);
         for len in 1_usize..=12 {
             for &mode in &ViewMode::ALL {
-                let last = last_spread(mode, len);
+                let last = last_spread(mode, pages(len));
                 assert_eq!(
-                    spread_for(last, mode, len).first,
+                    spread_for(last, mode, pages(len)).first,
                     last,
                     "len {len} {mode:?}"
                 );

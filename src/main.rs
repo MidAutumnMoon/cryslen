@@ -33,6 +33,7 @@ use rustfs_mimalloc::MiMalloc;
 #[global_allocator]
 static ALLOC: MiMalloc = MiMalloc;
 
+#[derive(Debug, PartialEq)]
 enum Arg {
     Open(PathBuf),
     Image { dir: PathBuf, name: String },
@@ -117,7 +118,7 @@ fn run(open_path: &Path, land_on: Option<&str>) -> eros::Result<()> {
         // Every page index below `len` has a name, so the indices survive
         // the filter.
         landing(
-            (0..source.len()).filter_map(|page| source.name(page)),
+            (0..source.len().get()).filter_map(|page| source.name(page)),
             name,
         )
     });
@@ -132,10 +133,6 @@ fn run(open_path: &Path, land_on: Option<&str>) -> eros::Result<()> {
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::panic,
-    reason = "a panic in test code is inconsequential"
-)]
 mod tests {
     use super::*;
     use crate::testkit::TempDir;
@@ -149,9 +146,21 @@ mod tests {
         dir.write("notes.txt", b"not a page");
 
         let rows = [
-            (dir.path().join("page.png"), Ok(Some("page.png"))),
-            (dir.path().join("book.cbz"), Ok(None)),
-            (dir.path().to_path_buf(), Ok(None)),
+            (
+                dir.path().join("page.png"),
+                Ok(Arg::Image {
+                    dir: dir.path().to_path_buf(),
+                    name: String::from("page.png"),
+                }),
+            ),
+            (
+                dir.path().join("book.cbz"),
+                Ok(Arg::Open(dir.path().join("book.cbz"))),
+            ),
+            (
+                dir.path().to_path_buf(),
+                Ok(Arg::Open(dir.path().to_path_buf())),
+            ),
             (
                 dir.path().join("notes.txt"),
                 Err(fault::OpenRefusal::Unsupported(
@@ -160,45 +169,7 @@ mod tests {
             ),
         ];
         for (path, want) in rows {
-            match (classify(&path), want) {
-                (
-                    Ok(Arg::Image { dir: parent, name }),
-                    Ok(Some(want_name)),
-                ) => {
-                    assert_eq!(
-                        parent,
-                        dir.path(),
-                        "{}: parent dir",
-                        path.display()
-                    );
-                    assert_eq!(
-                        name,
-                        want_name,
-                        "{}: image name",
-                        path.display()
-                    );
-                }
-                (Ok(Arg::Open(open)), Ok(None)) => {
-                    assert_eq!(
-                        open,
-                        path,
-                        "{}: source path",
-                        path.display()
-                    );
-                }
-                (Err(error), Err(want_refusal)) => {
-                    assert_eq!(
-                        error,
-                        want_refusal,
-                        "{}: open refusal",
-                        path.display()
-                    );
-                }
-                (_, want) => panic!(
-                    "{}: wrong kind, wanted {want:?}",
-                    path.display()
-                ),
-            }
+            assert_eq!(classify(&path), want, "{}", path.display());
         }
     }
 

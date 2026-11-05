@@ -1,22 +1,47 @@
 //! Screen: what each seat shows. The commit policy holds a spread
 //! change while any of its wanted seats is undecided and changes every
 //! seat in one frame, stages the forward spread's textures ahead of a
-//! turn, and owns the errors no page owns.
+//! turn, and owns the upload error no page owns. Seat binding is this
+//! module's one fact: the pages, their dims, and the uploads they
+//! need all read from it.
 
 use std::sync::Arc;
 
 use crate::decode::Decoded;
-use crate::fault::OpenError;
 use crate::fault::PageError;
-use crate::fault::StatusFault;
+use crate::fault::TextureError;
 use crate::render::PageTextures;
 use crate::view;
-use crate::view::Seat;
+use crate::view::PageCount;
 use crate::view::Spread;
 use crate::view::ViewMode;
 use crate::worker::SeatView;
 use crate::worker::SpreadView;
 use crate::worker::Worker;
+
+/// The texture work the screen asks for: stage one page's textures,
+/// protecting `bound` — the pages the seats draw — from eviction.
+/// `PageTextures` implements this against GL; tests drive it with a
+/// recorder.
+pub trait PageStage {
+    fn stage(
+        &mut self,
+        page: usize,
+        decoded: &Decoded,
+        bound: [Option<usize>; 2],
+    ) -> Result<(), TextureError>;
+}
+
+impl PageStage for PageTextures {
+    fn stage(
+        &mut self,
+        page: usize,
+        decoded: &Decoded,
+        bound: [Option<usize>; 2],
+    ) -> Result<(), TextureError> {
+        self.stage(page, decoded, bound)
+    }
+}
 
 enum SeatStep<'view> {
     Show {
@@ -108,7 +133,11 @@ fn plan_screen(
 
 /// The spread one forward turn lands on: the only neighbor the frame
 /// stages and watches, because reading runs forward.
-fn forward_spread(spread: Spread, mode: ViewMode, len: usize) -> Spread {
+fn forward_spread(
+    spread: Spread,
+    mode: ViewMode,
+    len: PageCount,
+) -> Spread {
     let next = view::advance(spread.first, true, mode, len);
     view::spread_for(next, mode, len)
 }
@@ -124,7 +153,7 @@ pub(crate) fn page_watched(
     page: usize,
     spread: Spread,
     mode: ViewMode,
-    len: usize,
+    len: PageCount,
 ) -> bool {
     spread.contains(page)
         || forward_spread(spread, mode, len).contains(page)
@@ -148,28 +177,27 @@ pub(crate) struct Screen {
     /// commit (cold start).
     shown: Option<Spread>,
     seats: [Option<SeatShow>; 2],
-    /// A texture upload the GPU refused. A binding frame rewrites this:
-    /// a refused bind retries every frame while its page stays wanted,
+    /// A texture upload the GPU refused. A staging frame rewrites this:
+    /// a refused upload retries every frame while its page stays wanted,
     /// so the error holds exactly that long.
     upload_error: Option<Arc<PageError>>,
-    /// A failure the app noted (a book switch that failed). No frame
-    /// retries it, so it holds until a successful switch clears the
-    /// book.
-    noted_error: Option<Arc<OpenError>>,
 }
 
 impl Screen {
     /// Present `wanted` through `pages` per the plan. Returns whether
     /// the frame committed a new spread, which re-arms the caller's fit.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "i enumerates two zipped two-seat arrays, so it always indexes within them"
+    )]
     pub(crate) fn display(
         &mut self,
-        pages: &mut PageTextures,
+        pages: &mut impl PageStage,
         wanted: Spread,
         mode: ViewMode,
         snapshot: &SpreadView,
     ) -> bool {
-        let bound =
-            self.seats.each_ref().map(|seat| seat.map(|show| show.page));
+        let mut bound = self.seat_pages();
         let plan = plan_screen(
             self.shown,
             wanted,
@@ -177,27 +205,30 @@ impl Screen {
             snapshot.seats(mode),
             bound,
         );
-        // The frame's binds are one outcome: a refused upload on either
-        // seat must survive the partner's success, and a frame that
-        // bound cleanly clears the upload error. A hold frame leaves it.
+        // The frame's uploads are one outcome: a refused upload on
+        // either seat must survive the partner's success, and a frame
+        // that staged cleanly clears the upload error. A hold frame
+        // leaves it.
         let mut bind_error = None;
-        let mut bound_cleanly = false;
-        for ((seat, shown), step) in Seat::ALL
-            .into_iter()
-            .zip(self.seats.each_mut())
-            .zip(plan.steps)
+        let mut staged_cleanly = false;
+        for (i, (shown, step)) in
+            self.seats.iter_mut().zip(plan.steps).enumerate()
         {
             match step {
                 SeatStep::Show { page, decoded } => {
-                    match pages.bind(seat, page, decoded) {
-                        Ok(()) => bound_cleanly = true,
+                    // The incoming page joins the protected set before
+                    // the upload, so a fresh destination cannot evict
+                    // itself.
+                    bound[i] = Some(page);
+                    match pages.stage(page, decoded, bound) {
+                        Ok(()) => staged_cleanly = true,
                         Err(error) => {
                             bind_error = Some(Arc::new(error.widen()));
                         }
                     }
                     // The seat keeps its page and dims even on a refused
                     // upload, so the layout and hold policy stay stable
-                    // while the next frame retries the bind.
+                    // while the next frame retries the stage.
                     *shown = Some(SeatShow {
                         page,
                         dims: (decoded.width, decoded.height),
@@ -205,12 +236,12 @@ impl Screen {
                 }
                 SeatStep::Hold => {}
                 SeatStep::Clear => {
+                    bound[i] = None;
                     *shown = None;
-                    pages.clear(seat);
                 }
             }
         }
-        if bind_error.is_some() || bound_cleanly {
+        if bind_error.is_some() || staged_cleanly {
             self.upload_error = bind_error;
         }
         if let Some((page, decoded)) = plan.stage {
@@ -221,15 +252,15 @@ impl Screen {
     }
 
     /// Upload the forward spread's decided pages ahead of the turn, so
-    /// an ordinary commit is a pure rebind: the multi-megabyte upload
-    /// lands on this frame, which redraws anyway, instead of the turn's
-    /// first visible one.
+    /// an ordinary commit is a pure restage: the multi-megabyte upload
+    /// lands on this frame, which redraws anyway, instead of the
+    /// turn's first visible one.
     pub(crate) fn stage_forward(
         &mut self,
-        pages: &mut PageTextures,
+        pages: &mut impl PageStage,
         current: Spread,
         mode: ViewMode,
-        len: usize,
+        len: PageCount,
         worker: &Worker,
     ) {
         let next = forward_spread(current, mode, len);
@@ -244,36 +275,33 @@ impl Screen {
         }
     }
 
-    /// Upload `page`'s textures without binding a seat. A refusal
-    /// surfaces in the status line and repeats while staging retries
-    /// each frame.
-    fn stage(
-        &mut self,
-        pages: &mut PageTextures,
-        page: usize,
-        decoded: &Arc<Decoded>,
-    ) {
-        if let Err(error) = pages.stage(page, decoded) {
-            self.upload_error = Some(Arc::new(error.widen()));
-        }
+    /// The page each seat shows, for staging protection and the draw.
+    pub(crate) fn seat_pages(&self) -> [Option<usize>; 2] {
+        self.seats.each_ref().map(|seat| seat.map(|show| show.page))
     }
 
     pub(crate) fn seat_dims(&self) -> [Option<(u32, u32)>; 2] {
         self.seats.each_ref().map(|seat| seat.map(|show| show.dims))
     }
 
-    /// An error the status line must show that no page owns.
-    pub(crate) fn error(&self) -> Option<StatusFault> {
-        if let Some(error) = &self.noted_error {
-            return Some(StatusFault::Noted(Arc::clone(error)));
-        }
-        self.upload_error
-            .as_ref()
-            .map(|error| StatusFault::Page(Arc::clone(error)))
+    /// The refused upload the status line must show, if the seats'
+    /// pages are still wanted.
+    pub(crate) fn upload_error(&self) -> Option<&Arc<PageError>> {
+        self.upload_error.as_ref()
     }
 
-    pub(crate) fn note_error(&mut self, error: Arc<OpenError>) {
-        self.noted_error = Some(error);
+    /// Upload `page`'s textures without binding a seat. A refusal
+    /// surfaces in the status line and repeats while staging retries
+    /// each frame.
+    fn stage(
+        &mut self,
+        pages: &mut impl PageStage,
+        page: usize,
+        decoded: &Arc<Decoded>,
+    ) {
+        if let Err(error) = pages.stage(page, decoded, self.seat_pages()) {
+            self.upload_error = Some(Arc::new(error.widen()));
+        }
     }
 
     /// Drop every shown fact.
@@ -281,16 +309,25 @@ impl Screen {
         self.shown = None;
         self.seats = [None, None];
         self.upload_error = None;
-        self.noted_error = None;
     }
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "a panic in test code is inconsequential"
+)]
 mod tests {
     use super::*;
+    use crate::fault::TextureFault;
     use crate::testkit::failed_seat;
     use crate::testkit::ready_seat;
     use crate::view::ViewMode;
+    use eros::ErrorUnion;
+
+    fn pages(count: usize) -> PageCount {
+        PageCount::new(count).expect("test book is non-empty")
+    }
 
     #[test]
     fn plan_screen_table() {
@@ -514,5 +551,199 @@ mod tests {
                 "{name}: stage"
             );
         }
+    }
+
+    /// A `PageStage` that records every ask and refuses the pages it
+    /// is told to, so `display`'s apply half runs headless.
+    struct Recorder {
+        refuse: Vec<usize>,
+        log: Vec<(usize, [Option<usize>; 2])>,
+    }
+
+    impl PageStage for Recorder {
+        fn stage(
+            &mut self,
+            page: usize,
+            _decoded: &Decoded,
+            bound: [Option<usize>; 2],
+        ) -> Result<(), TextureError> {
+            self.log.push((page, bound));
+            if self.refuse.contains(&page) {
+                Err(ErrorUnion::new(TextureFault {
+                    dims: (1, 1),
+                    max_edge: 1,
+                }))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn lone_view(seat: SeatView) -> SpreadView {
+        SpreadView {
+            first: seat,
+            second: None,
+        }
+    }
+
+    #[test]
+    fn a_refused_upload_keeps_the_seat_and_retries() {
+        let wanted = Spread::lone(5);
+        let mut screen = Screen::default();
+        let mut pages = Recorder {
+            refuse: vec![5],
+            log: Vec::new(),
+        };
+
+        // The upload is refused: the seat keeps its page and dims, the
+        // commit happens, and the error surfaces.
+        let committed = screen.display(
+            &mut pages,
+            wanted,
+            ViewMode::Normal,
+            &lone_view(ready_seat(600, 700)),
+        );
+        assert!(committed, "the refused page still commits the spread");
+        assert_eq!(screen.seat_dims(), [Some((600, 700)), None]);
+        assert!(screen.upload_error().is_some());
+
+        // The next frame retries the same stage: the page is protected
+        // in its own bound set even though the upload never landed.
+        pages.refuse.clear();
+        let retried = screen.display(
+            &mut pages,
+            wanted,
+            ViewMode::Normal,
+            &lone_view(ready_seat(600, 700)),
+        );
+        assert!(!retried, "the spread is already shown");
+        assert_eq!(pages.log.last().copied(), Some((5, [Some(5), None])));
+        assert!(
+            screen.upload_error().is_none(),
+            "a cleanly staged frame clears the error"
+        );
+    }
+
+    #[test]
+    fn a_refused_upload_survives_the_partners_success() {
+        // Manga: left = second page 6, right = first page 5.
+        let wanted = Spread {
+            first: 5,
+            second: Some(6),
+        };
+        let mut screen = Screen::default();
+        let mut pages = Recorder {
+            refuse: vec![6],
+            log: Vec::new(),
+        };
+        screen.display(
+            &mut pages,
+            wanted,
+            ViewMode::Manga,
+            &SpreadView {
+                first: ready_seat(500, 700),
+                second: Some(ready_seat(600, 700)),
+            },
+        );
+        assert!(screen.upload_error().is_some());
+        // The partner's success must not clear the refused upload's
+        // error: the frame is one outcome.
+        assert_eq!(
+            screen.seat_dims(),
+            [Some((600, 700)), Some((500, 700))]
+        );
+        // The incoming pages were protected across both stages: the
+        // second stage's bound set names both seats' new pages.
+        assert_eq!(
+            pages.log,
+            vec![(6, [Some(6), None]), (5, [Some(6), Some(5)])]
+        );
+    }
+
+    #[test]
+    fn a_hold_frame_leaves_the_upload_error_alone() {
+        let refused = Spread::lone(5);
+        let wanted = Spread::lone(6);
+        let mut screen = Screen::default();
+        let mut pages = Recorder {
+            refuse: vec![5],
+            log: Vec::new(),
+        };
+        // Seed the upload error: page 5's stage is refused while its
+        // seat keeps it.
+        screen.display(
+            &mut pages,
+            refused,
+            ViewMode::Normal,
+            &lone_view(ready_seat(600, 700)),
+        );
+        assert!(screen.upload_error().is_some());
+        // A hold frame plans no stages at all, so the refusal survives
+        // it: only a staging frame rewrites the error.
+        pages.log.clear();
+        let committed = screen.display(
+            &mut pages,
+            wanted,
+            ViewMode::Normal,
+            &lone_view(SeatView::Pending),
+        );
+        assert!(!committed);
+        assert!(pages.log.is_empty(), "a hold frame stages nothing");
+        assert!(
+            screen.upload_error().is_some(),
+            "a hold frame leaves the upload error"
+        );
+    }
+
+    #[test]
+    fn a_clear_step_drops_the_seat_without_touching_pages() {
+        let old = Spread::lone(5);
+        let wanted = Spread::lone(6);
+        let mut screen = Screen::default();
+        let mut pages = Recorder {
+            refuse: vec![],
+            log: Vec::new(),
+        };
+        screen.display(
+            &mut pages,
+            old,
+            ViewMode::Normal,
+            &lone_view(ready_seat(600, 700)),
+        );
+        pages.log.clear();
+        // A failed page clears its seat: pure bookkeeping, no stage ask.
+        screen.display(
+            &mut pages,
+            wanted,
+            ViewMode::Normal,
+            &lone_view(failed_seat("boom")),
+        );
+        assert_eq!(screen.seat_dims(), [None, None]);
+        assert!(pages.log.is_empty(), "clearing a seat stages nothing");
+        assert_eq!(screen.seat_pages(), [None, None]);
+    }
+
+    #[test]
+    fn page_watched_covers_the_shown_and_forward_spreads() {
+        let len = pages(10);
+        let shown = Spread {
+            first: 3,
+            second: Some(4),
+        };
+        for page in [3_usize, 4] {
+            assert!(page_watched(page, shown, ViewMode::Manga, len));
+        }
+        // The forward spread under Manga from 3 is {5, 6}.
+        for page in [5_usize, 6] {
+            assert!(page_watched(page, shown, ViewMode::Manga, len));
+        }
+        assert!(!page_watched(0, shown, ViewMode::Manga, len));
+        assert!(!page_watched(9, shown, ViewMode::Manga, len));
+        // At the book's end the forward spread wraps to the cover.
+        let last = Spread {
+            first: 9,
+            second: None,
+        };
+        assert!(page_watched(0, last, ViewMode::Manga, len));
     }
 }
