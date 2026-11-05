@@ -9,7 +9,7 @@ use winit::keyboard::ModifiersState;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[expect(
     clippy::redundant_pub_crate,
-    reason = "pub(crate) is the crate's visibility style for crate-wide items, even inside private modules"
+    reason = "crate-wide items use pub(crate) as project style"
 )]
 pub(crate) enum Action {
     Quit,

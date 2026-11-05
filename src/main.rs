@@ -41,7 +41,7 @@ enum Arg {
 
 #[expect(
     clippy::use_debug,
-    reason = "the fatal exit prints the error's Debug on purpose: the full report with location, source chain, and backtrace status"
+    reason = "the fatal exit prints the full error report"
 )]
 fn main() -> ExitCode {
     use std::env;

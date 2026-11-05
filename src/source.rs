@@ -57,7 +57,7 @@ fn archive_kind(path: &Path) -> Option<ArchiveKind> {
 
 #[expect(
     clippy::redundant_pub_crate,
-    reason = "pub(crate) is the crate's visibility style for crate-wide items, even inside private modules"
+    reason = "crate-wide items use pub(crate) as project style"
 )]
 pub(crate) fn is_archive(path: &Path) -> bool {
     archive_kind(path).is_some()
@@ -297,7 +297,7 @@ impl Source {
     /// directory.
     #[expect(
         clippy::indexing_slicing,
-        reason = "the page list is non-empty and immutable, and callers pass an index below its length; the debug assert restates it"
+        reason = "the list is non-empty and callers stay below its length; the debug assert restates it"
     )]
     pub fn page_name(&self, index: usize) -> PageName {
         debug_assert!(
@@ -383,7 +383,7 @@ fn validated_listing(
 /// significant like an archive listing.
 #[expect(
     clippy::redundant_pub_crate,
-    reason = "pub(crate) is the crate's visibility style for crate-wide items, even inside private modules"
+    reason = "crate-wide items use pub(crate) as project style"
 )]
 pub(crate) fn compare_names(left: &str, right: &str) -> Ordering {
     let (mut left, mut right) = (left.as_bytes(), right.as_bytes());
@@ -461,7 +461,7 @@ fn read_member(
             #[expect(
                 clippy::let_underscore_must_use,
                 clippy::let_underscore_untyped,
-                reason = "the drain's outcome is irrelevant; only its side effect of consuming the member's remaining bytes matters"
+                reason = "only the drain's side effect matters; its result is irrelevant"
             )]
             let _ = member.read_to_end(&mut bytes);
             Err(ErrorUnion::new(error))
@@ -739,7 +739,7 @@ mod tests {
             .unwrap();
         #[expect(
             clippy::rest_pattern_accessible_field,
-            reason = "binding the ignored field as `_` instead trips unneeded_field_pattern"
+            reason = "naming the ignored field as `_` would trip unneeded_field_pattern"
         )]
         let Err(OpenRefusal::TooBig { unpacked, .. }) = guard_memory(
             available - MEM_RESERVE_BYTES + 1,
@@ -785,7 +785,7 @@ mod tests {
         assert_eq!(unpacked, u64::MAX);
         #[expect(
             clippy::rest_pattern_accessible_field,
-            reason = "binding the ignored field as `_` instead trips unneeded_field_pattern"
+            reason = "naming the ignored field as `_` would trip unneeded_field_pattern"
         )]
         let Err(OpenRefusal::TooBig { unpacked, .. }) =
             guard_memory(unpacked, Some(4 * 1024 * 1024 * 1024))

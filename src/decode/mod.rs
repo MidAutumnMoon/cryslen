@@ -7,7 +7,7 @@
 
 #![expect(
     clippy::definition_in_module_root,
-    reason = "the decode tree's shared vocabulary and dispatch live in the module root by design; per-format detail sits in the submodules"
+    reason = "the decode tree's shared vocabulary lives in its module root by design"
 )]
 
 use eros::ErrorUnion;
@@ -365,7 +365,7 @@ where
             let index = source_index(x, y);
             #[expect(
                 clippy::indexing_slicing,
-                reason = "the transform maps inside the plane: out dims keep the sample count and coordinates stay in range"
+                reason = "out dims keep the sample count, so the mapped index stays in range"
             )]
             out.push(samples[index]);
         }
@@ -398,7 +398,7 @@ pub fn decode(bytes: &[u8], name: &str) -> Result<Decoded, DecodeError> {
 /// decode and what gets listed as a page.
 #[expect(
     clippy::redundant_pub_crate,
-    reason = "pub(crate) is the crate's visibility style for crate-wide items, even inside private modules"
+    reason = "crate-wide items use pub(crate) as project style"
 )]
 pub(crate) fn format_from_name(name: &str) -> Option<Format> {
     use std::path::Path;

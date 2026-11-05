@@ -254,7 +254,7 @@ impl PageTextures {
     /// silently black, so it is refused as the page's error instead.
     #[expect(
         clippy::same_name_method,
-        reason = "the screen's PageStage trait mirrors this API on purpose: its impl is plain delegation, and tests substitute a recorder for the GL type"
+        reason = "PageStage mirrors this API by design; its impl delegates and tests substitute a recorder"
     )]
     pub fn stage(
         &mut self,
@@ -356,7 +356,7 @@ impl PageTextures {
         #[expect(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
-            reason = "viewport size is whole physical px carried as f32"
+            reason = "viewport size is clamped non-negative whole physical px held as f32"
         )]
         let (width, height) =
             (viewport.size().0 as u32, viewport.size().1 as u32);
@@ -517,7 +517,7 @@ unsafe fn create_pipeline(
     gl.bind_vertex_array(Some(vao));
     #[expect(
         clippy::expect_used,
-        reason = "the attribute is declared and used in this file's in-tree shader sources, so failure means an in-tree regression"
+        reason = "declared and used in the in-tree shader sources, so a miss is an in-tree regression"
     )]
     let loc = gl
         .get_attrib_location(program, "pos")
@@ -532,7 +532,7 @@ unsafe fn create_pipeline(
     let location = |name: &str| {
         #[expect(
             clippy::expect_used,
-            reason = "the uniform is declared and statically used by this file's in-tree shader sources, so a missing location means an in-tree regression"
+            reason = "declared and used in the in-tree shader sources, so a miss is an in-tree regression"
         )]
         gl.get_uniform_location(program, name)
             .expect("uniform location in page shader")
@@ -730,7 +730,7 @@ unsafe fn delete_entry(gl: &glow::Context, entry: &Entry) {
 
 #[expect(
     clippy::cast_possible_wrap,
-    reason = "GL enums, 16384-capped texture edges, and window px all sit far below i32. This is the GL ABI's u32-enum to i32-parameter seam"
+    reason = "GL enums, capped texture edges, and window px fit i32; the GL ABI takes i32 enums"
 )]
 fn gl_int(value: u32) -> i32 {
     value as i32
@@ -1046,7 +1046,7 @@ fn stub_plane(depth: u8, code: u32) -> Plane {
     if depth > 8 {
         #[expect(
             clippy::cast_possible_truncation,
-            reason = "the depth clamp keeps codes within u16"
+            reason = "callers pass a depth clamped to 16, so the code fits u16"
         )]
         let wide = code as u16;
         Plane::U16(vec![wide].into_boxed_slice())

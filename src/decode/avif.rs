@@ -237,7 +237,7 @@ fn display_transform(frame: &avifImage) -> DisplayTransform {
 #[expect(
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
-    reason = "the thread count is min(available, MAX_THREADS) before the C-int maxThreads field, so the narrowing cannot occur"
+    reason = "the thread count is capped at MAX_THREADS, so it fits the C int field"
 )]
 fn threads() -> i32 {
     use std::num::NonZeroUsize;

@@ -45,7 +45,7 @@ pub enum UserEvent {
 /// A failed send means the loop is gone, leaving the event with no consumer.
 #[expect(
     clippy::redundant_pub_crate,
-    reason = "pub(crate) is the crate's visibility style for crate-wide items, even inside private modules"
+    reason = "crate-wide items use pub(crate) as project style"
 )]
 pub(crate) fn post(proxy: &EventLoopProxy<UserEvent>, event: UserEvent) {
     let Ok(()) = proxy.send_event(event) else {
@@ -419,7 +419,7 @@ impl App {
 
 #[expect(
     clippy::rest_pattern_accessible_field,
-    reason = "the matched fields are unused here, so naming them would trip unneeded_field_pattern"
+    reason = "the ignored fields are unused; naming them would trip unneeded_field_pattern"
 )]
 impl ApplicationHandler<UserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
@@ -616,7 +616,7 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CursorMoved { position, .. } => {
                 #[expect(
                     clippy::cast_possible_truncation,
-                    reason = "cursor positions are physical px; f32 keeps subpixel precision at window sizes"
+                    reason = "cursor positions are physical px, where f32 keeps subpixel precision"
                 )]
                 let cursor_pos = (position.x as f32, position.y as f32);
                 if self.dragging && !egui_wants_pointer {

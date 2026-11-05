@@ -113,7 +113,7 @@ fn plan_screen(
     ];
     #[expect(
         clippy::rest_pattern_accessible_field,
-        reason = "the matched fields are unused here, so naming them would trip unneeded_field_pattern"
+        reason = "the ignored fields are unused; naming them would trip unneeded_field_pattern"
     )]
     let any_shown = steps
         .iter()
@@ -144,7 +144,7 @@ fn forward_spread(
 /// texture-staged. Everything else is prefetch the screen never shows.
 #[expect(
     clippy::redundant_pub_crate,
-    reason = "pub(crate) is the crate's visibility style for crate-wide items, even inside private modules"
+    reason = "crate-wide items use pub(crate) as project style"
 )]
 pub(crate) fn page_watched(
     page: usize,
@@ -165,7 +165,7 @@ struct SeatShow {
 #[derive(Default)]
 #[expect(
     clippy::redundant_pub_crate,
-    reason = "pub(crate) is the crate's visibility style for crate-wide items, even inside private modules"
+    reason = "crate-wide items use pub(crate) as project style"
 )]
 pub(crate) struct Screen {
     shown: Option<Spread>,

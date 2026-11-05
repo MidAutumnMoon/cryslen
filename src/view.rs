@@ -268,7 +268,7 @@ impl SpreadLayout {
 
 #[expect(
     clippy::cast_precision_loss,
-    reason = "page edges are capped at 16384 px and window extents are physical-device sized, both far below f32's exact-integer range 2^24"
+    reason = "page edges and window extents stay far below f32's exact-integer range 2^24"
 )]
 pub fn px_f32(dims: (u32, u32)) -> (f32, f32) {
     (dims.0 as f32, dims.1 as f32)
