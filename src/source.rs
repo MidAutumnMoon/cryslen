@@ -194,7 +194,7 @@ impl Source {
             .filter_map(|entry| entry.file_name().into_string().ok())
             .filter(|name| format_from_name(name).is_some())
             .collect();
-        sort_pages(&mut names);
+        sort_page_names(&mut names);
         Self::from_names(
             Backend::Directory(dir.to_path_buf()),
             names,
@@ -351,7 +351,7 @@ fn duplicate_name(sorted: &[String]) -> Option<String> {
         .map(|(name, _)| name.clone())
 }
 
-fn sort_pages(names: &mut [String]) {
+fn sort_page_names(names: &mut [String]) {
     names.sort_by(|left, right| compare_names(left, right));
 }
 
@@ -366,17 +366,16 @@ fn validated_listing(
         .fold(0, u64::saturating_add);
     let mut names: Vec<String> =
         listed.into_iter().map(|(name, _)| name).collect();
-    sort_pages(&mut names);
+    sort_page_names(&mut names);
     if let Some(name) = duplicate_name(&names) {
         return Err(OpenRefusal::Duplicate(name));
     }
     Ok((names, unpacked_bytes))
 }
 
-/// Natural page order: digit runs compare by numeric value, so padding
-/// width ("010" vs "10") and mixed widths ("9" vs "10") both order by
-/// number; everything else compares byte-wise, with case and spaces
-/// significant like an archive listing.
+/// Natural order over UTF-8 names: ASCII digit runs compare numerically
+/// (fewer leading zeros first); remaining text compares by code point.
+/// Only identical names compare equal.
 fn compare_names(left: &str, right: &str) -> Ordering {
     let (mut left, mut right) = (left.as_bytes(), right.as_bytes());
     loop {
@@ -390,7 +389,7 @@ fn compare_names(left: &str, right: &str) -> Ordering {
                 {
                     let (left_run, left_rest) = leading_digits(left);
                     let (right_run, right_rest) = leading_digits(right);
-                    let order = number_order(left_run, right_run);
+                    let order = compare_digit_runs(left_run, right_run);
                     if order != Ordering::Equal {
                         return order;
                     }
@@ -418,8 +417,7 @@ fn leading_digits(bytes: &[u8]) -> (&[u8], &[u8]) {
     bytes.split_at(end)
 }
 
-/// The digits of a run without their leading zeros; all-zero runs empty.
-fn value_digits(digits: &[u8]) -> &[u8] {
+fn strip_leading_zeros(digits: &[u8]) -> &[u8] {
     let start = digits
         .iter()
         .position(|&byte| byte != b'0')
@@ -427,17 +425,19 @@ fn value_digits(digits: &[u8]) -> &[u8] {
     digits.split_at(start).1
 }
 
-/// Numeric order of ASCII digit runs: by value, then fewer leading zeros
-/// first, so "010" sorts after "9" (its value is 10) and beside only
-/// "10".
-fn number_order(left: &[u8], right: &[u8]) -> Ordering {
+/// By value, then fewer leading zeros.
+fn compare_digit_runs(left: &[u8], right: &[u8]) -> Ordering {
     let (left_value, right_value) =
-        (value_digits(left), value_digits(right));
+        (strip_leading_zeros(left), strip_leading_zeros(right));
+    let (left_zeros, right_zeros) = (
+        left.len() - left_value.len(),
+        right.len() - right_value.len(),
+    );
     left_value
         .len()
         .cmp(&right_value.len())
         .then_with(|| left_value.cmp(right_value))
-        .then_with(|| left.len().cmp(&right.len()))
+        .then_with(|| left_zeros.cmp(&right_zeros))
 }
 
 /// One member's bytes, or its read error. A failed member is drained,
@@ -669,19 +669,17 @@ mod tests {
 
     #[test]
     fn natural_order_compares_digit_runs_by_value() {
-        use std::cmp::Ordering;
-
         // Mixed padding widths order by value, not byte-wise.
         let mut names = vec![
             "9.png".to_owned(),
             "010.png".to_owned(),
             "1.png".to_owned(),
         ];
-        sort_pages(&mut names);
+        sort_page_names(&mut names);
         assert_eq!(names, ["1.png", "9.png", "010.png"]);
         let mut padded =
             vec!["page10.png".to_owned(), "page09.png".to_owned()];
-        sort_pages(&mut padded);
+        sort_page_names(&mut padded);
         assert_eq!(padded, ["page09.png", "page10.png"]);
         // Equal values keep a deterministic order: fewer zeros first.
         assert_eq!(compare_names("10.png", "010.png"), Ordering::Less);
@@ -700,6 +698,86 @@ mod tests {
         assert_eq!(compare_names("b", "a"), Ordering::Greater);
         assert_eq!(compare_names("", ""), Ordering::Equal);
         assert_eq!(compare_names("", "a"), Ordering::Less);
+    }
+
+    #[test]
+    fn natural_order_handles_non_ascii_prefixes() {
+        assert_eq!(
+            compare_names("漫画-2.jpg", "漫画-10.jpg"),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_names("第1話.cbz", "第10話.cbz"),
+            Ordering::Less
+        );
+        // Code-point order, not pinyin.
+        assert_eq!(compare_names("阿", "白"), Ordering::Greater);
+        assert_eq!(
+            compare_names("06-漫画.jpg", "漫画-06.jpg"),
+            Ordering::Less
+        );
+    }
+
+    #[test]
+    fn natural_order_is_total() {
+        let names = [
+            "",
+            "0",
+            "00",
+            "1",
+            "01",
+            "9",
+            "10",
+            "010",
+            "A",
+            "a",
+            "a0",
+            "a1",
+            "a01",
+            "b",
+            "page 2",
+            "page2",
+            "z",
+            "é",
+            "第1話",
+            "第10話",
+            "漫画-2",
+            "漫画-10",
+            "阿",
+            "白",
+        ];
+        for &left in &names {
+            for &right in &names {
+                let forward = compare_names(left, right);
+                assert_eq!(
+                    forward,
+                    compare_names(right, left).reverse(),
+                    "{left:?} vs {right:?}"
+                );
+                assert_eq!(
+                    forward == Ordering::Equal,
+                    left == right,
+                    "{left:?} vs {right:?}"
+                );
+            }
+        }
+        for &left in &names {
+            for &middle in &names {
+                if compare_names(left, middle) == Ordering::Greater {
+                    continue;
+                }
+                for &right in &names {
+                    if compare_names(middle, right) == Ordering::Greater {
+                        continue;
+                    }
+                    assert_ne!(
+                        compare_names(left, right),
+                        Ordering::Greater,
+                        "{left:?} <= {middle:?} <= {right:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
