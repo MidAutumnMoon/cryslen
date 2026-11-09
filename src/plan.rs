@@ -1,5 +1,8 @@
 //! Prefetch planning: which spreads the worker should have ready.
 
+use serde::Deserialize;
+use serde::Serialize;
+
 use crate::view;
 use crate::view::PageCount;
 use crate::view::Spread;
@@ -9,7 +12,7 @@ pub const AHEAD_PAGES: usize = 512;
 pub const BEHIND_PAGES: usize = 64;
 pub const HEAD_SPREADS: usize = 3;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub enum Direction {
     Forward,
     Backward,

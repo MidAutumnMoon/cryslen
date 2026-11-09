@@ -1,0 +1,190 @@
+//! Book catalog: archive detection, page naming, sibling books, and the
+//! natural order shared by listings and sibling walks.
+
+use std::cmp::Ordering;
+use std::ffi::OsStr;
+use std::fs;
+use std::path::Path;
+use std::path::PathBuf;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageName {
+    pub parent: Option<String>,
+    pub file: String,
+}
+
+/// The archive family; `Source::open` and the argument check share
+/// this table.
+pub enum ArchiveKind {
+    Zip,
+    SevenZip,
+}
+
+pub fn archive_kind(path: &Path) -> Option<ArchiveKind> {
+    let ext = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "zip" | "cbz" => Some(ArchiveKind::Zip),
+        "7z" | "cb7" => Some(ArchiveKind::SevenZip),
+        _ => None,
+    }
+}
+
+pub fn is_archive(path: &Path) -> bool {
+    archive_kind(path).is_some()
+}
+
+/// The next or previous sibling book of the same kind, in natural order;
+/// none at either end.
+pub fn sibling(path: &Path, forward: bool) -> Option<PathBuf> {
+    let parent = path.parent()?;
+    let current = path.file_name()?;
+    let archive = is_archive(path);
+    let mut siblings: Vec<(String, PathBuf)> = fs::read_dir(parent)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|entry| {
+            if archive {
+                entry.is_file() && is_archive(entry)
+            } else {
+                entry.is_dir()
+            }
+        })
+        .filter_map(|entry| {
+            let name = entry.file_name()?.to_string_lossy().into_owned();
+            Some((name, entry))
+        })
+        .collect();
+    siblings.sort_by(|left, right| compare_names(&left.0, &right.0));
+    let position = siblings
+        .iter()
+        .position(|(name, _)| OsStr::new(name.as_str()) == current)?;
+    let next = if forward {
+        position.checked_add(1)?
+    } else {
+        position.checked_sub(1)?
+    };
+    siblings.get(next).map(|(_, sibling)| sibling.clone())
+}
+
+/// The index of the entry a file argument names, or the first page when
+/// the wanted name is absent.
+pub fn landing<'entries>(
+    mut entries: impl Iterator<Item = &'entries str>,
+    want: &str,
+) -> usize {
+    entries
+        .position(|entry| entry.eq_ignore_ascii_case(want))
+        .unwrap_or(0)
+}
+
+/// The status line's name segment: the basename plus its immediate parent
+/// directory. Archives carry the inner path; directories use the source
+/// directory's own name.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "the list is non-empty and callers stay below its length; the debug assert restates it"
+)]
+pub fn page_name(
+    names: &[String],
+    archive: bool,
+    dir_name: Option<&str>,
+    index: usize,
+) -> PageName {
+    debug_assert!(index < names.len(), "caller clamps the page index");
+    let entry = &names[index];
+    let file = entry.rsplit('/').next().unwrap_or(entry).to_owned();
+    let parent = if archive {
+        entry.rsplit_once('/').map(|(path, _)| {
+            path.rsplit('/').next().unwrap_or(path).to_owned()
+        })
+    } else {
+        dir_name.map(str::to_owned)
+    };
+    PageName { parent, file }
+}
+
+/// Natural order over UTF-8 names: ASCII digit runs compare numerically
+/// (fewer leading zeros first); remaining text compares by code point.
+/// Only identical names compare equal.
+pub fn compare_names(left: &str, right: &str) -> Ordering {
+    let (mut left, mut right) = (left.as_bytes(), right.as_bytes());
+    loop {
+        match (left.first(), right.first()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(&left_byte), Some(&right_byte)) => {
+                if left_byte.is_ascii_digit()
+                    && right_byte.is_ascii_digit()
+                {
+                    let (left_run, left_rest) = leading_digits(left);
+                    let (right_run, right_rest) = leading_digits(right);
+                    let order = compare_digit_runs(left_run, right_run);
+                    if order != Ordering::Equal {
+                        return order;
+                    }
+                    left = left_rest;
+                    right = right_rest;
+                } else {
+                    let order = left_byte.cmp(&right_byte);
+                    if order == Ordering::Equal {
+                        left = left.split_at(1).1;
+                        right = right.split_at(1).1;
+                    } else {
+                        return order;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn leading_digits(bytes: &[u8]) -> (&[u8], &[u8]) {
+    let end = bytes
+        .iter()
+        .position(|byte| !byte.is_ascii_digit())
+        .unwrap_or(bytes.len());
+    bytes.split_at(end)
+}
+
+fn strip_leading_zeros(digits: &[u8]) -> &[u8] {
+    let start = digits
+        .iter()
+        .position(|&byte| byte != b'0')
+        .unwrap_or(digits.len());
+    digits.split_at(start).1
+}
+
+/// By value, then fewer leading zeros.
+fn compare_digit_runs(left: &[u8], right: &[u8]) -> Ordering {
+    let (left_value, right_value) =
+        (strip_leading_zeros(left), strip_leading_zeros(right));
+    let (left_zeros, right_zeros) = (
+        left.len() - left_value.len(),
+        right.len() - right_value.len(),
+    );
+    left_value
+        .len()
+        .cmp(&right_value.len())
+        .then_with(|| left_value.cmp(right_value))
+        .then_with(|| left_zeros.cmp(&right_zeros))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn landing_resolves_the_image_argument() {
+        let entries = ["cover.png", "Page2.png", "p3.png"];
+        let names = || entries.iter().copied();
+        assert_eq!(landing(names(), "Page2.png"), 1);
+        assert_eq!(landing(names(), "page2.PNG"), 1);
+        assert_eq!(landing(names(), "missing.png"), 0);
+    }
+}

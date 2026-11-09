@@ -1,12 +1,17 @@
 # Cache: three representations, one plan, one store
 
-Reference for anyone touching `preview.rs`, `plan.rs`, `worker.rs`, or
-the presentation half of `app.rs`/`render.rs`.
+Reference for anyone touching `preview.rs`, `plan.rs`, `worker.rs`,
+`child.rs`, `book.rs`, or the presentation half of `app.rs`/`render.rs`.
 
 The viewer holds three representations of a page, one production
 order, and one ownership rule: the app's texture maps decide what is
 missing and the worker serves exactly that, so neither side assumes a
 delivery arrived.
+
+Production runs in the book's child process, and the store is shared by
+every book process of the session; see `docs/internal/process.md`. The
+parent holds `BookView` and the GPU textures, and nothing else about a
+page.
 
 | representation | edge | bytes (3:2) | job | lifetime |
 |---|---|---|---|---|
@@ -33,10 +38,13 @@ refits.
 `$TMPDIR/cryslen-cache/{thumb,view}/<hex xxh3-128 of the encoded page
 bytes>`. Content addressing means there is no invalidation step: a
 changed page is a different key, and identical pages across
-books share an entry. The root resolves through `env::temp_dir()`, and
-on this host `/tmp` is a zram-backed filesystem, so entries live in RAM
-for the system's uptime and need no user-facing cleanup; a `TMPDIR` set
-per app instance shortens the lifetime to that instance.
+books share an entry. Every book process of the session opens this
+tree, so a switch keeps every entry and the new book starts with
+whatever the old one produced. The root resolves through
+`env::temp_dir()`, and on this host `/tmp` is a zram-backed filesystem,
+so entries live in RAM for the system's uptime and need no user-facing
+cleanup; a `TMPDIR` set per app instance shortens the lifetime to that
+instance.
 
 Files carry a `CYPV` header: version, artifact tag, pixel layout
 (RGBA8 or YUV with depth/subsampling/range/matrix), the mint edge,
@@ -44,13 +52,20 @@ page dims, image dims, `Format`, `Transfer`, then the plane payload.
 `load` reconstructs through `Decoded::rgba`/`yuv` and rejects an entry
 whose edge is not the current constant, so changing `THUMB_EDGE` or
 `VIEW_EDGE` is a miss that re-mints, never a stale size. A corrupt file
-is a miss, not a displayed page. Writes go through `<name>.tmp` +
-`rename`.
+is a miss, not a displayed page. Writes go through
+`<name>.<pid>.tmp` + `rename`, because two book processes can write one
+namespace at once: a reader sees a complete entry or a miss, never a
+partial file. `Store::open` drops a temp file whose pid is dead
+(`kill(pid, 0)`; ESRCH) or, when the pid cannot be checked, whose mtime
+is older than an hour, and never touches a live writer's file.
 
 Caps are per kind: 512 MiB of thumbs, 1.5 GiB of views; a shared budget
 would let a long run of views evict every thumb. A save that crosses its
 namespace's cap prunes that namespace, oldest mtime first; `load` touches
-mtime, so the order approximates last use. The save
+mtime, so the order approximates last use. The caps belong to the
+namespace, not the process, so every child enforces the same ones, and
+one child's prune can remove an entry another child's plan counts as
+produced; that costs one re-mint on the next want. The save
 returns the entries it evicted, so the worker forgets them in its plan
 ledger instead of claiming a pruned preview. A store that cannot be
 created (read-only tmp, foreign owner, symlink) degrades to disabled;
@@ -66,9 +81,12 @@ three spreads. This single order answers "what should be decoded next"
 for every consumer; there is no pending set, recency ledger, or
 per-cache ranking.
 
-## Production (worker)
+## Production (child worker)
 
-One thread, two inputs, one store.
+One thread per book, inside that book's child process: two inputs, one
+store. Wants arrive as one `SetWants` message on change; every delivery
+leaves as a `WireImage` and the app's reader thread turns it back into
+a `Decoded` (see `docs/internal/process.md` for the transport).
 
 - **Wants** (`Want { page, kind }`, ordered by the app): the artifacts
   the app's presentation is missing *right now*. They are served first,
@@ -95,7 +113,7 @@ One thread, two inputs, one store.
 - Delivery is never assumed. The app sends its want set only when it
   changes; a want that leaves the set and comes back is served again,
   while an unchanged set is not re-fetched. The worker keeps no
-  session-long "sent" ledger: `produced` records what this session put
+  session-long "sent" ledger: `produced` records what this child put
   in the store (or loaded from it) for the plan's benefit, and an
   eviction clears the entry, so the plan rebuilds a page that returns
   to its window. A failed save still counts as produced, so a store
@@ -110,6 +128,9 @@ presents whatever is resident, including thumbs) and what the plan
 produces (a skim never mints views).
 
 ## Presentation (app)
+
+The app holds no source, worker, or store handle: `BookView` and the
+texture maps are its whole knowledge of the book.
 
 Requested = `spread_for(index)`. A spread is presentable when every
 seat resolves: the page's facts are known and a representation is
@@ -165,10 +186,12 @@ upload budget, the view retention window, and the two motion intervals.
 ## Diagnosing a stall
 
 Logs go to stderr through `ino_tracing` (no timestamps; each line carries
-its own duration). The tracing target is the binary's crate name, so use
-`RUST_LOG=cy=debug` (not `cryslen`); a bare `RUST_LOG=debug` works too.
-The stall lines (`slow frame`, `slow upload`, `holding for a view`) are
-`info` and appear without any filter; the rest need the debug filter.
+its own duration). The tracing target is the module path inside the lib
+crate, so use `RUST_LOG=cryslen=debug`; a bare `RUST_LOG=debug` works
+too. A child writes to the same stderr, so a switch interleaves the old
+and the new book's lines. The stall lines (`slow frame`, `slow upload`,
+`holding for a view`) are `info` and appear without any filter; the rest
+need the debug filter.
 
 - `slow frame` (>50 ms) carries `total`, `drain`, `queue`, `presented`.
 - `slow upload` (>30 ms) names the representation, its dims, and the
@@ -209,3 +232,7 @@ The stall lines (`slow frame`, `slow upload`, `holding for a view`) are
 - Store pruning is LRU by file mtime, not by distance to the reader.
   The plan rebuilds an evicted page when it returns to its window; a
   want that arrives first pays the decode.
+- Every artifact crosses a process boundary on delivery: the child
+  copies the minted planes into shared memory and the parent copies
+  them out into a `Decoded` before upload. A store hit skips the
+  decode and the mint, not those two copies.

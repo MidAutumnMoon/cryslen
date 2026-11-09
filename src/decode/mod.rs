@@ -6,6 +6,8 @@
 )]
 
 use eros::ErrorUnion;
+use serde::Deserialize;
+use serde::Serialize;
 
 use crate::fault::DecodeError;
 use crate::fault::DecodeRefusal;
@@ -31,7 +33,7 @@ pub struct Decoded {
 /// Sample encoding. SDR pages are sRGB-class gamma, passed through to the
 /// sRGB framebuffer; PQ pages are absolute-luminance HDR, tone-mapped to
 /// SDR in the shader.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub enum Transfer {
     Srgb,
     Pq,
@@ -64,6 +66,7 @@ impl Decoded {
         self.page_dims
     }
 
+    #[must_use]
     pub fn with_page_dims(mut self, page_dims: (u32, u32)) -> Self {
         self.page_dims = page_dims;
         self
@@ -183,7 +186,7 @@ pub enum Pixels {
     /// Planar YUV, converted to RGB in the renderer's shader.
     Yuv(YuvImage),
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub enum Format {
     Jpeg,
     Png,
@@ -196,6 +199,7 @@ pub enum Format {
 }
 
 impl Format {
+    #[must_use]
     pub fn label(self) -> &'static str {
         match self {
             Self::Jpeg => "jpeg",
@@ -226,7 +230,7 @@ pub struct YuvImage {
     pub alpha: Option<Plane>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub enum Subsampling {
     Mono,
     Yuv420,
@@ -236,8 +240,9 @@ pub enum Subsampling {
 
 impl Subsampling {
     /// Chroma texels per luma texel on each axis: the sampling ratio
-    /// behind [`plane_dims`]'s texel counts. Mono carries no chroma, so
+    /// behind `plane_dims`'s texel counts. Mono carries no chroma, so
     /// its ratio is identity for the renderer's midpoint stub.
+    #[must_use]
     pub fn chroma_ratio(self) -> (f32, f32) {
         match self {
             Self::Mono | Self::Yuv444 => (1.0, 1.0),
@@ -247,7 +252,7 @@ impl Subsampling {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub enum Matrix {
     Bt601,
     Bt709,

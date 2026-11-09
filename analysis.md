@@ -1,4 +1,4 @@
-# Browsing: what is still open
+# Browsing: open items and what the process boundary closed
 
 The design this review argued for is in place: one ranked plan, a
 content-addressed preview store, request-driven delivery, and a skim
@@ -24,15 +24,6 @@ in 30 ms if its decode takes 550 ms: prepare earlier, decode cheaper, or
 show fewer samples.
 
 ## Open
-
-1. **A demand job can still wait out one in-flight decode.**
-   `IDLE_PRELOAD` keeps speculative work from starting while the reader
-   is turning. It does not remove the worst case: a turn can wait for
-   the decode already inside `decode::decode` (up to ~0.75 s for a 50 MP
-   JXL). A book switch also runs the old worker's decode alongside the
-   new one until it finishes. If this bites: cancellation inside the
-   decoder where supported, a second executor for demand, or process
-   isolation. Watch the JXL pool's threads when adding concurrency.
 
 2. **`VIEW_EDGE` is a constant.**
    2560 covers a 2560×1440 fit; a fitted page above that asks for a
@@ -60,9 +51,28 @@ show fewer samples.
    bounds it, but a ~190 MiB native can hitch one frame. Not seen in the
    logs (`slow upload` is instrumented): measure before changing.
 
-7. **`switch_book` opens the next source on the UI thread.**
-   Slow storage or an expensive archive listing stalls the switch before
-   decoding starts.
+## Resolved by the process boundary
+
+Item numbers stay fixed because other documents cite them. Both are
+described in `docs/internal/process.md`.
+
+1. **A demand job can wait out at most one book's in-flight decode.**
+   A switch kills the old child before spawning the next, so the old
+   book's decode, archive buffers, and store handles end with it: no
+   switch runs two decodes, and the new book's first turn waits only on
+   its own worker. Inside one book a want can still wait for the decode
+   already inside `decode::decode` (up to ~0.75 s for a 50 MP JXL),
+   because the worker is still one thread; a still frame keeps the
+   previous spread up meanwhile. Decoder-side cancellation remains the
+   lever if that in-book wait bites.
+
+7. **`switch_book` no longer opens the source on the UI thread.**
+   It kills the old child, returns, and starts a thread that runs
+   `PendingBookOpen::finish`; the app adopts the result when it arrives,
+   and the old `BookView` and textures stay on screen while it runs. A
+   slow archive listing now delays only the new book, never input or
+   drawing. The session's initial open is still synchronous, a residual
+   limit in `docs/internal/process.md`.
 
 ## Considered and left as is
 

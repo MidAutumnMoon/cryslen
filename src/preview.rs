@@ -24,9 +24,16 @@ use std::os::unix::fs::DirBuilderExt as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process;
+use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 
+use nix::errno::Errno;
+use nix::sys::signal;
+use nix::unistd::Pid;
+use serde::Deserialize;
+use serde::Serialize;
 use xxhash_rust::xxh3::xxh3_128;
 
 use crate::decode::plane_dims;
@@ -49,7 +56,7 @@ pub const VIEW_CAP_BYTES: u64 = 3 * 512 * 1024 * 1024;
 
 /// Which derived image a cache entry holds. `Native` is the decoded page
 /// itself and is never cached.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 pub enum Artifact {
     Thumb,
     View,
@@ -59,7 +66,7 @@ pub enum Artifact {
 impl Artifact {
     /// The mint edge, stored in the entry header so a changed constant
     /// misses old entries instead of serving the wrong size.
-    pub fn edge(self) -> Option<u32> {
+    pub(crate) fn edge(self) -> Option<u32> {
         match self {
             Self::Thumb => Some(THUMB_EDGE),
             Self::View => Some(VIEW_EDGE),
@@ -366,14 +373,14 @@ struct Namespace {
 
 impl Store {
     /// Open the shared store under `env::temp_dir()/cryslen-cache`.
-    pub fn open() -> Self {
+    pub(crate) fn open() -> Self {
         Self::at(&env::temp_dir().join("cryslen-cache"))
     }
 
     /// Open the store rooted at `root`, creating it if absent. A `root`
     /// that cannot be created, or that resolves through a symlink, leaves
     /// the store disabled.
-    pub fn at(root: &Path) -> Self {
+    pub(crate) fn at(root: &Path) -> Self {
         Self::with_caps(root, THUMB_CAP_BYTES, VIEW_CAP_BYTES)
     }
 
@@ -387,7 +394,11 @@ impl Store {
 
     /// Load `hash`, or `None` when absent, damaged, or not cached; a hit
     /// refreshes the entry's mtime for LRU.
-    pub fn load(&self, hash: u128, kind: Artifact) -> Option<Decoded> {
+    pub(crate) fn load(
+        &self,
+        hash: u128,
+        kind: Artifact,
+    ) -> Option<Decoded> {
         let started = Instant::now();
         let loaded = self.namespace(kind).and_then(|namespace| {
             let file = File::open(namespace.path(hash)).ok()?;
@@ -412,7 +423,7 @@ impl Store {
 
     /// Store `page` under `hash`, replacing the same key. Crossing the
     /// namespace's cap prunes it; the result names the removed entries.
-    pub fn save(
+    pub(crate) fn save(
         &mut self,
         hash: u128,
         kind: Artifact,
@@ -473,6 +484,7 @@ impl Store {
 
 impl Namespace {
     fn new(dir: PathBuf, cap: u64) -> Self {
+        clean_temps(&dir);
         let total = entries(&dir)
             .iter()
             .map(|entry| entry.size)
@@ -484,8 +496,10 @@ impl Namespace {
         self.dir.join(format!("{hash:032x}"))
     }
 
+    /// The per-writer temp name: several processes save into one
+    /// namespace, so the pid keeps their in-progress files apart.
     fn temp_path(&self, hash: u128) -> PathBuf {
-        self.dir.join(format!("{hash:032x}.tmp"))
+        self.dir.join(format!("{hash:032x}.{}.tmp", process::id()))
     }
 
     fn prune(&mut self) -> Vec<u128> {
@@ -572,6 +586,95 @@ fn is_hash_name(name: &OsStr) -> bool {
         name.len() == 32
             && name.bytes().all(|byte| byte.is_ascii_hexdigit())
     })
+}
+
+/// How long an unchecked temp file may survive. Only a liveness check
+/// that cannot answer (a pid this process may not signal) falls back to
+/// age; a live writer's file is never removed, however old it is.
+const TEMP_MAX_AGE: Duration = Duration::from_hours(1);
+
+/// Drop temp files whose writer can no longer rename them: a killed
+/// child leaves `<hash:032x>.<pid>.tmp` behind, and no later writer can
+/// claim a name carrying another pid. Names that do not have the exact
+/// temp shape belong to something else and are left alone.
+fn clean_temps(dir: &Path) {
+    let Ok(read) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut removed = 0_usize;
+    for entry in read.flatten() {
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(pid) = temp_pid(&name) else {
+            continue;
+        };
+        let stale = match writer(pid) {
+            Writer::Alive => false,
+            Writer::Dead => true,
+            Writer::Unknown => metadata.modified().is_ok_and(|modified| {
+                modified.elapsed().is_ok_and(|age| age >= TEMP_MAX_AGE)
+            }),
+        };
+        if !stale {
+            continue;
+        }
+        let path = entry.path();
+        if let Err(error) = fs::remove_file(&path) {
+            tracing::debug!(
+                %error,
+                path = %path.display(),
+                "stale preview temp"
+            );
+            continue;
+        }
+        removed += 1;
+    }
+    if removed > 0 {
+        tracing::debug!(
+            dir = %dir.display(),
+            removed,
+            "cleaned stale preview temps"
+        );
+    }
+}
+
+/// The writer pid of a `<hash:032x>.<pid>.tmp` name.
+fn temp_pid(name: &OsStr) -> Option<i32> {
+    let name = name.to_str()?;
+    let (hash, rest) = name.split_once('.')?;
+    let (pid, suffix) = rest.split_once('.')?;
+    if suffix != "tmp" || !is_hash_name(OsStr::new(hash)) {
+        return None;
+    }
+    if pid.is_empty() || !pid.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    // A pid the OS can hand out is positive; zero would check a process
+    // group instead of a process.
+    let pid = pid.parse::<i32>().ok()?;
+    (pid > 0).then_some(pid)
+}
+
+/// What `kill(pid, 0)` can tell about a temp file's writer.
+enum Writer {
+    Alive,
+    Dead,
+    /// The check itself failed, e.g. a process this one may not signal,
+    /// so liveness must not be concluded either way.
+    Unknown,
+}
+
+fn writer(pid: i32) -> Writer {
+    match signal::kill(Pid::from_raw(pid), None) {
+        Ok(()) => Writer::Alive,
+        Err(Errno::ESRCH) => Writer::Dead,
+        Err(_) => Writer::Unknown,
+    }
 }
 
 /// Create the store's directories, refusing a root that is not a plain
@@ -1022,6 +1125,7 @@ fn sample_count(dims: (u32, u32)) -> Option<usize> {
     reason = "a panic in test code is inconsequential"
 )]
 mod tests {
+    use std::fmt;
     use std::time::Duration;
 
     use super::*;
@@ -1131,6 +1235,74 @@ mod tests {
             SystemTime::UNIX_EPOCH + Duration::from_secs(seconds);
         file.set_times(FileTimes::new().set_modified(modified))
             .expect("set mtime");
+    }
+
+    /// A pid no process owns: spawn something that exits at once, reap
+    /// it, and reuse its number.
+    fn dead_pid() -> u32 {
+        let mut child =
+            process::Command::new("true").spawn().expect("spawn");
+        let pid = child.id();
+        child.wait().expect("wait");
+        pid
+    }
+
+    fn temp_name(hash: u128, pid: impl fmt::Display) -> String {
+        format!("{hash:032x}.{pid}.tmp")
+    }
+
+    #[test]
+    fn temp_names_carry_the_writer_pid() {
+        let dir = TempDir::new("preview-temp-pid");
+        let store = Store::at(dir.path());
+        let thumb = store.namespace(Artifact::Thumb).expect("thumb");
+        let hash = content_hash(b"temp-pid");
+        let expected = dir
+            .path()
+            .join("thumb")
+            .join(temp_name(hash, process::id()));
+        assert_eq!(thumb.temp_path(hash), expected);
+    }
+
+    #[test]
+    fn open_cleans_dead_writer_temps() {
+        let dir = TempDir::new("preview-stale-temps");
+        let root = dir.path().join("cache");
+        let page = rgba_page(2, 2);
+        let hash = content_hash(b"page-kept");
+        let mut store = Store::at(&root);
+        assert!(store.save(hash, Artifact::Thumb, &page).landed);
+        drop(store);
+
+        let dead = dead_pid();
+        let stale_thumb = root.join("thumb").join(temp_name(hash, dead));
+        fs::write(&stale_thumb, b"partial").expect("thumb temp");
+        let stale_view = root.join("view").join(temp_name(hash, dead));
+        fs::write(&stale_view, b"partial").expect("view temp");
+
+        // A live writer owns its temp however old the file is.
+        let live = root.join("thumb").join(temp_name(hash, process::id()));
+        fs::write(&live, b"partial").expect("live temp");
+        set_modified(&live, 0);
+
+        let malformed = [
+            "not-a-hash.123.tmp",
+            "0123456789abcdef0123456789abcdef.nope.tmp",
+            "0123456789abcdef0123456789abcdef.12.tmp.bak",
+        ];
+        for name in malformed {
+            fs::write(root.join("thumb").join(name), b"partial")
+                .expect("malformed temp");
+        }
+
+        let reopened = Store::at(&root);
+        assert!(!stale_thumb.exists());
+        assert!(!stale_view.exists());
+        assert!(live.exists());
+        for name in malformed {
+            assert!(root.join("thumb").join(name).exists(), "{name}");
+        }
+        assert!(reopened.load(hash, Artifact::Thumb).is_some());
     }
 
     #[test]

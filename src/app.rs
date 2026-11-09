@@ -4,6 +4,7 @@ use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -18,18 +19,21 @@ use winit::event_loop::EventLoopProxy;
 use winit::keyboard::ModifiersState;
 use winit::window::WindowId;
 
+use crate::book::BookEvent;
+use crate::book::BookProcess;
+use crate::book::BookView;
+use crate::book::PendingBookOpen;
+use crate::book::Wake;
 use crate::decode;
 use crate::decode::Format;
-use crate::fault::OpenError;
-use crate::fault::PageError;
-use crate::fault::SpawnError;
+use crate::fault::BookFault;
+use crate::fault::PageFault;
 use crate::keys::Action;
 use crate::plan::Direction;
-use crate::plan::Plan;
 use crate::preview::Artifact;
 use crate::preview::VIEW_EDGE;
+use crate::protocol::ParentMsg;
 use crate::render::PageTextures;
-use crate::source::Source;
 use crate::ui;
 use crate::ui::PageFacts;
 use crate::ui::StatusLine;
@@ -43,32 +47,20 @@ use crate::window::Window;
 use crate::worker;
 use crate::worker::Motion;
 use crate::worker::Want;
-use crate::worker::Worker;
 
 pub enum UserEvent {
     /// Arms a wake; `new_events` requests the redraw at the deadline.
     Repaint(Duration),
-    /// One worker decision: a decoded artifact to upload, or a page
-    /// failure to note. Every decision can change the frame.
-    Worker(worker::Event),
+    /// A book's reader thread forwarded an event, or a switch landed;
+    /// the loop must draw a frame to drain it.
+    Wake,
 }
 
 /// A failed send means the loop is gone, leaving the event with no consumer.
-fn post(proxy: &EventLoopProxy<UserEvent>, event: UserEvent) {
+pub fn post(proxy: &EventLoopProxy<UserEvent>, event: UserEvent) {
     let Ok(()) = proxy.send_event(event) else {
         return;
     };
-}
-
-fn spawn_worker(
-    source: &Arc<Source>,
-    plan: Plan,
-    proxy: &EventLoopProxy<UserEvent>,
-) -> Result<Worker, SpawnError> {
-    let proxy = proxy.clone();
-    Worker::spawn(Arc::clone(source), plan, move |event| {
-        post(&proxy, UserEvent::Worker(event));
-    })
 }
 
 struct Gl {
@@ -109,8 +101,16 @@ const UPLOAD_BUDGET_BYTES: usize = 8 * 1024 * 1024;
 const VIEW_KEEP_SPREADS: usize = 2;
 
 pub struct App {
-    source: Arc<Source>,
-    worker: Worker,
+    /// What the UI shows; it outlives a dead child until a switch lands.
+    view: BookView,
+    /// The live child, or `None` once it died or was killed.
+    process: Option<BookProcess>,
+    /// The one switch in flight; a switch while it runs is ignored.
+    pending: Option<
+        crossbeam_channel::Receiver<
+            Result<(BookView, BookProcess), BookFault>,
+        >,
+    >,
     gl: Option<Gl>,
     fatal_error: Option<eros::ErrorUnion>,
     index: usize,
@@ -121,11 +121,12 @@ pub struct App {
     /// Page facts, written at the first artifact that leaves the queue.
     cached: BTreeMap<usize, CachedPage>,
     /// Page failures, sticky per page so a blip cannot erase them.
-    errors: BTreeMap<usize, Arc<PageError>>,
+    errors: BTreeMap<usize, PageFault>,
     /// Decoded artifacts waiting for an upload, in arrival order.
     queue: VecDeque<worker::Ready>,
-    /// The last texture the GPU refused, held until a book switch.
-    upload_error: Option<Arc<PageError>>,
+    /// The page whose texture the GPU last refused, held until a book
+    /// switch; the failure itself lives in `errors`.
+    upload_error: Option<usize>,
     /// Whether the worker produces skim thumbs or full views.
     motion: Motion,
     /// When the last navigation was dispatched, for the skim window.
@@ -136,11 +137,11 @@ pub struct App {
     hold_logged: bool,
     /// The want set last sent to the worker.
     sent: Vec<Want>,
-    /// Reading direction of the last turn: plans and skim tie-breaks
-    /// follow it.
+    /// Reading direction of the last turn: the child's plan and skim
+    /// tie-breaks follow it.
     direction: Direction,
     /// A failed book switch, held until one succeeds.
-    noted_error: Option<Arc<OpenError>>,
+    noted_error: Option<BookFault>,
     timers: ui::Timers,
     /// Cursor position in viewport px, same as window px.
     cursor: (f32, f32),
@@ -150,30 +151,35 @@ pub struct App {
     modifiers: ModifiersState,
     /// The viewport the last frame painted into, read by input between frames.
     last_viewport: Viewport,
-    /// Wakes the parked loop from egui and timed waits, which run outside
-    /// the event loop's handlers.
+    /// Wakes the parked loop from egui, timed waits, and book readers,
+    /// which all run outside the event loop's handlers.
     proxy: EventLoopProxy<UserEvent>,
 }
 
 impl App {
     pub fn new(
-        source: Arc<Source>,
+        view: BookView,
+        process: BookProcess,
         index: usize,
         proxy: EventLoopProxy<UserEvent>,
-    ) -> Result<Self, SpawnError> {
+    ) -> Self {
         let mode = ViewMode::Normal;
         let direction = Direction::Forward;
-        let spread = view::spread_for(index, mode, source.len());
-        let plan = Plan::build(spread, direction, mode, source.len());
-        let worker = spawn_worker(&source, plan, &proxy)?;
         // The first frame is a frame away; declare what a cold start
-        // lacks now, so the worker serves the visible page before it
+        // lacks now, so the child serves the visible page before it
         // starts the plan.
-        let cold = cold_wants(spread, mode);
-        worker.retarget(cold.clone());
-        Ok(Self {
-            source,
-            worker,
+        let cold =
+            cold_wants(view::spread_for(index, mode, view.len()), mode);
+        process.send(ParentMsg::SetView {
+            index,
+            mode,
+            direction,
+        });
+        process.send(ParentMsg::SetWants(cold.clone()));
+        Self {
+            view,
+            process: Some(process),
+            pending: None,
             gl: None,
             fatal_error: None,
             index,
@@ -197,7 +203,7 @@ impl App {
             modifiers: ModifiersState::empty(),
             last_viewport: Viewport::default(),
             proxy,
-        })
+        }
     }
 
     /// Store `error` and exit so `main` can report it after `run_app`
@@ -215,8 +221,26 @@ impl App {
         self.fatal_error.take()
     }
 
+    fn send(&self, message: ParentMsg) {
+        if let Some(process) = self.process.as_ref() {
+            process.send(message);
+        }
+    }
+
+    fn kill_process(&mut self) {
+        if let Some(mut process) = self.process.take() {
+            process.kill();
+        }
+    }
+
+    fn drain_events(&self) -> Vec<BookEvent> {
+        self.process
+            .as_ref()
+            .map_or_else(Vec::new, BookProcess::drain)
+    }
+
     fn spread(&self) -> Spread {
-        view::spread_for(self.index, self.mode, self.source.len())
+        view::spread_for(self.index, self.mode, self.view.len())
     }
 
     fn has_any(&self, page: usize) -> bool {
@@ -262,6 +286,7 @@ impl App {
             return Ok(());
         };
 
+        self.poll_book_updates();
         self.drain_ready();
         let drained = frame_started.elapsed();
         let now = Instant::now();
@@ -273,7 +298,7 @@ impl App {
             requested,
             self.presented,
             self.mode,
-            self.source.len(),
+            self.view.len(),
             &self.cached,
             self.direction == Direction::Forward,
             |page| {
@@ -330,7 +355,7 @@ impl App {
         let spread_size = layout.total();
         let placed = self.fit.resolve(spread_size, self.last_viewport);
 
-        let (mode, len) = (self.mode, self.source.len());
+        let (mode, len) = (self.mode, self.view.len());
         if let Some(gl) = self.gl.as_mut() {
             // Retention is a performance policy: a dropped artifact is
             // just a want on the next frame.
@@ -368,20 +393,25 @@ impl App {
         );
         if wants != self.sent {
             tracing::debug!(?wants, "requested");
-            self.worker.retarget(wants.clone());
+            self.send(ParentMsg::SetWants(wants.clone()));
             self.sent = wants;
         }
 
+        let errors = &self.errors;
+        let cached = &self.cached;
+        let pages = self.gl.as_ref().map(|gl| &gl.pages);
         let folded = ui::fold_status(shown, |page| {
-            let entry = self.cached.get(&page);
+            let entry = cached.get(&page);
             // `waiting` means the spread has no pixels yet, so a page
             // counts as decoded only once its texture is cached.
             ui::PageState {
                 format: entry.and_then(|entry| {
-                    self.has_any(page).then_some(entry.format)
+                    pages
+                        .is_some_and(|pages| pages.has_any(page))
+                        .then_some(entry.format)
                 }),
                 dims: entry.map(|entry| entry.dims),
-                error: self.errors.get(&page).cloned(),
+                error: errors.get(&page),
             }
         });
         if let Some(delay) = self.timers.tick_wait(now, folded.waiting) {
@@ -393,27 +423,28 @@ impl App {
 
         let page = folded.page.map(|(page, decoded, dims)| PageFacts {
             claimed: self
-                .source
+                .view
                 .name(page)
                 .and_then(decode::format_from_name),
             decoded,
             dims,
         });
+        let upload = self
+            .upload_error
+            .and_then(|failed| self.errors.get(&failed));
         let status = StatusLine {
-            page_count: self.source.len().get(),
+            page_count: self.view.len().get(),
             spread: shown,
             mode: self.mode,
             toast: self.timers.toasting(),
-            name: self.source.page_name(folded.speaker),
+            name: self.view.page_name(folded.speaker),
             page,
             zoom: placed.scale,
-            waiting: self
-                .timers
-                .wait_word(now, || self.source.unpacking()),
+            waiting: self.timers.wait_word(now, || self.view.unpacking),
             error: ui::fault_to_show(
                 folded.error,
                 self.noted_error.as_ref(),
-                self.upload_error.as_ref(),
+                upload,
             ),
         };
 
@@ -531,9 +562,9 @@ impl App {
                 );
             }
             if let Err(error) = refused {
-                let error = Arc::new(error.widen());
-                self.errors.insert(ready.page, Arc::clone(&error));
-                self.upload_error = Some(error);
+                self.errors
+                    .insert(ready.page, PageFault::from(error.widen()));
+                self.upload_error = Some(ready.page);
             }
             uploaded += 1;
             bytes = bytes.saturating_add(cost);
@@ -568,7 +599,7 @@ impl App {
         if flip && self.motion == Motion::Still {
             tracing::debug!(?gap, repeat, "skim begins");
             self.motion = Motion::Skimming;
-            self.worker.set_motion(Motion::Skimming);
+            self.send(ParentMsg::SetMotion(Motion::Skimming));
         }
         tracing::debug!(
             index = self.index,
@@ -608,7 +639,7 @@ impl App {
     fn end_skim(&mut self) {
         tracing::debug!("skim ends");
         self.motion = Motion::Still;
-        self.worker.set_motion(Motion::Still);
+        self.send(ParentMsg::SetMotion(Motion::Still));
         self.request_redraw();
     }
 
@@ -654,7 +685,7 @@ impl App {
                     self.mode,
                     mode,
                     self.index,
-                    self.source.len(),
+                    self.view.len(),
                 );
                 self.mode = mode;
                 self.index = switch.index;
@@ -665,15 +696,10 @@ impl App {
                     // a navigation, so the skim does not open.
                     self.fit.begin_turn();
                 }
-                // The plan carries the seating order and the spread, so
+                // The view carries the seating order and the spread, so
                 // both kinds of switch retune; only a pairing change
                 // restarts the fit.
-                self.worker.retune(Plan::build(
-                    self.spread(),
-                    Direction::Forward,
-                    self.mode,
-                    self.source.len(),
-                ));
+                self.set_view();
                 self.request_redraw();
             }
             Action::ToggleFullscreen => {
@@ -698,7 +724,7 @@ impl App {
                 self.index = if first {
                     view::first_spread()
                 } else {
-                    view::last_spread(self.mode, self.source.len())
+                    view::last_spread(self.mode, self.view.len())
                 };
                 self.after_page_change(travel_direction(first), repeat);
             }
@@ -714,85 +740,168 @@ impl App {
                     self.index,
                     forward,
                     self.mode,
-                    self.source.len(),
+                    self.view.len(),
                 );
                 self.after_page_change(travel_direction(forward), repeat);
             }
         }
     }
 
+    /// Start the next sibling book without blocking the frame. The old
+    /// child dies first, so its archive memory and its queued events
+    /// cannot outlive the switch; the old view and its textures stay on
+    /// screen until the new book lands.
     fn switch_book(&mut self, forward: bool) {
-        let Some(path) = self.source.sibling(forward) else {
+        if self.pending.is_some() {
+            return;
+        }
+        let Some(path) = self.view.sibling(forward) else {
             return;
         };
-        let source = match Source::open(&path) {
-            Ok(source) => Arc::new(source),
+        tracing::debug!(path = %path.display(), forward, "book switch");
+        self.kill_process();
+        // The fork happens here, on the loop's thread: the child's
+        // parent-death signal follows the thread that forked it.
+        let wake: Wake = {
+            let proxy = self.proxy.clone();
+            Box::new(move || post(&proxy, UserEvent::Wake))
+        };
+        let opened = match PendingBookOpen::begin(&path, wake) {
+            Ok(opened) => opened,
             Err(error) => {
-                self.noted_error = Some(Arc::new(error));
+                self.noted_error = Some(error);
                 self.request_redraw();
                 return;
             }
         };
-        let spread = view::spread_for(
-            view::first_spread(),
-            self.mode,
-            source.len(),
-        );
-        let plan = Plan::build(
-            spread,
-            Direction::Forward,
-            self.mode,
-            source.len(),
-        );
-        let worker = match spawn_worker(&source, plan, &self.proxy) {
-            Ok(worker) => worker,
-            Err(error) => {
-                self.noted_error = Some(Arc::new(error.widen()));
-                self.request_redraw();
-                return;
+        let (sender, result) = crossbeam_channel::bounded(1);
+        let proxy = self.proxy.clone();
+        let spawned = thread::Builder::new()
+            .name(String::from("cy-book-open"))
+            .spawn(move || {
+                // A receiver that is gone means the app is gone too.
+                if sender.send(opened.finish()).is_ok() {
+                    post(&proxy, UserEvent::Wake);
+                }
+            });
+        match spawned {
+            Ok(_detached) => {
+                self.pending = Some(result);
             }
-        };
+            Err(error) => {
+                // A failed spawn drops the pending open, which kills the
+                // child that was just forked for it.
+                self.noted_error =
+                    Some(BookFault::Spawn(error.to_string()));
+                self.request_redraw();
+            }
+        }
+    }
+
+    /// Put a freshly opened book on screen. Page numbering restarts, so
+    /// no artifact, fault, or want of the old book may survive.
+    fn adopt_book(&mut self, view: BookView, process: BookProcess) {
+        let index = view::first_spread();
         let cold = cold_wants(
-            view::spread_for(
-                view::first_spread(),
-                self.mode,
-                source.len(),
-            ),
+            view::spread_for(index, self.mode, view.len()),
             self.mode,
         );
-        worker.retarget(cold.clone());
-        // The old worker may sit mid-decode on the old book; detaching
-        // keeps the switch instant.
-        self.worker.detach();
-        self.worker = worker;
-        self.source = source;
-        self.index = view::first_spread();
+        process.send(ParentMsg::SetView {
+            index,
+            mode: self.mode,
+            direction: Direction::Forward,
+        });
+        process.send(ParentMsg::SetWants(cold.clone()));
+        tracing::debug!(
+            path = %view.path.display(),
+            count = view.len().get(),
+            "book adopted"
+        );
+        self.view = view;
+        // Assigning drops the old process, whose `Drop` kills it.
+        self.process = Some(process);
+        self.index = index;
+        self.direction = Direction::Forward;
         self.sent = cold;
-        self.noted_error = None;
-        // A book switch renumbers pages from zero, so nothing of the old
-        // book can stay.
+        self.presented = None;
         self.cached.clear();
         self.errors.clear();
-        self.presented = None;
         self.queue.clear();
         self.upload_error = None;
+        self.motion = Motion::Still;
+        self.last_nav = None;
+        self.hold_since = None;
+        self.hold_logged = false;
+        self.fit.refit();
+        self.noted_error = None;
         if let Some(gl) = self.gl.as_mut() {
             gl.pages.clear_all();
         }
-        self.after_page_change(Direction::Forward, false);
     }
 
-    /// Every spread mutation retunes the worker, restarts the fit, and
+    /// Drain the child's events and adopt a finished switch. A killed
+    /// child's receiver went with it, so nothing here can be a stale
+    /// event of a book that already left the screen.
+    fn poll_book_updates(&mut self) {
+        for event in self.drain_events() {
+            match event {
+                BookEvent::Ready(ready) => self.queue.push_back(ready),
+                BookEvent::Failed { page, fault } => {
+                    self.errors.insert(page, fault);
+                }
+                BookEvent::Unpacked => self.view.unpacking = false,
+                BookEvent::Died(detail) => {
+                    tracing::warn!(%detail, "the book process failed");
+                    // The process is gone; taking it reaps it and joins
+                    // the reader that just reported the death.
+                    self.kill_process();
+                    self.noted_error
+                        .get_or_insert(BookFault::Died(detail));
+                }
+            }
+        }
+        let Some(pending) = self.pending.take() else {
+            return;
+        };
+        let opened = match pending.try_recv() {
+            Ok(opened) => opened,
+            Err(crossbeam_channel::TryRecvError::Empty) => {
+                self.pending = Some(pending);
+                return;
+            }
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                self.noted_error.get_or_insert_with(|| {
+                    BookFault::Died(String::from(
+                        "the book switch ended without a book",
+                    ))
+                });
+                return;
+            }
+        };
+        match opened {
+            Ok((view, process)) => self.adopt_book(view, process),
+            Err(fault) => {
+                tracing::warn!(?fault, "book switch failed");
+                self.noted_error = Some(fault);
+            }
+        }
+    }
+
+    /// Retune the child: the view carries the spread, the seating order,
+    /// and the prefetch direction.
+    fn set_view(&self) {
+        self.send(ParentMsg::SetView {
+            index: self.index,
+            mode: self.mode,
+            direction: self.direction,
+        });
+    }
+
+    /// Every spread mutation retunes the child, restarts the fit, and
     /// opens the skim window here.
     fn after_page_change(&mut self, direction: Direction, repeat: bool) {
         self.direction = direction;
-        let plan = Plan::build(
-            self.spread(),
-            direction,
-            self.mode,
-            self.source.len(),
-        );
-        self.worker.retune(plan);
+        self.set_view();
         self.fit.begin_turn();
         self.note_navigation(Instant::now(), repeat);
         self.request_redraw();
@@ -1042,17 +1151,7 @@ impl ApplicationHandler<UserEvent> for App {
                 event_loop
                     .set_control_flow(ControlFlow::WaitUntil(deadline));
             }
-            UserEvent::Worker(event) => {
-                match event {
-                    worker::Event::Ready(ready) => {
-                        self.queue.push_back(ready);
-                    }
-                    worker::Event::Failed { page, error } => {
-                        self.errors.insert(page, error);
-                    }
-                }
-                self.request_redraw();
-            }
+            UserEvent::Wake => self.request_redraw(),
         }
     }
 
@@ -1067,8 +1166,10 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
-        // Quit must not wait out an in-flight decode; Drop would join it.
-        self.worker.detach();
+        // Quit must not wait out an in-flight decode; the child dies, and
+        // a pending open's book dies with its own result if it lands.
+        self.kill_process();
+        self.pending = None;
         self.gl = None;
     }
 

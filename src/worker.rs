@@ -18,6 +18,8 @@ use std::time::Instant;
 use std::path::Path;
 
 use eros::ErrorUnion;
+use serde::Deserialize;
+use serde::Serialize;
 
 use crate::decode;
 use crate::decode::Decoded;
@@ -41,7 +43,7 @@ const FILL_POLL: Duration = Duration::from_millis(15);
 const IDLE_PRELOAD: Duration = Duration::from_millis(300);
 
 /// What the reader is doing; only a still reader is worth a view.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub enum Motion {
     /// The reader is looking at the spread; its head is worth a view.
     Still,
@@ -56,18 +58,32 @@ pub enum Motion {
 pub struct Ready {
     pub page: usize,
     pub kind: Artifact,
-    pub image: Arc<Decoded>,
+    pub image: Box<Decoded>,
 }
 
 pub enum Event {
     Ready(Ready),
-    Failed { page: usize, error: Arc<PageError> },
+    Failed {
+        page: usize,
+        error: Arc<PageError>,
+    },
+    /// Every page now reads without waiting on an unpack pass. Sent
+    /// once, on the first loop iteration that observes it.
+    Unpacked,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[non_exhaustive]
 pub struct Want {
     pub page: usize,
     pub kind: Artifact,
+}
+
+impl Want {
+    #[must_use]
+    pub fn new(page: usize, kind: Artifact) -> Self {
+        Self { page, kind }
+    }
 }
 
 enum ToWorker {
@@ -282,7 +298,7 @@ impl Session {
         notify(Event::Ready(Ready {
             page,
             kind,
-            image: Arc::new(image),
+            image: Box::new(image),
         }));
     }
 
@@ -537,7 +553,14 @@ fn run(
     mut session: Session,
     notify: &dyn Fn(Event),
 ) {
+    // An archive pass that settled before this thread started is still
+    // announced; a directory has no pass to announce.
+    let mut unpacking = source.unpacks();
     loop {
+        if unpacking && !source.unpacking() {
+            unpacking = false;
+            notify(Event::Unpacked);
+        }
         while let Ok(message) = rx.try_recv() {
             if !session.apply(message) {
                 return;
@@ -749,15 +772,17 @@ mod tests {
             &self,
             what: &str,
             want: impl Fn(&Ready) -> bool,
-        ) -> Arc<Decoded> {
+        ) -> Decoded {
             eventually(20, what, || {
                 self.drain();
                 let seen = self.seen.lock();
                 seen.iter().find_map(|event| match event {
                     Event::Ready(ready) if want(ready) => {
-                        Some(Arc::clone(&ready.image))
+                        Some((*ready.image).clone())
                     }
-                    Event::Ready(_) | Event::Failed { .. } => None,
+                    Event::Ready(_)
+                    | Event::Failed { .. }
+                    | Event::Unpacked => None,
                 })
             })
         }
@@ -771,7 +796,9 @@ mod tests {
                         page: failed,
                         error,
                     } if *failed == page => Some(Arc::clone(error)),
-                    Event::Ready(_) | Event::Failed { .. } => None,
+                    Event::Ready(_)
+                    | Event::Failed { .. }
+                    | Event::Unpacked => None,
                 })
             })
         }
@@ -800,7 +827,9 @@ mod tests {
                         page: failed,
                         error,
                     } if *failed == page => Some(error),
-                    Event::Ready(_) | Event::Failed { .. } => None,
+                    Event::Ready(_)
+                    | Event::Failed { .. }
+                    | Event::Unpacked => None,
                 })
                 .count()
         }

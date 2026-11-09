@@ -67,7 +67,7 @@ Do not pipe command output through `head` or `tail`, especially `cargo test`.
 
 Tools, usable separately:
 
-- App: run the release binary under `nix develop`, with `RUST_LOG=cy=debug` and a scratch `$TMPDIR` for a cold store. Its window `app_id` is `cryslen`; the log records navigation and frame events.
+- App: run the release binary under `nix develop`, with `RUST_LOG=cryslen=debug` and a scratch `$TMPDIR` for a cold store. Its window `app_id` is `cryslen`; the log records navigation and frame events.
 - niri: `niri msg windows` lists windows, `niri msg action focus-window --id <id>` focuses one, `niri msg --json focused-window` confirms.
 - dotool: `printf 'key <name>\n' | nix run nixpkgs#dotool --` sends real input; it needs `/dev/uinput` and acts on the focused window. Key bindings: `src/keys.rs`.
 - Screenshot: `niri msg action screenshot-window --id <id> --write-to-disk true` writes a PNG under `~/Pictures/Screenshots`.

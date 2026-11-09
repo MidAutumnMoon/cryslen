@@ -2,9 +2,7 @@
 //! Archives unpack once on a background thread; `bytes` answers `NotYet`
 //! until a member arrives.
 
-use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::ffi::OsStr;
 use std::fs;
 use std::fs::File;
 use std::io;
@@ -21,6 +19,9 @@ use eros::ErrorUnion;
 use eros::IntoUnion as _;
 use parking_lot::Mutex;
 
+use crate::catalog::archive_kind;
+use crate::catalog::compare_names;
+use crate::catalog::ArchiveKind;
 use crate::decode::format_from_name;
 use crate::fault::BadIndex;
 use crate::fault::OpenError;
@@ -28,36 +29,6 @@ use crate::fault::OpenRefusal;
 use crate::fault::PageError;
 use crate::fault::PanicFault;
 use crate::view::PageCount;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PageName {
-    pub parent: Option<String>,
-    pub file: String,
-}
-
-/// The archive family; `Source::open` and main's argument check share
-/// this table.
-enum ArchiveKind {
-    Zip,
-    SevenZip,
-}
-
-fn archive_kind(path: &Path) -> Option<ArchiveKind> {
-    let ext = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    match ext.as_str() {
-        "zip" | "cbz" => Some(ArchiveKind::Zip),
-        "7z" | "cb7" => Some(ArchiveKind::SevenZip),
-        _ => None,
-    }
-}
-
-pub fn is_archive(path: &Path) -> bool {
-    archive_kind(path).is_some()
-}
 
 #[derive(Debug)]
 pub enum PageRead {
@@ -112,7 +83,6 @@ pub struct Source {
     names: Vec<String>,
     count: PageCount,
     backend: Backend,
-    path: PathBuf,
 }
 
 impl Source {
@@ -123,7 +93,7 @@ impl Source {
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 return Err(ErrorUnion::new(OpenRefusal::NotFound(
                     path.to_path_buf(),
-                )))
+                )));
             }
             Err(error) => return Err(ErrorUnion::new(error)),
         };
@@ -137,41 +107,6 @@ impl Source {
                 path.to_path_buf(),
             ))),
         }
-    }
-
-    /// The next or previous sibling book of the same kind, in natural order;
-    /// none at either end.
-    pub fn sibling(&self, forward: bool) -> Option<PathBuf> {
-        let parent = self.path.parent()?;
-        let current = self.path.file_name()?;
-        let archive = is_archive(&self.path);
-        let mut siblings: Vec<(String, PathBuf)> = fs::read_dir(parent)
-            .ok()?
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|entry| {
-                if archive {
-                    entry.is_file() && is_archive(entry)
-                } else {
-                    entry.is_dir()
-                }
-            })
-            .filter_map(|entry| {
-                let name =
-                    entry.file_name()?.to_string_lossy().into_owned();
-                Some((name, entry))
-            })
-            .collect();
-        siblings.sort_by(|left, right| compare_names(&left.0, &right.0));
-        let position = siblings
-            .iter()
-            .position(|(name, _)| OsStr::new(name.as_str()) == current)?;
-        let next = if forward {
-            position.checked_add(1)?
-        } else {
-            position.checked_sub(1)?
-        };
-        siblings.get(next).map(|(_, sibling)| sibling.clone())
     }
 
     fn open_dir(dir: &Path) -> Result<Self, OpenError> {
@@ -191,11 +126,7 @@ impl Source {
             .filter(|name| format_from_name(name).is_some())
             .collect();
         sort_page_names(&mut names);
-        Self::from_names(
-            Backend::Directory(dir.to_path_buf()),
-            names,
-            dir.to_path_buf(),
-        )
+        Self::from_names(Backend::Directory(dir.to_path_buf()), names)
     }
 
     /// Listing reads the central directory, so a damaged local header
@@ -223,7 +154,6 @@ impl Source {
         let source = Self::from_names(
             Backend::Archive(Arc::clone(&fill)),
             names.clone(),
-            path.to_path_buf(),
         )?;
         spawn_zip_fill(zip, names, &fill);
         Ok(source)
@@ -253,7 +183,6 @@ impl Source {
         let source = Self::from_names(
             Backend::Archive(Arc::clone(&fill)),
             names.clone(),
-            path.to_path_buf(),
         )?;
         spawn_sevenzip_fill(archive, &names, &fill);
         Ok(source)
@@ -262,7 +191,6 @@ impl Source {
     fn from_names(
         backend: Backend,
         names: Vec<String>,
-        path: PathBuf,
     ) -> Result<Self, OpenError> {
         let Some(count) = PageCount::new(names.len()) else {
             return Err(ErrorUnion::new(OpenRefusal::Empty));
@@ -271,7 +199,6 @@ impl Source {
             names,
             count,
             backend,
-            path,
         })
     }
 
@@ -279,36 +206,15 @@ impl Source {
         self.count
     }
 
+    /// Every page's entry name, in reading order.
+    pub fn names(&self) -> &[String] {
+        &self.names
+    }
+
     /// Entry name of one page. For archives this includes the inner
     /// path; for directories it is the bare filename.
     pub fn name(&self, index: usize) -> Option<&str> {
         self.names.get(index).map(String::as_str)
-    }
-
-    /// The status line's name segment: the basename plus its immediate parent
-    /// directory.
-    #[expect(
-        clippy::indexing_slicing,
-        reason = "the list is non-empty and callers stay below its length; the debug assert restates it"
-    )]
-    pub fn page_name(&self, index: usize) -> PageName {
-        debug_assert!(
-            index < self.names.len(),
-            "caller clamps the page index"
-        );
-        let entry = &self.names[index];
-        let file = entry.rsplit('/').next().unwrap_or(entry).to_owned();
-        let parent = match &self.backend {
-            Backend::Directory(dir) => dir
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned()),
-            Backend::Archive(_) => {
-                entry.rsplit_once('/').map(|(path, _)| {
-                    path.rsplit('/').next().unwrap_or(path).to_owned()
-                })
-            }
-        };
-        PageName { parent, file }
     }
 
     /// The encoded bytes of one page. An archive still unpacking answers
@@ -333,6 +239,12 @@ impl Source {
             Backend::Directory(_) => false,
             Backend::Archive(fill) => fill.lock().pass.is_none(),
         }
+    }
+
+    /// Whether this source ever runs an unpack pass. A directory has
+    /// nothing to announce when it is already settled.
+    pub(crate) fn unpacks(&self) -> bool {
+        matches!(self.backend, Backend::Archive(_))
     }
 }
 
@@ -367,73 +279,6 @@ fn validated_listing(
         return Err(OpenRefusal::Duplicate(name));
     }
     Ok((names, unpacked_bytes))
-}
-
-/// Natural order over UTF-8 names: ASCII digit runs compare numerically
-/// (fewer leading zeros first); remaining text compares by code point.
-/// Only identical names compare equal.
-fn compare_names(left: &str, right: &str) -> Ordering {
-    let (mut left, mut right) = (left.as_bytes(), right.as_bytes());
-    loop {
-        match (left.first(), right.first()) {
-            (None, None) => return Ordering::Equal,
-            (None, Some(_)) => return Ordering::Less,
-            (Some(_), None) => return Ordering::Greater,
-            (Some(&left_byte), Some(&right_byte)) => {
-                if left_byte.is_ascii_digit()
-                    && right_byte.is_ascii_digit()
-                {
-                    let (left_run, left_rest) = leading_digits(left);
-                    let (right_run, right_rest) = leading_digits(right);
-                    let order = compare_digit_runs(left_run, right_run);
-                    if order != Ordering::Equal {
-                        return order;
-                    }
-                    left = left_rest;
-                    right = right_rest;
-                } else {
-                    let order = left_byte.cmp(&right_byte);
-                    if order == Ordering::Equal {
-                        left = left.split_at(1).1;
-                        right = right.split_at(1).1;
-                    } else {
-                        return order;
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn leading_digits(bytes: &[u8]) -> (&[u8], &[u8]) {
-    let end = bytes
-        .iter()
-        .position(|byte| !byte.is_ascii_digit())
-        .unwrap_or(bytes.len());
-    bytes.split_at(end)
-}
-
-fn strip_leading_zeros(digits: &[u8]) -> &[u8] {
-    let start = digits
-        .iter()
-        .position(|&byte| byte != b'0')
-        .unwrap_or(digits.len());
-    digits.split_at(start).1
-}
-
-/// By value, then fewer leading zeros.
-fn compare_digit_runs(left: &[u8], right: &[u8]) -> Ordering {
-    let (left_value, right_value) =
-        (strip_leading_zeros(left), strip_leading_zeros(right));
-    let (left_zeros, right_zeros) = (
-        left.len() - left_value.len(),
-        right.len() - right_value.len(),
-    );
-    left_value
-        .len()
-        .cmp(&right_value.len())
-        .then_with(|| left_value.cmp(right_value))
-        .then_with(|| left_zeros.cmp(&right_zeros))
 }
 
 /// One member's bytes, or its read error. A failed member is drained,
@@ -544,6 +389,8 @@ fn spawn_sevenzip_fill(
     });
 }
 
+/// Settle the pass: from here on, an unfilled page answers the pass's
+/// verdict instead of `NotYet`.
 fn settle_pass(
     fill: &Arc<Mutex<Fill>>,
     body: impl FnOnce(&Arc<Mutex<Fill>>) -> Result<(), PageError>,
@@ -558,17 +405,19 @@ fn settle_pass(
         ok = matches!(outcome.as_ref(), Ok(Ok(()))),
         "unpack pass ended"
     );
-    let mut state = fill.lock();
-    state.pass = Some(match outcome {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(reason)) => {
-            tracing::warn!(?reason, "unpack pass ended early");
-            Err(Arc::new(reason))
-        }
-        Err(payload) => Err(Arc::new(ErrorUnion::new(
-            PanicFault::from_payload("unpack", payload.as_ref()),
-        ))),
-    });
+    {
+        let mut state = fill.lock();
+        state.pass = Some(match outcome {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(reason)) => {
+                tracing::warn!(?reason, "unpack pass ended early");
+                Err(Arc::new(reason))
+            }
+            Err(payload) => Err(Arc::new(ErrorUnion::new(
+                PanicFault::from_payload("unpack", payload.as_ref()),
+            ))),
+        });
+    }
 }
 
 /// `MemAvailable` from a `/proc/meminfo` text, converted to bytes. The
@@ -616,6 +465,10 @@ fn guard_memory(
 )]
 mod tests {
     use super::*;
+    use crate::catalog::compare_names;
+    use crate::catalog::page_name;
+    use crate::catalog::sibling;
+    use crate::catalog::PageName;
     use crate::decode;
     use crate::fault::BadIndex;
     use crate::fault::DecodeRefusal;
@@ -627,6 +480,7 @@ mod tests {
     use crate::testkit::tiny_png;
     use crate::testkit::TempDir;
 
+    use std::cmp::Ordering;
     use std::io::Error as IoError;
     use std::io::Write as _;
 
@@ -904,7 +758,7 @@ mod tests {
             Source::open(Path::new(SEVENZ_FIXTURE)).expect("7z opens");
         assert_eq!(source.names, ["p1.png", "p2.png"]);
         assert_eq!(
-            source.page_name(0),
+            page_name(&source.names, true, None, 0),
             PageName {
                 parent: None,
                 file: "p1.png".into()
@@ -967,16 +821,16 @@ mod tests {
         );
         assert_eq!(source.len().get(), 4);
         assert_eq!(source.name(2), Some("c10.png"));
+        let dir_name = dir
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         assert_eq!(
-            source.page_name(2),
+            page_name(&source.names, false, Some(&dir_name), 2),
             PageName {
-                parent: Some(
-                    dir.path()
-                        .file_name()
-                        .unwrap()
-                        .to_string_lossy()
-                        .into_owned()
-                ),
+                parent: Some(dir_name),
                 file: "c10.png".into(),
             }
         );
@@ -1017,14 +871,14 @@ mod tests {
             ["b/002.png", "b/010.png", "b/020.png", "b/deep/005.png"]
         );
         assert_eq!(
-            source.page_name(1),
+            page_name(&source.names, true, None, 1),
             PageName {
                 parent: Some("b".into()),
                 file: "010.png".into()
             }
         );
         assert_eq!(
-            source.page_name(3),
+            page_name(&source.names, true, None, 3),
             PageName {
                 parent: Some("deep".into()),
                 file: "005.png".into()
@@ -1154,20 +1008,18 @@ mod tests {
         fs::write(parent.path().join("notes.txt"), b"not a book")
             .expect("plain file writes");
 
-        let book = Source::open(&middle).expect("volume opens");
         assert_eq!(
-            book.sibling(true),
+            sibling(&middle, true),
             Some(last),
             "forward follows natural order"
         );
         assert_eq!(
-            book.sibling(false),
+            sibling(&middle, false),
             Some(first.clone()),
             "backward follows natural order"
         );
-        let cover = Source::open(&first).expect("volume opens");
         assert_eq!(
-            cover.sibling(false),
+            sibling(&first, false),
             None,
             "the shelf's start has no earlier book"
         );
@@ -1191,16 +1043,15 @@ mod tests {
         let after = write_cbz("b.cbz");
         fs::write(shelf.path().join("notes.txt"), b"not a book")
             .expect("plain file writes");
-        let archive = Source::open(&before).expect("zip opens");
         // The volumes directory is a sibling entry of the other kind and
         // must not answer.
         assert_eq!(
-            archive.sibling(true),
+            sibling(&before, true),
             Some(after),
             "archives step between archives"
         );
         assert_eq!(
-            archive.sibling(false),
+            sibling(&before, false),
             None,
             "the first archive has no earlier book"
         );

@@ -1,12 +1,16 @@
-//! The fault taxonomy: refusals are matchable verdicts about input, faults
-//! carry detail, and [`PageError`] is the shared page-level set. Decode and
-//! texture errors widen into it; an open error owns no page and never does.
+//! The fault taxonomy.
+//!
+//! Refusals are matchable verdicts about input, a page fault is text, and
+//! a book fault carries detail. [`PageError`] is the shared page-level
+//! set; decode and texture errors widen into it, and an open error owns no
+//! page.
 
 use std::any::Any;
 use std::error::Error;
 use std::fmt;
 use std::io;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use eros::ErrorUnion;
 use image::ImageError;
@@ -153,6 +157,74 @@ pub type DecodeError =
 pub type TextureError = ErrorUnion<(TextureFault,)>;
 
 pub type SpawnError = ErrorUnion<(io::Error,)>;
+
+/// A page's failure as the text the status line shows, wherever it was
+/// detected: the parent has no copy of the child's error types, so the
+/// wire carries only the summary.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PageFault {
+    summary: String,
+}
+
+impl PageFault {
+    pub fn new(summary: impl Into<String>) -> Self {
+        Self {
+            summary: summary.into(),
+        }
+    }
+}
+
+impl fmt::Display for PageFault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.summary)
+    }
+}
+
+impl From<PageError> for PageFault {
+    fn from(error: PageError) -> Self {
+        Self::new(error.to_string())
+    }
+}
+
+impl From<Arc<PageError>> for PageFault {
+    fn from(error: Arc<PageError>) -> Self {
+        Self::new(error.to_string())
+    }
+}
+
+/// Why a book could not be opened or kept open.
+#[derive(Debug)]
+pub enum BookFault {
+    Spawn(String),
+    Handshake(String),
+    Open(String),
+    Timeout,
+    Died(String),
+}
+
+impl fmt::Display for BookFault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Spawn(detail) => {
+                write!(f, "cannot spawn the book process: {detail}")
+            }
+            Self::Handshake(detail) => {
+                write!(f, "book process handshake failed: {detail}")
+            }
+            Self::Open(detail) => {
+                write!(f, "cannot open the book: {detail}")
+            }
+            Self::Timeout => {
+                write!(f, "the book process did not answer in time")
+            }
+            Self::Died(detail) => {
+                write!(f, "the book process died: {detail}")
+            }
+        }
+    }
+}
+
+impl Error for BookFault {}
 
 #[cfg(test)]
 mod tests {

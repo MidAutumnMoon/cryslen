@@ -2,20 +2,19 @@
 
 use std::fmt;
 use std::iter;
-use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
 use egui::text::LayoutJob;
 
+use crate::catalog::PageName;
 use crate::decode::Format;
-use crate::fault::OpenError;
-use crate::fault::PageError;
-use crate::source::PageName;
+use crate::fault::BookFault;
+use crate::fault::PageFault;
 use crate::view::Spread;
 use crate::view::ViewMode;
 
-pub struct StatusLine {
+pub struct StatusLine<'fault> {
     pub page_count: usize,
     pub spread: Spread,
     pub mode: ViewMode,
@@ -27,17 +26,17 @@ pub struct StatusLine {
     pub zoom: f32,
     /// The wait flag, once a waiting spread has outlived the grace.
     pub waiting: Option<Wait>,
-    pub error: Option<StatusFault>,
+    pub error: Option<StatusFault<'fault>>,
 }
 
 /// What the status line blames: a page's own failure (decode, source,
 /// or a texture the GPU refused), or a book switch that failed.
-pub enum StatusFault {
-    Page(Arc<PageError>),
-    Noted(Arc<OpenError>),
+pub enum StatusFault<'fault> {
+    Page(&'fault PageFault),
+    Noted(&'fault BookFault),
 }
 
-impl fmt::Display for StatusFault {
+impl fmt::Display for StatusFault<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Page(error) => error.fmt(f),
@@ -49,14 +48,14 @@ impl fmt::Display for StatusFault {
 /// The one fault the line shows: the page's own failure first, then a
 /// failed book switch, then a texture the GPU refused. Each layer's
 /// cell keeps its own retention; this is only the ordering.
-pub fn fault_to_show(
-    page: Option<Arc<PageError>>,
-    noted: Option<&Arc<OpenError>>,
-    upload: Option<&Arc<PageError>>,
-) -> Option<StatusFault> {
+pub fn fault_to_show<'fault>(
+    page: Option<&'fault PageFault>,
+    noted: Option<&'fault BookFault>,
+    upload: Option<&'fault PageFault>,
+) -> Option<StatusFault<'fault>> {
     page.map(StatusFault::Page)
-        .or_else(|| noted.cloned().map(StatusFault::Noted))
-        .or_else(|| upload.cloned().map(StatusFault::Page))
+        .or_else(|| noted.map(StatusFault::Noted))
+        .or_else(|| upload.map(StatusFault::Page))
 }
 
 /// Status-line timers, pure in the clock the caller passes.
@@ -139,16 +138,16 @@ impl Wait {
 /// One page's state as the status line reads it: the format the decoder
 /// identified, the page's pixel size, and its failure, each once known.
 #[derive(Clone)]
-pub struct PageState {
+pub struct PageState<'fault> {
     pub format: Option<Format>,
     pub dims: Option<(u32, u32)>,
-    pub error: Option<Arc<PageError>>,
+    pub error: Option<&'fault PageFault>,
 }
 
 /// The status line's view of one spread, in page order.
-pub struct FoldedStatus {
+pub struct FoldedStatus<'fault> {
     pub waiting: bool,
-    pub error: Option<Arc<PageError>>,
+    pub error: Option<&'fault PageFault>,
     pub page: Option<(usize, Format, (u32, u32))>,
     /// The page the line names: the failed one if any page failed, else
     /// the first decoded page, else the spread's first page.
@@ -158,13 +157,13 @@ pub struct FoldedStatus {
 /// Fold one spread's page states. The first failure waits no longer and
 /// speaks for the spread; otherwise the first decoded page supplies the
 /// facts and the name.
-pub fn fold_status(
+pub fn fold_status<'fault>(
     spread: Spread,
-    state: impl Fn(usize) -> PageState,
-) -> FoldedStatus {
+    state: impl Fn(usize) -> PageState<'fault>,
+) -> FoldedStatus<'fault> {
     let mut has_format = false;
     let mut has_error = false;
-    let mut failure: Option<(usize, Arc<PageError>)> = None;
+    let mut failure: Option<(usize, &'fault PageFault)> = None;
     let mut facts = None;
     let mut first_decoded = None;
     for page in iter::once(spread.first).chain(spread.second) {
@@ -217,7 +216,7 @@ pub struct PageFacts {
 /// bar (`fullscreen`) consumes nothing, so the rect is the whole window.
 pub fn show(
     ui: &mut egui::Ui,
-    status: &StatusLine,
+    status: &StatusLine<'_>,
     show_bar: bool,
 ) -> egui::Rect {
     if !show_bar {
@@ -242,7 +241,7 @@ pub fn show(
 /// The mode group plus a showing toast to its left. The Sides right
 /// side lays out right-to-left, so the display order iterates in
 /// reverse.
-fn right_end(ui: &mut egui::Ui, status: &StatusLine) {
+fn right_end(ui: &mut egui::Ui, status: &StatusLine<'_>) {
     for (mode_index, &mode) in ViewMode::ALL.iter().enumerate().rev() {
         let text = egui::RichText::new(group_label(mode)).monospace();
         let text = if mode == status.mode {
@@ -283,7 +282,7 @@ const NAME_COLOR: egui::Color32 =
 /// The left-side facts as one job of colored sections, separate so they
 /// are directly testable. One job, one label: the whole line keeps
 /// eliding together on narrow screens.
-fn line(style: &egui::Style, status: &StatusLine) -> LayoutJob {
+fn line(style: &egui::Style, status: &StatusLine<'_>) -> LayoutJob {
     let font = egui::TextStyle::Monospace.resolve(style);
     let plain = style.visuals.text_color();
     let section =
@@ -337,9 +336,10 @@ fn line(style: &egui::Style, status: &StatusLine) -> LayoutJob {
 )]
 mod tests {
     use super::*;
-    use crate::fault::OpenRefusal;
-    use crate::testkit::failed_page;
-    use eros::ErrorUnion;
+
+    fn shown(fault: Option<StatusFault<'_>>) -> Option<String> {
+        fault.map(|fault| fault.to_string())
+    }
 
     #[test]
     fn timers_wait_and_toast_lifecycle() {
@@ -399,30 +399,45 @@ mod tests {
 
     #[test]
     fn the_line_blames_the_page_before_the_book_before_the_upload() {
-        let page_fault = failed_page("page");
-        let upload_fault = failed_page("upload");
-        let noted: Arc<OpenError> =
-            Arc::new(ErrorUnion::new(OpenRefusal::Empty));
+        let page_fault = PageFault::new("page");
+        let upload_fault = PageFault::new("upload");
+        let noted = BookFault::Timeout;
         assert!(fault_to_show(None, None, None).is_none());
         assert!(matches!(
             fault_to_show(None, Some(&noted), Some(&upload_fault)),
-            Some(StatusFault::Noted(error)) if Arc::ptr_eq(&error, &noted)
+            Some(StatusFault::Noted(_))
         ));
+        assert_eq!(
+            shown(fault_to_show(None, Some(&noted), Some(&upload_fault))),
+            Some(noted.to_string())
+        );
         assert!(matches!(
             fault_to_show(None, None, Some(&upload_fault)),
-            Some(StatusFault::Page(error)) if Arc::ptr_eq(&error, &upload_fault)
+            Some(StatusFault::Page(_))
         ));
+        assert_eq!(
+            shown(fault_to_show(None, None, Some(&upload_fault))),
+            Some(String::from("upload"))
+        );
         assert!(matches!(
             fault_to_show(
-                Some(Arc::clone(&page_fault)),
+                Some(&page_fault),
                 Some(&noted),
                 Some(&upload_fault)
             ),
-            Some(StatusFault::Page(error)) if Arc::ptr_eq(&error, &page_fault)
+            Some(StatusFault::Page(_))
         ));
+        assert_eq!(
+            shown(fault_to_show(
+                Some(&page_fault),
+                Some(&noted),
+                Some(&upload_fault)
+            )),
+            Some(String::from("page"))
+        );
     }
 
-    fn status() -> StatusLine {
+    fn status() -> StatusLine<'static> {
         StatusLine {
             page_count: 214,
             spread: Spread {
@@ -486,7 +501,7 @@ mod tests {
     /// settles one frame late. Only the texture upload needs a GPU.
     fn render(
         width: f32,
-        status: &StatusLine,
+        status: &StatusLine<'_>,
     ) -> (Vec<TextItem>, egui::Rect) {
         use std::mem;
 

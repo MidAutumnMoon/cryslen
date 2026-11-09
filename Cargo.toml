@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "minimal wayland image viewer with manga mode"
 
+[lib]
+name = "cryslen"
+path = "src/lib.rs"
+
 [[bin]]
 name = "cy"
 path = "src/main.rs"
@@ -16,6 +20,11 @@ egui_glow = { version = "0.37", default-features = false, features = ["winit", "
 egui_system_font_provider = "0.37"
 glutin = { version = "0.32", default-features = false, features = ["egl", "wayland"] }
 glutin-winit = { version = "0.5", default-features = false, features = ["egl", "wayland"] }
+
+crossbeam-channel = "0.5"
+ipc-channel = "0.23"
+nix = { version = "0.31", features = ["process", "signal"] }
+serde = { version = "1", features = ["derive"] }
 
 eros = { version = "0.8", default-features = false, features = ["context", "backtrace", "location"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "tiff"] }
@@ -69,6 +78,10 @@ correctness = { level = "deny", priority = -1 }
 
 # Suppress Clippy's warning about enabling all restriction lints.
 blanket_clippy_restriction_lints = "allow"
+
+# The debug/status wire vocabulary is closed and matched exhaustively
+# inside the crate; exhaustive public enums buy nothing here.
+exhaustive_enums = "allow"
 
 # Too annoying!
 cognitive_complexity = "allow"

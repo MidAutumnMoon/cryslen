@@ -3,6 +3,9 @@
 
 use std::num::NonZeroUsize;
 
+use serde::Deserialize;
+use serde::Serialize;
+
 /// A book's page count. A live source lists at least one page, so the
 /// count is nonzero by shape and the spread math never clamps it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,7 +21,7 @@ impl PageCount {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub enum ViewMode {
     Normal,
     Manga,
@@ -28,14 +31,17 @@ pub enum ViewMode {
 impl ViewMode {
     pub const ALL: [Self; 3] = [Self::Normal, Self::Manga, Self::Comic];
 
+    #[must_use]
     pub fn pairs(self) -> bool {
         matches!(self, Self::Manga | Self::Comic)
     }
 
+    #[must_use]
     pub fn rtl(self) -> bool {
         self == Self::Manga
     }
 
+    #[must_use]
     pub fn label(self) -> &'static str {
         match self {
             Self::Normal => "Normal",
@@ -44,6 +50,7 @@ impl ViewMode {
         }
     }
 
+    #[must_use]
     pub fn shortcut(self) -> &'static str {
         match self {
             Self::Normal => "n",
@@ -52,6 +59,7 @@ impl ViewMode {
         }
     }
 
+    #[must_use]
     pub fn effect(self) -> &'static str {
         match self {
             Self::Normal => "left to right, single page",
