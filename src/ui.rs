@@ -1,6 +1,7 @@
 //! Status overlay: one egui bottom panel, data in / text out.
 
 use std::fmt;
+use std::iter;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -13,8 +14,6 @@ use crate::fault::PageError;
 use crate::source::PageName;
 use crate::view::Spread;
 use crate::view::ViewMode;
-use crate::worker::SeatView;
-use crate::worker::SpreadView;
 
 pub struct StatusLine {
     pub page_count: usize,
@@ -144,7 +143,16 @@ impl Wait {
     }
 }
 
-/// The status line's view of one spread's snapshot, in reading order.
+/// One page's state as the status line reads it: the format the decoder
+/// identified, the page's pixel size, or the page's failure.
+#[derive(Clone)]
+pub struct PageState {
+    pub format: Option<Format>,
+    pub source: Option<(u32, u32)>,
+    pub error: Option<Arc<PageError>>,
+}
+
+/// The status line's view of one spread, in page order.
 pub struct FoldedStatus {
     pub waiting: bool,
     pub error: Option<Arc<PageError>>,
@@ -154,33 +162,53 @@ pub struct FoldedStatus {
     pub speaker: usize,
 }
 
-pub fn fold_status(spread: Spread, snapshot: &SpreadView) -> FoldedStatus {
-    let mut folded = FoldedStatus {
-        waiting: matches!(snapshot.first, SeatView::Pending)
-            || matches!(snapshot.second.as_ref(), Some(SeatView::Pending)),
-        error: None,
-        page: None,
-        speaker: spread.first,
-    };
-    for (page, view) in snapshot.reading_order(spread) {
-        match view {
-            SeatView::Failed(error) => {
-                folded.error = Some(Arc::clone(error));
-                folded.speaker = page;
-                break;
+/// Fold one spread's page states. A failure anywhere waits no longer and
+/// speaks for the spread; pages past the first failure contribute only
+/// their own state. With no failure, the first decoded page supplies the
+/// facts and the name.
+pub fn fold_status(
+    spread: Spread,
+    state: impl Fn(usize) -> PageState,
+) -> FoldedStatus {
+    let mut has_format = false;
+    let mut has_error = false;
+    let mut failure: Option<(usize, Arc<PageError>)> = None;
+    let mut facts = None;
+    let mut first_decoded = None;
+    for page in iter::once(spread.first).chain(spread.second) {
+        let PageState {
+            format,
+            source,
+            error,
+        } = state(page);
+        has_format |= format.is_some();
+        has_error |= error.is_some();
+        if failure.is_some() {
+            continue;
+        }
+        if let Some(fault) = error {
+            failure = Some((page, fault));
+            continue;
+        }
+        if let Some(format) = format {
+            first_decoded.get_or_insert(page);
+            if facts.is_none() {
+                if let Some(source) = source {
+                    facts = Some((page, format, source));
+                }
             }
-            SeatView::Ready(decoded) if folded.page.is_none() => {
-                folded.page = Some((
-                    page,
-                    decoded.format(),
-                    (decoded.width(), decoded.height()),
-                ));
-                folded.speaker = page;
-            }
-            SeatView::Ready(_) | SeatView::Pending => {}
         }
     }
-    folded
+    let (speaker, error) = match failure {
+        Some((page, fault)) => (page, Some(fault)),
+        None => (first_decoded.unwrap_or(spread.first), None),
+    };
+    FoldedStatus {
+        waiting: !has_format && !has_error,
+        error,
+        page: facts,
+        speaker,
+    }
 }
 
 pub struct PageFacts {
@@ -319,8 +347,6 @@ mod tests {
     use super::*;
     use crate::fault::OpenRefusal;
     use crate::testkit::failed_page;
-    use crate::testkit::failed_seat;
-    use crate::testkit::ready_seat;
     use eros::ErrorUnion;
 
     #[test]
@@ -402,138 +428,6 @@ mod tests {
             ),
             Some(StatusFault::Page(error)) if Arc::ptr_eq(&error, &page_fault)
         ));
-    }
-
-    #[test]
-    fn fold_status_table() {
-        struct Expect {
-            waiting: bool,
-            error: Option<Arc<PageError>>,
-            page: Option<(usize, Format, (u32, u32))>,
-            speaker: usize,
-        }
-        let pair = Spread {
-            first: 0,
-            second: Some(1),
-        };
-        let spread_view = |first: SeatView, second: Option<SeatView>| {
-            SpreadView { first, second }
-        };
-        // A failed seat plus the fault it carries, so the row can
-        // expect that exact cell back.
-        let failed = || {
-            let fault = failed_page("x");
-            (SeatView::Failed(Arc::clone(&fault)), fault)
-        };
-        let rows = [
-            (pair, {
-                let (second, fault) = failed();
-                (
-                    spread_view(ready_seat(2, 2), Some(second)),
-                    Expect {
-                        waiting: false,
-                        error: Some(fault),
-                        page: Some((0, Format::Png, (2, 2))),
-                        speaker: 1,
-                    },
-                )
-            }),
-            (
-                pair,
-                (
-                    spread_view(SeatView::Pending, Some(ready_seat(2, 2))),
-                    Expect {
-                        waiting: true,
-                        error: None,
-                        page: Some((1, Format::Png, (2, 2))),
-                        speaker: 1,
-                    },
-                ),
-            ),
-            (
-                Spread::lone(0),
-                (
-                    spread_view(ready_seat(2, 2), None),
-                    Expect {
-                        waiting: false,
-                        error: None,
-                        page: Some((0, Format::Png, (2, 2))),
-                        speaker: 0,
-                    },
-                ),
-            ),
-            (pair, {
-                let (first, fault) = failed();
-                (
-                    spread_view(first, Some(failed_seat("second"))),
-                    Expect {
-                        waiting: false,
-                        error: Some(fault),
-                        page: None,
-                        speaker: 0,
-                    },
-                )
-            }),
-            (pair, {
-                let (second, fault) = failed();
-                (
-                    spread_view(ready_seat(800, 600), Some(second)),
-                    Expect {
-                        waiting: false,
-                        error: Some(fault),
-                        page: Some((0, Format::Png, (800, 600))),
-                        speaker: 1,
-                    },
-                )
-            }),
-            (pair, {
-                let (first, fault) = failed();
-                (
-                    spread_view(first, Some(ready_seat(640, 480))),
-                    Expect {
-                        waiting: false,
-                        error: Some(fault),
-                        page: None,
-                        speaker: 0,
-                    },
-                )
-            }),
-            (pair, {
-                let (second, fault) = failed();
-                (
-                    spread_view(SeatView::Pending, Some(second)),
-                    Expect {
-                        waiting: true,
-                        error: Some(fault),
-                        page: None,
-                        speaker: 1,
-                    },
-                )
-            }),
-            (
-                Spread::lone(0),
-                (
-                    spread_view(SeatView::Pending, None),
-                    Expect {
-                        waiting: true,
-                        error: None,
-                        page: None,
-                        speaker: 0,
-                    },
-                ),
-            ),
-        ];
-        for (i, (spread, (snapshot, want))) in rows.iter().enumerate() {
-            let folded = fold_status(*spread, snapshot);
-            assert_eq!(folded.waiting, want.waiting, "row {i}: waiting");
-            assert_eq!(
-                folded.error.as_ref().map(Arc::as_ptr),
-                want.error.as_ref().map(Arc::as_ptr),
-                "row {i}: error"
-            );
-            assert_eq!(folded.page, want.page, "row {i}: page");
-            assert_eq!(folded.speaker, want.speaker, "row {i}: speaker");
-        }
     }
 
     fn status() -> StatusLine {

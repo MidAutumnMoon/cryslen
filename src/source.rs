@@ -16,6 +16,8 @@ use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
+use std::time::Instant;
 
 use eros::ErrorUnion;
 use eros::IntoUnion as _;
@@ -446,9 +448,20 @@ fn compare_digit_runs(left: &[u8], right: &[u8]) -> Ordering {
 fn read_member(
     member: &mut (impl Read + ?Sized),
 ) -> Result<Arc<[u8]>, PageError> {
+    let started = Instant::now();
     let mut bytes = Vec::new();
     match member.read_to_end(&mut bytes) {
-        Ok(_) => Ok(bytes.into()),
+        Ok(_) => {
+            let elapsed = started.elapsed();
+            if elapsed >= Duration::from_millis(200) {
+                tracing::debug!(
+                    bytes = bytes.len(),
+                    elapsed = ?elapsed,
+                    "slow member read"
+                );
+            }
+            Ok(bytes.into())
+        }
         Err(error) => {
             #[expect(
                 clippy::let_underscore_must_use,
@@ -544,7 +557,13 @@ fn settle_pass(
     use std::panic;
     use std::panic::AssertUnwindSafe;
 
+    let started = Instant::now();
     let outcome = panic::catch_unwind(AssertUnwindSafe(|| body(fill)));
+    tracing::debug!(
+        elapsed = ?started.elapsed(),
+        ok = matches!(outcome.as_ref(), Ok(Ok(()))),
+        "unpack pass ended"
+    );
     let mut state = fill.lock();
     state.pass = Some(match outcome {
         Ok(Ok(())) => Ok(()),

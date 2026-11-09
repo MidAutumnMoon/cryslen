@@ -4,8 +4,9 @@ mod app;
 mod decode;
 mod fault;
 mod keys;
+mod plan;
+mod preview;
 mod render;
-mod screen;
 mod source;
 #[cfg(test)]
 #[expect(

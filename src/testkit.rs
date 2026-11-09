@@ -7,14 +7,10 @@ use std::sync::Arc;
 
 use eros::ErrorUnion;
 
-use crate::decode::Decoded;
-use crate::decode::Format;
-use crate::decode::Transfer;
 use crate::fault::DecodeRefusal;
 use crate::fault::PageError;
 use crate::source::PageRead;
 use crate::source::Source;
-use crate::worker::SeatView;
 
 fn encode(
     img: &image::DynamicImage,
@@ -69,26 +65,8 @@ pub fn tiny_tiff(width: u32, height: u32, rgb: [u8; 3]) -> Vec<u8> {
     )
 }
 
-pub fn ready_seat(width: u32, height: u32) -> SeatView {
-    SeatView::Ready(Arc::new(
-        Decoded::rgba(
-            width,
-            height,
-            Format::Png,
-            Transfer::Srgb,
-            vec![0_u8; width as usize * height as usize * 4]
-                .into_boxed_slice(),
-        )
-        .expect("valid rgba page"),
-    ))
-}
-
 pub fn failed_page(message: &'static str) -> Arc<PageError> {
     Arc::new(ErrorUnion::new(DecodeRefusal::Corrupt(message)))
-}
-
-pub fn failed_seat(message: &'static str) -> SeatView {
-    SeatView::Failed(failed_page(message))
 }
 
 /// Poll a source page until its bytes arrive. Panics if the page

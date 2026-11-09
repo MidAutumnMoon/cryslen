@@ -28,6 +28,7 @@ jxl = "0.8"
 tracing = "0.1"
 ino_tracing = "1"
 rustfs-mimalloc = { version = "0.7.3", features = ["override", "no_profile"] }
+xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
 
 [profile.release]
 lto = "thin"

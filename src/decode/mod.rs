@@ -23,12 +23,18 @@ mod jxl;
 /// pixel extents against the dimensions.
 #[derive(Clone)]
 pub struct Decoded {
+    /// Pixel dimensions of this representation. A preview is smaller
+    /// than the page; the page's own dimensions live in [`Self::source`].
     width: u32,
     height: u32,
     pixels: Pixels,
     /// Sample encoding the renderer must undo before the framebuffer.
     transfer: Transfer,
     format: Format,
+    /// The page's oriented dimensions, which the layout pairs and fits
+    /// against. Equal to `width`/`height` for a native decode, and
+    /// unchanged by preview minting.
+    source: (u32, u32),
 }
 
 /// Sample encoding. SDR pages are sRGB-class gamma, passed through to the
@@ -61,6 +67,18 @@ impl Decoded {
         self.format
     }
 
+    /// The page's oriented dimensions, independent of how far this
+    /// representation is downsampled.
+    pub fn source(&self) -> (u32, u32) {
+        self.source
+    }
+
+    /// Record the page dimensions this representation was minted from.
+    pub fn with_source(mut self, source: (u32, u32)) -> Self {
+        self.source = source;
+        self
+    }
+
     pub fn rgba(
         width: u32,
         height: u32,
@@ -79,6 +97,7 @@ impl Decoded {
             pixels: Pixels::Rgba8(bytes),
             transfer,
             format,
+            source: (width, height),
         })
     }
 
@@ -110,6 +129,7 @@ impl Decoded {
             pixels: Pixels::Yuv(yuv),
             transfer,
             format,
+            source: (width, height),
         })
     }
 
