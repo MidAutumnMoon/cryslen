@@ -1,9 +1,6 @@
-//! The fault taxonomy.
-//!
-//! Refusals are matchable verdicts about input, a page fault is text, and
-//! a book fault carries detail. [`PageError`] is the shared page-level
-//! set; decode and texture errors widen into it, and an open error owns no
-//! page.
+//! The fault taxonomy: matchable refusals about input, a page fault as
+//! text, and a book fault with detail. [`PageError`] collects the
+//! page-level errors; an open error owns no page.
 
 use std::any::Any;
 use std::error::Error;
@@ -15,6 +12,8 @@ use std::sync::Arc;
 use eros::ErrorUnion;
 use image::ImageError;
 use jxl::error::Error as JxlError;
+use serde::Deserialize;
+use serde::Serialize;
 use zip::result::ZipError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,7 +160,7 @@ pub type SpawnError = ErrorUnion<(io::Error,)>;
 /// A page's failure as the text the status line shows, wherever it was
 /// detected: the parent has no copy of the child's error types, so the
 /// wire carries only the summary.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PageFault {
     summary: String,
 }
@@ -206,7 +205,7 @@ impl fmt::Display for BookFault {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Spawn(detail) => {
-                write!(f, "cannot spawn the book process: {detail}")
+                write!(f, "cannot start the book process: {detail}")
             }
             Self::Handshake(detail) => {
                 write!(f, "book process handshake failed: {detail}")

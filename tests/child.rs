@@ -46,22 +46,21 @@ use ipc_channel::ipc::IpcOneShotServer;
 const PIXEL: [u8; 4] = [0x40, 0x80, 0xc0, 0xff];
 
 /// The page's edge. Small enough that the thumb mint is the page itself.
-const EDGE: u32 = 2;
+const PAGE_EDGE: u32 = 2;
 
 /// RGBA bytes in the page: four channels per pixel.
-const PAGE_BYTES: usize = (EDGE * EDGE * 4) as usize;
+const PAGE_BYTES: usize = (PAGE_EDGE * PAGE_EDGE * 4) as usize;
 
 /// Generous bound on each protocol step: a healthy child answers in
 /// milliseconds, but a cold process start can be slow.
-const PATIENCE: Duration = Duration::from_secs(30);
+const STEP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How often the handshake wait rechecks the child process.
-const POLL: Duration = Duration::from_millis(50);
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 static ROOTS: AtomicU64 = AtomicU64::new(0);
 
-/// Unique scratch root, removed on drop. No `tempfile` dependency, and
-/// nothing survives a panicking test.
+/// A scratch root unique within this test process, removed on drop.
 struct TempRoot(PathBuf);
 
 impl TempRoot {
@@ -118,11 +117,14 @@ impl Drop for ChildGuard {
     }
 }
 
-/// A solid `EDGE`-square RGBA page the test can recognize after the
+/// A solid `PAGE_EDGE`-square RGBA page the test can recognize after the
 /// round trip.
 fn write_page(dir: &Path) {
-    let page =
-        image::RgbaImage::from_pixel(EDGE, EDGE, image::Rgba(PIXEL));
+    let page = image::RgbaImage::from_pixel(
+        PAGE_EDGE,
+        PAGE_EDGE,
+        image::Rgba(PIXEL),
+    );
     let mut encoded = Cursor::new(Vec::<u8>::new());
     image::DynamicImage::ImageRgba8(page)
         .write_to(&mut encoded, image::ImageFormat::Png)
@@ -171,7 +173,7 @@ fn child_serves_a_decoded_thumb() {
 
     let started = Instant::now();
     let hello = loop {
-        match accepted_rx.recv_timeout(POLL) {
+        match accepted_rx.recv_timeout(POLL_INTERVAL) {
             Ok(Ok((_, hello))) => break hello,
             Ok(Err(error)) => {
                 panic!("the child failed the handshake: {error}");
@@ -186,8 +188,8 @@ fn child_serves_a_decoded_thumb() {
                     );
                 }
                 assert!(
-                    started.elapsed() <= PATIENCE,
-                    "{binary} did not connect within {PATIENCE:?}",
+                    started.elapsed() <= STEP_TIMEOUT,
+                    "{binary} did not connect within {STEP_TIMEOUT:?}",
                 );
             }
         }
@@ -198,7 +200,7 @@ fn child_serves_a_decoded_thumb() {
 
     let (messages, commands) = hello;
 
-    let info = match messages.try_recv_timeout(PATIENCE) {
+    let info = match messages.try_recv_timeout(STEP_TIMEOUT) {
         Ok(ChildMsg::BookInfo(info)) => info,
         Ok(message) => panic!("expected BookInfo first, got {message:?}"),
         Err(error) => panic!("no BookInfo from the child: {error}"),
@@ -222,7 +224,7 @@ fn child_serves_a_decoded_thumb() {
         .send(ParentMsg::SetWants(vec![Want::new(0, Artifact::Thumb)]))
         .expect("send SetWants");
 
-    let image = match messages.try_recv_timeout(PATIENCE) {
+    let image = match messages.try_recv_timeout(STEP_TIMEOUT) {
         Ok(ChildMsg::Ready {
             page: 0,
             kind: Artifact::Thumb,
@@ -234,16 +236,14 @@ fn child_serves_a_decoded_thumb() {
         Err(error) => panic!("no Ready from the child: {error}"),
     };
 
-    // The wire copy must carry the page the child started from: same
-    // extents, page dims, format, and pixels.
     assert_eq!(
         (image.width, image.height),
-        (EDGE, EDGE),
+        (PAGE_EDGE, PAGE_EDGE),
         "the thumb is the page's own size",
     );
     assert_eq!(
         image.page_dims,
-        (EDGE, EDGE),
+        (PAGE_EDGE, PAGE_EDGE),
         "the thumb reports the page's dimensions",
     );
     assert_eq!(

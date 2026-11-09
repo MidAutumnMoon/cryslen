@@ -555,10 +555,10 @@ fn run(
 ) {
     // An archive pass that settled before this thread started is still
     // announced; a directory has no pass to announce.
-    let mut unpacking = source.unpacks();
+    let mut unpack_pending = source.unpacks();
     loop {
-        if unpacking && !source.unpacking() {
-            unpacking = false;
+        if unpack_pending && !source.unpacking() {
+            unpack_pending = false;
             notify(Event::Unpacked);
         }
         while let Ok(message) = rx.try_recv() {

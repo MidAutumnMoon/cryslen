@@ -57,14 +57,13 @@ Item numbers stay fixed because other documents cite them. Both are
 described in `docs/internal/process.md`.
 
 1. **A demand job can wait out at most one book's in-flight decode.**
-   A switch kills the old child before spawning the next, so the old
-   book's decode, archive buffers, and store handles end with it: no
-   switch runs two decodes, and the new book's first turn waits only on
-   its own worker. Inside one book a want can still wait for the decode
-   already inside `decode::decode` (up to ~0.75 s for a 50 MP JXL),
-   because the worker is still one thread; a still frame keeps the
-   previous spread up meanwhile. Decoder-side cancellation remains the
-   lever if that in-book wait bites.
+   A switch kills the old child, so its decode, archive buffers, and
+   store handles end with it: no switch runs two decodes, and the new
+   book waits only on its own worker. Inside one book a want can still
+   wait for the decode already inside `decode::decode` (up to ~0.75 s
+   for a 50 MP JXL), because the worker is still one thread; a still
+   frame keeps the previous spread up meanwhile. Decoder-side
+   cancellation remains the lever if that in-book wait bites.
 
 7. **`switch_book` no longer opens the source on the UI thread.**
    It kills the old child, returns, and starts a thread that runs

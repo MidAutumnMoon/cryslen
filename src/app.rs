@@ -8,6 +8,8 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
+use crossbeam_channel::Receiver;
+use crossbeam_channel::TryRecvError;
 use egui_winit::winit;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -106,11 +108,8 @@ pub struct App {
     /// The live child, or `None` once it died or was killed.
     process: Option<BookProcess>,
     /// The one switch in flight; a switch while it runs is ignored.
-    pending: Option<
-        crossbeam_channel::Receiver<
-            Result<(BookView, BookProcess), BookFault>,
-        >,
-    >,
+    pending_open:
+        Option<Receiver<Result<(BookView, BookProcess), BookFault>>>,
     gl: Option<Gl>,
     fatal_error: Option<eros::ErrorUnion>,
     index: usize,
@@ -120,13 +119,13 @@ pub struct App {
     presented: Option<Spread>,
     /// Page facts, written at the first artifact that leaves the queue.
     cached: BTreeMap<usize, CachedPage>,
-    /// Page failures, sticky per page so a blip cannot erase them.
-    errors: BTreeMap<usize, PageFault>,
+    /// Page faults, sticky per page so a blip cannot erase them.
+    faults: BTreeMap<usize, PageFault>,
     /// Decoded artifacts waiting for an upload, in arrival order.
     queue: VecDeque<worker::Ready>,
     /// The page whose texture the GPU last refused, held until a book
-    /// switch; the failure itself lives in `errors`.
-    upload_error: Option<usize>,
+    /// switch; the fault itself lives in `faults`.
+    upload_fault_page: Option<usize>,
     /// Whether the worker produces skim thumbs or full views.
     motion: Motion,
     /// When the last navigation was dispatched, for the skim window.
@@ -135,13 +134,13 @@ pub struct App {
     /// it was logged.
     hold_since: Option<Instant>,
     hold_logged: bool,
-    /// The want set last sent to the worker.
-    sent: Vec<Want>,
+    /// The want set last sent to the child.
+    sent_wants: Vec<Want>,
     /// Reading direction of the last turn: the child's plan and skim
     /// tie-breaks follow it.
     direction: Direction,
-    /// A failed book switch, held until one succeeds.
-    noted_error: Option<BookFault>,
+    /// A failed switch or a dead child, held until the next book lands.
+    book_fault: Option<BookFault>,
     timers: ui::Timers,
     /// Cursor position in viewport px, same as window px.
     cursor: (f32, f32),
@@ -179,7 +178,7 @@ impl App {
         Self {
             view,
             process: Some(process),
-            pending: None,
+            pending_open: None,
             gl: None,
             fatal_error: None,
             index,
@@ -187,16 +186,16 @@ impl App {
             fit: view::Fit::default(),
             presented: None,
             cached: BTreeMap::new(),
-            errors: BTreeMap::new(),
+            faults: BTreeMap::new(),
             queue: VecDeque::new(),
-            upload_error: None,
+            upload_fault_page: None,
             motion: Motion::Still,
             last_nav: None,
             hold_since: None,
             hold_logged: false,
-            sent: cold,
+            sent_wants: cold,
             direction,
-            noted_error: None,
+            book_fault: None,
             timers: ui::Timers::default(),
             cursor: (0.0, 0.0),
             dragging: false,
@@ -302,7 +301,7 @@ impl App {
             &self.cached,
             self.direction == Direction::Forward,
             |page| {
-                self.errors.contains_key(&page)
+                self.faults.contains_key(&page)
                     || (self.cached.contains_key(&page)
                         && if skimming {
                             self.has_any(page)
@@ -382,7 +381,7 @@ impl App {
                     })
             },
             |page, kind| self.has(page, kind),
-            |page| self.errors.contains_key(&page),
+            |page| self.faults.contains_key(&page),
         );
         debug_assert!(
             wants.iter().all(|want| kept(
@@ -391,13 +390,13 @@ impl App {
             "retention must cover every want; a want that never leaves \
              the sent set can never be re-served"
         );
-        if wants != self.sent {
+        if wants != self.sent_wants {
             tracing::debug!(?wants, "requested");
             self.send(ParentMsg::SetWants(wants.clone()));
-            self.sent = wants;
+            self.sent_wants = wants;
         }
 
-        let errors = &self.errors;
+        let faults = &self.faults;
         let cached = &self.cached;
         let pages = self.gl.as_ref().map(|gl| &gl.pages);
         let folded = ui::fold_status(shown, |page| {
@@ -411,7 +410,7 @@ impl App {
                         .then_some(entry.format)
                 }),
                 dims: entry.map(|entry| entry.dims),
-                error: errors.get(&page),
+                fault: faults.get(&page),
             }
         });
         if let Some(delay) = self.timers.tick_wait(now, folded.waiting) {
@@ -429,9 +428,9 @@ impl App {
             decoded,
             dims,
         });
-        let upload = self
-            .upload_error
-            .and_then(|failed| self.errors.get(&failed));
+        let upload_fault = self
+            .upload_fault_page
+            .and_then(|failed| self.faults.get(&failed));
         let status = StatusLine {
             page_count: self.view.len().get(),
             spread: shown,
@@ -441,10 +440,10 @@ impl App {
             page,
             zoom: placed.scale,
             waiting: self.timers.wait_word(now, || self.view.unpacking),
-            error: ui::fault_to_show(
-                folded.error,
-                self.noted_error.as_ref(),
-                upload,
+            fault: ui::fault_to_show(
+                folded.fault,
+                self.book_fault.as_ref(),
+                upload_fault,
             ),
         };
 
@@ -562,9 +561,9 @@ impl App {
                 );
             }
             if let Err(error) = refused {
-                self.errors
+                self.faults
                     .insert(ready.page, PageFault::from(error.widen()));
-                self.upload_error = Some(ready.page);
+                self.upload_fault_page = Some(ready.page);
             }
             uploaded += 1;
             bytes = bytes.saturating_add(cost);
@@ -747,12 +746,11 @@ impl App {
         }
     }
 
-    /// Start the next sibling book without blocking the frame. The old
-    /// child dies first, so its archive memory and its queued events
-    /// cannot outlive the switch; the old view and its textures stay on
-    /// screen until the new book lands.
+    /// Start the next sibling book without blocking the frame. The old child
+    /// dies first, so its queued events cannot outlive the switch; its view
+    /// and textures stay on screen until the new book lands.
     fn switch_book(&mut self, forward: bool) {
-        if self.pending.is_some() {
+        if self.pending_open.is_some() {
             return;
         }
         let Some(path) = self.view.sibling(forward) else {
@@ -760,8 +758,6 @@ impl App {
         };
         tracing::debug!(path = %path.display(), forward, "book switch");
         self.kill_process();
-        // The fork happens here, on the loop's thread: the child's
-        // parent-death signal follows the thread that forked it.
         let wake: Wake = {
             let proxy = self.proxy.clone();
             Box::new(move || post(&proxy, UserEvent::Wake))
@@ -769,29 +765,29 @@ impl App {
         let opened = match PendingBookOpen::begin(&path, wake) {
             Ok(opened) => opened,
             Err(error) => {
-                self.noted_error = Some(error);
+                self.book_fault = Some(error);
                 self.request_redraw();
                 return;
             }
         };
-        let (sender, result) = crossbeam_channel::bounded(1);
+        let (opened_tx, opened_rx) = crossbeam_channel::bounded(1);
         let proxy = self.proxy.clone();
         let spawned = thread::Builder::new()
             .name(String::from("cy-book-open"))
             .spawn(move || {
                 // A receiver that is gone means the app is gone too.
-                if sender.send(opened.finish()).is_ok() {
+                if opened_tx.send(opened.finish()).is_ok() {
                     post(&proxy, UserEvent::Wake);
                 }
             });
         match spawned {
             Ok(_detached) => {
-                self.pending = Some(result);
+                self.pending_open = Some(opened_rx);
             }
             Err(error) => {
                 // A failed spawn drops the pending open, which kills the
                 // child that was just forked for it.
-                self.noted_error =
+                self.book_fault =
                     Some(BookFault::Spawn(error.to_string()));
                 self.request_redraw();
             }
@@ -822,32 +818,32 @@ impl App {
         self.process = Some(process);
         self.index = index;
         self.direction = Direction::Forward;
-        self.sent = cold;
+        self.sent_wants = cold;
         self.presented = None;
         self.cached.clear();
-        self.errors.clear();
+        self.faults.clear();
         self.queue.clear();
-        self.upload_error = None;
+        self.upload_fault_page = None;
         self.motion = Motion::Still;
         self.last_nav = None;
         self.hold_since = None;
         self.hold_logged = false;
         self.fit.refit();
-        self.noted_error = None;
+        self.book_fault = None;
         if let Some(gl) = self.gl.as_mut() {
             gl.pages.clear_all();
         }
     }
 
     /// Drain the child's events and adopt a finished switch. A killed
-    /// child's receiver went with it, so nothing here can be a stale
-    /// event of a book that already left the screen.
+    /// child's receiver went with it, so no stale event of a book that
+    /// already left the screen can arrive here.
     fn poll_book_updates(&mut self) {
         for event in self.drain_events() {
             match event {
                 BookEvent::Ready(ready) => self.queue.push_back(ready),
                 BookEvent::Failed { page, fault } => {
-                    self.errors.insert(page, fault);
+                    self.faults.insert(page, fault);
                 }
                 BookEvent::Unpacked => self.view.unpacking = false,
                 BookEvent::Died(detail) => {
@@ -855,22 +851,21 @@ impl App {
                     // The process is gone; taking it reaps it and joins
                     // the reader that just reported the death.
                     self.kill_process();
-                    self.noted_error
-                        .get_or_insert(BookFault::Died(detail));
+                    self.book_fault.get_or_insert(BookFault::Died(detail));
                 }
             }
         }
-        let Some(pending) = self.pending.take() else {
+        let Some(in_flight) = self.pending_open.take() else {
             return;
         };
-        let opened = match pending.try_recv() {
+        let opened = match in_flight.try_recv() {
             Ok(opened) => opened,
-            Err(crossbeam_channel::TryRecvError::Empty) => {
-                self.pending = Some(pending);
+            Err(TryRecvError::Empty) => {
+                self.pending_open = Some(in_flight);
                 return;
             }
-            Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                self.noted_error.get_or_insert_with(|| {
+            Err(TryRecvError::Disconnected) => {
+                self.book_fault.get_or_insert_with(|| {
                     BookFault::Died(String::from(
                         "the book switch ended without a book",
                     ))
@@ -882,13 +877,12 @@ impl App {
             Ok((view, process)) => self.adopt_book(view, process),
             Err(fault) => {
                 tracing::warn!(?fault, "book switch failed");
-                self.noted_error = Some(fault);
+                self.book_fault = Some(fault);
             }
         }
     }
 
-    /// Retune the child: the view carries the spread, the seating order,
-    /// and the prefetch direction.
+    /// Retune the child to the current spread, mode, and direction.
     fn set_view(&self) {
         self.send(ParentMsg::SetView {
             index: self.index,
@@ -1169,7 +1163,7 @@ impl ApplicationHandler<UserEvent> for App {
         // Quit must not wait out an in-flight decode; the child dies, and
         // a pending open's book dies with its own result if it lands.
         self.kill_process();
-        self.pending = None;
+        self.pending_open = None;
         self.gl = None;
     }
 

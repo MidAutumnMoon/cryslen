@@ -19,8 +19,7 @@ use eros::ErrorUnion;
 use eros::IntoUnion as _;
 use parking_lot::Mutex;
 
-use crate::catalog::archive_kind;
-use crate::catalog::compare_names;
+use crate::catalog;
 use crate::catalog::ArchiveKind;
 use crate::decode::format_from_name;
 use crate::fault::BadIndex;
@@ -100,7 +99,7 @@ impl Source {
         if metadata.is_dir() {
             return Self::open_dir(path);
         }
-        match archive_kind(path) {
+        match catalog::archive_kind(path) {
             Some(ArchiveKind::Zip) => Self::open_zip(path),
             Some(ArchiveKind::SevenZip) => Self::open_sevenzip(path),
             None => Err(ErrorUnion::new(OpenRefusal::Unsupported(
@@ -241,8 +240,8 @@ impl Source {
         }
     }
 
-    /// Whether this source ever runs an unpack pass. A directory has
-    /// nothing to announce when it is already settled.
+    /// Whether this source has an unpack pass at all, unlike
+    /// `unpacking()`.
     pub(crate) fn unpacks(&self) -> bool {
         matches!(self.backend, Backend::Archive(_))
     }
@@ -260,7 +259,7 @@ fn duplicate_name(sorted: &[String]) -> Option<String> {
 }
 
 fn sort_page_names(names: &mut [String]) {
-    names.sort_by(|left, right| compare_names(left, right));
+    names.sort_by(|left, right| catalog::compare_names(left, right));
 }
 
 fn validated_listing(
@@ -760,7 +759,7 @@ mod tests {
         assert_eq!(
             page_name(&source.names, true, None, 0),
             PageName {
-                parent: None,
+                parent_dir: None,
                 file: "p1.png".into()
             }
         );
@@ -830,7 +829,7 @@ mod tests {
         assert_eq!(
             page_name(&source.names, false, Some(&dir_name), 2),
             PageName {
-                parent: Some(dir_name),
+                parent_dir: Some(dir_name),
                 file: "c10.png".into(),
             }
         );
@@ -873,14 +872,14 @@ mod tests {
         assert_eq!(
             page_name(&source.names, true, None, 1),
             PageName {
-                parent: Some("b".into()),
+                parent_dir: Some("b".into()),
                 file: "010.png".into()
             }
         );
         assert_eq!(
             page_name(&source.names, true, None, 3),
             PageName {
-                parent: Some("deep".into()),
+                parent_dir: Some("deep".into()),
                 file: "005.png".into()
             }
         );

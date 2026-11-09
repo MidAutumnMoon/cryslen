@@ -6,7 +6,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use crate::app::post;
+use crate::app;
 use crate::app::App;
 use crate::app::UserEvent;
 use crate::book::BookProcess;
@@ -16,8 +16,8 @@ use crate::decode;
 use crate::fault;
 
 #[derive(Debug, PartialEq)]
-enum Arg {
-    Open(PathBuf),
+enum Argument {
+    Book(PathBuf),
     Image { dir: PathBuf, name: String },
 }
 
@@ -26,12 +26,11 @@ enum Arg {
     reason = "the fatal exit prints the full error report"
 )]
 pub fn main(args: &[OsString]) -> ExitCode {
-    // env::args panics on non-UTF-8 argv, which file managers pass.
-    let Some(arg_os) = args.get(1) else {
+    let Some(argument) = args.get(1) else {
         eprintln!("usage: cy <dir | archive | image-file>");
         return ExitCode::from(2);
     };
-    let open = match classify(Path::new(arg_os)) {
+    let open = match classify(Path::new(argument)) {
         Ok(open) => open,
         Err(error) => {
             eprintln!("cy: {error}");
@@ -39,8 +38,10 @@ pub fn main(args: &[OsString]) -> ExitCode {
         }
     };
     let (open_path, land_on) = match &open {
-        Arg::Open(path) => (path.as_path(), None),
-        Arg::Image { dir, name } => (dir.as_path(), Some(name.as_str())),
+        Argument::Book(path) => (path.as_path(), None),
+        Argument::Image { dir, name } => {
+            (dir.as_path(), Some(name.as_str()))
+        }
     };
 
     match run(open_path, land_on) {
@@ -53,12 +54,12 @@ pub fn main(args: &[OsString]) -> ExitCode {
     }
 }
 
-fn classify(path: &Path) -> Result<Arg, fault::OpenRefusal> {
+fn classify(path: &Path) -> Result<Argument, fault::OpenRefusal> {
     let Some(name) = path.file_name() else {
-        return Ok(Arg::Open(path.to_path_buf()));
+        return Ok(Argument::Book(path.to_path_buf()));
     };
     if !path.is_file() || catalog::is_archive(path) {
-        return Ok(Arg::Open(path.to_path_buf()));
+        return Ok(Argument::Book(path.to_path_buf()));
     }
     let name = name.to_string_lossy().into_owned();
     if decode::format_from_name(&name).is_none() {
@@ -69,7 +70,7 @@ fn classify(path: &Path) -> Result<Arg, fault::OpenRefusal> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    Ok(Arg::Image {
+    Ok(Argument::Image {
         dir: dir.to_path_buf(),
         name,
     })
@@ -83,7 +84,7 @@ fn run(open_path: &Path, land_on: Option<&str>) -> eros::Result<()> {
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     let wake: Wake = {
         let proxy = event_loop.create_proxy();
-        Box::new(move || post(&proxy, UserEvent::Wake))
+        Box::new(move || app::post(&proxy, UserEvent::Wake))
     };
     // The initial open is the one blocking open; every switch after it
     // runs off the event loop.
@@ -122,18 +123,18 @@ mod tests {
         let rows = [
             (
                 dir.path().join("page.png"),
-                Ok(Arg::Image {
+                Ok(Argument::Image {
                     dir: dir.path().to_path_buf(),
                     name: String::from("page.png"),
                 }),
             ),
             (
                 dir.path().join("book.cbz"),
-                Ok(Arg::Open(dir.path().join("book.cbz"))),
+                Ok(Argument::Book(dir.path().join("book.cbz"))),
             ),
             (
                 dir.path().to_path_buf(),
-                Ok(Arg::Open(dir.path().to_path_buf())),
+                Ok(Argument::Book(dir.path().to_path_buf())),
             ),
             (
                 dir.path().join("notes.txt"),
@@ -142,8 +143,8 @@ mod tests {
                 )),
             ),
         ];
-        for (path, want) in rows {
-            assert_eq!(classify(&path), want, "{}", path.display());
+        for (path, expected) in rows {
+            assert_eq!(classify(&path), expected, "{}", path.display());
         }
     }
 }

@@ -46,9 +46,10 @@ so entries live in RAM for the system's uptime and need no user-facing
 cleanup; a `TMPDIR` set per app instance shortens the lifetime to that
 instance.
 
-Files carry a `CYPV` header: version, artifact tag, pixel layout
-(RGBA8 or YUV with depth/subsampling/range/matrix), the mint edge,
-page dims, image dims, `Format`, `Transfer`, then the plane payload.
+Files are little-endian and carry a `CYPV` header: version, artifact
+tag, pixel layout (RGBA8 or YUV with depth/subsampling/range/matrix),
+the mint edge, page dims, image dims, `Format`, `Transfer`, then the
+plane payload.
 `load` reconstructs through `Decoded::rgba`/`yuv` and rejects an entry
 whose edge is not the current constant, so changing `THUMB_EDGE` or
 `VIEW_EDGE` is a miss that re-mints, never a stale size. A corrupt file

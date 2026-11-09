@@ -26,35 +26,35 @@ pub struct StatusLine<'fault> {
     pub zoom: f32,
     /// The wait flag, once a waiting spread has outlived the grace.
     pub waiting: Option<Wait>,
-    pub error: Option<StatusFault<'fault>>,
+    pub fault: Option<StatusFault<'fault>>,
 }
 
-/// What the status line blames: a page's own failure (decode, source,
-/// or a texture the GPU refused), or a book switch that failed.
+/// What the status line blames: a page's own failure (decode, source, or
+/// a texture the GPU refused), or the book's.
 pub enum StatusFault<'fault> {
     Page(&'fault PageFault),
-    Noted(&'fault BookFault),
+    Book(&'fault BookFault),
 }
 
 impl fmt::Display for StatusFault<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Page(error) => error.fmt(f),
-            Self::Noted(error) => error.fmt(f),
+            Self::Page(fault) => fault.fmt(f),
+            Self::Book(fault) => fault.fmt(f),
         }
     }
 }
 
-/// The one fault the line shows: the page's own failure first, then a
-/// failed book switch, then a texture the GPU refused. Each layer's
-/// cell keeps its own retention; this is only the ordering.
+/// The one fault the line shows: the page's own failure first, then the
+/// book's, then a texture the GPU refused. Each layer's cell keeps its
+/// own retention; this is only the ordering.
 pub fn fault_to_show<'fault>(
     page: Option<&'fault PageFault>,
-    noted: Option<&'fault BookFault>,
+    book: Option<&'fault BookFault>,
     upload: Option<&'fault PageFault>,
 ) -> Option<StatusFault<'fault>> {
     page.map(StatusFault::Page)
-        .or_else(|| noted.map(StatusFault::Noted))
+        .or_else(|| book.map(StatusFault::Book))
         .or_else(|| upload.map(StatusFault::Page))
 }
 
@@ -141,13 +141,13 @@ impl Wait {
 pub struct PageState<'fault> {
     pub format: Option<Format>,
     pub dims: Option<(u32, u32)>,
-    pub error: Option<&'fault PageFault>,
+    pub fault: Option<&'fault PageFault>,
 }
 
 /// The status line's view of one spread, in page order.
 pub struct FoldedStatus<'fault> {
     pub waiting: bool,
-    pub error: Option<&'fault PageFault>,
+    pub fault: Option<&'fault PageFault>,
     pub page: Option<(usize, Format, (u32, u32))>,
     /// The page the line names: the failed one if any page failed, else
     /// the first decoded page, else the spread's first page.
@@ -162,7 +162,7 @@ pub fn fold_status<'fault>(
     state: impl Fn(usize) -> PageState<'fault>,
 ) -> FoldedStatus<'fault> {
     let mut has_format = false;
-    let mut has_error = false;
+    let mut has_fault = false;
     let mut failure: Option<(usize, &'fault PageFault)> = None;
     let mut facts = None;
     let mut first_decoded = None;
@@ -170,14 +170,14 @@ pub fn fold_status<'fault>(
         let PageState {
             format,
             dims,
-            error,
+            fault,
         } = state(page);
         has_format |= format.is_some();
-        has_error |= error.is_some();
+        has_fault |= fault.is_some();
         if failure.is_some() {
             continue;
         }
-        if let Some(fault) = error {
+        if let Some(fault) = fault {
             failure = Some((page, fault));
             continue;
         }
@@ -190,13 +190,13 @@ pub fn fold_status<'fault>(
             }
         }
     }
-    let (speaker, error) = match failure {
+    let (speaker, fault) = match failure {
         Some((page, fault)) => (page, Some(fault)),
         None => (first_decoded.unwrap_or(spread.first), None),
     };
     FoldedStatus {
-        waiting: !has_format && !has_error,
-        error,
+        waiting: !has_format && !has_fault,
+        fault,
         page: facts,
         speaker,
     }
@@ -303,8 +303,8 @@ fn line(style: &egui::Style, status: &StatusLine<'_>) -> LayoutJob {
     section(&mut job, &format!("/{}", status.page_count), plain);
 
     section(&mut job, " · ", plain);
-    if let Some(parent) = &status.name.parent {
-        section(&mut job, parent, plain);
+    if let Some(parent_dir) = &status.name.parent_dir {
+        section(&mut job, parent_dir, plain);
         section(&mut job, "/", plain);
     }
     section(&mut job, &status.name.file, NAME_COLOR);
@@ -323,8 +323,8 @@ fn line(style: &egui::Style, status: &StatusLine<'_>) -> LayoutJob {
     if let Some(wait) = status.waiting {
         section(&mut job, &format!(" · {}", wait.label()), plain);
     }
-    if let Some(error) = &status.error {
-        section(&mut job, &format!(" · {error}"), plain);
+    if let Some(fault) = &status.fault {
+        section(&mut job, &format!(" · {fault}"), plain);
     }
     job
 }
@@ -401,15 +401,19 @@ mod tests {
     fn the_line_blames_the_page_before_the_book_before_the_upload() {
         let page_fault = PageFault::new("page");
         let upload_fault = PageFault::new("upload");
-        let noted = BookFault::Timeout;
+        let book_fault = BookFault::Timeout;
         assert!(fault_to_show(None, None, None).is_none());
         assert!(matches!(
-            fault_to_show(None, Some(&noted), Some(&upload_fault)),
-            Some(StatusFault::Noted(_))
+            fault_to_show(None, Some(&book_fault), Some(&upload_fault)),
+            Some(StatusFault::Book(_))
         ));
         assert_eq!(
-            shown(fault_to_show(None, Some(&noted), Some(&upload_fault))),
-            Some(noted.to_string())
+            shown(fault_to_show(
+                None,
+                Some(&book_fault),
+                Some(&upload_fault)
+            )),
+            Some(book_fault.to_string())
         );
         assert!(matches!(
             fault_to_show(None, None, Some(&upload_fault)),
@@ -422,7 +426,7 @@ mod tests {
         assert!(matches!(
             fault_to_show(
                 Some(&page_fault),
-                Some(&noted),
+                Some(&book_fault),
                 Some(&upload_fault)
             ),
             Some(StatusFault::Page(_))
@@ -430,7 +434,7 @@ mod tests {
         assert_eq!(
             shown(fault_to_show(
                 Some(&page_fault),
-                Some(&noted),
+                Some(&book_fault),
                 Some(&upload_fault)
             )),
             Some(String::from("page"))
@@ -447,7 +451,7 @@ mod tests {
             mode: ViewMode::Manga,
             toast: false,
             name: PageName {
-                parent: Some("b".into()),
+                parent_dir: Some("b".into()),
                 file: "010.png".into(),
             },
             // The name claims png and the page decodes as jxl, so the
@@ -459,7 +463,7 @@ mod tests {
             }),
             zoom: 0.866,
             waiting: None,
-            error: None,
+            fault: None,
         }
     }
 

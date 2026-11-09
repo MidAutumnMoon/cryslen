@@ -1,8 +1,6 @@
 //! Child process: owns one book's source, worker, and preview store.
-//!
-//! Started by the parent as `cy --worker <ipc-server-name> <path>`. The
-//! child never touches winit or GL; everything it learns about the UI
-//! arrives as [`ParentMsg`].
+//! The parent starts it as `cy --worker`; it never touches winit or GL,
+//! and learns about the UI only from [`ParentMsg`].
 
 use std::ffi::OsStr;
 use std::ffi::OsString;
@@ -11,7 +9,6 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::thread;
 
-use crossbeam_channel::bounded;
 use crossbeam_channel::Receiver;
 use ipc_channel::ipc;
 use ipc_channel::ipc::IpcSender;
@@ -34,16 +31,16 @@ use crate::worker::Worker;
 /// Messages a producer may queue for the writer. Small because the
 /// parent consumes at frame pace; this bounds events awaiting
 /// conversion, while the want set bounds images in flight.
-const OUT_QUEUE: usize = 2;
+const WRITER_QUEUE_DEPTH: usize = 2;
 
 /// One message on its way to the parent, from the worker or the main
 /// thread.
-enum Out {
+enum ToParent {
     Event(Event),
     Fatal(String),
 }
 
-impl Out {
+impl ToParent {
     fn into_message(self) -> ChildMsg {
         match self {
             Self::Event(Event::Ready(ready)) => ChildMsg::Ready {
@@ -142,10 +139,11 @@ pub fn main(args: &[OsString]) -> ExitCode {
 
     // One thread owns the child's only `IpcSender`, so messages reach the
     // parent in the order they were queued.
-    let (out_tx, out_rx) = bounded::<Out>(OUT_QUEUE);
+    let (to_parent_tx, to_parent_rx) =
+        crossbeam_channel::bounded::<ToParent>(WRITER_QUEUE_DEPTH);
     let writer = match thread::Builder::new()
         .name("cy-writer".into())
-        .spawn(move || write(&child_tx, &out_rx))
+        .spawn(move || write(&child_tx, &to_parent_rx))
     {
         Ok(writer) => writer,
         Err(error) => {
@@ -157,7 +155,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
     let len = opened.len();
     let source = Arc::new(opened);
     let mut worker: Option<Worker> = None;
-    let mut fatal = false;
+    let mut worker_failed = false;
     while let Ok(message) = parent_rx.recv() {
         match message {
             ParentMsg::SetView {
@@ -174,11 +172,12 @@ pub fn main(args: &[OsString]) -> ExitCode {
                 if let Some(running) = worker.as_ref() {
                     running.retune(plan);
                 } else {
-                    let events = out_tx.clone();
+                    let queue = to_parent_tx.clone();
                     let notify = move |event| {
                         // A disconnected queue only means the writer
                         // already left, so the event has no reader.
-                        let Ok(()) = events.send(Out::Event(event)) else {
+                        let Ok(()) = queue.send(ToParent::Event(event))
+                        else {
                             return;
                         };
                     };
@@ -190,15 +189,15 @@ pub fn main(args: &[OsString]) -> ExitCode {
                                 ?error,
                                 "could not start the decode worker"
                             );
-                            if out_tx
-                                .send(Out::Fatal(error.to_string()))
+                            if to_parent_tx
+                                .send(ToParent::Fatal(error.to_string()))
                                 .is_err()
                             {
                                 tracing::debug!(
                                     "the writer already exited"
                                 );
                             }
-                            fatal = true;
+                            worker_failed = true;
                             break;
                         }
                     }
@@ -225,7 +224,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
         // decode would only delay the exit.
         running.detach();
     }
-    if fatal {
+    if worker_failed {
         // The writer delivers the verdict before the process goes away.
         if writer.join().is_err() {
             tracing::warn!("the writer thread panicked");
@@ -246,12 +245,12 @@ fn parse(args: &[OsString]) -> Option<(&OsStr, &Path)> {
     Some((server.as_os_str(), Path::new(path)))
 }
 
-/// Serialize `Out` onto the parent channel until a fatal verdict ends the
-/// run.
-fn write(child_tx: &IpcSender<ChildMsg>, out: &Receiver<Out>) {
-    while let Ok(item) = out.recv() {
-        let last = item.last();
-        let Ok(()) = child_tx.send(item.into_message()) else {
+/// Serialize `ToParent` onto the parent channel until a fatal verdict
+/// ends the run.
+fn write(child_tx: &IpcSender<ChildMsg>, queue: &Receiver<ToParent>) {
+    while let Ok(message) = queue.recv() {
+        let last = message.last();
+        let Ok(()) = child_tx.send(message.into_message()) else {
             return;
         };
         if last {

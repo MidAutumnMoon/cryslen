@@ -11,7 +11,7 @@ use ipc_channel::ipc::IpcSharedMemory;
 use serde::Deserialize;
 use serde::Serialize;
 
-use crate::decode::plane_bytes;
+use crate::decode;
 use crate::decode::Decoded;
 use crate::decode::Pixels;
 use crate::decode::Plane;
@@ -29,9 +29,7 @@ pub use crate::view::ViewMode;
 pub use crate::worker::Motion;
 pub use crate::worker::Want;
 
-/// What a freshly opened child knows about its book. The page count and
-/// the archive flag are derivations the parent already owns, so the
-/// child sends only the facts it discovered.
+/// What a freshly opened child knows about its book.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[non_exhaustive]
 pub struct BookInfo {
@@ -68,8 +66,7 @@ pub struct WireImage {
 }
 
 impl WireImage {
-    /// Copy every plane into shared memory. The child keeps its own
-    /// `Decoded`; this is the one transfer.
+    /// Copy every plane into shared memory.
     pub(crate) fn from_decoded(image: &Decoded) -> Self {
         let pixels = match image.pixels() {
             Pixels::Rgba8(bytes) => {
@@ -140,15 +137,15 @@ impl WireImage {
 }
 
 fn shared_plane(plane: &Plane) -> IpcSharedMemory {
-    IpcSharedMemory::from_bytes(plane_bytes(plane))
+    IpcSharedMemory::from_bytes(decode::plane_bytes(plane))
 }
 
 /// Deeper planes travel as native-endian byte pairs, matching
-/// [`plane_bytes`].
+/// [`decode::plane_bytes`].
 fn plane_from_shared(shared: &IpcSharedMemory, depth: u8) -> Plane {
     if depth > 8 {
-        // The block starts page-aligned, so the reinterpretation holds;
-        // the copy fallback keeps a misaligned block from panicking.
+        // The cast is the fast path; the fallback keeps an unaligned
+        // block from panicking.
         let bytes = shared;
         let words = bytemuck::try_cast_slice(bytes).map_or_else(
             |_| bytemuck::pod_collect_to_vec(bytes),
@@ -188,8 +185,8 @@ pub enum ChildMsg {
     Fatal(String),
 }
 
-/// What the child sends back on connect: its event receiver and the
-/// parent's outbound sender.
+/// What the child sends on connect: the receiver for its messages and the
+/// sender for the parent's.
 pub type Hello = (IpcReceiver<ChildMsg>, IpcSender<ParentMsg>);
 
 #[cfg(test)]

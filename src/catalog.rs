@@ -9,11 +9,11 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageName {
-    pub parent: Option<String>,
+    pub parent_dir: Option<String>,
     pub file: String,
 }
 
-/// The archive family; `Source::open` and the argument check share
+/// The archive family; source opening and argument classification share
 /// this table.
 pub enum ArchiveKind {
     Zip,
@@ -72,13 +72,13 @@ pub fn sibling(path: &Path, forward: bool) -> Option<PathBuf> {
 }
 
 /// The index of the entry a file argument names, or the first page when
-/// the wanted name is absent.
+/// the name is absent.
 pub fn landing<'entries>(
     mut entries: impl Iterator<Item = &'entries str>,
-    want: &str,
+    name: &str,
 ) -> usize {
     entries
-        .position(|entry| entry.eq_ignore_ascii_case(want))
+        .position(|entry| entry.eq_ignore_ascii_case(name))
         .unwrap_or(0)
 }
 
@@ -98,14 +98,14 @@ pub fn page_name(
     debug_assert!(index < names.len(), "caller clamps the page index");
     let entry = &names[index];
     let file = entry.rsplit('/').next().unwrap_or(entry).to_owned();
-    let parent = if archive {
+    let parent_dir = if archive {
         entry.rsplit_once('/').map(|(path, _)| {
             path.rsplit('/').next().unwrap_or(path).to_owned()
         })
     } else {
         dir_name.map(str::to_owned)
     };
-    PageName { parent, file }
+    PageName { parent_dir, file }
 }
 
 /// Natural order over UTF-8 names: ASCII digit runs compare numerically

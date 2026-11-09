@@ -13,6 +13,7 @@ fn main() -> ExitCode {
     // live for the whole process.
     let _log_guard = ino_tracing::init_tracing_subscriber();
 
+    // env::args panics on non-UTF-8 argv, which file managers pass.
     let args: Vec<_> = env::args_os().collect();
     cryslen::run(&args)
 }

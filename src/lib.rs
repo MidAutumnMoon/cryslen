@@ -1,8 +1,6 @@
 //! cryslen: a wayland image viewer with manga mode.
-//!
-//! The parent process owns the window, the UI, and the GPU; each open
-//! book lives in a child process that owns its source, decode, and
-//! preview store. The two sides exchange [`protocol`] messages.
+//! The parent owns the window, the UI, and the GPU; each open book lives
+//! in a child process and talks to the parent over [`protocol`].
 
 use std::ffi::OsStr;
 use std::ffi::OsString;
@@ -31,10 +29,10 @@ mod worker;
 /// <path>` serves one book, and anything else is the windowed parent.
 #[must_use]
 pub fn run(args: &[OsString]) -> ExitCode {
-    let worker = args
+    let worker_mode = args
         .get(1)
         .is_some_and(|arg| arg.as_os_str() == OsStr::new("--worker"));
-    if worker {
+    if worker_mode {
         child::main(args)
     } else {
         parent::main(args)

@@ -13,6 +13,7 @@ use std::time::Instant;
 
 use crossbeam_channel::Receiver;
 use crossbeam_channel::RecvTimeoutError;
+use crossbeam_channel::Sender;
 use ipc_channel::ipc::IpcOneShotServer;
 use ipc_channel::ipc::IpcReceiver;
 use ipc_channel::ipc::IpcSender;
@@ -34,12 +35,9 @@ use crate::worker;
 const OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Tells the event loop that a [`BookEvent`] is waiting to be drained.
-/// The app supplies the closure; this module only calls it, so the book
-/// layer never learns what an event loop is.
 pub type Wake = Box<dyn Fn() + Send + Sync + 'static>;
 
-/// What a book looks like from the parent: everything the UI needs, and
-/// nothing that lives in the child.
+/// Everything the UI knows about a book; nothing that lives in the child.
 pub struct BookView {
     pub path: PathBuf,
     pub archive: bool,
@@ -50,8 +48,8 @@ pub struct BookView {
 }
 
 impl BookView {
-    /// The wire sends only what the child discovered; the count and the
-    /// archive flag follow from the path the parent handed it.
+    /// The count derives from `names` and the archive flag from `path`;
+    /// the child sends only what it discovered.
     pub fn from_info(
         path: PathBuf,
         info: BookInfo,
@@ -105,8 +103,7 @@ impl BookView {
     }
 }
 
-/// One child's message as the app consumes it. The handshake is read
-/// before the reader starts, so every event here follows it.
+/// One child's message as the app consumes it.
 pub enum BookEvent {
     Ready(worker::Ready),
     Failed { page: usize, fault: PageFault },
@@ -116,7 +113,7 @@ pub enum BookEvent {
 
 pub struct BookProcess {
     child: Option<Child>,
-    tx: IpcSender<ParentMsg>,
+    to_child: IpcSender<ParentMsg>,
     events: Receiver<BookEvent>,
     reader: Option<JoinHandle<()>>,
 }
@@ -133,7 +130,7 @@ impl BookProcess {
 
     pub fn send(&self, message: ParentMsg) {
         // A dead child is reported through the event stream, not here.
-        if let Err(error) = self.tx.send(message) {
+        if let Err(error) = self.to_child.send(message) {
             tracing::debug!(?error, "the book process is gone");
         }
     }
@@ -146,7 +143,7 @@ impl BookProcess {
     /// an explicit switch and `Drop` can rely on it.
     pub fn kill(&mut self) {
         if let Some(mut child) = self.child.take() {
-            stop(&mut child);
+            kill_and_reap(&mut child);
         }
         if let Some(reader) = self.reader.take() {
             if reader.join().is_err() {
@@ -173,20 +170,15 @@ pub struct PendingBookOpen {
 }
 
 impl PendingBookOpen {
-    /// Create the server and fork the child on the calling thread, then
-    /// return the state its handshake needs.
-    ///
-    /// The fork belongs here, not in [`Self::finish`]: Linux delivers the
-    /// child's `PR_SET_PDEATHSIG` when the thread that forked it exits,
-    /// so a fork made on a short-lived handshake thread would kill the
-    /// child the moment that thread returned.
+    /// Create the server and fork the child on the calling thread.
+    /// Linux delivers the child's `PR_SET_PDEATHSIG` when the thread that
+    /// forked it exits, so this cannot run on a short-lived handshake thread.
     pub fn begin(path: &Path, wake: Wake) -> Result<Self, BookFault> {
         let (server, server_name) = IpcOneShotServer::<Hello>::new()
             .map_err(|error| BookFault::Spawn(error.to_string()))?;
         let exe = env::current_exe()
             .map_err(|error| BookFault::Spawn(error.to_string()))?;
-        // The path travels as an argument, never as a message: only the
-        // channels cross the handshake.
+        // The path travels in argv, so a non-UTF-8 path survives.
         let child = Command::new(exe)
             .arg("--worker")
             .arg(&server_name)
@@ -204,13 +196,9 @@ impl PendingBookOpen {
         })
     }
 
-    /// Run the handshake: accept the child's channels, read its book
-    /// info, and start the reader. This is the slow half of an open and
-    /// may run off the thread that forked the child.
-    ///
-    /// `accept` is a blocking `accept(2)`, and a child that never
-    /// connected leaves no signal to wake it, so it runs on its own
-    /// thread. The accept and the first message share one deadline.
+    /// Accept the child's channels, read its book info, and start the reader.
+    /// A blocking `accept(2)` on a child that never connected cannot be
+    /// woken, so it runs on its own thread under the first message's deadline.
     pub fn finish(self) -> Result<(BookView, BookProcess), BookFault> {
         let Self {
             path,
@@ -221,7 +209,7 @@ impl PendingBookOpen {
         } = self;
         let deadline = Instant::now() + OPEN_TIMEOUT;
         let (accept_tx, accept_rx) = crossbeam_channel::bounded(1);
-        let accept = thread::Builder::new()
+        let accept_thread = thread::Builder::new()
             .name(String::from("cy-book-accept"))
             .spawn(move || {
                 let _sent = accept_tx.send(server.accept());
@@ -230,12 +218,12 @@ impl PendingBookOpen {
         let accepted = match accept_rx.recv_timeout(remaining(deadline)) {
             Ok(accepted) => accepted,
             Err(RecvTimeoutError::Timeout) => {
-                // A child that connected but never sent leaves the
-                // accept thread blocked on the read, and only its death
-                // closes that socket; the connect then wakes a listener
-                // that has no client at all.
+                // A child that connected but never sent leaves the accept
+                // thread blocked on the read, and only its death closes
+                // that socket; a child that never connected needs the
+                // dummy connect below instead.
                 child.kill();
-                wake_accept(&server_name, accept);
+                wake_accept(&server_name, accept_thread);
                 return Err(BookFault::Timeout);
             }
             // The thread cannot end without sending, but a panic would.
@@ -245,8 +233,8 @@ impl PendingBookOpen {
                 )))
             }
         };
-        let (_, (child_rx, tx)) = match accepted {
-            Ok(hello) => hello,
+        let (_, (child_rx, to_child)) = match accepted {
+            Ok(accepted) => accepted,
             Err(error) => {
                 return Err(BookFault::Handshake(error.to_string()))
             }
@@ -272,7 +260,7 @@ impl PendingBookOpen {
         // Any error below drops the process, whose `Drop` kills the child.
         let process = BookProcess {
             child: child.release(),
-            tx,
+            to_child,
             events,
             reader: Some(reader),
         };
@@ -285,19 +273,18 @@ fn remaining(deadline: Instant) -> Duration {
     deadline.saturating_duration_since(Instant::now())
 }
 
-/// End the blocked `accept(2)`: connecting once wakes the listener, and
-/// closing the sender ends the read that follows, so the thread exits.
-fn wake_accept(server_name: &str, accept: JoinHandle<()>) {
-    let connected = IpcSender::<Hello>::connect(server_name.to_owned());
-    let Ok(dummy) = connected else {
-        // The listener is already gone and the thread dies with the
-        // process, so there is nothing to join.
+/// End the blocked `accept(2)`: one connect wakes the listener, and
+/// closing the sender ends the read that follows.
+fn wake_accept(server_name: &str, accept_thread: JoinHandle<()>) {
+    let Ok(waker) = IpcSender::<Hello>::connect(server_name.to_owned())
+    else {
+        // Nothing can end a still-blocked accept, so the thread is not
+        // joined.
         tracing::warn!("could not wake the book accept thread");
         return;
     };
-    // Closing the sender ends the read that followed the connect.
-    drop(dummy);
-    if accept.join().is_err() {
+    drop(waker);
+    if accept_thread.join().is_err() {
         tracing::warn!("the book accept thread panicked");
     }
 }
@@ -306,17 +293,14 @@ fn wake_accept(server_name: &str, accept: JoinHandle<()>) {
 struct ForkedChild(Option<Child>);
 
 impl ForkedChild {
-    /// Hand the process to its permanent owner; the guard stops killing
-    /// it.
+    /// Hand the process to its permanent owner, disarming the guard.
     fn release(mut self) -> Option<Child> {
         self.0.take()
     }
 
-    /// Kill and reap the child before the guard drops, so a blocked
-    /// handshake can end.
     fn kill(&mut self) {
         if let Some(mut child) = self.0.take() {
-            stop(&mut child);
+            kill_and_reap(&mut child);
         }
     }
 }
@@ -324,13 +308,12 @@ impl ForkedChild {
 impl Drop for ForkedChild {
     fn drop(&mut self) {
         if let Some(mut child) = self.0.take() {
-            stop(&mut child);
+            kill_and_reap(&mut child);
         }
     }
 }
 
-/// Kill the child and reap it on an open's error path.
-fn stop(child: &mut Child) {
+fn kill_and_reap(child: &mut Child) {
     if let Err(error) = child.kill() {
         tracing::debug!(?error, "cannot signal the book process");
     }
@@ -339,36 +322,35 @@ fn stop(child: &mut Child) {
     }
 }
 
-/// The reader forwards each message as a [`BookEvent`] and wakes the
-/// event loop, so a frame drains it; the receiver dies with the process,
-/// so an event can never outlive its book.
+/// Forward each message as a [`BookEvent`] and wake the event loop, so a
+/// frame drains it.
 fn spawn_reader(
     child_rx: IpcReceiver<ChildMsg>,
     wake: Wake,
 ) -> Result<(Receiver<BookEvent>, JoinHandle<()>), BookFault> {
-    let (events, receiver) = crossbeam_channel::unbounded();
+    let (event_sender, events) = crossbeam_channel::unbounded();
     let handle = thread::Builder::new()
         .name(String::from("cy-book-reader"))
-        .spawn(move || read_events(&child_rx, &events, &*wake))
+        .spawn(move || read_events(&child_rx, &event_sender, &*wake))
         .map_err(|error| BookFault::Spawn(error.to_string()))?;
-    Ok((receiver, handle))
+    Ok((events, handle))
 }
 
 fn read_events(
     child_rx: &IpcReceiver<ChildMsg>,
-    events: &crossbeam_channel::Sender<BookEvent>,
+    event_sender: &Sender<BookEvent>,
     wake: &dyn Fn(),
 ) {
     loop {
         // The app learns about a dead child from the closed stream.
         let event = child_rx.recv().map_or_else(
             |_| BookEvent::Died(String::from("the book process exited")),
-            event_of,
+            event_from_message,
         );
         let last = matches!(event, BookEvent::Died(_));
         // A failed send means the receiver is gone with the book, and
         // nobody is left to wake.
-        if events.send(event).is_err() {
+        if event_sender.send(event).is_err() {
             return;
         }
         wake();
@@ -378,9 +360,7 @@ fn read_events(
     }
 }
 
-/// Convert one wire message. A pixel payload is rebuilt into a
-/// [`worker::Ready`], and a refusal becomes this page's fault.
-fn event_of(message: ChildMsg) -> BookEvent {
+fn event_from_message(message: ChildMsg) -> BookEvent {
     match message {
         // The handshake is read before this thread starts; a repeat is a
         // protocol violation, not an event.
@@ -409,6 +389,7 @@ fn event_of(message: ChildMsg) -> BookEvent {
         ChildMsg::Fatal(detail) => BookEvent::Died(detail),
     }
 }
+
 #[cfg(test)]
 #[expect(
     clippy::expect_used,
@@ -421,9 +402,9 @@ mod tests {
     fn wake_accept_unblocks_a_waiting_listener() {
         let (server, name) =
             IpcOneShotServer::<Hello>::new().expect("server");
-        let accept = thread::spawn(move || {
+        let accept_thread = thread::spawn(move || {
             drop(server.accept());
         });
-        wake_accept(&name, accept);
+        wake_accept(&name, accept_thread);
     }
 }

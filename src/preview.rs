@@ -1,10 +1,6 @@
-//! Downscaled page previews and the on-disk cache.
-//!
-//! Entries live under `env::temp_dir()`, one namespace per kind, keyed by
-//! [`content_hash`]. File layout, little-endian: magic `CYPV`, a `u16`
-//! version, artifact and pixel tags, the mint edge, page and image dims,
-//! format and transfer tags, an optional YUV description, then planes as
-//! `u32`-length-prefixed payloads.
+//! Downscaled page previews and the on-disk cache: one directory per kind
+//! under `env::temp_dir()`, keyed by [`content_hash`]. The little-endian
+//! file format is described in `docs/internal/cache.md`.
 
 #![expect(
     clippy::little_endian_bytes,
@@ -591,12 +587,11 @@ fn is_hash_name(name: &OsStr) -> bool {
 /// How long an unchecked temp file may survive. Only a liveness check
 /// that cannot answer (a pid this process may not signal) falls back to
 /// age; a live writer's file is never removed, however old it is.
-const TEMP_MAX_AGE: Duration = Duration::from_hours(1);
+const STALE_TEMP_AGE: Duration = Duration::from_hours(1);
 
-/// Drop temp files whose writer can no longer rename them: a killed
-/// child leaves `<hash:032x>.<pid>.tmp` behind, and no later writer can
-/// claim a name carrying another pid. Names that do not have the exact
-/// temp shape belong to something else and are left alone.
+/// Drop temp files whose writer can no longer rename them: a killed child
+/// leaves `<hash:032x>.<pid>.tmp`, and no later writer claims another pid's
+/// name. Other names are left alone.
 fn clean_temps(dir: &Path) {
     let Ok(read) = fs::read_dir(dir) else {
         return;
@@ -613,12 +608,16 @@ fn clean_temps(dir: &Path) {
         let Some(pid) = temp_pid(&name) else {
             continue;
         };
-        let stale = match writer(pid) {
-            Writer::Alive => false,
-            Writer::Dead => true,
-            Writer::Unknown => metadata.modified().is_ok_and(|modified| {
-                modified.elapsed().is_ok_and(|age| age >= TEMP_MAX_AGE)
-            }),
+        let stale = match liveness(pid) {
+            Liveness::Alive => false,
+            Liveness::Dead => true,
+            Liveness::Unknown => {
+                metadata.modified().is_ok_and(|modified| {
+                    modified
+                        .elapsed()
+                        .is_ok_and(|age| age >= STALE_TEMP_AGE)
+                })
+            }
         };
         if !stale {
             continue;
@@ -661,7 +660,7 @@ fn temp_pid(name: &OsStr) -> Option<i32> {
 }
 
 /// What `kill(pid, 0)` can tell about a temp file's writer.
-enum Writer {
+enum Liveness {
     Alive,
     Dead,
     /// The check itself failed, e.g. a process this one may not signal,
@@ -669,11 +668,11 @@ enum Writer {
     Unknown,
 }
 
-fn writer(pid: i32) -> Writer {
+fn liveness(pid: i32) -> Liveness {
     match signal::kill(Pid::from_raw(pid), None) {
-        Ok(()) => Writer::Alive,
-        Err(Errno::ESRCH) => Writer::Dead,
-        Err(_) => Writer::Unknown,
+        Ok(()) => Liveness::Alive,
+        Err(Errno::ESRCH) => Liveness::Dead,
+        Err(_) => Liveness::Unknown,
     }
 }
 
