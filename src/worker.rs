@@ -1,16 +1,5 @@
-//! Decode worker: the app's demand service over a store of previews.
-//!
-//! Two inputs decide what the thread does: the app's [`Want`]s, the
-//! artifacts its presentation is missing right now, and the plan, the
-//! order in which pages are worth producing into the store ahead of
-//! time. Wants are served first, from the store when the plan already
-//! warmed them and otherwise by decoding and minting on the spot; the
-//! plan alone never delivers anything, it only fills the store.
-//!
-//! Nothing decoded survives here. The preview store is the only cache: a
-//! page is read, hashed, minted into the artifacts it needs, persisted,
-//! and the pixels drop. A later want, or a later session over the same
-//! root, loads the artifact back instead of decoding again.
+//! Decode worker: serves the app's [`Want`]s and fills the preview store
+//! from the plan. Nothing decoded survives here.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -26,7 +15,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 #[cfg(test)]
-use std::path::PathBuf;
+use std::path::Path;
 
 use eros::ErrorUnion;
 
@@ -43,19 +32,15 @@ use crate::preview::Store;
 use crate::source::PageRead;
 use crate::source::Source;
 
-/// How long the loop naps when a page's bytes are still unpacking. The
-/// channel is drained after every nap, so a stop or a newer plan answers
-/// within one nap.
+/// Nap between checks while a page unpacks; the loop drains the channel
+/// after each, so a stop or target waits at most this long.
 const FILL_POLL: Duration = Duration::from_millis(15);
 
-/// How long the app must stay silent before the worker spends time on
-/// pages beyond the head. Those pages are preload, not demand: a reader
-/// who is turning pages leaves the worker idle between turns, so the
-/// next target is served without waiting out a speculative decode.
+/// Silence required before preload beyond the head starts, so a turning
+/// reader leaves the worker idle between turns.
 const IDLE_PRELOAD: Duration = Duration::from_millis(300);
 
-/// What the reader is doing, which decides whether views are worth
-/// minting at all.
+/// What the reader is doing; only a still reader is worth a view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Motion {
     /// The reader is looking at the spread; its head is worth a view.
@@ -66,7 +51,8 @@ pub enum Motion {
 }
 
 /// One artifact for the app. `image` is what the renderer uploads: the
-/// stored crop for `Thumb` and `View`, the page's own pixels for `Native`.
+/// stored preview for `Thumb` and `View`, the page's own pixels for
+/// `Native`.
 pub struct Ready {
     pub page: usize,
     pub kind: Artifact,
@@ -78,8 +64,6 @@ pub enum Event {
     Failed { page: usize, error: Arc<PageError> },
 }
 
-/// One artifact the app is missing. The app's texture maps are the only
-/// authority on what it has; the worker never assumes a delivery stuck.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Want {
     pub page: usize,
@@ -96,7 +80,6 @@ enum ToWorker {
     Stop,
 }
 
-/// Which of a page's artifacts a step will produce or deliver.
 #[derive(Clone, Copy, Debug, Default)]
 struct Artifacts {
     thumb: bool,
@@ -126,10 +109,8 @@ impl Artifacts {
     }
 }
 
-/// One unit of work: a page and the artifacts to produce. `demand` means
-/// the app is waiting for them and they are delivered; otherwise they
-/// only fill the store. `preload` means the work is speculative and must
-/// not make a turning reader wait.
+/// A page and the artifacts to produce. A `demand` job is delivered; a
+/// `preload` job is speculative.
 #[derive(Clone, Copy, Debug)]
 struct Job {
     page: usize,
@@ -138,31 +119,24 @@ struct Job {
     preload: bool,
 }
 
-/// Everything the worker thread knows: what the app wants, and what the
-/// store already answers.
 struct Session {
     plan: Plan,
     motion: Motion,
     store: Store,
     /// Content hash of each page's bytes, computed once per session.
     hashes: HashMap<usize, u128>,
-    /// Artifacts this session put in the store, or loaded from it, keyed
-    /// by the store's own content hash. The plan uses this to skip
-    /// pages; a save's evictions clear the entry directly, so the plan
-    /// rebuilds a page that returns to its window. A failed save still
-    /// counts, so a store that refuses writes cannot make the plan spin
-    /// on the same page.
+    /// Artifacts this session put in the store or loaded, by content
+    /// hash. Evictions clear the entry, and a failed save still counts so
+    /// a refusing store cannot make the plan spin.
     produced: HashMap<u128, Artifacts>,
     /// A page's first failure is its verdict for the session.
     failed: HashMap<usize, Arc<PageError>>,
     /// What the app is missing, in its priority order.
     targets: Vec<Want>,
-    /// When the current target set arrived, for the wait diagnostics.
     targets_at: Instant,
     /// Wants already handed over since they last entered the set.
     delivered: HashSet<Want>,
-    /// Whether the idle preload burst is running. Any word from the app
-    /// stops it, so a turning reader never competes with the tail.
+    /// Whether an idle preload burst is running.
     preloading: bool,
 }
 
@@ -201,8 +175,6 @@ impl Session {
                 self.motion = motion;
             }
             ToWorker::Targets(targets) => {
-                // A want that left the set was delivered and uploaded;
-                // if it comes back, it must be served again.
                 tracing::debug!(count = targets.len(), "targets");
                 self.delivered.retain(|want| targets.contains(want));
                 self.targets = targets;
@@ -213,9 +185,6 @@ impl Session {
         true
     }
 
-    /// The first page in plan order that still needs an artifact, and
-    /// which artifacts it needs. A failed page is never a candidate
-    /// again.
     fn next_job(&self) -> Option<Job> {
         let head = self.plan.head();
         for spread in self.plan.spreads() {
@@ -252,9 +221,8 @@ impl Session {
         None
     }
 
-    /// The first target page with an undelivered kind, and those kinds.
-    /// The app lists its wants in priority order, so a page's group is
-    /// taken whole and served with a single decode.
+    /// The first wanted page with an undelivered kind, with the page's whole
+    /// group so one decode serves it.
     fn next_target(&self) -> Option<Job> {
         let mut found: Option<Job> = None;
         for want in &self.targets {
@@ -283,12 +251,10 @@ impl Session {
         found
     }
 
-    /// How long the app has been missing the current target set.
     fn target_wait(&self) -> Duration {
         self.targets_at.elapsed()
     }
 
-    /// Content hash of the page's bytes, computed once per session.
     fn hash(&mut self, page: usize, bytes: &[u8]) -> u128 {
         *self
             .hashes
@@ -296,8 +262,8 @@ impl Session {
             .or_insert_with(|| preview::content_hash(bytes))
     }
 
-    /// Hand one artifact to the app and remember it for the current target
-    /// set, so an unchanged set does not fetch it twice.
+    /// Hand one artifact to the app and mark it delivered for the current
+    /// set.
     fn publish(
         &mut self,
         page: usize,
@@ -320,14 +286,11 @@ impl Session {
         }));
     }
 
-    /// Remember that the store holds `hash`'s `kind`.
     fn mark_produced(&mut self, hash: u128, kind: Artifact) {
         self.produced.entry(hash).or_default().set(kind);
     }
 
-    /// Save one artifact and remember the store has it. A save only prunes
-    /// when a cap is crossed, and it reports the entries it evicted, so
-    /// the ledger stays exact instead of claiming a pruned preview.
+    /// Save one artifact; the evictions it reports leave the ledger.
     fn keep(
         &mut self,
         page: usize,
@@ -361,11 +324,14 @@ impl Session {
         notify(Event::Failed { page, error });
     }
 
-    /// Produce a job's artifacts: load what the store already answers,
-    /// decode once for the rest, and save every preview made. A demand
-    /// job hands the artifacts to the app; a plan job only fills the
-    /// store.
-    fn serve(&mut self, source: &Source, job: Job, notify: &dyn Fn(Event)) {
+    /// Load what the store answers, decode once for the rest, and save every
+    /// preview; a demand job also publishes.
+    fn serve(
+        &mut self,
+        source: &Source,
+        job: Job,
+        notify: &dyn Fn(Event),
+    ) {
         let page = job.page;
         let needs = job.needs;
         let demand = job.demand;
@@ -428,7 +394,7 @@ impl Session {
             if needs.thumb && thumb.is_none() {
                 let started = Instant::now();
                 // The view is the cheaper source: one area pass over the
-                // preview instead of a second over the full page.
+                // view instead of a second over the full page.
                 let from = view.as_ref().unwrap_or(&native);
                 let minted = preview::mint(from, preview::THUMB_EDGE);
                 tracing::debug!(
@@ -436,14 +402,13 @@ impl Session {
                     elapsed = ?started.elapsed(),
                     "thumb minted"
                 );
-                thumb = Some(self.keep(page, hash, Artifact::Thumb, minted));
+                thumb =
+                    Some(self.keep(page, hash, Artifact::Thumb, minted));
             }
-            // Natives are the page's own pixels; the store never holds
-            // them, and only a target can ask for them.
+            // Natives are never stored; only a demand job delivers them.
             if needs.native && demand {
                 self.publish(page, Artifact::Native, native, notify);
             }
-            // `native` drops here: the store is the only cache.
         }
         if demand {
             tracing::debug!(
@@ -459,8 +424,7 @@ impl Session {
             );
             // The view goes first: a still frame waits on it, and the
             // app's upload budget would otherwise defer it behind the
-            // thumb by a frame. A skim wants only thumbs, so it is
-            // unaffected.
+            // thumb by a frame.
             if needs.view {
                 if let Some(view) = view {
                     self.publish(page, Artifact::View, view, notify);
@@ -475,18 +439,16 @@ impl Session {
     }
 }
 
-/// Handle to the decode thread. Every control is a cheap send; the
-/// thread applies the queued messages in order before its next pick, so
-/// the last retune wins and a newer plan overtakes the old one's tail.
+/// Handle to the decode thread. Every control is a send; the last
+/// retune wins, and a newer plan overtakes the old one's tail.
 pub struct Worker {
     tx: mpsc::Sender<ToWorker>,
     handle: Option<JoinHandle<()>>,
 }
 
 impl Worker {
-    /// Spawn the worker for `source`, opened on `initial`. `notify` fires
-    /// from the worker thread with each artifact or failure; the worker
-    /// knows nothing about winit.
+    /// Spawn the worker for `source` with `initial` as its plan. `notify`
+    /// fires from the worker thread with each artifact or failure.
     pub fn spawn(
         source: Arc<Source>,
         initial: Plan,
@@ -495,13 +457,12 @@ impl Worker {
         Self::launch(source, initial, Store::open(), notify)
     }
 
-    /// Spawn against an explicit store root. Tests own the root so a
-    /// warm-store case can reuse one; production takes [`Store::open`].
+    /// Spawn against an explicit store root for tests.
     #[cfg(test)]
     fn spawn_at(
         source: Arc<Source>,
         initial: Plan,
-        root: PathBuf,
+        root: &Path,
         notify: impl Fn(Event) + Send + Sync + 'static,
     ) -> Result<Self, SpawnError> {
         Self::launch(source, initial, Store::at(root), notify)
@@ -532,8 +493,7 @@ impl Worker {
         };
     }
 
-    /// Replace the plan. The in-flight decode still finishes and its
-    /// result still reaches the store and the app.
+    /// Replace the plan; the in-flight decode still finishes.
     pub fn retune(&self, plan: Plan) {
         self.tell(ToWorker::Retune(plan));
     }
@@ -542,10 +502,8 @@ impl Worker {
         self.tell(ToWorker::Motion(motion));
     }
 
-    /// Replace the set of artifacts the app is missing. The app calls
-    /// this only when the set changes; the worker serves the wants in
-    /// the given order, ahead of the plan. A want the app drops and adds
-    /// again is served again.
+    /// Serve these wants in order, ahead of the plan; the app sends only
+    /// changes, and a want that leaves and returns is served again.
     pub fn retarget(&self, targets: Vec<Want>) {
         self.tell(ToWorker::Targets(targets));
     }
@@ -563,18 +521,16 @@ impl Drop for Worker {
         // Stop wakes a parked loop so the join returns.
         self.tell(ToWorker::Stop);
         if let Some(handle) = self.handle.take() {
-            // Join Err means the thread died of a panic. Nothing can act
-            // on the payload at teardown, so debug builds surface the
-            // breach and release reaps regardless.
+            // A panicked thread leaves nothing to act on at teardown, so
+            // debug builds surface the breach.
             let joined = handle.join();
             debug_assert!(joined.is_ok(), "worker thread panicked");
         }
     }
 }
 
-/// Worker loop: the channel is drained before every pick, so Stop and a
-/// newer plan answer between decodes. One decode in flight always runs to
-/// completion.
+/// Worker loop: drain the channel before every pick, so Stop and a newer
+/// plan answer between decodes, and one in-flight decode completes.
 fn run(
     source: &Source,
     rx: &mpsc::Receiver<ToWorker>,
@@ -667,7 +623,6 @@ fn decode_page(
 )]
 mod tests {
     use super::*;
-    use crate::decode::decode as decode_bytes;
     use crate::fault::DecodeRefusal;
     use crate::plan::Direction;
     use crate::preview::Store;
@@ -790,7 +745,6 @@ mod tests {
             }
         }
 
-        /// Wait for the first ready event matching `want`.
         fn ready(
             &self,
             what: &str,
@@ -808,7 +762,6 @@ mod tests {
             })
         }
 
-        /// Wait for `page`'s failure.
         fn failure(&self, page: usize) -> Arc<PageError> {
             eventually(20, "page never failed", || {
                 self.drain();
@@ -823,7 +776,6 @@ mod tests {
             })
         }
 
-        /// How many ready events for `page` match `want`.
         fn delivered(
             &self,
             page: usize,
@@ -839,17 +791,15 @@ mod tests {
                 .count()
         }
 
-        /// How many failures `page` reported.
         fn failures(&self, page: usize) -> usize {
             self.drain();
             let seen = self.seen.lock();
             seen.iter()
                 .filter_map(|event| match event {
-                    Event::Failed { page: failed, error }
-                        if *failed == page =>
-                    {
-                        Some(error)
-                    }
+                    Event::Failed {
+                        page: failed,
+                        error,
+                    } if *failed == page => Some(error),
                     Event::Ready(_) | Event::Failed { .. } => None,
                 })
                 .count()
@@ -864,7 +814,7 @@ mod tests {
         let worker = Worker::spawn_at(
             Arc::clone(&source),
             plan(0, 1),
-            root.path().to_path_buf(),
+            root.path(),
             notify,
         )
         .expect("worker spawns");
@@ -885,8 +835,7 @@ mod tests {
             "the view is minted at the view edge, never upscaled"
         );
 
-        // One decode fed both artifacts, and both reached the store.
-        let store = Store::at(root.path().to_path_buf());
+        let store = Store::at(root.path());
         let hash = page_hash(&source, 0);
         assert!(
             store.load(hash, Artifact::Thumb).is_some(),
@@ -905,11 +854,11 @@ mod tests {
         let _worker = Worker::spawn_at(
             Arc::clone(&source),
             plan(0, 6),
-            root.path().to_path_buf(),
+            root.path(),
             |_| {},
         )
         .expect("worker spawns");
-        let store = Store::at(root.path().to_path_buf());
+        let store = Store::at(root.path());
         // The head is pages 0, 1 and 2; wait until it is fully produced.
         for page in [0, 1, 2] {
             eventually(20, "the head never reached the store", || {
@@ -953,7 +902,7 @@ mod tests {
         let _worker = Worker::spawn_at(
             Arc::clone(&source),
             plan(0, 5),
-            root.path().to_path_buf(),
+            root.path(),
             notify,
         )
         .expect("worker spawns");
@@ -966,7 +915,7 @@ mod tests {
         );
         // The failure does not stall the plan: pages behind it still
         // reach the store.
-        let store = Store::at(root.path().to_path_buf());
+        let store = Store::at(root.path());
         eventually(20, "the failure stalled the plan", || {
             store
                 .load(page_hash(&source, 4), Artifact::Thumb)
@@ -988,12 +937,12 @@ mod tests {
         let _worker = Worker::spawn_at(
             Arc::clone(&source),
             plan(0, 1),
-            root.path().to_path_buf(),
+            root.path(),
             notify,
         )
         .expect("worker spawns");
 
-        let store = Store::at(root.path().to_path_buf());
+        let store = Store::at(root.path());
         eventually(20, "the plan never produced the head view", || {
             store
                 .load(page_hash(&source, 0), Artifact::View)
@@ -1016,7 +965,7 @@ mod tests {
         let worker = Worker::spawn_at(
             Arc::clone(&source),
             plan(0, 1),
-            root.path().to_path_buf(),
+            root.path(),
             notify,
         )
         .expect("worker spawns");
@@ -1051,7 +1000,7 @@ mod tests {
         let worker = Worker::spawn_at(
             Arc::clone(&source),
             plan(0, 1),
-            root.path().to_path_buf(),
+            root.path(),
             notify,
         )
         .expect("worker spawns");
@@ -1074,14 +1023,14 @@ mod tests {
     fn a_warm_store_serves_without_decoding() {
         let (_dir, source) = page_dir("worker-warm", 1, BIG);
         let root = TempDir::new("worker-warm-store");
-        let layout = root.path().to_path_buf();
+        let store_root = root.path();
 
         // The first session mints and persists both artifacts.
         let (first, notify) = Events::new();
         let worker = Worker::spawn_at(
             Arc::clone(&source),
             plan(0, 1),
-            layout.clone(),
+            store_root,
             notify,
         )
         .expect("worker spawns");
@@ -1103,7 +1052,7 @@ mod tests {
         drop(worker);
 
         let hash = page_hash(&source, 0);
-        let mut store = Store::at(layout.clone());
+        let mut store = Store::at(store_root);
         assert!(
             store.load(hash, Artifact::Thumb).is_some(),
             "the thumb was not persisted"
@@ -1116,9 +1065,11 @@ mod tests {
         // Replace both persisted artifacts with a size no decode of this
         // page could produce, so the second session's events say where
         // the pixels came from.
-        let sentinel =
-            decode_bytes(&tiny_png(7, 7, [1, 2, 3, 255]), "sentinel.png")
-                .expect("sentinel decodes");
+        let sentinel = decode::decode(
+            &tiny_png(7, 7, [1, 2, 3, 255]),
+            "sentinel.png",
+        )
+        .expect("sentinel decodes");
         assert!(store.save(hash, Artifact::Thumb, &sentinel).landed);
         assert!(store.save(hash, Artifact::View, &sentinel).landed);
         drop(store);
@@ -1128,15 +1079,15 @@ mod tests {
         let warm = Worker::spawn_at(
             Arc::clone(&source),
             plan(0, 1),
-            layout.clone(),
+            store_root,
             notify_second,
         )
         .expect("worker spawns");
         warm.retarget(vec![want_thumb(0), want_view(0)]);
-        let warm_thumb = second
-            .ready("the second session never delivered a thumb", |ready| {
-                ready.page == 0 && is_thumb(ready)
-            });
+        let warm_thumb = second.ready(
+            "the second session never delivered a thumb",
+            |ready| ready.page == 0 && is_thumb(ready),
+        );
         let warm_view = second
             .ready("the second session never delivered a view", |ready| {
                 ready.page == 0 && is_view(ready)
@@ -1153,7 +1104,7 @@ mod tests {
         );
 
         // Loading saves nothing over the artifacts it read.
-        let kept = Store::at(layout)
+        let kept = Store::at(store_root)
             .load(hash, Artifact::View)
             .expect("the sentinel view stays");
         assert_eq!((kept.width(), kept.height()), (7, 7));

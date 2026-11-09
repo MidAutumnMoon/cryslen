@@ -1,15 +1,9 @@
 //! GL rendering: the page quad renderer.
 //!
-//! GL is used from the main thread only and `Window` makes the GL context
+//! GL is used from the main thread only and `Window` makes the context
 //! current once, so the `# Safety` docs below presuppose a current context.
-//!
-//! Runtime texture-creation failure panics. Recovery is deliberately not
-//! built: an upstream `egui_glow` unwrap can panic anyway, so recovery
-//! cannot be total.
-//!
-//! Chroma is sampled bilinearly at centered (interstitial) positions,
-//! the JPEG convention and the AVIF default. avifChromaSamplePosition is
-//! not applied, so declared co-sited chroma biases by half a texel.
+//! Texture-creation failure panics; recovery is deliberately not built
+//! because an `egui_glow` unwrap can panic anyway.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -82,7 +76,7 @@ shader_variants!(
     in vec2 v_px;
     out vec4 color;
     uniform vec2 u_offset;   // page rect origin, screen px
-    uniform vec2 u_lmap;     // screen px -> page fraction: 1 / (scale * source size)
+    uniform vec2 u_lmap;     // screen px -> page fraction: 1 / (scale * page size)
     uniform vec2 u_cmap;     // screen px -> chroma-page fraction, subsample-aware
     uniform mat3 u_mat;      // storage samples -> gamma RGB
     uniform vec3 u_off;      // u_mat times the quantization anchors
@@ -144,10 +138,8 @@ shader_variants!(
     }"
 );
 
-/// Page-keyed texture cache plus the spread draw. Seat binding (which
-/// page sits where) is the screen's fact; this type uploads, caches, and
-/// draws the pages it is handed. One page can sit in the cache at up to
-/// three sizes, and a seat draws the largest one present.
+/// Page-keyed texture cache plus the spread draw. Seat binding is the
+/// app's fact; a seat draws the largest size present.
 pub struct PageTextures {
     gl: Arc<glow::Context>,
     pipeline: Pipeline,
@@ -239,10 +231,9 @@ impl PageTextures {
         })
     }
 
-    /// Upload `image` as `page`'s `kind` unless that slot already holds
-    /// a texture; an insert never evicts. A page over
-    /// `MAX_TEXTURE_SIZE` would upload as silently black, so it is
-    /// refused as the page's error instead.
+    /// Upload `image` as `page`'s `kind`; no-op if present, never evicts.
+    /// A page over `MAX_TEXTURE_SIZE` would upload black, so it returns
+    /// the page's error instead.
     pub fn insert(
         &mut self,
         page: usize,
@@ -275,7 +266,6 @@ impl PageTextures {
         self.map(kind).contains_key(&page)
     }
 
-    /// Whether `page` is resident at any of the three sizes.
     pub fn has_any(&self, page: usize) -> bool {
         self.has(page, Artifact::Thumb)
             || self.has(page, Artifact::View)
@@ -311,13 +301,8 @@ impl PageTextures {
         }
     }
 
-    /// Draw the spread into `viewport`, laid out by `layout` and
-    /// `placement`. `seat_pages` names the page each visual seat draws; a
-    /// seat draws the largest texture its page has resident, and a page
-    /// with no entry draws nothing. The draw is scissor-clipped to the
-    /// viewport.
-    ///
-    /// Does not clear; the app owns the framebuffer clear each frame.
+    /// Draw the presented spread, clipped to `viewport`; each seat draws
+    /// its page's largest resident texture. Does not clear the framebuffer.
     pub fn draw(
         &self,
         size: (u32, u32),
@@ -438,12 +423,12 @@ fn retain_map(
 /// The entry a seat draws for `page`: the native page beats the view,
 /// which beats the thumb. Callers keep the three maps apart by size, so
 /// the order is the only policy here.
-fn pick<'map, T>(
-    thumbs: &'map HashMap<usize, T>,
-    views: &'map HashMap<usize, T>,
-    natives: &'map HashMap<usize, T>,
+fn pick<'map>(
+    thumbs: &'map HashMap<usize, Entry>,
+    views: &'map HashMap<usize, Entry>,
+    natives: &'map HashMap<usize, Entry>,
     page: usize,
-) -> Option<&'map T> {
+) -> Option<&'map Entry> {
     natives
         .get(&page)
         .or_else(|| views.get(&page))
@@ -1030,24 +1015,20 @@ unsafe fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> Entry {
     }
 }
 
-/// The maps an entry must carry: the page's source size, never the
-/// texture's. A preview is a crop of the page's grid, but its UV still
-/// runs across the whole page, and the seat rect is laid out in source
-/// pixels.
+/// The maps an entry must carry: the page's dims, never the texture's.
+/// A preview covers the whole page at lower resolution, so its UV spans
+/// the page while the seat rect is laid out in page pixels.
 fn page_lmap(decoded: &Decoded) -> (f32, f32) {
-    lmap_base(decoded.source())
+    lmap_base(decoded.page_dims())
 }
 
-fn page_cmap(
-    decoded: &Decoded,
-    subsampling: Subsampling,
-) -> (f32, f32) {
-    cmap_base(decoded.source(), subsampling)
+fn page_cmap(decoded: &Decoded, subsampling: Subsampling) -> (f32, f32) {
+    cmap_base(decoded.page_dims(), subsampling)
 }
 
 /// Page fractions per screen px, before the zoom-scale divide. `size` is
-/// the page's source size: the texture may be a smaller crop, but its
-/// UV still spans the whole page.
+/// the page's dims: a texture may be a smaller rendering, but its UV
+/// still spans the whole page.
 fn lmap_base(size: (u32, u32)) -> (f32, f32) {
     let img = view::px_f32(size);
     (1.0 / img.0, 1.0 / img.1)
@@ -1106,10 +1087,9 @@ const R16_STORAGE_MAX: f32 = 65535.0;
 const MIN_PLANE_DEPTH: u8 = 1;
 const MAX_PLANE_DEPTH: u8 = 16;
 
-/// The quantization of one page's storage codes at `depth`: the anchor
-/// codes (luma black, chroma neutral), the sample-to-RGB scales, and the
-/// storage capacity. Full range spans 0..2^depth-1 with chroma neutral at
-/// half; limited range scales the BT studio swing by 2^(depth-8).
+/// One page's storage-code quantization: anchor codes, sample-to-RGB
+/// scales, and capacity. Limited range scales the BT studio swing by
+/// 2^(depth-8).
 struct Quantization {
     luma_black: f32,
     chroma_neutral: f32,
@@ -1145,10 +1125,9 @@ fn quantization(depth: u8, full_range: bool) -> Quantization {
     }
 }
 
-/// Fold a page's whole sample-to-RGB math at upload. The stored matrix
-/// maps storage-normalized samples (0..1 as the sampler returns them)
-/// through depth normalization, quantization, and the KR/KB matrix (or
-/// the GBR permutation of an identity page); the stored offset is that
+/// Fold the sample-to-RGB math at upload: the stored matrix maps
+/// storage-normalized samples through depth normalization, quantization,
+/// and the KR/KB matrix (or the GBR permutation); the offset is that
 /// matrix times the anchor codes.
 fn page_conversion(decoded: &Decoded) -> Conversion {
     let Pixels::Yuv(yuv) = &decoded.pixels() else {
@@ -1463,8 +1442,8 @@ mod tests {
 
     #[test]
     fn preview_maps_span_the_page_not_the_texture() {
-        // A 100x100 crop standing for a 1000x2000 page. Keying the map
-        // by the crop's dims would squeeze the page into the first
+        // A 100x100 preview standing for a 1000x2000 page. Keying the
+        // map by the preview's dims would squeeze the page into the first
         // fraction of the seat and clamp the rest.
         let page = Decoded::rgba(
             100,
@@ -1474,7 +1453,7 @@ mod tests {
             vec![0_u8; 100 * 100 * 4].into_boxed_slice(),
         )
         .expect("valid page")
-        .with_source((1000, 2000));
+        .with_page_dims((1000, 2000));
         assert_eq!(page_lmap(&page), (1.0_f32 / 1000.0, 1.0_f32 / 2000.0));
     }
 }

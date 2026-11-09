@@ -84,29 +84,28 @@ impl Drop for Gl {
     }
 }
 
-/// What the layout and the status line know about one decoded page.
-/// The dims are the content's, independent of which representation
-/// (thumb, view, native) the cache currently holds.
+/// A drained page's own dims and format, not its representation's.
 #[derive(Clone, Copy)]
-struct Fact {
-    source: (u32, u32),
+struct CachedPage {
+    dims: (u32, u32),
     format: Format,
 }
 
-/// Two presses closer than this cannot be read between, so they are a
-/// flip rather than a read. A held key is a flip by its repeat events;
-/// this covers very fast tapping and scripted input.
+/// Two presses closer than this are a flip, not a read; a held key flips
+/// by its repeat events.
 const SKIM_GAP: Duration = Duration::from_millis(100);
 
-/// How long after the last navigation the skim decays to a still read,
-/// which promotes the presented spread from thumbs to views.
+/// How long after the last navigation a skim becomes a still read.
 const SKIM_DECAY: Duration = Duration::from_millis(250);
 
-/// Artifacts one frame may upload, and the bytes they may hold. A big
-/// page upload stalls the frame, so the rest waits for a fresh paint;
-/// one artifact always goes through.
+/// Per-frame upload budget; one artifact always goes through, so a big
+/// page stalls at most one frame.
 const UPLOAD_BUDGET_COUNT: usize = 16;
 const UPLOAD_BUDGET_BYTES: usize = 8 * 1024 * 1024;
+
+/// Spread starts around the shown and requested spreads whose views
+/// stay resident.
+const VIEW_KEEP_SPREADS: usize = 2;
 
 pub struct App {
     source: Arc<Source>,
@@ -119,8 +118,8 @@ pub struct App {
     /// The spread the last frame presented, `None` until a page has
     /// pixels.
     presented: Option<Spread>,
-    /// The content facts of every page whose pixels reached the cache.
-    facts: BTreeMap<usize, Fact>,
+    /// One entry per page whose artifact left the upload queue.
+    cached: BTreeMap<usize, CachedPage>,
     /// Page failures, sticky per page so a blip cannot erase them.
     errors: BTreeMap<usize, Arc<PageError>>,
     /// Decoded artifacts waiting for an upload, in arrival order.
@@ -131,18 +130,16 @@ pub struct App {
     motion: Motion,
     /// When the last navigation was dispatched, for the skim window.
     last_nav: Option<Instant>,
-    /// When the requested spread stopped being presentable while still:
-    /// the "waiting for a view" hold, logged once per hold.
+    /// When the still-frame "waiting for a view" hold began, and whether
+    /// it was logged.
     hold_since: Option<Instant>,
     hold_logged: bool,
-    /// The target set last sent to the worker: what the app was
-    /// missing when it last spoke, in the same order.
+    /// The want set last sent to the worker.
     sent: Vec<Want>,
     /// Reading direction of the last turn: plans and skim tie-breaks
     /// follow it.
     direction: Direction,
-    /// A failure the app noted (a book switch that failed). No frame
-    /// retries it, so it holds until a successful switch clears it.
+    /// A failed book switch, held until one succeeds.
     noted_error: Option<Arc<OpenError>>,
     timers: ui::Timers,
     /// Cursor position in viewport px, same as window px.
@@ -183,7 +180,7 @@ impl App {
             mode,
             fit: view::Fit::default(),
             presented: None,
-            facts: BTreeMap::new(),
+            cached: BTreeMap::new(),
             errors: BTreeMap::new(),
             queue: VecDeque::new(),
             upload_error: None,
@@ -222,19 +219,17 @@ impl App {
         view::spread_for(self.index, self.mode, self.source.len())
     }
 
-    /// Whether the texture cache holds any representation of `page`.
-    fn live(&self, page: usize) -> bool {
+    fn has_any(&self, page: usize) -> bool {
         self.gl.as_ref().is_some_and(|gl| gl.pages.has_any(page))
     }
 
-    /// Whether the texture cache holds `page`'s `kind`.
     fn has(&self, page: usize, kind: Artifact) -> bool {
         self.gl.as_ref().is_some_and(|gl| gl.pages.has(page, kind))
     }
 
     /// The largest representation a seat can draw, for the presentation
     /// log.
-    fn kind_of(&self, page: Option<usize>) -> &'static str {
+    fn artifact_name(&self, page: Option<usize>) -> &'static str {
         let Some(page) = page else {
             return "empty";
         };
@@ -249,11 +244,8 @@ impl App {
         }
     }
 
-    /// Whether `page` clears the bar a still frame presents: a view
-    /// image or the native page. A 192 px thumb is a motion artifact;
-    /// showing it while reading would be a blur the reader did not ask
-    /// for, so a still frame holds the previous spread until the view
-    /// arrives instead.
+    /// A still frame presents only a view or native; a thumb is a motion
+    /// artifact, so the previous spread stays up until the view arrives.
     fn readable(&self, page: usize) -> bool {
         self.has(page, Artifact::View) || self.has(page, Artifact::Native)
     }
@@ -282,11 +274,11 @@ impl App {
             self.presented,
             self.mode,
             self.source.len(),
-            &self.facts,
+            &self.cached,
             self.direction == Direction::Forward,
             |page| {
                 if skimming {
-                    self.live(page)
+                    self.has_any(page)
                 } else {
                     self.readable(page)
                 }
@@ -294,10 +286,13 @@ impl App {
         );
         if chosen != self.presented {
             let seats = chosen.map(|spread| {
-                spread.seats(self.mode).map(|seat| self.kind_of(seat))
+                spread
+                    .seats(self.mode)
+                    .map(|seat| self.artifact_name(seat))
             });
-            let took =
-                self.last_nav.map(|last| now.saturating_duration_since(last));
+            let took = self
+                .last_nav
+                .map(|last| now.saturating_duration_since(last));
             tracing::debug!(
                 from = ?self.presented,
                 to = ?chosen,
@@ -309,8 +304,7 @@ impl App {
             self.presented = chosen;
             self.fit.commit();
         }
-        // A still frame that is not showing its request is waiting for a
-        // view; a long one is the "frozen page" report, so log it once.
+        // A long still-frame hold is the frozen-page report; log it once.
         if self.motion == Motion::Still && chosen != Some(requested) {
             let since = *self.hold_since.get_or_insert(now);
             let waited = now.saturating_duration_since(since);
@@ -334,24 +328,17 @@ impl App {
         let spread_size = layout.total();
         let placed = self.fit.resolve(spread_size, self.last_viewport);
 
+        let (mode, len) = (self.mode, self.source.len());
         if let Some(gl) = self.gl.as_mut() {
-            let (mode, len) = (self.mode, self.source.len());
             // Retention is a performance policy: a dropped artifact is
-            // just a want on the next frame. Thumbs make a skim cheap,
-            // so they stay for the session; views serve the presented
-            // spread, the requested one, and their neighbours; natives
-            // serve only the pages on screen.
-            gl.pages
-                .retain(|page, kind| kept(page, kind, shown, requested, mode, len));
+            // just a want on the next frame.
+            gl.pages.retain(|page, kind| {
+                kept(page, kind, shown, requested, mode, len)
+            });
         }
-        // The app's texture maps are the authority on what it can draw;
-        // the worker's delivery ledger is not. Recompute the delta every
-        // frame and send it only when it changes. `kept` covers every
-        // want, so an artifact must leave the sent set before retention
-        // can drop it, and the worker sees the whole round trip.
-        //
-        // A zero-sized viewport leaves the placement inert at 1:1,
-        // which says nothing about what the screen can resolve.
+        // The texture maps are the authority, not the worker's ledger:
+        // recompute the wants each frame and send only changes. A
+        // zero-sized viewport says nothing about what the screen resolves.
         let (view_width, view_height) = self.last_viewport.size();
         let measurable = view_width > 0.0 && view_height > 0.0;
         let wants = wants(
@@ -363,18 +350,17 @@ impl App {
             // is the only one up, so `wants` only asks for those.
             |page| {
                 measurable
-                    && self.facts.get(&page).is_some_and(|fact| {
-                        native_wanted(placed.scale, fact.source)
+                    && self.cached.get(&page).is_some_and(|entry| {
+                        native_wanted(placed.scale, entry.dims)
                     })
             },
             |page, kind| self.has(page, kind),
             |page| self.errors.contains_key(&page),
         );
-        let (mode, len) = (self.mode, self.source.len());
         debug_assert!(
-            wants
-                .iter()
-                .all(|want| kept(want.page, want.kind, shown, requested, mode, len)),
+            wants.iter().all(|want| kept(
+                want.page, want.kind, shown, requested, mode, len
+            )),
             "retention must cover every want; a want that never leaves \
              the sent set can never be re-served"
         );
@@ -385,14 +371,14 @@ impl App {
         }
 
         let folded = ui::fold_status(shown, |page| {
-            let fact = self.facts.get(&page);
+            let entry = self.cached.get(&page);
             // `waiting` means the spread has no pixels yet, so a page
             // counts as decoded only once its texture is cached.
             ui::PageState {
-                format: fact.and_then(|fact| {
-                    self.live(page).then_some(fact.format)
+                format: entry.and_then(|entry| {
+                    self.has_any(page).then_some(entry.format)
                 }),
-                source: fact.map(|fact| fact.source),
+                dims: entry.map(|entry| entry.dims),
                 error: self.errors.get(&page).cloned(),
             }
         });
@@ -485,9 +471,9 @@ impl App {
         Ok(())
     }
 
-    /// Upload the queued artifacts under this frame's budget. A queue
-    /// with more left re-arms the loop immediately, the only
-    /// self-sustaining wake.
+    /// Upload the queued artifacts under this frame's budget. A queue with
+    /// more left re-arms the loop immediately, so a backlog keeps
+    /// draining.
     fn drain_ready(&mut self) {
         let Some(gl) = self.gl.as_mut() else {
             return;
@@ -506,10 +492,10 @@ impl App {
             let Some(ready) = self.queue.pop_front() else {
                 break;
             };
-            self.facts.insert(
+            self.cached.insert(
                 ready.page,
-                Fact {
-                    source: ready.image.source(),
+                CachedPage {
+                    dims: ready.image.page_dims(),
                     format: ready.image.format(),
                 },
             );
@@ -554,19 +540,21 @@ impl App {
         }
     }
 
-    /// The source dims of the page in each visual seat, from the content
-    /// truth, so a thumb-to-view promotion never refits.
+    /// The page dims in each visual seat, so a thumb-to-view promotion
+    /// never refits.
     fn seat_dims(&self) -> [Option<(u32, u32)>; 2] {
         let shown = self.presented.unwrap_or_else(|| self.spread());
         shown.seats(self.mode).map(|seat| {
             let page = seat?;
-            self.facts.get(&page).map(|fact| fact.source)
+            self.cached.get(&page).map(|entry| entry.dims)
         })
     }
 
     /// One flip starts a skim; every nav opens a fresh decay window.
     fn note_navigation(&mut self, now: Instant, repeat: bool) {
-        let gap = self.last_nav.map(|last| now.saturating_duration_since(last));
+        let gap = self
+            .last_nav
+            .map(|last| now.saturating_duration_since(last));
         let flip = repeat || gap.is_some_and(|gap| gap < SKIM_GAP);
         if flip && self.motion == Motion::Still {
             tracing::debug!(?gap, repeat, "skim begins");
@@ -703,7 +691,7 @@ impl App {
                 } else {
                     view::last_spread(self.mode, self.source.len())
                 };
-                self.after_page_change(travel(first), repeat);
+                self.after_page_change(travel_direction(first), repeat);
             }
             Action::NextBook | Action::PrevBook => {
                 self.switch_book(matches!(action, Action::NextBook));
@@ -719,7 +707,7 @@ impl App {
                     self.mode,
                     self.source.len(),
                 );
-                self.after_page_change(travel(forward), repeat);
+                self.after_page_change(travel_direction(forward), repeat);
             }
         }
     }
@@ -756,7 +744,11 @@ impl App {
             }
         };
         let cold = cold_wants(
-            view::spread_for(view::first_spread(), self.mode, source.len()),
+            view::spread_for(
+                view::first_spread(),
+                self.mode,
+                source.len(),
+            ),
             self.mode,
         );
         worker.retarget(cold.clone());
@@ -770,12 +762,10 @@ impl App {
         self.noted_error = None;
         // A book switch renumbers pages from zero, so nothing of the old
         // book can stay.
-        self.facts.clear();
+        self.cached.clear();
         self.errors.clear();
         self.presented = None;
         self.queue.clear();
-        // The new worker starts with no targets; tell it what the first
-        // spread of the new book lacks right away.
         self.upload_error = None;
         if let Some(gl) = self.gl.as_mut() {
             gl.pages.clear_all();
@@ -800,7 +790,7 @@ impl App {
     }
 }
 
-fn travel(forward: bool) -> Direction {
+fn travel_direction(forward: bool) -> Direction {
     if forward {
         Direction::Forward
     } else {
@@ -815,16 +805,14 @@ fn travel(forward: bool) -> Direction {
     clippy::cast_precision_loss,
     reason = "page edges and the fixed view edge stay far below f32's exact-integer range, so the threshold comparison holds"
 )]
-fn native_wanted(scale: f32, source: (u32, u32)) -> bool {
-    let edge = source.0.max(source.1);
+fn native_wanted(scale: f32, page_dims: (u32, u32)) -> bool {
+    let edge = page_dims.0.max(page_dims.1);
     edge > 0 && scale > VIEW_EDGE as f32 / edge as f32
 }
 
-/// Every artifact the frame's presentation is missing, in service
-/// order: the requested spread first (a pair needs both seats before it
-/// can present), then the shown one. A still frame waits for views and
-/// thumbs; a skim runs on thumbs alone. A native is wanted only for a
-/// page on screen: the requested spread is not up yet.
+/// Every artifact the frame's presentation is missing, in service order:
+/// requested spread, then shown. A still frame wants views and thumbs; a
+/// skim wants thumbs; a native only for a page on screen.
 fn wants(
     requested: Spread,
     shown: Spread,
@@ -845,29 +833,29 @@ fn wants(
             }
             if still {
                 if !readable(page) {
-                    push(&mut wants, page, Artifact::View);
+                    push_want(&mut wants, page, Artifact::View);
                 }
                 if !has(page, Artifact::Thumb) {
-                    push(&mut wants, page, Artifact::Thumb);
+                    push_want(&mut wants, page, Artifact::Thumb);
                 }
                 if shown.contains(page)
                     && upscaled(page)
                     && !has(page, Artifact::Native)
                 {
-                    push(&mut wants, page, Artifact::Native);
+                    push_want(&mut wants, page, Artifact::Native);
                 }
                 continue;
             }
             if !has(page, Artifact::Thumb) {
-                push(&mut wants, page, Artifact::Thumb);
+                push_want(&mut wants, page, Artifact::Thumb);
             }
         }
     }
     wants
 }
 
-/// What a spread with no textures at all is missing. Used when a
-/// worker starts, before the first frame can measure the placement.
+/// What a spread with no textures is missing, used before the first
+/// frame can measure the placement.
 fn cold_wants(spread: Spread, mode: ViewMode) -> Vec<Want> {
     wants(
         spread,
@@ -880,7 +868,7 @@ fn cold_wants(spread: Spread, mode: ViewMode) -> Vec<Want> {
     )
 }
 
-fn push(wants: &mut Vec<Want>, page: usize, kind: Artifact) {
+fn push_want(wants: &mut Vec<Want>, page: usize, kind: Artifact) {
     let want = Want { page, kind };
     if !wants.contains(&want) {
         wants.push(want);
@@ -888,9 +876,8 @@ fn push(wants: &mut Vec<Want>, page: usize, kind: Artifact) {
 }
 
 /// Whether the frame keeps `page`'s `kind` resident. Must cover every
-/// [`wants`] entry: a want may only leave the sent set while the app
-/// still holds the artifact, or the worker would never learn it is
-/// missing again.
+/// [`wants`] entry, or the worker never learns the artifact is missing
+/// again.
 fn kept(
     page: usize,
     kind: Artifact,
@@ -906,12 +893,6 @@ fn kept(
     }
 }
 
-/// Whether a view of `page` sits close enough to the presented or the
-/// requested spread to be worth keeping for a likely turn. Two spread
-/// starts covers a spread and its neighbours in every mode, including
-/// the head's third spread at the start of a book (where no backward
-/// neighbour exists). A view outside this window is dropped and asked
-/// for again if a turn needs it.
 fn view_kept(
     page: usize,
     shown: Spread,
@@ -920,36 +901,24 @@ fn view_kept(
     len: PageCount,
 ) -> bool {
     let start = view::spread_for(page, mode, len).first;
-    start.abs_diff(shown.first) <= 2 || start.abs_diff(requested.first) <= 2
+    start.abs_diff(shown.first) <= VIEW_KEEP_SPREADS
+        || start.abs_diff(requested.first) <= VIEW_KEEP_SPREADS
 }
 
-/// The spread a frame presents.
-///
-/// The requested spread wins once any of its pages clears the caller's
-/// bar (a view or native while still, any artifact while skimming).
-/// Otherwise
-/// the frame steps through the presentable spreads whose start lies
-/// between the shown and the requested one, nearest to the request
-/// first, so a cold skim advances monotonically and never replays a page
-/// the reader already passed. With nothing eligible, the shown spread
-/// stays up rather than blanking. A cold start has no interval to
-/// respect. `forward` only breaks the distance tie a cold start can
-/// produce.
+/// The requested spread once a page clears `can_show`; otherwise the
+/// nearest presentable start between the shown and requested spreads, so
+/// a skim never replays a passed page; otherwise the shown spread.
 fn choose_presented(
     requested: Spread,
     shown: Option<Spread>,
     mode: ViewMode,
     len: PageCount,
-    facts: &BTreeMap<usize, Fact>,
+    cached: &BTreeMap<usize, CachedPage>,
     forward: bool,
-    live: impl Fn(usize) -> bool,
+    can_show: impl Fn(usize) -> bool,
 ) -> Option<Spread> {
     let presentable = |spread: Spread| {
-        spread
-            .seats(mode)
-            .into_iter()
-            .flatten()
-            .any(&live)
+        spread.seats(mode).into_iter().flatten().any(&can_show)
     };
     if presentable(requested) {
         return Some(requested);
@@ -961,7 +930,7 @@ fn choose_presented(
         )
     });
     let mut best: Option<Spread> = None;
-    for &page in facts.keys() {
+    for &page in cached.keys() {
         let spread = view::spread_for(page, mode, len);
         if spread.first < low
             || spread.first > high
@@ -1153,7 +1122,9 @@ impl ApplicationHandler<UserEvent> for App {
                             Action::from_key(code, self.modifiers)
                         {
                             if !key.repeat || action.repeats() {
-                                self.dispatch(action, key.repeat, event_loop);
+                                self.dispatch(
+                                    action, key.repeat, event_loop,
+                                );
                             }
                         }
                     }
@@ -1371,13 +1342,13 @@ mod tests {
     fn presentation_advances_through_presentable_spreads() {
         let len = PageCount::new(12).expect("the test book is not empty");
         let mode = ViewMode::Normal;
-        let fact = Fact {
-            source: (2, 2),
+        let entry = CachedPage {
+            dims: (2, 2),
             format: Format::Png,
         };
-        let facts: BTreeMap<usize, Fact> =
-            [0, 2, 4, 8].into_iter().map(|page| (page, fact)).collect();
-        let live = |page: usize| matches!(page, 0 | 2 | 4);
+        let cached: BTreeMap<usize, CachedPage> =
+            [0, 2, 4, 8].into_iter().map(|page| (page, entry)).collect();
+        let can_show = |page: usize| matches!(page, 0 | 2 | 4);
         let lone = Spread::lone;
 
         // The request wins as soon as it has a pixel.
@@ -1387,23 +1358,23 @@ mod tests {
                 Some(lone(0)),
                 mode,
                 len,
-                &facts,
+                &cached,
                 true,
-                live
+                can_show
             ),
             Some(lone(4))
         );
         // Otherwise the nearest presentable spread between the shown
-        // and the requested one; page 8 has a fact but no pixels.
+        // and the requested one; page 8 is cached but has no pixels.
         assert_eq!(
             choose_presented(
                 lone(9),
                 Some(lone(0)),
                 mode,
                 len,
-                &facts,
+                &cached,
                 true,
-                live
+                can_show
             ),
             Some(lone(4))
         );
@@ -1414,7 +1385,7 @@ mod tests {
                 Some(lone(2)),
                 mode,
                 len,
-                &facts,
+                &cached,
                 true,
                 |page| page == 0
             ),
@@ -1422,7 +1393,15 @@ mod tests {
         );
         // A cold start picks the nearest presentable spread.
         assert_eq!(
-            choose_presented(lone(5), None, mode, len, &facts, true, live),
+            choose_presented(
+                lone(5),
+                None,
+                mode,
+                len,
+                &cached,
+                true,
+                can_show
+            ),
             Some(lone(4))
         );
         // A cold start with nothing decoded presents nothing.
@@ -1432,7 +1411,7 @@ mod tests {
                 None,
                 mode,
                 len,
-                &facts,
+                &cached,
                 true,
                 |_| false
             ),

@@ -1,37 +1,10 @@
-//! Downscaled page previews: minting and the on-disk cache.
+//! Downscaled page previews and the on-disk cache.
 //!
-//! A page decodes once at full resolution, then [`mint`] brings it to the
-//! two sizes the UI shows: a [`THUMB_EDGE`] thumbnail for the page strip
-//! and a [`VIEW_EDGE`] image for the viewport. Re-decoding for every
-//! scroll would repeat the expensive work, so minted images are cached.
-//!
-//! The cache lives under `env::temp_dir()/cryslen-cache`, which on this
-//! host is a tmpfs: entries survive process restarts but not a reboot, are
-//! backed by compressed RAM rather than disk, and can be reclaimed under
-//! memory pressure. Nothing outside the cache may assume an entry exists;
-//! a miss re-decodes and re-mints.
-//!
-//! Entries are keyed by [`content_hash`], the xxh3-128 of the page's
-//! encoded bytes. The key names the content, so a changed page gets a new
-//! key and its stale entries age out; there is no invalidation protocol,
-//! only least-recently-used pruning. Two files with the same bytes share
-//! one entry no matter where either lives in a book or archive.
-//!
-//! Caps are per kind because the two namespaces have different shapes:
-//! one thumbnail per page is cheap and numerous, while a view image is a
-//! handful of large allocations. A shared budget would let a long run of
-//! view images evict the whole strip, and a cap sized for thumbnails
-//! would force a re-mint on every turn. Each namespace therefore has its
-//! own byte cap: [`THUMB_CAP_BYTES`] and [`VIEW_CAP_BYTES`].
-//!
-//! File layout, all header fields little-endian: magic `CYPV`, a `u16`
-//! version, the artifact tag, the pixel tag, the mint edge (so a changed
-//! [`THUMB_EDGE`] or [`VIEW_EDGE`] misses old entries), the source and
-//! image dimensions, the format and transfer tags, the YUV description
-//! when the pixel tag says YUV, then the payload. Each payload length is a `u32`
-//! byte count; the extent the header implies must match it before any of
-//! those bytes are read, so a file that disagrees with itself is
-//! discarded instead of funded.
+//! Entries live under `env::temp_dir()`, one namespace per kind, keyed by
+//! [`content_hash`]. File layout, little-endian: magic `CYPV`, a `u16`
+//! version, artifact and pixel tags, the mint edge, page and image dims,
+//! format and transfer tags, an optional YUV description, then planes as
+//! `u32`-length-prefixed payloads.
 
 #![expect(
     clippy::little_endian_bytes,
@@ -84,10 +57,8 @@ pub enum Artifact {
 }
 
 impl Artifact {
-    /// The long edge this artifact is minted at, or `None` for a native
-    /// page. The edge is stored in the entry header: changing a mint
-    /// constant must miss the old entries rather than serve them at the
-    /// wrong size.
+    /// The mint edge, stored in the entry header so a changed constant
+    /// misses old entries instead of serving the wrong size.
     pub fn edge(self) -> Option<u32> {
         match self {
             Self::Thumb => Some(THUMB_EDGE),
@@ -102,25 +73,20 @@ pub fn content_hash(bytes: &[u8]) -> u128 {
     xxh3_128(bytes)
 }
 
-/// Downsample `page` so its long edge is at most `edge`, by exact area
-/// averaging. Never upsamples, and returns a copy of `page` when it
-/// already fits, so callers need not special-case small pages.
-///
-/// `source`, `format`, and `transfer` are preserved. YUV planes are
-/// resampled in their own layout; the target chroma extents come from
-/// `plane_dims` of the target image dimensions, which is what
-/// [`Decoded::yuv`] checks, so 4:2:0 and 4:2:2 stay consistent even
-/// where rounding the ratio per plane would disagree.
+/// Downsample to a long edge of at most `edge` by area averaging; returns
+/// a copy when it already fits. Preserves page dims, format, and transfer;
+/// YUV planes resample in their own layout from `plane_dims`, which
+/// [`Decoded::yuv`] validates.
 pub fn mint(page: &Decoded, edge: u32) -> Decoded {
-    let source = page.source();
-    let image = (page.width(), page.height());
-    let target = fit_dims(image, edge);
-    if target == image {
+    let page_dims = page.page_dims();
+    let dims = (page.width(), page.height());
+    let target = fit_dims(dims, edge);
+    if target == dims {
         return page.clone();
     }
     let minted = match page.pixels() {
         Pixels::Rgba8(bytes) => {
-            let bytes = resample_rgba(bytes, image, target);
+            let bytes = resample_rgba(bytes, dims, target);
             Decoded::rgba(
                 target.0,
                 target.1,
@@ -131,7 +97,7 @@ pub fn mint(page: &Decoded, edge: u32) -> Decoded {
         }
         Pixels::Yuv(yuv) => {
             let ((luma_w, luma_h), (chroma_w, chroma_h)) =
-                plane_dims(image, yuv.subsampling);
+                plane_dims(dims, yuv.subsampling);
             let (_, (target_w, target_h)) =
                 plane_dims(target, yuv.subsampling);
             let resized = YuvImage {
@@ -164,7 +130,7 @@ pub fn mint(page: &Decoded, edge: u32) -> Decoded {
         }
     };
     match minted {
-        Ok(minted) => minted.with_source(source),
+        Ok(minted) => minted.with_page_dims(page_dims),
         Err(error) => {
             tracing::warn!(
                 %error,
@@ -183,12 +149,12 @@ pub fn mint(page: &Decoded, edge: u32) -> Decoded {
 )]
 fn fit_dims(dims: (u32, u32), edge: u32) -> (u32, u32) {
     let (width, height) = (u64::from(dims.0), u64::from(dims.1));
-    let long = width.max(height);
-    if long <= u64::from(edge) {
+    let long_edge = width.max(height);
+    if long_edge <= u64::from(edge) {
         return dims;
     }
     let scaled = |axis: u64| {
-        let rounded = (axis * u64::from(edge) + long / 2) / long;
+        let rounded = (axis * u64::from(edge) + long_edge / 2) / long_edge;
         u32::try_from(rounded.max(1)).unwrap_or(u32::MAX)
     };
     (scaled(width), scaled(height))
@@ -209,9 +175,7 @@ fn resample_plane(
 }
 
 /// How much of each source index a target index covers, as `(index,
-/// weight)` pairs in units where one source pixel spans `target_len`. The
-/// weights of one target index sum to `source_len`, so the area average
-/// divides by the source extent alone.
+/// weight)`; one target index's weights sum to `source_len`.
 #[expect(
     clippy::integer_division,
     reason = "coverage weights are exact integer grid overlaps"
@@ -238,7 +202,6 @@ fn axis_weights(
     table
 }
 
-/// One plane resampled by area averaging, sample by sample.
 fn resample<T>(
     source: &[T],
     source_dims: (u32, u32),
@@ -281,7 +244,6 @@ where
     out.into_boxed_slice()
 }
 
-/// Interleaved RGBA resampled by area averaging, one channel at a time.
 fn resample_rgba(
     source: &[u8],
     source_dims: (u32, u32),
@@ -335,7 +297,6 @@ fn resample_rgba(
     out.into_boxed_slice()
 }
 
-/// Nearest integer of `sum / divisor`, rounded half up.
 #[expect(
     clippy::integer_division,
     reason = "an area average lands between integer samples"
@@ -349,7 +310,6 @@ fn round_channel(sum: u128, divisor: u128) -> u8 {
     u8::try_from(round(sum, divisor)).unwrap_or(u8::MAX)
 }
 
-/// A sample type a plane or an RGBA channel can hold.
 trait Sample: Copy {
     fn value(self) -> u16;
 
@@ -400,25 +360,21 @@ pub struct Saved {
 struct Namespace {
     dir: PathBuf,
     cap: u64,
-    /// Bytes currently held, as last computed by a scan or a prune.
+    /// Bytes written since the last scan or prune.
     total: u64,
 }
 
 impl Store {
     /// Open the shared store under `env::temp_dir()/cryslen-cache`.
     pub fn open() -> Self {
-        Self::at(env::temp_dir().join("cryslen-cache"))
+        Self::at(&env::temp_dir().join("cryslen-cache"))
     }
 
     /// Open the store rooted at `root`, creating it if absent. A `root`
     /// that cannot be created, or that resolves through a symlink, leaves
     /// the store disabled.
-    #[expect(
-        clippy::needless_pass_by_value,
-        reason = "the caller hands over the root; the store keeps only the derived namespace directories"
-    )]
-    pub fn at(root: PathBuf) -> Self {
-        Self::with_caps(&root, THUMB_CAP_BYTES, VIEW_CAP_BYTES)
+    pub fn at(root: &Path) -> Self {
+        Self::with_caps(root, THUMB_CAP_BYTES, VIEW_CAP_BYTES)
     }
 
     fn with_caps(root: &Path, thumb_cap: u64, view_cap: u64) -> Self {
@@ -429,9 +385,8 @@ impl Store {
         Self { state }
     }
 
-    /// Load the cached artifact for `hash`, or `None` when the namespace
-    /// has no entry, the file is damaged, or the kind is not cached. A
-    /// hit refreshes the entry's modification time for LRU pruning.
+    /// Load `hash`, or `None` when absent, damaged, or not cached; a hit
+    /// refreshes the entry's mtime for LRU.
     pub fn load(&self, hash: u128, kind: Artifact) -> Option<Decoded> {
         let started = Instant::now();
         let loaded = self.namespace(kind).and_then(|namespace| {
@@ -455,9 +410,8 @@ impl Store {
         loaded
     }
 
-    /// Store `page` under `hash` for `kind`, replacing any entry with the
-    /// same key. A save that crosses the namespace's cap prunes that
-    /// namespace, and the result names the entries it removed.
+    /// Store `page` under `hash`, replacing the same key. Crossing the
+    /// namespace's cap prunes it; the result names the removed entries.
     pub fn save(
         &mut self,
         hash: u128,
@@ -695,7 +649,9 @@ const ALPHA_ABSENT: u8 = 0;
 const ALPHA_U8: u8 = 1;
 const ALPHA_U16: u8 = 2;
 
-/// The decoder's admission edge. A cache file claiming more is corrupt.
+/// Loose per-axis bound on a dimension a cache header may claim. Real
+/// pages stop at the decoder's 0x4000 edge cap, so this is slack;
+/// `MAX_SAMPLES` bounds the product.
 const MAX_EDGE: u32 = 0x0001_0000;
 
 /// Mirror of the decoder's 512 MiB RGBA allocation ceiling, in pixels.
@@ -712,8 +668,8 @@ fn encode(page: &Decoded, kind: Artifact) -> Vec<u8> {
     });
     push_u32(&mut out, kind.edge().unwrap_or(0));
     for value in [
-        page.source().0,
-        page.source().1,
+        page.page_dims().0,
+        page.page_dims().1,
         page.width(),
         page.height(),
     ] {
@@ -927,11 +883,11 @@ fn read_artifact(file: File, kind: Artifact) -> Option<Decoded> {
     if reader.u32()? != kind.edge().unwrap_or(0) {
         return None;
     }
-    let source = (reader.u32()?, reader.u32()?);
+    let page_dims = (reader.u32()?, reader.u32()?);
     let image = (reader.u32()?, reader.u32()?);
     let format = format_from_tag(reader.u8()?)?;
     let transfer = transfer_from_tag(reader.u8()?)?;
-    sample_count(source)?;
+    sample_count(page_dims)?;
     let page = match pixel {
         PIXEL_RGBA => read_rgba(&mut reader, image, format, transfer)?,
         PIXEL_YUV => read_yuv(&mut reader, image, format, transfer)?,
@@ -940,7 +896,7 @@ fn read_artifact(file: File, kind: Artifact) -> Option<Decoded> {
     if !reader.at_end() {
         return None;
     }
-    Some(page.with_source(source))
+    Some(page.with_page_dims(page_dims))
 }
 
 fn read_rgba(
@@ -1020,17 +976,17 @@ fn read_plane_tag(
     tag: u8,
     samples: usize,
 ) -> Option<Plane> {
-    let width = match tag {
+    let bytes_per_sample = match tag {
         PLANE_U8 => 1,
         PLANE_U16 => 2,
         _ => return None,
     };
-    let want = samples.checked_mul(width)?;
+    let want = samples.checked_mul(bytes_per_sample)?;
     if usize::try_from(reader.u32()?).ok()? != want {
         return None;
     }
     let bytes = reader.bytes(want)?;
-    Some(if width == 1 {
+    Some(if bytes_per_sample == 1 {
         Plane::U8(bytes.into_boxed_slice())
     } else {
         Plane::U16(words(&bytes))
@@ -1047,8 +1003,8 @@ fn words(bytes: &[u8]) -> Box<[u16]> {
         .into_boxed_slice()
 }
 
-/// Pixel count of a `dims` plane, refusing dimensions the decoder would
-/// refuse.
+/// Pixel count of a `dims` plane, refusing implausible extents and more
+/// samples than the decoder could ever allocate.
 fn sample_count(dims: (u32, u32)) -> Option<usize> {
     let (width, height) = dims;
     if width == 0 || height == 0 || width > MAX_EDGE || height > MAX_EDGE {
@@ -1082,7 +1038,7 @@ mod tests {
             .into_boxed_slice();
         Decoded::rgba(width, height, Format::Png, Transfer::Srgb, bytes)
             .expect("rgba page")
-            .with_source((width, height))
+            .with_page_dims((width, height))
     }
 
     fn yuv_page(
@@ -1141,7 +1097,7 @@ mod tests {
         };
         Decoded::yuv(width, height, Format::Avif, Transfer::Pq, yuv)
             .expect("yuv page")
-            .with_source((width, height))
+            .with_page_dims((width, height))
     }
 
     fn rgba_bytes(page: &Decoded) -> Vec<u8> {
@@ -1180,8 +1136,8 @@ mod tests {
     #[test]
     fn rgba_roundtrip_preserves_the_page() {
         let dir = TempDir::new("preview-rgba");
-        let page = rgba_page(3, 2).with_source((9, 6));
-        let mut store = Store::at(dir.path().to_path_buf());
+        let page = rgba_page(3, 2).with_page_dims((9, 6));
+        let mut store = Store::at(dir.path());
         assert!(store.state.is_some());
         let hash = content_hash(b"page-a");
         assert!(store.save(hash, Artifact::Thumb, &page).landed);
@@ -1191,7 +1147,7 @@ mod tests {
         let loaded =
             store.load(hash, Artifact::Thumb).expect("cached thumb");
         assert_eq!((loaded.width(), loaded.height()), (3, 2));
-        assert_eq!(loaded.source(), (9, 6));
+        assert_eq!(loaded.page_dims(), (9, 6));
         assert_eq!(loaded.format(), Format::Png);
         assert_eq!(loaded.transfer(), Transfer::Srgb);
         assert_eq!(rgba_bytes(&loaded), rgba_bytes(&page));
@@ -1201,15 +1157,15 @@ mod tests {
     fn yuv_plane_roundtrip_preserves_the_page() {
         let dir = TempDir::new("preview-yuv");
         let page =
-            yuv_page(5, 3, Subsampling::Yuv420).with_source((15, 9));
-        let mut store = Store::at(dir.path().to_path_buf());
+            yuv_page(5, 3, Subsampling::Yuv420).with_page_dims((15, 9));
+        let mut store = Store::at(dir.path());
         let hash = content_hash(b"page-b");
         assert!(store.save(hash, Artifact::View, &page).landed);
 
         let loaded =
             store.load(hash, Artifact::View).expect("cached view");
         assert_eq!((loaded.width(), loaded.height()), (5, 3));
-        assert_eq!(loaded.source(), (15, 9));
+        assert_eq!(loaded.page_dims(), (15, 9));
         assert_eq!(loaded.format(), Format::Avif);
         assert_eq!(loaded.transfer(), Transfer::Pq);
         let Pixels::Yuv(yuv) = loaded.pixels() else {
@@ -1226,7 +1182,7 @@ mod tests {
     fn yuv_u8_planes_and_alpha_roundtrip() {
         let dir = TempDir::new("preview-yuv8");
         let page = yuv_page_with(6, 4, Subsampling::Yuv444, 8, true);
-        let mut store = Store::at(dir.path().to_path_buf());
+        let mut store = Store::at(dir.path());
         let hash = content_hash(b"page-e");
         assert!(store.save(hash, Artifact::Thumb, &page).landed);
 
@@ -1244,7 +1200,7 @@ mod tests {
     fn corrupt_entries_are_rejected() {
         let dir = TempDir::new("preview-corrupt");
         let page = rgba_page(2, 2);
-        let mut store = Store::at(dir.path().to_path_buf());
+        let mut store = Store::at(dir.path());
         let hash = content_hash(b"page-c");
         assert!(store.save(hash, Artifact::Thumb, &page).landed);
         let path = dir.path().join("thumb").join(format!("{hash:032x}"));
@@ -1264,7 +1220,7 @@ mod tests {
         fs::write(&path, &bad_version).expect("write version");
         assert!(store.load(hash, Artifact::Thumb).is_none());
 
-        // The mint edge sits between the pixel tag and the source dims;
+        // The mint edge sits between the pixel tag and the page dims;
         // a different edge is a different artifact.
         let mut bad_edge = good.clone();
         if let Some(field) = bad_edge.get_mut(8..12) {
@@ -1299,7 +1255,7 @@ mod tests {
     fn disabled_store_is_a_no_op() {
         let dir = TempDir::new("preview-disabled");
         dir.write("not-a-directory", b"x");
-        let mut store = Store::at(dir.path().join("not-a-directory"));
+        let mut store = Store::at(&dir.path().join("not-a-directory"));
         assert!(store.state.is_none());
         let page = rgba_page(2, 2);
         let hash = content_hash(b"page-d");
@@ -1307,17 +1263,17 @@ mod tests {
         assert!(store.load(hash, Artifact::Thumb).is_none());
 
         let mut nested =
-            Store::at(dir.path().join("not-a-directory/file"));
+            Store::at(&dir.path().join("not-a-directory/file"));
         assert!(nested.state.is_none());
         assert!(!nested.save(hash, Artifact::View, &page).landed);
     }
 
     #[test]
     fn mint_scales_to_the_edge() {
-        let page = rgba_page(500, 200).with_source((1500, 600));
+        let page = rgba_page(500, 200).with_page_dims((1500, 600));
         let thumb = mint(&page, 200);
         assert_eq!((thumb.width(), thumb.height()), (200, 80));
-        assert_eq!(thumb.source(), (1500, 600));
+        assert_eq!(thumb.page_dims(), (1500, 600));
         assert_eq!(thumb.format(), Format::Png);
         assert_eq!(thumb.transfer(), Transfer::Srgb);
         assert_eq!(
@@ -1362,7 +1318,7 @@ mod tests {
         let page = yuv_page(500, 200, Subsampling::Yuv420);
         let thumb = mint(&page, 200);
         assert_eq!((thumb.width(), thumb.height()), (200, 80));
-        assert_eq!(thumb.source(), (500, 200));
+        assert_eq!(thumb.page_dims(), (500, 200));
         let Pixels::Yuv(yuv) = thumb.pixels() else {
             panic!("expected yuv pixels");
         };
@@ -1392,11 +1348,7 @@ mod tests {
         let page = rgba_page(4, 4);
         let size = u64::try_from(encode(&page, Artifact::Thumb).len())
             .expect("size");
-        let mut store = Store::with_caps(
-            &root,
-            size + 1,
-            VIEW_CAP_BYTES,
-        );
+        let mut store = Store::with_caps(&root, size + 1, VIEW_CAP_BYTES);
 
         let first = content_hash(b"first");
         let second = content_hash(b"second");

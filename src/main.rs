@@ -1,4 +1,4 @@
-//! Usage: cy <dir | file.zip | file.7z | image-file>.
+//! Usage: cy <dir | archive | image-file>.
 
 mod app;
 mod decode;

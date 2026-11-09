@@ -1,8 +1,6 @@
-//! Page source: a directory or archive viewed as a natural-sorted list
-//! of pages. An archive unpacks once into memory on a background
-//! thread while `bytes` serves whatever the pass has filled, so archive
-//! reads never block and no member is ever unpacked twice. A directory
-//! keeps reading files, which the OS page cache serves.
+//! Page source: a directory or archive as a natural-sorted page list.
+//! Archives unpack once on a background thread; `bytes` answers `NotYet`
+//! until a member arrives.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -37,8 +35,8 @@ pub struct PageName {
     pub file: String,
 }
 
-/// Which archive family a path's extension names. Both `Source::open` and
-/// main's argument classification dispatch on this one table.
+/// The archive family; `Source::open` and main's argument check share
+/// this table.
 enum ArchiveKind {
     Zip,
     SevenZip,
@@ -68,11 +66,9 @@ pub enum PageRead {
     Failed(Arc<PageError>),
 }
 
-/// The pages one background pass fills. A page member that fails to
-/// read settles as its own page's error and the pass continues. A
-/// failure that ends the pass (an undecodable block, a non-page member
-/// that cannot be drained, a panic, a failed thread spawn) is what its
-/// unfilled pages report, while filled pages keep their results.
+/// Pages one background pass fills. A member's own failure settles that
+/// page; a pass-level failure answers every unfilled page, while filled
+/// pages keep their results.
 #[derive(Debug)]
 struct Fill {
     pages: HashMap<usize, Result<Arc<[u8]>, Arc<PageError>>>,
@@ -143,10 +139,8 @@ impl Source {
         }
     }
 
-    /// The next (`forward`) or previous sibling book of the same kind in
-    /// this book's parent directory, in natural order: archives beside
-    /// archives, directories beside directories. `None` at either end or
-    /// when the parent holds no order to walk.
+    /// The next or previous sibling book of the same kind, in natural order;
+    /// none at either end.
     pub fn sibling(&self, forward: bool) -> Option<PathBuf> {
         let parent = self.path.parent()?;
         let current = self.path.file_name()?;
@@ -591,8 +585,9 @@ fn mem_available_bytes() -> Option<u64> {
     parse_mem_available_bytes(&fs::read_to_string("/proc/meminfo").ok()?)
 }
 
-/// Kept free of the archive's unpacked pages: the decode book, texture
-/// uploads, and the rest of the system also live in `MemAvailable`.
+/// Kept free of the archive's unpacked pages: the worker's in-flight
+/// decode, the app's page textures, the preview store, and the rest of
+/// the system also live in `MemAvailable`.
 const MEM_RESERVE_BYTES: u64 = 1024 * 1024 * 1024;
 
 fn guard_memory(

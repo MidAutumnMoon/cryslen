@@ -1,26 +1,6 @@
 //! Prefetch planning: which spreads the worker should have ready.
-//!
-//! Decoding runs ahead of the reader, and the order matters: the next
-//! spread is the one the reader is most likely to land on, so it goes
-//! first, and the rest of the window is a hedge. [`Plan::build`] lists the
-//! anchor, then both neighbors at distance one, then distance two, and so
-//! on, alternating sides, with the direction of travel ahead of the
-//! opposite side at equal distance. The walk never wraps, so a plan holds
-//! each page at most once and stops at the book's ends.
-//!
-//! [`AHEAD_PAGES`] and [`BEHIND_PAGES`] bound the window asymmetrically
-//! because readers move forward far more often than back: the direction
-//! of travel gets the wide budget, the opposite side the narrow one. They
-//! count page indices from the anchor's first page: a spread joins the
-//! plan only if it starts within the budget, which keeps the plan's size
-//! near the budget rather than doubling it for pair modes.
-//!
-//! The first [`HEAD_SPREADS`] spreads are [`Plan::head`]: the ones that
-//! need a view image, while the tail is only worth a thumbnail. A short
-//! book makes the head shorter, so it is never assumed to be full.
 
-use crate::view::advance;
-use crate::view::spread_for;
+use crate::view;
 use crate::view::PageCount;
 use crate::view::Spread;
 use crate::view::ViewMode;
@@ -44,12 +24,6 @@ pub struct Plan {
 
 impl Plan {
     /// Plan around `anchor` for a step in `direction`.
-    ///
-    /// The anchor comes first, then neighbors by increasing page distance,
-    /// the direction of travel's side first at equal distance, bounded to
-    /// [`AHEAD_PAGES`] in the direction of travel and [`BEHIND_PAGES`]
-    /// against it. The walk stops at the ends of the book instead of
-    /// wrapping, so an end page has no neighbors on that side.
     pub fn build(
         anchor: Spread,
         direction: Direction,
@@ -60,22 +34,22 @@ impl Plan {
             Direction::Forward => (AHEAD_PAGES, BEHIND_PAGES),
             Direction::Backward => (BEHIND_PAGES, AHEAD_PAGES),
         };
-        let forward = walk(anchor.first, true, mode, len, ahead);
-        let backward = walk(anchor.first, false, mode, len, behind);
+        let increasing = walk(anchor.first, true, mode, len, ahead);
+        let decreasing = walk(anchor.first, false, mode, len, behind);
         let mut spreads =
-            Vec::with_capacity(1 + forward.len() + backward.len());
+            Vec::with_capacity(1 + increasing.len() + decreasing.len());
         spreads.push(anchor);
-        for distance in 0..forward.len().max(backward.len()) {
-            let (first, second) = match direction {
+        for distance in 0..increasing.len().max(decreasing.len()) {
+            let (travel, opposite) = match direction {
                 Direction::Forward => {
-                    (forward.get(distance), backward.get(distance))
+                    (increasing.get(distance), decreasing.get(distance))
                 }
                 Direction::Backward => {
-                    (backward.get(distance), forward.get(distance))
+                    (decreasing.get(distance), increasing.get(distance))
                 }
             };
-            spreads.extend(first);
-            spreads.extend(second);
+            spreads.extend(travel);
+            spreads.extend(opposite);
         }
         let head = spreads.len().min(HEAD_SPREADS);
         Self { spreads, head }
@@ -92,8 +66,6 @@ impl Plan {
     }
 }
 
-/// Spreads reachable from `start` in one direction, nearest first, stopping
-/// before the walk wraps around the book or exceeds `limit` pages.
 fn walk(
     start: usize,
     forward: bool,
@@ -104,7 +76,7 @@ fn walk(
     let mut spreads = Vec::new();
     let mut current = start;
     loop {
-        let next = advance(current, forward, mode, len);
+        let next = view::advance(current, forward, mode, len);
         let wrapped = if forward {
             next <= current
         } else {
@@ -117,7 +89,7 @@ fn walk(
         if distance > limit {
             break;
         }
-        spreads.push(spread_for(next, mode, len));
+        spreads.push(view::spread_for(next, mode, len));
         current = next;
     }
     spreads
@@ -144,7 +116,7 @@ mod tests {
     #[test]
     fn single_mode_walks_out_from_the_anchor() {
         let book = pages(10);
-        let anchor = spread_for(4, ViewMode::Normal, book);
+        let anchor = view::spread_for(4, ViewMode::Normal, book);
         let forward = Plan::build(
             anchor,
             Direction::Forward,
@@ -169,7 +141,7 @@ mod tests {
     #[test]
     fn the_ends_do_not_wrap() {
         let long_book = pages(1200);
-        let opening = spread_for(0, ViewMode::Normal, long_book);
+        let opening = view::spread_for(0, ViewMode::Normal, long_book);
         let before = Plan::build(
             opening,
             Direction::Backward,
@@ -183,7 +155,7 @@ mod tests {
             .iter()
             .all(|spread| spread.first <= BEHIND_PAGES));
 
-        let closing = spread_for(1199, ViewMode::Normal, long_book);
+        let closing = view::spread_for(1199, ViewMode::Normal, long_book);
         let after = Plan::build(
             closing,
             Direction::Forward,
@@ -198,7 +170,7 @@ mod tests {
             .all(|spread| spread.first >= 1199 - BEHIND_PAGES));
 
         let single = pages(1);
-        let only = spread_for(0, ViewMode::Manga, single);
+        let only = view::spread_for(0, ViewMode::Manga, single);
         for direction in [Direction::Forward, Direction::Backward] {
             let alone =
                 Plan::build(only, direction, ViewMode::Manga, single);
@@ -210,7 +182,7 @@ mod tests {
     #[test]
     fn bounds_are_respected_and_unique() {
         let book = pages(1200);
-        let anchor = spread_for(600, ViewMode::Normal, book);
+        let anchor = view::spread_for(600, ViewMode::Normal, book);
         let plan = Plan::build(
             anchor,
             Direction::Forward,

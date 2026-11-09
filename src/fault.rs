@@ -1,15 +1,6 @@
-//! The fault taxonomy: what can go wrong, as types.
-//!
-//! Refusals ([`OpenRefusal`], [`DecodeRefusal`]) are verdicts about the
-//! input that callers may match on. Faults carry structured detail;
-//! [`PanicFault`] and [`BadIndex`] name bugs, not bad input.
-//!
-//! [`PageError`] is the one shared set, stored behind `Arc` in the
-//! source's fill, the worker's book, and the screen's upload error, so
-//! an error cannot change set once wrapped. [`DecodeError`] and
-//! [`TextureError`] widen into it where the page is the unit of
-//! failure. [`OpenError`] never does, because an open refusal owns no
-//! page; [`SpawnError`] widens into [`OpenError`] at the book switch.
+//! The fault taxonomy: refusals are matchable verdicts about input, faults
+//! carry detail, and [`PageError`] is the shared page-level set. Decode and
+//! texture errors widen into it; an open error owns no page and never does.
 
 use std::any::Any;
 use std::error::Error;

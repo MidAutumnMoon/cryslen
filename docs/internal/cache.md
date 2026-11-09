@@ -5,53 +5,52 @@ the presentation half of `app.rs`/`render.rs`.
 
 The viewer holds three representations of a page, one production
 order, and one ownership rule: the app's texture maps decide what is
-missing, and the worker serves exactly that. No component assumes a
-delivery stuck.
+missing and the worker serves exactly that, so neither side assumes a
+delivery arrived.
 
 | representation | edge | bytes (3:2) | job | lifetime |
 |---|---|---|---|---|
-| thumb | 192 | ~96 KiB | the skim and a future gallery | tmpfs, library-wide |
-| view | 2560 | ~17.5 MiB | reading at fit, revisits | tmpfs, current book |
-| native | full | up to 191 MiB @ 50 MP | zoom only | delivered on want, never stored |
+| thumb | 192 | ~96 KiB | the skim | stored; resident for the book |
+| view | 2560 | ~16.7 MiB | reading at fit, revisits | stored; resident near the shown/requested spreads |
+| native | full | up to 191 MiB @ 50 MP | zoom only | never stored; resident for the shown spread |
 
 At fit the view image is the display representation; the native is
-decoded only when the zoom scale exceeds `VIEW_EDGE / source edge`, and
+decoded only when the zoom scale exceeds `VIEW_EDGE / page edge`, and
 it is never uploaded on a turn. The view edge must therefore cover the
-fitted page's long edge in physical pixels. At 1024 a 1400 px display
-asked for a native decode on every settled turn and showed the upscaled
-view until it arrived; at 2560 a 2560×1440 window needs no native at
-fit. Above a 2560 px fitted page (a 4K single-page view) the native is
-requested again; deriving the edge from the viewport is the eventual
-fix.
+fitted page's long edge in physical pixels, or every still turn asks
+for a native decode and shows the upscaled view until it arrives; 2560
+covers a 2560×1440 window. Above a 2560 px fitted page (a 4K
+single-page view) the native is requested again, so deriving the edge
+from the viewport is the eventual fix.
+
 `decoded.width()`/`height()` are the representation's pixel
-dimensions; `decoded.source()` is the page's oriented dimensions and is
-what layout and the status line use, so a thumb→view promotion never
+dimensions; `decoded.page_dims()` is the page's dimensions and is what
+layout and the status line use, so a thumb→view promotion never
 refits.
 
-## The store (tmpfs)
+## The store
 
 `$TMPDIR/cryslen-cache/{thumb,view}/<hex xxh3-128 of the encoded page
 bytes>`. Content addressing means there is no invalidation step: a
-changed page is simply a different key, and identical pages across
-books share an entry. The store is tmpfs (on this host `/tmp` is zram),
-so it lives for the system's uptime and needs no user-facing cleanup.
-
-The root resolves through `env::temp_dir()`, so a `TMPDIR` set per
-app instance shortens the lifetime to that instance; on a normal
-desktop session it is `/tmp` (zram here), cleared at boot.
+changed page is a different key, and identical pages across
+books share an entry. The root resolves through `env::temp_dir()`, and
+on this host `/tmp` is a zram-backed filesystem, so entries live in RAM
+for the system's uptime and need no user-facing cleanup; a `TMPDIR` set
+per app instance shortens the lifetime to that instance.
 
 Files carry a `CYPV` header: version, artifact tag, pixel layout
 (RGBA8 or YUV with depth/subsampling/range/matrix), the mint edge,
-source dims, image dims, `Format`, `Transfer`, then the plane payload.
+page dims, image dims, `Format`, `Transfer`, then the plane payload.
 `load` reconstructs through `Decoded::rgba`/`yuv` and rejects an entry
 whose edge is not the current constant, so changing `THUMB_EDGE` or
 `VIEW_EDGE` is a miss that re-mints, never a stale size. A corrupt file
 is a miss, not a displayed page. Writes go through `<name>.tmp` +
 `rename`.
 
-Caps are per kind: 512 MiB of thumbs, 1.5 GiB of views. A save that
-crosses its namespace's cap prunes that namespace, oldest mtime first;
-`load` touches mtime, so the order approximates last use. The save
+Caps are per kind: 512 MiB of thumbs, 1.5 GiB of views; a shared budget
+would let a long run of views evict every thumb. A save that crosses its
+namespace's cap prunes that namespace, oldest mtime first; `load` touches
+mtime, so the order approximates last use. The save
 returns the entries it evicted, so the worker forgets them in its plan
 ledger instead of claiming a pruned preview. A store that cannot be
 created (read-only tmp, foreign owner, symlink) degrades to disabled;
@@ -84,13 +83,15 @@ One thread, two inputs, one store.
   A job beyond `head()` is preload, not demand: it starts only after
   the app has been silent for 300 ms, and the burst continues until the
   app speaks again. A reader who is turning pages leaves the worker
-  idle between turns, so a want is served without waiting out a
-  speculative decode; a reader who pauses still gets the deep preload.
-- A want is answered from the store when the plan already produced it;
-  otherwise the page is decoded once and every wanted preview is
-  minted, persisted, and delivered. The thumb is minted from the view
-  (one area pass over 1.5 MP instead of the source), the native is the
-  page's own pixels and is never stored.
+  idle between turns, so a want does not queue behind a speculative
+  job (an in-flight one still finishes; see `analysis.md` item 1); a
+  reader who pauses still gets the deep preload.
+- A want is answered from the store when the artifact is already there
+  (left by the plan, an earlier want, or an earlier session); otherwise
+  the page is decoded once, and every wanted preview is minted,
+  persisted, and delivered. The thumb is minted from the view
+  when the job has one (one area pass over the view instead of the full
+  page), and the native is the page's own pixels, never stored.
 - Delivery is never assumed. The app sends its want set only when it
   changes; a want that leaves the set and comes back is served again,
   while an unchanged set is not re-fetched. The worker keeps no
@@ -111,7 +112,8 @@ produces (a skim never mints views).
 ## Presentation (app)
 
 Requested = `spread_for(index)`. A spread is presentable when any of
-its pages has any representation uploaded.
+its pages has a representation uploaded: any of the three while
+skimming, only a view or native while still.
 
 1. The requested spread, if presentable.
 2. Else the presentable spread closest to the requested that lies
@@ -121,44 +123,50 @@ its pages has any representation uploaded.
 
 Seats are always the presented spread's pages, so pairing identity is
 correct even when one seat is a thumb and the other a view. The seat
-dims come from `source()`, never the representation.
+dims come from `page_dims()`, never the representation.
 
 Each frame, after retention, the app computes the wants: for the
-requested spread and the shown one, the missing **view** (still), the
-missing **thumb** (always, so the next skim is free), and the missing
-**native** (shown pages, when the placement upscales the view). It
+requested spread and the shown one, the missing view (still), the
+missing thumb (always, so the next skim is free), and the missing
+native (shown pages, when the placement upscales the view). It
 sends the set on change. The app's texture maps are the only authority
 on what it can draw; the worker's delivery ledger is not.
 
 `PageTextures` holds three maps and no budget. Retention is a
-performance policy: thumbs stay for the session, views for the
-presented and requested spreads and their neighbours, natives for the
+performance policy: thumbs stay for the book, views within two spread
+starts of the presented and requested spreads, natives for the
 presented spread only. `kept` also covers every want by construction,
 so an artifact must leave the sent set before retention can drop it and
 the worker always sees the round trip; if it is needed again, it is
-simply asked for again.
+asked for again.
 
 Uploads drain from a queue with a per-frame budget; a non-empty queue
-arms the next frame. The queue is the only reason a repaint can happen
-without visible change.
+arms the next frame immediately, so a backlog keeps draining.
 
-## What was removed
+## Do not revive
 
-`Screen`'s hold/commit policy, `page_watched`, `stage_forward`, the
-decoded `Book` and its pending trail/recency/eviction, and the GPU
-byte budget with distance eviction. Also gone: the worker's `shipped`
-ledger (delivery is demand-driven), the `want_view`/`want_native`
-single-slot requests, the 250 ms request-echo grace, and the separate
-`serve`/`serve_view`/`serve_native` paths. The remaining knobs are the
-three edges, the two store caps, the plan bounds, and the two motion
-intervals.
+- A GPU texture byte budget with distance eviction. Retention is
+  role-bounded instead, which needs no cost accounting: thumbs stay for
+  the book, views for the spread window, natives for the shown spread.
+- A session-long delivery ledger that remembers every want it has ever
+  served. The app's texture maps are the authority; the per-set
+  `delivered` set is all the worker keeps, and its pruning on retarget
+  is where the app's acknowledgement takes effect, so a want that
+  leaves and returns is served again.
+- Separate single-slot requests for a view or a native. One ordered want
+  set lets a single decode serve a page's whole group.
+
+The remaining knobs are the representation edges, the two store caps,
+the plan bounds, the preload and fill-poll intervals, the per-frame
+upload budget, the view retention window, and the two motion intervals.
 
 ## Diagnosing a stall
 
 Logs go to stderr through `ino_tracing` (no timestamps; each line carries
 its own duration). The tracing target is the binary's crate name, so use
 `RUST_LOG=cy=debug` (not `cryslen`); a bare `RUST_LOG=debug` works too.
-The stall lines are `info` and appear without any filter.
+The stall lines (`slow frame`, `slow upload`, `holding for a view`) are
+`info` and appear without any filter; the rest need the debug filter.
 
 - `slow frame` (>50 ms) carries `total`, `drain`, `queue`, `presented`.
 - `slow upload` (>30 ms) names the representation, its dims, and the
@@ -174,14 +182,13 @@ The stall lines are `info` and appear without any filter.
 - `targets`, `target`, `target served`: the worker's queue and the
   served page (`waited` = time since the set arrived, `thumb_hit` /
   `view_hit` = store hits, `elapsed` = serve cost).
-- `job` (head or preload), `preload` bursts: what the worker was doing
-  around a hold.
+- `job` and its `preload` flag: what the worker was doing around a hold.
 - `decoded`, `view minted`, `thumb minted`, `preview load/save/prune`,
   `publish`: per-artifact cost.
 
 ## Honest limits
 
-- The mint is roughly 15 ns per source sample in release: ~125 ms for
+- The mint is roughly 15 ns per page sample in release: ~125 ms for
   an 8 MP page and ~0.75 s for a 50 MP page. Head spreads are minted
   during a reading dwell, so a turn does not pay it; a cold start or a
   jump holds one mint. A debug build is ~30x slower and will look like

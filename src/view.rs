@@ -339,10 +339,8 @@ pub fn last_spread(mode: ViewMode, len: PageCount) -> usize {
 const MIN_SCALE: f32 = 0.05;
 const MAX_SCALE: f32 = 40.0;
 
-/// Zoom by `factor`, keeping the image point under `cursor` (viewport px)
-/// anchored. Clamps scale to [`MIN_SCALE`]..=[`MAX_SCALE`]. The anchor
-/// uses the *actual* factor applied so hitting the clamp does not shift
-/// the image.
+/// Zoom by `factor`, anchoring the point under `cursor`; clamps to
+/// [`MIN_SCALE`]..=[`MAX_SCALE`] with the applied factor.
 pub fn zoom_at(
     mut placement: Placement,
     cursor: (f32, f32),
@@ -398,10 +396,8 @@ fn clamp_axis(offset: f32, content: f32, size: f32) -> f32 {
     }
 }
 
-/// The current spread's fit: the mode, the live placement, and whether
-/// the placement is due for recomputation. A user zoom or pan keeps its
-/// placement until a turn; a commit refits only if the user did not move
-/// during the hold.
+/// The current spread's fit: mode, live placement, and whether a commit
+/// refits (a user move during the hold pins it).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Fit {
     mode: FitMode,
@@ -474,8 +470,8 @@ impl Fit {
         self.user_moved = false;
     }
 
-    /// The screen committed a new spread: the next `resolve` places it.
-    /// Moves made during the hold carry into it.
+    /// The app presented a new spread: the next `resolve` places it. Moves
+    /// made during the hold carry into it.
     pub fn commit(&mut self) {
         self.settled = None;
     }

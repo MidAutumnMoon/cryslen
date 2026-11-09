@@ -1,13 +1,13 @@
 # Browsing: what is still open
 
 The design this review argued for is in place: one ranked plan, a
-content-addressed preview store, request-driven delivery, a sampled skim
-with no replay, and input-driven skimming. See `docs/internal/cache.md`.
+content-addressed preview store, request-driven delivery, and a skim
+with no replay. See `docs/internal/cache.md`.
 
 Do not revive the rejected mechanisms: six-slot residency, animated
 skeletons, a pending/replay trail, GPU byte budgets with distance
 eviction, or insert-before-protect. Response, browsing, and landing are
-different promises; today they are served by wants, stashed thumbs, and
+different promises; today they are served by wants, stored thumbs, and
 the plan's head views.
 
 The model that still explains the limits: with a turn rate `r`, a
@@ -26,13 +26,13 @@ show fewer samples.
 ## Open
 
 1. **A demand job can still wait out one in-flight decode.**
-   `IDLE_PRELOAD` removes the collision probability, not the worst case:
-   a turn can wait for the decode already inside `decode::decode` (up to
-   ~0.75 s for a 50 MP JXL). A book switch also runs the old worker's
-   decode alongside the new one until it finishes. If this bites:
-   cancellation inside the decoder where supported, a second executor
-   for demand, or process isolation — and watch the JXL pool's threads
-   when adding concurrency.
+   `IDLE_PRELOAD` keeps speculative work from starting while the reader
+   is turning. It does not remove the worst case: a turn can wait for
+   the decode already inside `decode::decode` (up to ~0.75 s for a 50 MP
+   JXL). A book switch also runs the old worker's decode alongside the
+   new one until it finishes. If this bites: cancellation inside the
+   decoder where supported, a second executor for demand, or process
+   isolation. Watch the JXL pool's threads when adding concurrency.
 
 2. **`VIEW_EDGE` is a constant.**
    2560 covers a 2560×1440 fit; a fitted page above that asks for a
@@ -45,11 +45,11 @@ show fewer samples.
    would end the gesture at the release and start the settle mint
    earlier; the last skim settle in a real run cost one 47 ms mint.
 
-4. **The derived cache is tmpfs-only.**
-   `$TMPDIR/cryslen-cache` dies at reboot. A bounded, versioned
-   persistent preview/view cache would make the first preparation
-   reusable; an explicit "prepare this book" pass is the same lever for
-   unusually expensive books.
+4. **The derived cache lives in `$TMPDIR` and dies at reboot.**
+   Entries survive process restarts, never a reboot. A bounded,
+   versioned persistent preview/view cache would make the first
+   preparation reusable; an explicit "prepare this book" pass is the
+   same lever for unusually expensive books.
 
 5. **`jxl::Pool::run` scopes and joins threads per invocation.**
    Measure a persistent executor and an alternative backend on the
@@ -57,7 +57,7 @@ show fewer samples.
 
 6. **Large uploads still run on the UI thread.**
    The drain budget (16 artifacts / 8 MiB, one artifact always through)
-   bounds it, but a ~190 MB native can hitch one frame. Not seen in the
+   bounds it, but a ~190 MiB native can hitch one frame. Not seen in the
    logs (`slow upload` is instrumented): measure before changing.
 
 7. **`switch_book` opens the next source on the UI thread.**

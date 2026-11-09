@@ -25,7 +25,7 @@ pub struct StatusLine {
     pub page: Option<PageFacts>,
     /// Placement scale, screen px per image px.
     pub zoom: f32,
-    /// The wait flag, once a pending seat has outlived the grace.
+    /// The wait flag, once a waiting spread has outlived the grace.
     pub waiting: Option<Wait>,
     pub error: Option<StatusFault>,
 }
@@ -59,9 +59,7 @@ pub fn fault_to_show(
         .or_else(|| upload.cloned().map(StatusFault::Page))
 }
 
-/// The status line's time-driven facts: how long the spread has waited
-/// undecided, and when the mode toast expires. Pure in the clock the
-/// caller passes, so the timing policy is testable headless.
+/// Status-line timers, pure in the clock the caller passes.
 #[derive(Default)]
 pub struct Timers {
     waiting_since: Option<Instant>,
@@ -77,9 +75,8 @@ impl Timers {
         self.toast_since = Some(now);
     }
 
-    /// Track the wait flag: armed while `waiting`, cleared otherwise.
-    /// Returns the delay until the grace elapses, for the parked loop
-    /// to arm — without it the loop never wakes to show the flag.
+    /// Track the wait flag and return the grace's remaining delay for the
+    /// parked loop to arm.
     pub fn tick_wait(
         &mut self,
         now: Instant,
@@ -93,10 +90,8 @@ impl Timers {
         WAIT_GRACE.checked_sub(now - since)
     }
 
-    /// The wait word once the grace has elapsed, `None` before. The
-    /// word distinguishes the two waits the app can observe;
-    /// `unpacking` is consulted only when the word will show, so its
-    /// cost stays off every settled frame.
+    /// The wait word once the grace has elapsed; `unpacking` runs only
+    /// when the word will show.
     pub fn wait_word(
         &self,
         now: Instant,
@@ -113,9 +108,7 @@ impl Timers {
         })
     }
 
-    /// Expire the toast. Returns the delay until it does, for the
-    /// parked loop to arm, so the toast disappears without other
-    /// traffic.
+    /// Expire the toast and return the delay until it does.
     pub fn tick_toast(&mut self, now: Instant) -> Option<Duration> {
         self.toast_since =
             self.toast_since.filter(|&since| now - since < MODE_TOAST);
@@ -144,11 +137,11 @@ impl Wait {
 }
 
 /// One page's state as the status line reads it: the format the decoder
-/// identified, the page's pixel size, or the page's failure.
+/// identified, the page's pixel size, and its failure, each once known.
 #[derive(Clone)]
 pub struct PageState {
     pub format: Option<Format>,
-    pub source: Option<(u32, u32)>,
+    pub dims: Option<(u32, u32)>,
     pub error: Option<Arc<PageError>>,
 }
 
@@ -162,9 +155,8 @@ pub struct FoldedStatus {
     pub speaker: usize,
 }
 
-/// Fold one spread's page states. A failure anywhere waits no longer and
-/// speaks for the spread; pages past the first failure contribute only
-/// their own state. With no failure, the first decoded page supplies the
+/// Fold one spread's page states. The first failure waits no longer and
+/// speaks for the spread; otherwise the first decoded page supplies the
 /// facts and the name.
 pub fn fold_status(
     spread: Spread,
@@ -178,7 +170,7 @@ pub fn fold_status(
     for page in iter::once(spread.first).chain(spread.second) {
         let PageState {
             format,
-            source,
+            dims,
             error,
         } = state(page);
         has_format |= format.is_some();
@@ -193,8 +185,8 @@ pub fn fold_status(
         if let Some(format) = format {
             first_decoded.get_or_insert(page);
             if facts.is_none() {
-                if let Some(source) = source {
-                    facts = Some((page, format, source));
+                if let Some(dims) = dims {
+                    facts = Some((page, format, dims));
                 }
             }
         }
@@ -354,7 +346,7 @@ mod tests {
         let start = Instant::now();
         let mut timers = Timers::default();
 
-        // A pending spread arms the grace; the word appears only after
+        // A waiting spread arms the grace; the word appears only after
         // it elapses, and mid-grace the wake is what remains of it.
         assert_eq!(timers.tick_wait(start, true), Some(WAIT_GRACE));
         assert_eq!(
@@ -490,11 +482,8 @@ mod tests {
         }
     }
 
-    /// Render the bar headlessly on a `width`-wide screen and return
-    /// the settled frame's text items and content rect. egui panel
-    /// sizing settles one frame late, so a settle pass runs first.
-    /// Only the texture upload needs a GPU, and
-    /// `drop_without_applying_deltas` skips it.
+    /// Render the bar headlessly on a `width`-wide screen; egui panel sizing
+    /// settles one frame late. Only the texture upload needs a GPU.
     fn render(
         width: f32,
         status: &StatusLine,

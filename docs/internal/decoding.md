@@ -93,16 +93,19 @@ tags.
 
 ## Decode worker pattern
 
-One worker thread serves the wanted spread; retunes arrive on a channel
-and are observed between decodes, so a newer spread overtakes the
-backlog and one in-flight decode always completes. Every retune queues
-the spread plus its ±3 neighborhood and bounds the pending trail to ±64
-pages; the wanted spread itself never drops. Decided and pending pages
-live in one book: failures are sticky per page, and eviction takes
-never-wanted pages first, then least recently wanted, then farthest from
-the spread, never a wanted page. The book's byte budget is in the
-hundreds of MiB; an oversized wanted spread stays over budget rather
-than losing a shown page.
+One worker thread serves the app's wants, an ordered `Want { page,
+kind }` set sent on change. Retunes arrive on a channel and are
+observed between decodes, so a newer plan or want set overtakes the
+backlog and one in-flight decode always completes. A want is answered
+from the preview store when the plan, an earlier want, or an earlier
+session left it there, and otherwise by one decode that mints the
+wanted previews (a native is the decode itself). The plan fills the
+store ahead of the reader but delivers nothing. The worker holds no
+decoded pages and no byte budget. Failures are sticky per page.
+Preload beyond the head starts only after 300 ms of app silence, so no
+speculative job starts during a turn; an in-flight one still finishes
+(see `analysis.md` item 1). The budgets, edges, and retention policy
+live in `docs/internal/cache.md`.
 
 An archive unpacks once on its own thread; `Source::bytes` answers
 `NotYet` until a page is filled, and the claimed unpacked sizes are

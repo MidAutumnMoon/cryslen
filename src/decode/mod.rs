@@ -1,9 +1,4 @@
-//! Decoding: raw page bytes -> `Decoded` (RGBA or YUV planes).
-//!
-//! Dispatch is by magic bytes, then extension; AVIF decodes to YUV
-//! planes and the rest to RGBA. Corrupt input fails as `DecodeError`,
-//! but the decoder libraries can still panic on hostile bytes; the
-//! worker's `catch_unwind` catches that.
+//! Decoding: raw page bytes to `Decoded` (RGBA or YUV planes).
 
 #![expect(
     clippy::definition_in_module_root,
@@ -23,18 +18,14 @@ mod jxl;
 /// pixel extents against the dimensions.
 #[derive(Clone)]
 pub struct Decoded {
-    /// Pixel dimensions of this representation. A preview is smaller
-    /// than the page; the page's own dimensions live in [`Self::source`].
+    /// This representation's pixel dimensions, not the page's.
     width: u32,
     height: u32,
     pixels: Pixels,
     /// Sample encoding the renderer must undo before the framebuffer.
     transfer: Transfer,
     format: Format,
-    /// The page's oriented dimensions, which the layout pairs and fits
-    /// against. Equal to `width`/`height` for a native decode, and
-    /// unchanged by preview minting.
-    source: (u32, u32),
+    page_dims: (u32, u32),
 }
 
 /// Sample encoding. SDR pages are sRGB-class gamma, passed through to the
@@ -67,15 +58,14 @@ impl Decoded {
         self.format
     }
 
-    /// The page's oriented dimensions, independent of how far this
-    /// representation is downsampled.
-    pub fn source(&self) -> (u32, u32) {
-        self.source
+    /// The page's dimensions, however far this representation is
+    /// downsampled.
+    pub fn page_dims(&self) -> (u32, u32) {
+        self.page_dims
     }
 
-    /// Record the page dimensions this representation was minted from.
-    pub fn with_source(mut self, source: (u32, u32)) -> Self {
-        self.source = source;
+    pub fn with_page_dims(mut self, page_dims: (u32, u32)) -> Self {
+        self.page_dims = page_dims;
         self
     }
 
@@ -97,7 +87,7 @@ impl Decoded {
             pixels: Pixels::Rgba8(bytes),
             transfer,
             format,
-            source: (width, height),
+            page_dims: (width, height),
         })
     }
 
@@ -129,7 +119,7 @@ impl Decoded {
             pixels: Pixels::Yuv(yuv),
             transfer,
             format,
-            source: (width, height),
+            page_dims: (width, height),
         })
     }
 
@@ -173,10 +163,8 @@ fn checked_extent(
 )]
 const MAX_PIXELS: u32 = (512 << 20) / 4;
 
-/// Decode-time admission cap on a page edge: pages over it fail before
-/// any buffer is funded for them. 0x4000 is the texture edge common
-/// desktop GPUs support; the authoritative per-GPU check is the
-/// renderer's runtime query, reported as `TextureFault`.
+/// Admission cap on a page edge; the renderer still checks the GPU's
+/// `MAX_TEXTURE_SIZE` at upload.
 const DECODE_EDGE_LIMIT: u32 = 0x4000;
 
 fn check_dims(width: u32, height: u32) -> Result<(), DecodeRefusal> {
@@ -222,10 +210,9 @@ impl Format {
     }
 }
 
-/// 8-bit planes are one byte per sample; deeper planes are `u16` samples
-/// with `depth` significant bits. Mono carries luma only, so its chroma
-/// planes stay empty. Alpha, when the file carries one, is a luma-sized
-/// full-range plane.
+/// 8-bit planes are one byte per sample; deeper planes are `u16` with
+/// `depth` significant bits. Mono carries luma only; alpha, when present,
+/// is a luma-sized full-range plane.
 #[derive(Clone)]
 pub struct YuvImage {
     pub depth: u8,
@@ -658,7 +645,8 @@ mod tests {
         let page =
             Decoded::yuv(32, 16, Format::Avif, Transfer::Srgb, real)
                 .expect("mono yuv page constructs");
-        // The worker's book budget consumes this count.
+        // The app's upload drain charges this count against its
+        // per-frame byte budget.
         assert_eq!(page.resident_bytes(), 32 * 16 * 2);
         let empty = mono(Plane::U16(Box::new([])), None);
         assert!(matches!(

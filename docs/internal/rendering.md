@@ -45,7 +45,7 @@ arboard bundle.
   `egui_ctx.set_request_repaint_callback` → send a user event. The
   proxy must come from `EventLoop::create_proxy` *before* `run_app`.
   winit 0.30 has no `create_proxy` on `ActiveEventLoop`.
-- While a page is pending, re-arm at the status-grace deadline or
+- While the shown spread waits, re-arm at the status-grace deadline or
   the wait word never appears (the loop is parked).
 
 ## GL state gotchas
@@ -96,9 +96,9 @@ and complicates tiling later.
 ## YUV-in-shader (why AVIF renders without a CPU conversion)
 
 One program handles RGBA and YUV, sRGB and PQ, via uniforms: the mode
-and transfer ids, the screen-px→texel maps, the folded conversion mat3
-and offset, and the alpha depth normalizer. Folding every per-draw
-constant on the CPU keeps the shader trivial:
+and transfer ids, the screen-px→page-fraction maps (`u_lmap`/`u_cmap`),
+the folded conversion mat3 and offset, and the alpha depth normalizer.
+Folding every per-draw constant on the CPU keeps the shader trivial:
 
 - KR/KB per standard: BT.601 (0.299, 0.114), BT.709 (0.2126, 0.0722),
   BT.2020 (0.2627, 0.0593). KG = 1 - KR - KB.
@@ -124,21 +124,19 @@ regressions without a GPU.
 
 ## Upload policy
 
-Texture uploads are expensive, a full upload plus mipmap generation per
-plane, so uploaded pages stay in a page-keyed cache. `bind(seat, page,
-decoded)` no-ops on the same page id, uploads only on a cache miss, and
-otherwise rebinds the seat to the cached textures. Page revisits and
-the mode re-seat are pure binds. `stage(page, decoded)` uploads without
-binding a seat, moving a decided page's upload off the frame that will
-show it.
+Uploads are the expensive operation: a full upload per plane, plus
+mipmap generation for filterable planes (R16 on GLES stays NEAREST,
+no mips). Decoded artifacts wait in the app's queue and
+drain under a per-frame budget, with one artifact always admitted; a
+queue with more left arms the next frame immediately, so a backlog
+keeps draining. A revisit to a retained page is a texture hit, not an
+upload.
 
-The screen module owns what the screen shows (the page and dims
-per seat, plus the `shown` spread they belong to) and changes seats
-only through one whole-screen plan per frame.
-
-Each entry counts its plane bytes plus the mip chain against a 3 GiB
-cap. An insert past the cap evicts unbound pages, farthest from the
-nearest bound page first. Bound pages are never evicted, so a held last
-spread keeps drawing. A staged page is unbound and may be evicted,
-which reverts it to an upload when the page is shown. A page that alone
-exceeds the cap renders until a later insert finds it unbound.
+`PageTextures::insert(page, kind, image)` uploads one artifact into
+the thumb, view, or native map. It no-ops when that slot already holds
+a texture and never evicts, and it refuses a page over
+`MAX_TEXTURE_SIZE` as the page's `TextureFault`. `retain` applies
+`app::kept`: thumbs stay for the book, views within two spread starts
+of the shown and requested spreads, natives for the shown spread. A
+seat draws the largest representation present (native, then view, then
+thumb), and `clear_all` runs on a book switch.
