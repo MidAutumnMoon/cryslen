@@ -63,6 +63,17 @@ After making changes (scope to the relevant app/crate):
 
 Do not pipe command output through `head` or `tail`, especially `cargo test`.
 
+### Visual smoke test
+
+Tools, usable separately:
+
+- App: run the release binary under `nix develop`, with `RUST_LOG=cy=debug` and a scratch `$TMPDIR` for a cold store. Its window `app_id` is `cryslen`; the log records navigation and frame events.
+- niri: `niri msg windows` lists windows, `niri msg action focus-window --id <id>` focuses one, `niri msg --json focused-window` confirms.
+- dotool: `printf 'key <name>\n' | nix run nixpkgs#dotool --` sends real input; it needs `/dev/uinput` and acts on the focused window. Key bindings: `src/keys.rs`.
+- Screenshot: `niri msg action screenshot-window --id <id> --write-to-disk true` writes a PNG under `~/Pictures/Screenshots`.
+
+A screenshot shows the settled frame, not an interim one. Delete the screenshots you create and stop the app with `pkill -x cy`.
+
 ## VCS
 
 Use `jj` vcs exclusively. For example, `jj status`, `jj new`.
