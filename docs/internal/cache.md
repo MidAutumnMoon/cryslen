@@ -111,9 +111,10 @@ produces (a skim never mints views).
 
 ## Presentation (app)
 
-Requested = `spread_for(index)`. A spread is presentable when any of
-its pages has a representation uploaded: any of the three while
-skimming, only a view or native while still.
+Requested = `spread_for(index)`. A spread is presentable when every
+seat resolves: the page's facts are known and a representation is
+uploaded (any of the three while skimming, only a view or native while
+still), or the page failed. A frame draws only the presented spread.
 
 1. The requested spread, if presentable.
 2. Else the presentable spread closest to the requested that lies
@@ -123,7 +124,8 @@ skimming, only a view or native while still.
 
 Seats are always the presented spread's pages, so pairing identity is
 correct even when one seat is a thumb and the other a view. The seat
-dims come from `page_dims()`, never the representation.
+dims come from `page_dims()`, never the representation, and are written
+once per page, so a presented layout cannot move.
 
 Each frame, after retention, the app computes the wants: for the
 requested spread and the shown one, the missing view (still), the

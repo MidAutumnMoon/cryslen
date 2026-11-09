@@ -1,5 +1,6 @@
 //! App: winit event handling, state transitions, frame composition.
 
+use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -115,10 +116,9 @@ pub struct App {
     index: usize,
     mode: ViewMode,
     fit: view::Fit,
-    /// The spread the last frame presented, `None` until a page has
-    /// pixels.
+    /// Set only when every seat resolves; frames draw only this.
     presented: Option<Spread>,
-    /// One entry per page whose artifact left the upload queue.
+    /// Page facts, written at the first artifact that leaves the queue.
     cached: BTreeMap<usize, CachedPage>,
     /// Page failures, sticky per page so a blip cannot erase them.
     errors: BTreeMap<usize, Arc<PageError>>,
@@ -277,11 +277,13 @@ impl App {
             &self.cached,
             self.direction == Direction::Forward,
             |page| {
-                if skimming {
-                    self.has_any(page)
-                } else {
-                    self.readable(page)
-                }
+                self.errors.contains_key(&page)
+                    || (self.cached.contains_key(&page)
+                        && if skimming {
+                            self.has_any(page)
+                        } else {
+                            self.readable(page)
+                        })
             },
         );
         if chosen != self.presented {
@@ -449,13 +451,15 @@ impl App {
             [size.width, size.height],
             clear_color(gl.window.translucent()),
         );
-        gl.pages.draw(
-            (size.width, size.height),
-            viewport,
-            &layout,
-            shown.seats(self.mode),
-            &drawn,
-        );
+        if let Some(presented) = self.presented {
+            gl.pages.draw(
+                (size.width, size.height),
+                viewport,
+                &layout,
+                presented.seats(self.mode),
+                &drawn,
+            );
+        }
         gl.egui.paint(gl.window.winit());
         gl.window.pre_present_and_swap()?;
         let total = frame_started.elapsed();
@@ -492,13 +496,18 @@ impl App {
             let Some(ready) = self.queue.pop_front() else {
                 break;
             };
-            self.cached.insert(
-                ready.page,
-                CachedPage {
-                    dims: ready.image.page_dims(),
-                    format: ready.image.format(),
-                },
-            );
+            let dims = ready.image.page_dims();
+            let format = ready.image.format();
+            match self.cached.entry(ready.page) {
+                Entry::Vacant(entry) => {
+                    entry.insert(CachedPage { dims, format });
+                }
+                Entry::Occupied(entry) => debug_assert_eq!(
+                    (entry.get().dims, entry.get().format),
+                    (dims, format),
+                    "page facts are fixed at the first upload"
+                ),
+            }
             let upload_started = Instant::now();
             let refused =
                 gl.pages.insert(ready.page, ready.kind, &ready.image);
@@ -522,7 +531,9 @@ impl App {
                 );
             }
             if let Err(error) = refused {
-                self.upload_error = Some(Arc::new(error.widen()));
+                let error = Arc::new(error.widen());
+                self.errors.insert(ready.page, Arc::clone(&error));
+                self.upload_error = Some(error);
             }
             uploaded += 1;
             bytes = bytes.saturating_add(cost);
@@ -540,8 +551,6 @@ impl App {
         }
     }
 
-    /// The page dims in each visual seat, so a thumb-to-view promotion
-    /// never refits.
     fn seat_dims(&self) -> [Option<(u32, u32)>; 2] {
         let shown = self.presented.unwrap_or_else(|| self.spread());
         shown.seats(self.mode).map(|seat| {
@@ -905,7 +914,7 @@ fn view_kept(
         || start.abs_diff(requested.first) <= VIEW_KEEP_SPREADS
 }
 
-/// The requested spread once a page clears `can_show`; otherwise the
+/// The requested spread once every page clears `can_show`; otherwise the
 /// nearest presentable start between the shown and requested spreads, so
 /// a skim never replays a passed page; otherwise the shown spread.
 fn choose_presented(
@@ -918,7 +927,7 @@ fn choose_presented(
     can_show: impl Fn(usize) -> bool,
 ) -> Option<Spread> {
     let presentable = |spread: Spread| {
-        spread.seats(mode).into_iter().flatten().any(&can_show)
+        spread.seats(mode).into_iter().flatten().all(&can_show)
     };
     if presentable(requested) {
         return Some(requested);
@@ -1416,6 +1425,48 @@ mod tests {
                 |_| false
             ),
             None
+        );
+    }
+
+    #[test]
+    fn paired_spread_waits_for_every_seat() {
+        let len = PageCount::new(12).expect("the test book is not empty");
+        let mode = ViewMode::Manga;
+        let entry = CachedPage {
+            dims: (2, 2),
+            format: Format::Png,
+        };
+        let cached: BTreeMap<usize, CachedPage> =
+            [0, 2].into_iter().map(|page| (page, entry)).collect();
+        let pair = Spread {
+            first: 1,
+            second: Some(2),
+        };
+        let shown = Spread::lone(0);
+
+        assert_eq!(
+            choose_presented(
+                pair,
+                Some(shown),
+                mode,
+                len,
+                &cached,
+                true,
+                |page| page == 2
+            ),
+            Some(shown)
+        );
+        assert_eq!(
+            choose_presented(
+                pair,
+                Some(shown),
+                mode,
+                len,
+                &cached,
+                true,
+                |page| matches!(page, 1 | 2)
+            ),
+            Some(pair)
         );
     }
 }

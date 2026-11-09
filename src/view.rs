@@ -274,9 +274,7 @@ pub fn px_f32(dims: (u32, u32)) -> (f32, f32) {
     (dims.0 as f32, dims.1 as f32)
 }
 
-/// Compose one or two pages side by side, top-aligned. `dims[i]` is the
-/// decoded size of visual seat i (0 = left, 1 = right). A still-decoding
-/// seat is None and joins the layout when it arrives.
+/// `dims[i]` is the page size in visual seat i, 0 = left, 1 = right.
 pub fn layout(dims: [Option<(u32, u32)>; 2]) -> SpreadLayout {
     let mut next_seat_x = 0.0;
     SpreadLayout {
