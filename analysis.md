@@ -31,11 +31,6 @@ show fewer samples.
    viewport pixels and key entries by it; the store header already
    carries the edge, so a changed edge is a miss, not a stale size.
 
-3. **A held-key skim ends on a timer, not the key release.**
-   `SKIM_DECAY` (250 ms) ends it. Handling `Released` (and focus loss)
-   would end the gesture at the release and start the settle derivation
-   earlier; the last skim settle in a real run cost one 47 ms derivation.
-
 4. **The derived cache lives in `$TMPDIR` and dies at reboot.**
    Entries survive process restarts, never a reboot. A bounded,
    versioned persistent preview/view cache would make the first
@@ -51,10 +46,10 @@ show fewer samples.
    bounds it, but a ~190 MiB native can hitch one frame. Not seen in the
    logs (`slow upload` is instrumented): measure before changing.
 
-## Resolved by the process boundary
+## Resolved
 
-Item numbers stay fixed because other documents cite them. Both are
-described in `docs/internal/process.md`.
+Item numbers stay fixed because other documents cite them. Items 1 and 7
+are described in `docs/internal/process.md`.
 
 1. **A demand job can wait out at most one book's in-flight decode.**
    A switch kills the old child, so its decode, archive buffers, and
@@ -64,6 +59,12 @@ described in `docs/internal/process.md`.
    for a 50 MP JXL), because the worker is still one thread; a still
    frame keeps the previous spread up meanwhile. Decoder-side
    cancellation remains the lever if that in-book wait bites.
+
+3. **A held-key skim ends at the release.**
+   A page-turn key the platform repeats starts a skim; `Released` or
+   focus loss ends it. The final page's view want is sent in the release
+   frame, so the store hit or decode starts there instead of after
+   `SKIM_DECAY`. Rapid taps demand their own view.
 
 7. **`switch_book` no longer opens the source on the UI thread.**
    It kills the old child, returns, and starts a thread that runs

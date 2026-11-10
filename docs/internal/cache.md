@@ -52,24 +52,32 @@ decode serves all its artifacts. A want hits the store or decodes once;
 a missing preview is derived and persisted, and the thumb derives from
 the view when available. The plan warms ahead; work beyond `head()` is
 preload and waits for `IDLE_PRELOAD` of app silence. `Motion` picks views
-for still reading and thumbs for skims.
+for still reading and thumbs for skims. A page-turn key the platform
+auto-repeats starts a skim; `Released` or focus loss ends it, so the
+final page's view is wanted in the release frame.
 
 ## Presentation
 
 A spread is presentable when every seat has a page fact plus a resident
 texture, or the page failed. Draw the requested spread when presentable;
-otherwise the nearest presentable start between presented and requested;
-otherwise the presented spread. Seats use `page_dims`, so pairing survives
+otherwise the nearest presentable start between shown and requested;
+otherwise the shown spread. Seats use `page_dims`, so pairing survives
 promotion.
 
-Each frame recomputes wants for the requested and presented spreads from
+Each frame recomputes wants for the requested and shown spreads from
 the texture maps: view and thumb while still, thumb while skimming, native
 for a shown upscaled page. Send the set on change.
 
+Ending a skim commits `shown` into `requested`, so the thumb being
+looked at promotes in place. `requested` is lookahead for the plan and
+wants; `shown` is the last spread on screen and carries its mode, so a
+pairing change cannot commit it. A still turn moves `requested` ahead; a
+gesture's unseen turns are discarded at exit.
+
 Retention is role-bounded: thumbs for the book, views within
-`VIEW_KEEP_SPREADS` of presented or requested, natives for the presented
-spread. `kept` covers every want, so an artifact leaves the sent set
-before retention drops it. Uploads drain on a per-frame budget
+`VIEW_KEEP_SPREADS` of shown or requested, natives for the shown spread.
+`kept` covers every want, so an artifact leaves the sent set before
+retention drops it. Uploads drain on a per-frame budget
 (`UPLOAD_BUDGET_*`); a backlog re-arms the next frame.
 
 ## Limits

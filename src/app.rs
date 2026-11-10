@@ -18,6 +18,7 @@ use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
 use winit::event_loop::ControlFlow;
 use winit::event_loop::EventLoopProxy;
+use winit::keyboard::KeyCode;
 use winit::keyboard::ModifiersState;
 use winit::window::WindowId;
 
@@ -85,18 +86,84 @@ struct CachedPage {
     format: Format,
 }
 
-/// Two presses closer than this are a flip; a held key flips by its
-/// repeat events.
-const SKIM_GAP: Duration = Duration::from_millis(100);
-
-/// How long after the last navigation a skim becomes a still read.
-const SKIM_DECAY: Duration = Duration::from_millis(250);
-
 /// One artifact always goes through, so a big page stalls at most one frame.
 const UPLOAD_BUDGET_COUNT: usize = 16;
 const UPLOAD_BUDGET_BYTES: usize = 8 * 1024 * 1024;
 
 const VIEW_KEEP_SPREADS: usize = 2;
+
+/// Page-turn keys currently down, and whether the platform has repeated
+/// them.
+#[derive(Default)]
+struct HeldKeys {
+    page_turn_keys: BTreeMap<KeyCode, bool>,
+}
+
+impl HeldKeys {
+    fn press(&mut self, code: KeyCode, repeated: bool) {
+        *self.page_turn_keys.entry(code).or_default() |= repeated;
+    }
+
+    fn release(&mut self, code: KeyCode) {
+        self.page_turn_keys.remove(&code);
+    }
+
+    fn clear(&mut self) {
+        self.page_turn_keys.clear();
+    }
+
+    fn skimming(&self) -> bool {
+        self.page_turn_keys.values().any(|&repeated| repeated)
+    }
+}
+
+#[derive(Debug)]
+struct Position {
+    requested: usize,
+    shown: Option<ShownSpread>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ShownSpread {
+    mode: ViewMode,
+    spread: Spread,
+}
+
+impl Position {
+    fn new(requested: usize) -> Self {
+        Self {
+            requested,
+            shown: None,
+        }
+    }
+
+    fn requested(&self) -> usize {
+        self.requested
+    }
+
+    fn shown(&self) -> Option<Spread> {
+        self.shown.map(|shown| shown.spread)
+    }
+
+    fn set_requested(&mut self, requested: usize) {
+        self.requested = requested;
+    }
+
+    fn record_shown(&mut self, mode: ViewMode, shown: Option<Spread>) {
+        self.shown = shown.map(|spread| ShownSpread { mode, spread });
+    }
+
+    fn commit_shown(&mut self, mode: ViewMode) -> bool {
+        let Some(shown) = self.shown else {
+            return false;
+        };
+        if shown.mode != mode || shown.spread.first == self.requested {
+            return false;
+        }
+        self.requested = shown.spread.first;
+        true
+    }
+}
 
 pub struct App {
     /// What the UI shows; it outlives a dead child until a switch lands.
@@ -107,17 +174,16 @@ pub struct App {
         Option<Receiver<Result<(BookView, BookProcess), BookFault>>>,
     gl: Option<Gl>,
     fatal_error: Option<eros::ErrorUnion>,
-    index: usize,
+    position: Position,
     mode: ViewMode,
     fit: view::Fit,
-    /// Set only when every seat resolves; frames draw only this.
-    presented: Option<Spread>,
     cached: BTreeMap<usize, CachedPage>,
     /// Page faults, sticky per page so a blip cannot erase them.
     faults: BTreeMap<usize, PageFault>,
     queue: VecDeque<worker::Ready>,
     upload_fault_page: Option<usize>,
     motion: Motion,
+    held_keys: HeldKeys,
     last_nav: Option<Instant>,
     hold_since: Option<Instant>,
     hold_logged: bool,
@@ -166,15 +232,15 @@ impl App {
             pending_open: None,
             gl: None,
             fatal_error: None,
-            index,
+            position: Position::new(index),
             mode,
             fit: view::Fit::default(),
-            presented: None,
             cached: BTreeMap::new(),
             faults: BTreeMap::new(),
             queue: VecDeque::new(),
             upload_fault_page: None,
             motion: Motion::Still,
+            held_keys: HeldKeys::default(),
             last_nav: None,
             hold_since: None,
             hold_logged: false,
@@ -222,7 +288,11 @@ impl App {
     }
 
     fn spread(&self) -> Spread {
-        view::spread_for(self.index, self.mode, self.view.len())
+        view::spread_for(
+            self.position.requested(),
+            self.mode,
+            self.view.len(),
+        )
     }
 
     fn has_any(&self, page: usize) -> bool {
@@ -270,13 +340,12 @@ impl App {
         self.drain_ready();
         let drained = frame_started.elapsed();
         let now = Instant::now();
-        self.tick_motion(now);
 
         let requested = self.spread();
         let skimming = self.motion == Motion::Skimming;
         let chosen = choose_presented(
             requested,
-            self.presented,
+            self.position.shown(),
             self.mode,
             self.view.len(),
             &self.cached,
@@ -291,7 +360,7 @@ impl App {
                         })
             },
         );
-        if chosen != self.presented {
+        if chosen != self.position.shown() {
             let seats = chosen.map(|spread| {
                 spread
                     .seats(self.mode)
@@ -301,16 +370,17 @@ impl App {
                 .last_nav
                 .map(|last| now.saturating_duration_since(last));
             tracing::debug!(
-                from = ?self.presented,
+                from = ?self.position.shown(),
                 to = ?chosen,
                 motion = ?self.motion,
                 ?seats,
                 ?took,
                 "presented"
             );
-            self.presented = chosen;
             self.fit.commit();
         }
+        // Record every frame so a mode switch retags an unchanged spread.
+        self.position.record_shown(self.mode, chosen);
         if self.motion == Motion::Still && chosen != Some(requested) {
             let since = *self.hold_since.get_or_insert(now);
             let waited = now.saturating_duration_since(since);
@@ -461,12 +531,12 @@ impl App {
             [size.width, size.height],
             clear_color(gl.window.translucent()),
         );
-        if let Some(presented) = self.presented {
+        if let Some(spread) = self.position.shown() {
             gl.pages.draw(
                 (size.width, size.height),
                 viewport,
                 &layout,
-                presented.seats(self.mode),
+                spread.seats(self.mode),
                 &drawn,
             );
         }
@@ -478,7 +548,7 @@ impl App {
                 total = ?total,
                 drain = ?drained,
                 queue = self.queue.len(),
-                presented = ?self.presented,
+                shown = ?self.position.shown(),
                 "slow frame"
             );
         }
@@ -562,62 +632,43 @@ impl App {
     }
 
     fn seat_dims(&self) -> [Option<(u32, u32)>; 2] {
-        let shown = self.presented.unwrap_or_else(|| self.spread());
+        let shown = self.position.shown().unwrap_or_else(|| self.spread());
         shown.seats(self.mode).map(|seat| {
             let page = seat?;
             self.cached.get(&page).map(|entry| entry.dims)
         })
     }
 
-    fn note_navigation(&mut self, now: Instant, repeat: bool) {
-        let gap = self
-            .last_nav
-            .map(|last| now.saturating_duration_since(last));
-        let flip = repeat || gap.is_some_and(|gap| gap < SKIM_GAP);
-        if flip && self.motion == Motion::Still {
-            tracing::debug!(?gap, repeat, "skim begins");
-            self.motion = Motion::Skimming;
-            self.send(ParentMsg::SetMotion(Motion::Skimming));
+    fn sync_motion(&mut self) {
+        let motion = if self.held_keys.skimming() {
+            Motion::Skimming
+        } else {
+            Motion::Still
+        };
+        if motion == self.motion {
+            return;
+        }
+        if motion == Motion::Still {
+            // A turn may not have reached the screen; commit the shown
+            // spread so its thumb promotes in place.
+            let from = self.position.requested();
+            if self.position.commit_shown(self.mode) {
+                tracing::debug!(
+                    from,
+                    to = self.position.requested(),
+                    "commit shown"
+                );
+                self.set_view();
+            }
         }
         tracing::debug!(
-            index = self.index,
-            ?gap,
-            repeat,
-            motion = ?self.motion,
-            "turn"
+            ?motion,
+            requested = self.position.requested(),
+            shown = ?self.position.shown(),
+            "motion"
         );
-        self.last_nav = Some(now);
-        post(&self.proxy, UserEvent::Repaint(SKIM_DECAY));
-    }
-
-    /// End a skim once the reader stops, and repaint so the presented
-    /// page promotes from its thumb.
-    fn tick_motion(&mut self, now: Instant) {
-        if self.motion != Motion::Skimming {
-            return;
-        }
-        let Some(last) = self.last_nav else {
-            self.end_skim();
-            return;
-        };
-        let quiet = now.saturating_duration_since(last);
-        if quiet < SKIM_DECAY {
-            // A later navigation moved the decay past the wake that
-            // fired, and the arming logic keeps the earliest wake, so
-            // this frame must arm the new deadline itself.
-            post(
-                &self.proxy,
-                UserEvent::Repaint(SKIM_DECAY.saturating_sub(quiet)),
-            );
-            return;
-        }
-        self.end_skim();
-    }
-
-    fn end_skim(&mut self) {
-        tracing::debug!("skim ends");
-        self.motion = Motion::Still;
-        self.send(ParentMsg::SetMotion(Motion::Still));
+        self.motion = motion;
+        self.send(ParentMsg::SetMotion(motion));
         self.request_redraw();
     }
 
@@ -641,12 +692,7 @@ impl App {
         (view::layout(self.seat_dims()).total(), self.last_viewport)
     }
 
-    fn dispatch(
-        &mut self,
-        action: Action,
-        repeat: bool,
-        event_loop: &ActiveEventLoop,
-    ) {
+    fn dispatch(&mut self, action: Action, event_loop: &ActiveEventLoop) {
         match action {
             Action::Quit => event_loop.exit(),
             Action::Escape => {
@@ -659,14 +705,26 @@ impl App {
                 }
             }
             Action::SelectMode(mode) => {
+                if self.motion == Motion::Skimming {
+                    // The new pairing is a different coordinate system;
+                    // commit the shown spread before switching.
+                    let from = self.position.requested();
+                    if self.position.commit_shown(self.mode) {
+                        tracing::debug!(
+                            from,
+                            to = self.position.requested(),
+                            "mode switch commits shown"
+                        );
+                    }
+                }
                 let switch = view::switch_mode(
                     self.mode,
                     mode,
-                    self.index,
+                    self.position.requested(),
                     self.view.len(),
                 );
                 self.mode = mode;
-                self.index = switch.index;
+                self.position.set_requested(switch.index);
                 self.direction = Direction::Forward;
                 self.timers.toast(Instant::now());
                 if switch.pairing_changed {
@@ -696,12 +754,13 @@ impl App {
             }
             Action::First | Action::Last => {
                 let first = matches!(action, Action::First);
-                self.index = if first {
+                let index = if first {
                     view::first_spread()
                 } else {
                     view::last_spread(self.mode, self.view.len())
                 };
-                self.after_page_change(travel_direction(first), repeat);
+                self.position.set_requested(index);
+                self.after_page_change(travel_direction(first));
             }
             Action::NextBook | Action::PrevBook => {
                 self.switch_book(matches!(action, Action::NextBook));
@@ -711,13 +770,14 @@ impl App {
             | Action::Forward
             | Action::Back => {
                 let forward = action.is_forward(self.mode);
-                self.index = view::advance(
-                    self.index,
+                let next = view::advance(
+                    self.position.requested(),
                     forward,
                     self.mode,
                     self.view.len(),
                 );
-                self.after_page_change(travel_direction(forward), repeat);
+                self.position.set_requested(next);
+                self.after_page_change(travel_direction(forward));
             }
         }
     }
@@ -791,15 +851,15 @@ impl App {
         self.view = view;
         // Assigning drops the old process, whose `Drop` kills it.
         self.process = Some(process);
-        self.index = index;
+        self.position = Position::new(index);
         self.direction = Direction::Forward;
         self.sent_wants = cold;
-        self.presented = None;
         self.cached.clear();
         self.faults.clear();
         self.queue.clear();
         self.upload_fault_page = None;
         self.motion = Motion::Still;
+        self.held_keys.clear();
         self.last_nav = None;
         self.hold_since = None;
         self.hold_logged = false;
@@ -859,19 +919,23 @@ impl App {
 
     fn set_view(&self) {
         self.send(ParentMsg::SetView {
-            index: self.index,
+            index: self.position.requested(),
             mode: self.mode,
             direction: self.direction,
         });
     }
 
-    /// Every spread mutation retunes the child, restarts the fit, and
-    /// opens the skim window here.
-    fn after_page_change(&mut self, direction: Direction, repeat: bool) {
+    fn after_page_change(&mut self, direction: Direction) {
         self.direction = direction;
         self.set_view();
         self.fit.begin_turn();
-        self.note_navigation(Instant::now(), repeat);
+        self.last_nav = Some(Instant::now());
+        tracing::debug!(
+            index = self.position.requested(),
+            ?direction,
+            motion = ?self.motion,
+            "turn"
+        );
         self.request_redraw();
     }
 }
@@ -1192,21 +1256,40 @@ impl ApplicationHandler<UserEvent> for App {
                 self.modifiers = modifiers.state();
             }
             WindowEvent::KeyboardInput { event: key, .. } => {
-                if key.state == ElementState::Pressed
-                    && !gl.egui.egui_ctx.egui_wants_keyboard_input()
-                {
-                    if let PhysicalKey::Code(code) = key.physical_key {
-                        if let Some(action) =
+                let PhysicalKey::Code(code) = key.physical_key else {
+                    return;
+                };
+                match key.state {
+                    ElementState::Pressed
+                        if !gl
+                            .egui
+                            .egui_ctx
+                            .egui_wants_keyboard_input() =>
+                    {
+                        let Some(action) =
                             Action::from_key(code, self.modifiers)
-                        {
-                            if !key.repeat || action.repeats() {
-                                self.dispatch(
-                                    action, key.repeat, event_loop,
-                                );
-                            }
+                        else {
+                            return;
+                        };
+                        if key.repeat && !action.repeats() {
+                            return;
                         }
+                        if action.repeats() {
+                            self.held_keys.press(code, key.repeat);
+                            self.sync_motion();
+                        }
+                        self.dispatch(action, event_loop);
                     }
+                    ElementState::Released => {
+                        self.held_keys.release(code);
+                        self.sync_motion();
+                    }
+                    ElementState::Pressed => {}
                 }
+            }
+            WindowEvent::Focused(false) => {
+                self.held_keys.clear();
+                self.sync_motion();
             }
             WindowEvent::MouseWheel { delta, .. }
                 if !egui_wants_pointer =>
@@ -1338,6 +1421,33 @@ fn wheel_lines(dy: f64, scale_factor: f64) -> f32 {
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tap_stays_still_and_a_repeat_skims_until_release() {
+        let mut held_keys = HeldKeys::default();
+        held_keys.press(KeyCode::ArrowRight, false);
+        assert!(!held_keys.skimming());
+        held_keys.press(KeyCode::ArrowRight, true);
+        assert!(held_keys.skimming());
+        held_keys.release(KeyCode::ArrowRight);
+        assert!(!held_keys.skimming());
+    }
+
+    #[test]
+    fn commit_shown_requires_a_spread_shown_in_the_current_mode() {
+        let mut position = Position::new(5);
+        assert!(!position.commit_shown(ViewMode::Normal));
+        assert_eq!(position.requested(), 5);
+
+        position.record_shown(ViewMode::Normal, Some(Spread::lone(4)));
+        assert!(position.commit_shown(ViewMode::Normal));
+        assert_eq!(position.requested(), 4);
+        assert!(!position.commit_shown(ViewMode::Normal));
+
+        position.set_requested(5);
+        assert!(!position.commit_shown(ViewMode::Manga));
+        assert_eq!(position.requested(), 5);
+    }
 
     #[test]
     fn clear_color_premultiplies_the_glass() {
