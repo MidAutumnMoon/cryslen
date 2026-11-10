@@ -948,16 +948,15 @@ fn travel_direction(forward: bool) -> Direction {
     }
 }
 
-/// Whether the view artifact is upscaled: the placement asks for more
-/// than [`VIEW_EDGE`] screen px across the page's long edge, so only the
-/// native decode has pixels to spare.
+/// Whether the placement needs more pixels than the view holds: only when
+/// the page's long edge and the fitted edge both exceed [`VIEW_EDGE`].
 #[expect(
     clippy::cast_precision_loss,
     reason = "page edges and the fixed view edge stay far below f32's exact-integer range, so the threshold comparison holds"
 )]
 fn native_wanted(scale: f32, page_dims: (u32, u32)) -> bool {
-    let edge = page_dims.0.max(page_dims.1);
-    edge > 0 && scale > VIEW_EDGE as f32 / edge as f32
+    let page_edge = page_dims.0.max(page_dims.1);
+    page_edge > VIEW_EDGE && scale > VIEW_EDGE as f32 / page_edge as f32
 }
 
 /// Every artifact the frame's presentation is missing, in service order:
@@ -1482,6 +1481,18 @@ mod tests {
         assert_eq!(wheel_lines(40.0, 1.0), 1.0);
         assert_eq!(wheel_lines(80.0, 2.0), 1.0);
         assert_eq!(wheel_lines(40.0, 2.0), 0.5);
+    }
+
+    #[test]
+    fn a_native_is_only_wanted_when_the_view_has_fewer_pixels() {
+        assert!(!native_wanted(16.0, (1920, 1080)));
+        assert!(!native_wanted(16.0, (VIEW_EDGE, 1440)));
+        let four_k = (3840, 2160);
+        assert!(!native_wanted(0.66, four_k));
+        assert!(native_wanted(0.67, four_k));
+        let ten_k = (10080, 5640);
+        assert!(!native_wanted(0.25, ten_k));
+        assert!(native_wanted(0.26, ten_k));
     }
 
     #[test]

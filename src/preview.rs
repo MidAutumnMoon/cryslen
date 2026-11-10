@@ -10,6 +10,7 @@
 use std::env;
 use std::ffi::OsStr;
 use std::ffi::OsString;
+use std::fmt;
 use std::fs;
 use std::fs::File;
 use std::fs::FileTimes;
@@ -25,6 +26,15 @@ use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 
+use fast_image_resize::images::Image;
+use fast_image_resize::images::ImageRef;
+use fast_image_resize::FilterType;
+use fast_image_resize::ImageBufferError;
+use fast_image_resize::PixelType;
+use fast_image_resize::ResizeAlg;
+use fast_image_resize::ResizeError;
+use fast_image_resize::ResizeOptions;
+use fast_image_resize::Resizer;
 use nix::errno::Errno;
 use nix::sys::signal;
 use nix::unistd::Pid;
@@ -41,11 +51,11 @@ use crate::decode::Plane;
 use crate::decode::Subsampling;
 use crate::decode::Transfer;
 use crate::decode::YuvImage;
+use crate::fault::DecodeRefusal;
 
 pub const THUMB_EDGE: u32 = 192;
-/// The settled reading image. It must cover the fitted page's long edge
-/// in physical pixels, or every still turn asks for a native decode and
-/// shows the upscaled view until it arrives.
+/// The settled reading image; it must cover the fitted page's long edge in
+/// physical pixels.
 pub const VIEW_EDGE: u32 = 2560;
 pub const THUMB_CAP_BYTES: u64 = 512 * 1024 * 1024;
 pub const VIEW_CAP_BYTES: u64 = 3 * 512 * 1024 * 1024;
@@ -60,12 +70,15 @@ pub enum Artifact {
 }
 
 impl Artifact {
-    /// The target edge, stored in the entry header, so a changed constant
-    /// invalidates old entries.
+    /// The target edge, stored in the entry header.
     pub fn edge(self) -> Option<u32> {
+        self.derivation().map(|(edge, _)| edge)
+    }
+
+    fn derivation(self) -> Option<(u32, FilterType)> {
         match self {
-            Self::Thumb => Some(THUMB_EDGE),
-            Self::View => Some(VIEW_EDGE),
+            Self::Thumb => Some((THUMB_EDGE, FilterType::Box)),
+            Self::View => Some((VIEW_EDGE, FilterType::Hamming)),
             Self::Native => None,
         }
     }
@@ -76,76 +89,39 @@ pub fn content_hash(bytes: &[u8]) -> u128 {
     xxh3_128(bytes)
 }
 
-/// Downsample to a long edge of at most `edge` by area averaging; returns
-/// a copy when it already fits. Preserves page dims, format, and transfer;
-/// YUV planes resample in their own layout from `plane_dims`, which
-/// [`Decoded::yuv`] validates.
-pub fn derive(page: &Decoded, edge: u32) -> Decoded {
+/// Downsample to the artifact's long edge; returns `page` unchanged when it
+/// already fits or the resample fails.
+pub fn derive(page: &Decoded, kind: Artifact) -> Decoded {
+    let Some((edge, filter)) = kind.derivation() else {
+        return page.clone();
+    };
+    derive_to_edge(page, edge, filter)
+}
+
+fn derive_to_edge(
+    page: &Decoded,
+    edge: u32,
+    filter: FilterType,
+) -> Decoded {
     let page_dims = page.page_dims();
     let dims = (page.width(), page.height());
     let target = fit_dims(dims, edge);
     if target == dims {
         return page.clone();
     }
-    let derived = match page.pixels() {
-        Pixels::Rgba8(bytes) => {
-            let bytes = resample_rgba(bytes, dims, target);
-            Decoded::rgba(
-                target.0,
-                target.1,
-                page.format(),
-                page.transfer(),
-                bytes,
-            )
-        }
-        Pixels::Yuv(yuv) => {
-            let ((luma_w, luma_h), (chroma_w, chroma_h)) =
-                plane_dims(dims, yuv.subsampling);
-            let (_, (target_w, target_h)) =
-                plane_dims(target, yuv.subsampling);
-            let resized = YuvImage {
-                depth: yuv.depth,
-                subsampling: yuv.subsampling,
-                full_range: yuv.full_range,
-                matrix: yuv.matrix,
-                luma: resample_plane(&yuv.luma, (luma_w, luma_h), target),
-                cb: resample_plane(
-                    &yuv.cb,
-                    (chroma_w, chroma_h),
-                    (target_w, target_h),
-                ),
-                cr: resample_plane(
-                    &yuv.cr,
-                    (chroma_w, chroma_h),
-                    (target_w, target_h),
-                ),
-                alpha: yuv.alpha.as_ref().map(|alpha| {
-                    resample_plane(alpha, (luma_w, luma_h), target)
-                }),
-            };
-            Decoded::yuv(
-                target.0,
-                target.1,
-                page.format(),
-                page.transfer(),
-                resized,
-            )
-        }
-    };
-    match derived {
+    match resample_page(page, target, filter) {
         Ok(derived) => derived.with_page_dims(page_dims),
         Err(error) => {
             tracing::warn!(
                 %error,
-                "resampled page fell outside the extent checks"
+                target = ?target,
+                "resample failed; keeping the page"
             );
             page.clone()
         }
     }
 }
 
-/// The target dimensions for a long edge of at most `edge`. Ratios below
-/// one are identity, so the result is at most the input size.
 #[expect(
     clippy::integer_division,
     reason = "edge scaling is integer pixel arithmetic"
@@ -163,180 +139,165 @@ fn fit_dims(dims: (u32, u32), edge: u32) -> (u32, u32) {
     (scaled(width), scaled(height))
 }
 
-fn resample_plane(
-    plane: &Plane,
-    source: (u32, u32),
-    target: (u32, u32),
-) -> Plane {
-    if source == target {
-        return plane.clone();
-    }
-    match plane {
-        Plane::U8(bytes) => Plane::U8(resample(bytes, source, target)),
-        Plane::U16(words) => Plane::U16(resample(words, source, target)),
-    }
+#[derive(Debug)]
+enum ResampleError {
+    Buffer(ImageBufferError),
+    Resize(ResizeError),
+    Extent(DecodeRefusal),
 }
 
-/// How much of each source index a target index covers, as `(index,
-/// weight)`; one target index's weights sum to `source_len`.
-#[expect(
-    clippy::integer_division,
-    reason = "coverage weights are exact integer grid overlaps"
-)]
-fn axis_weights(
-    source_len: usize,
-    target_len: usize,
-) -> Vec<Box<[(usize, u64)]>> {
-    let mut table = Vec::with_capacity(target_len);
-    for target in 0..target_len {
-        let start = target * source_len / target_len;
-        let end = ((target + 1) * source_len).div_ceil(target_len);
-        let mut weights = Vec::with_capacity(end.saturating_sub(start));
-        for source in start..end {
-            let overlap = ((source + 1) * target_len)
-                .min((target + 1) * source_len)
-                - (source * target_len).max(target * source_len);
-            if overlap > 0 {
-                weights.push((source, overlap as u64));
-            }
+impl fmt::Display for ResampleError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Buffer(error) => write!(f, "{error}"),
+            Self::Resize(error) => write!(f, "{error}"),
+            Self::Extent(error) => write!(f, "{error}"),
         }
-        table.push(weights.into_boxed_slice());
     }
-    table
 }
 
-fn resample<T>(
-    source: &[T],
+fn resample_page(
+    page: &Decoded,
+    target: (u32, u32),
+    filter: FilterType,
+) -> Result<Decoded, ResampleError> {
+    let dims = (page.width(), page.height());
+    let mut resizer = Resizer::new();
+    match page.pixels() {
+        Pixels::Rgba8(bytes) => {
+            let bytes = resize_buffer(
+                &mut resizer,
+                bytes,
+                dims,
+                target,
+                PixelType::U8x4,
+                filter,
+            )?;
+            Decoded::rgba(
+                target.0,
+                target.1,
+                page.format(),
+                page.transfer(),
+                bytes.into_boxed_slice(),
+            )
+            .map_err(ResampleError::Extent)
+        }
+        Pixels::Yuv(yuv) => {
+            let ((luma_w, luma_h), (chroma_w, chroma_h)) =
+                plane_dims(dims, yuv.subsampling);
+            let (_, (target_w, target_h)) =
+                plane_dims(target, yuv.subsampling);
+            let planes = YuvImage {
+                depth: yuv.depth,
+                subsampling: yuv.subsampling,
+                full_range: yuv.full_range,
+                matrix: yuv.matrix,
+                luma: resize_plane(
+                    &mut resizer,
+                    &yuv.luma,
+                    (luma_w, luma_h),
+                    target,
+                    filter,
+                )?,
+                cb: resize_plane(
+                    &mut resizer,
+                    &yuv.cb,
+                    (chroma_w, chroma_h),
+                    (target_w, target_h),
+                    filter,
+                )?,
+                cr: resize_plane(
+                    &mut resizer,
+                    &yuv.cr,
+                    (chroma_w, chroma_h),
+                    (target_w, target_h),
+                    filter,
+                )?,
+                alpha: match yuv.alpha.as_ref() {
+                    Some(alpha) => Some(resize_plane(
+                        &mut resizer,
+                        alpha,
+                        (luma_w, luma_h),
+                        target,
+                        filter,
+                    )?),
+                    None => None,
+                },
+            };
+            Decoded::yuv(
+                target.0,
+                target.1,
+                page.format(),
+                page.transfer(),
+                planes,
+            )
+            .map_err(ResampleError::Extent)
+        }
+    }
+}
+
+fn resize_plane(
+    resizer: &mut Resizer,
+    plane: &Plane,
     source_dims: (u32, u32),
     target_dims: (u32, u32),
-) -> Box<[T]>
-where
-    T: Sample,
-{
-    if source.is_empty() {
-        return Vec::new().into_boxed_slice();
+    filter: FilterType,
+) -> Result<Plane, ResampleError> {
+    // Equal extents also cover Mono's empty chroma planes, which carry a
+    // 1x1 extent without samples.
+    if source_dims == target_dims {
+        return Ok(plane.clone());
     }
-    let source_width = source_dims.0 as usize;
-    let columns = axis_weights(source_width, target_dims.0 as usize);
-    let rows =
-        axis_weights(source_dims.1 as usize, target_dims.1 as usize);
-    let divisor = u128::from(source_dims.0) * u128::from(source_dims.1);
-    let mut out = Vec::with_capacity(
-        target_dims.0 as usize * target_dims.1 as usize,
-    );
-    for row_weights in &rows {
-        for column_weights in &columns {
-            let mut sum = 0_u128;
-            for &(row, row_weight) in row_weights.as_ref() {
-                let start = row * source_width;
-                for &(column, column_weight) in column_weights.as_ref() {
-                    let Some(index) = start.checked_add(column) else {
-                        continue;
-                    };
-                    let Some(&sample) = source.get(index) else {
-                        continue;
-                    };
-                    sum += u128::from(sample.value())
-                        * u128::from(row_weight)
-                        * u128::from(column_weight);
-                }
-            }
-            out.push(T::from_value(round(sum, divisor)));
+    Ok(match plane {
+        Plane::U8(bytes) => {
+            let bytes = resize_buffer(
+                resizer,
+                bytes,
+                source_dims,
+                target_dims,
+                PixelType::U8,
+                filter,
+            )?;
+            Plane::U8(bytes.into_boxed_slice())
         }
-    }
-    out.into_boxed_slice()
+        Plane::U16(words) => {
+            let source = bytemuck::cast_slice(words);
+            let bytes = resize_buffer(
+                resizer,
+                source,
+                source_dims,
+                target_dims,
+                PixelType::U16,
+                filter,
+            )?;
+            let pixels = bytemuck::pod_collect_to_vec(&bytes);
+            Plane::U16(pixels.into_boxed_slice())
+        }
+    })
 }
 
-fn resample_rgba(
+fn resize_buffer(
+    resizer: &mut Resizer,
     source: &[u8],
     source_dims: (u32, u32),
     target_dims: (u32, u32),
-) -> Box<[u8]> {
-    if source.is_empty() {
-        return Vec::new().into_boxed_slice();
-    }
-    let source_width = source_dims.0 as usize;
-    let columns = axis_weights(source_width, target_dims.0 as usize);
-    let rows =
-        axis_weights(source_dims.1 as usize, target_dims.1 as usize);
-    let divisor = u128::from(source_dims.0) * u128::from(source_dims.1);
-    let mut out = Vec::with_capacity(
-        target_dims.0 as usize * target_dims.1 as usize * 4,
-    );
-    for row_weights in &rows {
-        for column_weights in &columns {
-            let mut sums = [0_u128; 4];
-            for &(row, row_weight) in row_weights.as_ref() {
-                let start = row * source_width;
-                for &(column, column_weight) in column_weights.as_ref() {
-                    let Some(index) = start.checked_add(column) else {
-                        continue;
-                    };
-                    let Some(offset) = index.checked_mul(4) else {
-                        continue;
-                    };
-                    let Some(pixel) = source.get(offset..offset + 4)
-                    else {
-                        continue;
-                    };
-                    let values = match pixel {
-                        [red, green, blue, alpha] => {
-                            [*red, *green, *blue, *alpha]
-                        }
-                        _ => continue,
-                    };
-                    let weight =
-                        u128::from(row_weight) * u128::from(column_weight);
-                    for (sum, value) in sums.iter_mut().zip(values) {
-                        *sum += u128::from(value) * weight;
-                    }
-                }
-            }
-            for sum in sums {
-                out.push(round_channel(sum, divisor));
-            }
-        }
-    }
-    out.into_boxed_slice()
-}
-
-#[expect(
-    clippy::integer_division,
-    reason = "an area average lands between integer samples"
-)]
-fn round(sum: u128, divisor: u128) -> u64 {
-    let divisor = divisor.max(1);
-    u64::try_from((sum + divisor / 2) / divisor).unwrap_or(u64::MAX)
-}
-
-fn round_channel(sum: u128, divisor: u128) -> u8 {
-    u8::try_from(round(sum, divisor)).unwrap_or(u8::MAX)
-}
-
-trait Sample: Copy {
-    fn value(self) -> u16;
-
-    fn from_value(value: u64) -> Self;
-}
-
-impl Sample for u8 {
-    fn value(self) -> u16 {
-        u16::from(self)
-    }
-
-    fn from_value(value: u64) -> Self {
-        Self::try_from(value).unwrap_or(Self::MAX)
-    }
-}
-
-impl Sample for u16 {
-    fn value(self) -> u16 {
-        self
-    }
-
-    fn from_value(value: u64) -> Self {
-        Self::try_from(value).unwrap_or(Self::MAX)
-    }
+    pixel: PixelType,
+    filter: FilterType,
+) -> Result<Vec<u8>, ResampleError> {
+    let source =
+        ImageRef::new(source_dims.0, source_dims.1, source, pixel)
+            .map_err(ResampleError::Buffer)?;
+    let mut target = Image::new(target_dims.0, target_dims.1, pixel);
+    // Straight alpha: the renderer premultiplies at draw. Alpha-aware
+    // resampling avoids the color bleed at transparent edges but costs a
+    // source-sized temporary and about double the time.
+    let options = ResizeOptions::new()
+        .resize_alg(ResizeAlg::Convolution(filter))
+        .use_alpha(false);
+    resizer
+        .resize(&source, &mut target, &options)
+        .map_err(ResampleError::Resize)?;
+    Ok(target.into_vec())
 }
 
 /// The shared preview cache. A store that could not claim a real
@@ -390,11 +351,7 @@ impl Store {
 
     /// Load `hash`, or `None` when absent, damaged, or not cached; a hit
     /// refreshes the entry's mtime for LRU.
-    pub fn load(
-        &self,
-        hash: u128,
-        kind: Artifact,
-    ) -> Option<Decoded> {
+    pub fn load(&self, hash: u128, kind: Artifact) -> Option<Decoded> {
         let started = Instant::now();
         let loaded = self.namespace(kind).and_then(|namespace| {
             let file = File::open(namespace.path(hash)).ok()?;
@@ -1208,6 +1165,39 @@ mod tests {
         bytes.to_vec()
     }
 
+    /// A page whose planes are each one constant, `values` in luma, Cb,
+    /// Cr, alpha order.
+    fn flat_yuv_page(
+        width: u32,
+        height: u32,
+        subsampling: Subsampling,
+        values: [u16; 4],
+    ) -> Decoded {
+        let ((_, _), (chroma_w, chroma_h)) =
+            plane_dims((width, height), subsampling);
+        let plane = |samples: usize, value: u16| {
+            Plane::U16(vec![value; samples].into_boxed_slice())
+        };
+        let chroma = if subsampling == Subsampling::Mono {
+            0
+        } else {
+            count(chroma_w, chroma_h)
+        };
+        let yuv = YuvImage {
+            depth: 10,
+            subsampling,
+            full_range: false,
+            matrix: Matrix::Bt709,
+            luma: plane(count(width, height), values[0]),
+            cb: plane(chroma, values[1]),
+            cr: plane(chroma, values[2]),
+            alpha: Some(plane(count(width, height), values[3])),
+        };
+        Decoded::yuv(width, height, Format::Avif, Transfer::Pq, yuv)
+            .expect("yuv page")
+            .with_page_dims((width, height))
+    }
+
     fn yuv_planes(page: &Decoded) -> [Vec<u16>; 4] {
         let Pixels::Yuv(yuv) = page.pixels() else {
             panic!("expected yuv pixels");
@@ -1440,7 +1430,7 @@ mod tests {
     #[test]
     fn derive_scales_to_the_edge() {
         let page = rgba_page(500, 200).with_page_dims((1500, 600));
-        let thumb = derive(&page, 200);
+        let thumb = derive_to_edge(&page, 200, FilterType::Box);
         assert_eq!((thumb.width(), thumb.height()), (200, 80));
         assert_eq!(thumb.page_dims(), (1500, 600));
         assert_eq!(thumb.format(), Format::Png);
@@ -1452,40 +1442,151 @@ mod tests {
         );
 
         let wide = rgba_page(1800, 900);
-        let wide_thumb = derive(&wide, 200);
+        let wide_thumb = derive_to_edge(&wide, 200, FilterType::Box);
         assert_eq!((wide_thumb.width(), wide_thumb.height()), (200, 100));
 
         let exact = rgba_page(200, 100);
-        let kept = derive(&exact, 200);
+        let kept = derive_to_edge(&exact, 200, FilterType::Box);
         assert_eq!((kept.width(), kept.height()), (200, 100));
         assert_eq!(rgba_bytes(&kept), rgba_bytes(&exact));
 
         let small = rgba_page(40, 30);
-        let grown = derive(&small, 1024);
+        let grown = derive_to_edge(&small, 1024, FilterType::Box);
         assert_eq!((grown.width(), grown.height()), (40, 30));
     }
 
     #[test]
-    fn derive_averages_area_coverage() {
-        // A 3x1 source into 2x1: the first target covers source pixel 0
-        // fully and half of pixel 1, so it is (0 * 2 + 255 * 1) / 3.
-        let bytes =
-            vec![0_u8, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 255]
-                .into_boxed_slice();
-        let page = Decoded::rgba(3, 1, Format::Png, Transfer::Srgb, bytes)
+    #[expect(
+        clippy::integer_division,
+        reason = "the divisions locate a row's midpoint and quarter points; truncating to a pixel is intended"
+    )]
+    fn derive_preserves_a_hard_edge() {
+        let (page_width, page_height) = (4000_u32, 100_u32);
+        let page_row_width = count(page_width, 1);
+        let mut bytes = vec![0_u8; count(page_width, page_height) * 4];
+        for (index, pixel) in
+            bytes.as_chunks_mut::<4>().0.iter_mut().enumerate()
+        {
+            let column = index % page_row_width;
+            let value = if column * 2 >= page_row_width {
+                [0, 0, 255, 255]
+            } else {
+                [255, 0, 0, 255]
+            };
+            pixel.copy_from_slice(&value);
+        }
+        let page = Decoded::rgba(
+            page_width,
+            page_height,
+            Format::Png,
+            Transfer::Srgb,
+            bytes.into_boxed_slice(),
+        )
+        .expect("rgba page");
+        for (kind, edge, row_count) in [
+            (Artifact::Thumb, THUMB_EDGE, 5_u32),
+            (Artifact::View, VIEW_EDGE, 64),
+        ] {
+            let derived = derive(&page, kind);
+            let row_width = count(derived.width(), 1);
+            assert_eq!(
+                (derived.width(), derived.height()),
+                (edge, row_count)
+            );
+            let pixels = rgba_bytes(&derived);
+            let rows: Vec<&[[u8; 4]]> =
+                pixels.as_chunks::<4>().0.chunks(row_width).collect();
+            let first = rows.first().expect("a row");
+            assert_eq!(first.first(), Some(&[255, 0, 0, 255]), "{kind:?}");
+            assert_eq!(first.last(), Some(&[0, 0, 255, 255]), "{kind:?}");
+            assert_eq!(
+                first.get(row_width / 4),
+                Some(&[255, 0, 0, 255]),
+                "{kind:?}"
+            );
+            assert_eq!(
+                first.get(row_width * 3 / 4),
+                Some(&[0, 0, 255, 255]),
+                "{kind:?}"
+            );
+            for (y, row) in rows.iter().enumerate().skip(1) {
+                assert_eq!(*row, *first, "{kind:?} row {y}");
+            }
+            let crossing = first
+                .iter()
+                .position(|pixel| {
+                    let [_, _, blue, _] = *pixel;
+                    blue > 127
+                })
+                .expect("edge crossing");
+            assert!(
+                crossing.abs_diff(row_width / 2) <= 1,
+                "{kind:?}: crossing at {crossing}, edge at {}",
+                row_width / 2
+            );
+        }
+    }
+
+    #[test]
+    fn derive_keeps_straight_alpha() {
+        // Alpha-aware resampling would keep red at 255.
+        let bytes = vec![255, 0, 0, 255, 0, 0, 0, 0].into_boxed_slice();
+        let page = Decoded::rgba(2, 1, Format::Png, Transfer::Srgb, bytes)
             .expect("rgba page");
-        let derived = derive(&page, 2);
-        assert_eq!((derived.width(), derived.height()), (2, 1));
-        assert_eq!(
-            rgba_bytes(&derived),
-            vec![85_u8, 85, 85, 255, 255, 255, 255, 255]
+        let derived = derive_to_edge(&page, 1, FilterType::Box);
+        let pixel = rgba_bytes(&derived);
+        let [red, green, blue, alpha] = pixel.as_slice() else {
+            panic!("one pixel");
+        };
+        assert!(red.abs_diff(128) <= 1, "{pixel:?}");
+        assert_eq!(*green, 0);
+        assert_eq!(*blue, 0);
+        assert!(alpha.abs_diff(128) <= 1, "{pixel:?}");
+    }
+
+    #[test]
+    fn derive_keeps_yuv_plane_values() {
+        let page = flat_yuv_page(
+            4000,
+            100,
+            Subsampling::Yuv420,
+            [400, 600, 300, 1023],
         );
+        for (kind, edge, row_count) in [
+            (Artifact::Thumb, THUMB_EDGE, 5_u32),
+            (Artifact::View, VIEW_EDGE, 64),
+        ] {
+            let derived = derive(&page, kind);
+            assert_eq!(
+                (derived.width(), derived.height()),
+                (edge, row_count),
+                "{kind:?}"
+            );
+            assert_eq!(derived.page_dims(), (4000, 100), "{kind:?}");
+            let Pixels::Yuv(yuv) = derived.pixels() else {
+                panic!("expected yuv pixels");
+            };
+            assert_eq!(yuv.depth, 10, "{kind:?}");
+            assert_eq!(yuv.matrix, Matrix::Bt709, "{kind:?}");
+            let [luma, cb, cr, alpha] = yuv_planes(&derived);
+            for (name, plane, value) in [
+                ("luma", luma, 400_u16),
+                ("cb", cb, 600),
+                ("cr", cr, 300),
+                ("alpha", alpha, 1023),
+            ] {
+                assert!(
+                    plane.iter().all(|sample| sample.abs_diff(value) <= 1),
+                    "{kind:?} {name}"
+                );
+            }
+        }
     }
 
     #[test]
     fn derive_keeps_yuv_plane_extents_valid() {
         let page = yuv_page(500, 200, Subsampling::Yuv420);
-        let thumb = derive(&page, 200);
+        let thumb = derive_to_edge(&page, 200, FilterType::Hamming);
         assert_eq!((thumb.width(), thumb.height()), (200, 80));
         assert_eq!(thumb.page_dims(), (500, 200));
         let Pixels::Yuv(yuv) = thumb.pixels() else {
@@ -1501,7 +1602,7 @@ mod tests {
     #[test]
     fn derive_keeps_odd_yuv422_chroma_consistent() {
         let page = yuv_page(9, 10, Subsampling::Yuv422);
-        let thumb = derive(&page, 7);
+        let thumb = derive_to_edge(&page, 7, FilterType::Box);
         assert_eq!((thumb.width(), thumb.height()), (6, 7));
         let Pixels::Yuv(yuv) = thumb.pixels() else {
             panic!("expected yuv pixels");

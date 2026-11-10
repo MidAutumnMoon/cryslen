@@ -19,7 +19,7 @@ The boundary follows ownership. The parent owns the window, UI, GL, `App`, the w
 - The app sends the whole want set and uses its texture maps as the authority; the child acknowledges nothing.
 - Pixels cross as `WireImage`: metadata plus one `IpcSharedMemory` per plane. The shared blocks avoid serialization; each plane is copied once per direction.
 - `accept(2)` on a child that never connected cannot be woken, so `finish` accepts on its own thread under the same deadline as the first message.
-- Killing the old child at switch start ends switch-time decode concurrency; `analysis.md` item 1.
+- Killing the old child at switch start ends switch-time decode concurrency; see the limits in `analysis.md`.
 
 ## Limits
 

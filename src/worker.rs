@@ -397,7 +397,7 @@ impl Session {
             );
             if needs.view && view.is_none() {
                 let started = Instant::now();
-                let derived = preview::derive(&native, preview::VIEW_EDGE);
+                let derived = preview::derive(&native, Artifact::View);
                 tracing::debug!(
                     page,
                     elapsed = ?started.elapsed(),
@@ -408,10 +408,8 @@ impl Session {
             }
             if needs.thumb && thumb.is_none() {
                 let started = Instant::now();
-                // The view is the cheaper source: one area pass over the view
-                // covers the thumb.
                 let from = view.as_ref().unwrap_or(&native);
-                let derived = preview::derive(from, preview::THUMB_EDGE);
+                let derived = preview::derive(from, Artifact::Thumb);
                 tracing::debug!(
                     page,
                     elapsed = ?started.elapsed(),
