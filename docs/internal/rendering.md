@@ -14,7 +14,7 @@ Reference for `src/render.rs`, `src/window.rs`, and the frame loop in `src/app.r
 - Clip space is bottom-origin; flip in the vertex shader and keep the rest top-origin.
 - `begin_frame` sets the viewport and premultiplied blend for page quads; egui paints after and sets its own state.
 - Snap quad origins to whole pixels; NEAREST at 1:1 draws uneven rows at a fractional origin.
-- Minify with mipmaps and `LINEAR_MIPMAP_LINEAR`; magnify with NEAREST. Chroma reconstructs bilinearly.
+- Minify with mipmaps and `LINEAR_MIPMAP_LINEAR`; magnify a downscaled representation with LINEAR so it does not paint its pixel grid, and the page's own pixels with NEAREST so zoom stays crisp. Chroma reconstructs bilinearly.
 - Set `UNPACK_ALIGNMENT` to 1 for single-channel planes.
 - On GLES, R16 samples black under LINEAR; bind it as NEAREST and skip mips for a wide plane.
 - ES fragment shaders need `precision highp`; mediump can be fp16.

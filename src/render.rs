@@ -752,6 +752,14 @@ impl Mag {
     }
 }
 
+fn magnification(decoded: &Decoded) -> Mag {
+    if (decoded.width(), decoded.height()) == decoded.page_dims() {
+        Mag::Sharp
+    } else {
+        Mag::Smooth
+    }
+}
+
 /// Texture with viewer defaults. CLAMP keeps edge texels from bleeding.
 /// `filterable` false (GLES R16) means NEAREST and no mips.
 ///
@@ -806,8 +814,9 @@ unsafe fn upload_rgba(
     gl: &glow::Context,
     data: &[u8],
     dims: (u32, u32),
+    mag: Mag,
 ) -> <glow::Context as HasContext>::Texture {
-    let texture = new_texture(gl, true, Mag::Sharp);
+    let texture = new_texture(gl, true, mag);
     gl.bind_texture(glow::TEXTURE_2D, Some(texture));
     gl.tex_image_2d(
         glow::TEXTURE_2D,
@@ -873,6 +882,7 @@ unsafe fn upload_plane(
     reason = "Cb and Cr are the YUV plane names the two textures hold"
 )]
 unsafe fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> Entry {
+    let mag = magnification(decoded);
     let (width, height) = (decoded.width(), decoded.height());
     match &decoded.pixels() {
         Pixels::Rgba8(rgba_bytes) => {
@@ -882,7 +892,7 @@ unsafe fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> Entry {
                 "rgba byte length"
             );
             Entry::Rgba {
-                texture: upload_rgba(gl, rgba_bytes, (width, height)),
+                texture: upload_rgba(gl, rgba_bytes, (width, height), mag),
                 lmap_base: page_lmap(decoded),
                 transfer: decoded.transfer(),
             }
@@ -913,7 +923,7 @@ unsafe fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> Entry {
                 (luma_w, luma_h),
                 wide,
                 filterable,
-                Mag::Sharp,
+                mag,
             );
             let (cb_texture, cr_texture) =
                 if yuv.subsampling == Subsampling::Mono {
@@ -1455,5 +1465,20 @@ mod tests {
         .expect("valid page")
         .with_page_dims((1000, 2000));
         assert_eq!(page_lmap(&page), (1.0_f32 / 1000.0, 1.0_f32 / 2000.0));
+    }
+
+    #[test]
+    fn magnification_keys_on_page_resolution() {
+        let page = Decoded::rgba(
+            100,
+            100,
+            Format::Png,
+            Transfer::Srgb,
+            vec![0_u8; 100 * 100 * 4].into_boxed_slice(),
+        )
+        .expect("valid page");
+        assert!(matches!(magnification(&page), Mag::Sharp));
+        let preview = page.with_page_dims((1000, 2000));
+        assert!(matches!(magnification(&preview), Mag::Smooth));
     }
 }
