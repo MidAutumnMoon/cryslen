@@ -13,6 +13,12 @@ The boundary follows ownership. The parent owns the window, UI, GL, the app stat
 - A page fault is text; a book fault is the process.
 - The store, prefetch, and retention are in `docs/internal/cache.md`.
 
+## Playback
+
+- The parent owns display timing and the session lifecycle; the child owns decode and the loop policy.
+- One frame request is in flight. `generation` rejects a stopped session's answers.
+- A playback failure keeps the page's last raster.
+
 ## Invariants
 
 - Page identity is the index in the book the child was spawned with; no message carries a path.

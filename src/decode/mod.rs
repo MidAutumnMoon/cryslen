@@ -5,7 +5,13 @@
     reason = "the decode tree's shared vocabulary lives in its module root by design"
 )]
 
+use std::io::Cursor;
+use std::sync::Arc;
+use std::time::Duration;
+
+use ::image::Delay;
 use eros::ErrorUnion;
+use eros::IntoUnion as _;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -212,6 +218,19 @@ impl Format {
             Self::Jxl => "jxl",
         }
     }
+
+    /// Whether the parent may request playback.
+    #[must_use]
+    pub fn may_animate(self) -> bool {
+        matches!(self, Self::Gif)
+    }
+}
+
+/// Pass count. `Finite` counts total passes, including the first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub enum Loops {
+    Infinite,
+    Finite(u32),
 }
 
 /// 8-bit planes are one byte per sample; deeper planes are `u16` with
@@ -405,8 +424,9 @@ where
     (out.into_boxed_slice(), (out_width, out_height))
 }
 
-/// Decode one page. `name` is the page filename, used as the extension
-/// fallback. Animated images show their first frame.
+/// Decode one page's first raster. `name` is the page filename, used as
+/// the extension fallback. Animated pages stream the rest through
+/// [`open_animation`].
 pub fn decode(bytes: &[u8], name: &str) -> Result<Decoded, DecodeError> {
     let Some(format) = sniff(bytes).or_else(|| format_from_name(name))
     else {
@@ -422,6 +442,139 @@ pub fn decode(bytes: &[u8], name: &str) -> Result<Decoded, DecodeError> {
         | Format::Bmp
         | Format::Tiff => image::decode(bytes, format),
     }
+}
+
+/// An animated page's frame stream. Frames arrive sequentially; there is
+/// no seek.
+pub struct Animation {
+    bytes: Arc<[u8]>,
+    format: Format,
+    loops: Loops,
+    frames: Frames,
+}
+
+impl Animation {
+    #[must_use]
+    pub fn loops(&self) -> Loops {
+        self.loops
+    }
+
+    /// Restart the pass at frame 0.
+    pub fn rewind(&mut self) -> Result<(), DecodeError> {
+        self.frames = Frames::new(Arc::clone(&self.bytes), self.format)?;
+        Ok(())
+    }
+
+    /// `None` means the pass ended.
+    pub fn next_frame(&mut self) -> Option<Result<Frame, DecodeError>> {
+        self.frames.next_frame()
+    }
+}
+
+/// One composited animation frame at the page canvas size.
+#[derive(Clone)]
+pub struct Frame {
+    pub image: Decoded,
+    pub delay: Duration,
+}
+
+struct Frames {
+    inner: ::image::Frames<'static>,
+    format: Format,
+}
+
+impl Frames {
+    fn new(bytes: Arc<[u8]>, format: Format) -> Result<Self, DecodeError> {
+        use ::image::AnimationDecoder as _;
+        use ::image::ImageDecoder as _;
+        use ::image::codecs::gif::GifDecoder;
+
+        if format != Format::Gif {
+            return Err(ErrorUnion::new(DecodeRefusal::Unsupported(
+                "animation format",
+            )));
+        }
+        let decoder = GifDecoder::new(Cursor::new(bytes)).union()?;
+        let (width, height) = decoder.dimensions();
+        check_dims(width, height).union()?;
+        Ok(Self {
+            inner: decoder.into_frames(),
+            format,
+        })
+    }
+
+    fn next_frame(&mut self) -> Option<Result<Frame, DecodeError>> {
+        let frame = match self.inner.next() {
+            None => return None,
+            Some(Ok(frame)) => frame,
+            Some(Err(error)) => {
+                return Some(Err(ErrorUnion::new(error)));
+            }
+        };
+        let delay = delay_duration(frame.delay());
+        let buffer = frame.into_buffer();
+        let (width, height) = buffer.dimensions();
+        let rgba = buffer.into_raw().into_boxed_slice();
+        Some(
+            Decoded::rgba(width, height, self.format, Transfer::Srgb, rgba)
+                .map(|image| Frame { image, delay })
+                .union(),
+        )
+    }
+}
+
+/// `Ok(None)` means the format has no animation path; a still GIF
+/// streams one frame.
+pub fn open_animation(
+    bytes: Arc<[u8]>,
+    name: &str,
+) -> Result<Option<Animation>, DecodeError> {
+    let Some(format) = sniff(&bytes).or_else(|| format_from_name(name))
+    else {
+        return Err(ErrorUnion::new(DecodeRefusal::NotAnImage));
+    };
+    if !format.may_animate() {
+        return Ok(None);
+    }
+    let loops = gif_loops(&bytes);
+    let frames = Frames::new(Arc::clone(&bytes), format)?;
+    tracing::debug!(format = format.label(), ?loops, "animation opened");
+    Ok(Some(Animation {
+        bytes,
+        format,
+        loops,
+        frames,
+    }))
+}
+
+/// GIF's NETSCAPE repeat field. A file without the extension reports
+/// `Finite(0)`; the `image` wrapper would call that a forever loop.
+fn gif_loops(bytes: &[u8]) -> Loops {
+    use gif::DecodeOptions;
+    use gif::Repeat;
+
+    match DecodeOptions::new().read_info(Cursor::new(bytes)) {
+        Ok(decoder) => match decoder.repeat() {
+            Repeat::Infinite => Loops::Infinite,
+            Repeat::Finite(0) => Loops::Finite(1),
+            Repeat::Finite(repeats) => {
+                Loops::Finite(u32::from(repeats) + 1)
+            }
+        },
+        Err(error) => {
+            tracing::debug!(
+                %error,
+                "gif loop metadata unreadable; playing once"
+            );
+            Loops::Finite(1)
+        }
+    }
+}
+
+/// `image` reports delays as an exact millisecond ratio.
+fn delay_duration(delay: Delay) -> Duration {
+    let (numer, denom) = delay.numer_denom_ms();
+    Duration::from_millis(u64::from(numer)) / denom.max(1)
 }
 
 /// Format for a page filename's extension. The same table decides what can
@@ -520,6 +673,9 @@ fn ftyp_brands(bytes: &[u8]) -> Option<&[u8]> {
 )]
 mod tests {
     use super::*;
+    use crate::testkit::tiny_animated_gif;
+    use crate::testkit::tiny_gif;
+    use ::image::codecs::gif::Repeat;
 
     /// The refusal a decode returned, for tests that assert on the
     /// verdict rather than its message.
@@ -830,6 +986,102 @@ mod tests {
             .0
             .iter()
             .any(|px| px[0] != 0 || px[1] != 0 || px[2] != 0));
+    }
+
+    fn arc(bytes: Vec<u8>) -> Arc<[u8]> {
+        Arc::from(bytes.into_boxed_slice())
+    }
+
+    fn first_pixel(image: &Decoded) -> [u8; 4] {
+        let Pixels::Rgba8(bytes) = image.pixels() else {
+            panic!("a gif frame decodes to rgba");
+        };
+        let mut pixel = [0; 4];
+        pixel.copy_from_slice(bytes.get(..4).expect("one pixel"));
+        pixel
+    }
+
+    #[test]
+    fn animated_gif_streams_composited_frames() {
+        let colors = [
+            [255, 0, 0, 255],
+            [0, 255, 0, 255],
+            [0, 0, 255, 255],
+        ];
+        let bytes =
+            tiny_animated_gif(4, 3, &colors, 50, Repeat::Infinite);
+        let mut animation = open_animation(arc(bytes), "a.gif")
+            .expect("animated gif decodes")
+            .expect("gif has a frame stream");
+        assert_eq!(animation.loops(), Loops::Infinite);
+        for color in colors {
+            let frame = animation
+                .next_frame()
+                .expect("frame present")
+                .expect("frame decodes");
+            assert_eq!(
+                (frame.image.width(), frame.image.height()),
+                (4, 3),
+                "frames use the logical screen"
+            );
+            assert_eq!(first_pixel(&frame.image), color);
+            assert_eq!(frame.delay, Duration::from_millis(50));
+        }
+        assert!(animation.next_frame().is_none(), "pass ended");
+    }
+
+    #[test]
+    fn gif_loop_metadata_keeps_absent_distinct_from_infinite() {
+        // No NETSCAPE extension: the decoder's zero default means one
+        // play, not forever.
+        let still = tiny_gif(2, 2, [10, 20, 30]);
+        let mut once = open_animation(arc(still), "a.gif")
+            .expect("still gif decodes")
+            .expect("gif has a frame stream");
+        assert_eq!(once.loops(), Loops::Finite(1));
+        assert!(once.next_frame().is_some());
+        assert!(once.next_frame().is_none());
+
+        // The field counts repetitions after the first, so 2 means 3
+        // total passes.
+        let finite = tiny_animated_gif(
+            2,
+            2,
+            &[[1, 2, 3, 255], [4, 5, 6, 255]],
+            100,
+            Repeat::Finite(2),
+        );
+        let animation = open_animation(arc(finite), "a.gif")
+            .expect("finite gif decodes")
+            .expect("gif has a frame stream");
+        assert_eq!(animation.loops(), Loops::Finite(3));
+    }
+
+    #[test]
+    fn animation_rewinds() {
+        let colors = [
+            [255, 0, 0, 255],
+            [0, 255, 0, 255],
+            [0, 0, 255, 255],
+        ];
+        let bytes = tiny_animated_gif(2, 2, &colors, 20, Repeat::Infinite);
+        let mut animation = open_animation(arc(bytes), "a.gif")
+            .expect("gif decodes")
+            .expect("gif has a frame stream");
+        for color in colors {
+            let frame = animation
+                .next_frame()
+                .expect("frame present")
+                .expect("valid");
+            assert_eq!(first_pixel(&frame.image), color);
+        }
+        assert!(animation.next_frame().is_none(), "pass ended");
+        animation.rewind().expect("rewind");
+        let rewound = animation
+            .next_frame()
+            .expect("frame 0 again")
+            .expect("valid");
+        assert_eq!(first_pixel(&rewound.image), colors[0]);
     }
 
     // A truncation bug would hang the decode instead of failing it, hence

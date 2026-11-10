@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::panic;
@@ -28,14 +29,19 @@ use rustix::process::set_parent_process_death_signal;
 use rustix::process::Pid;
 use rustix::process::Signal;
 
+use crate::animation::DecodedEvent;
 use crate::browse::spread_for;
 use crate::browse::Motion;
 use crate::browse::Request;
 use crate::browse::Role;
 use crate::browse::Roles;
 use crate::decode;
+use crate::decode::Animation;
 use crate::decode::Decoded;
+use crate::decode::Frame;
+use crate::decode::Loops;
 use crate::fault::BadIndex;
+use crate::fault::DecodeError;
 use crate::fault::PageError;
 use crate::fault::PageFault;
 use crate::fault::PanicFault;
@@ -47,6 +53,9 @@ use crate::protocol::BookInfo;
 use crate::protocol::ChildMsg;
 use crate::protocol::Hello;
 use crate::protocol::ParentMsg;
+use crate::protocol::PlaybackCommand;
+use crate::protocol::PlaybackEvent;
+use crate::protocol::PlaybackId;
 use crate::protocol::WireImage;
 use crate::source::PageRead;
 use crate::source::Source;
@@ -59,9 +68,7 @@ const FILL_POLL: Duration = Duration::from_millis(15);
 /// reader leaves the worker idle between turns.
 const IDLE_PRELOAD: Duration = Duration::from_millis(300);
 
-/// One role for the app. `image` is what the renderer uploads: the
-/// stored preview for `Thumb` and `Fit`, the page's own pixels for
-/// `Full`. `Fatal` ends the child's writer run.
+/// One message from the decode thread.
 pub enum Update {
     Ready {
         page: usize,
@@ -72,6 +79,7 @@ pub enum Update {
         page: usize,
         error: Arc<PageError>,
     },
+    Playback(DecodedEvent),
     /// Every page now reads without waiting on an unpack pass. Sent
     /// once, on the first loop iteration that observes it.
     Unpacked,
@@ -85,7 +93,64 @@ enum WorkerCommand {
     /// it on change; a request leaving the set is how it says it got the
     /// role.
     Requests(Vec<Request>),
+    Playback(PlaybackCommand),
     Stop,
+}
+
+/// A playback step from the parent, in arrival order.
+#[derive(Clone, Copy, Debug)]
+enum PlaybackStep {
+    Start { id: PlaybackId, role: Role },
+    Next { id: PlaybackId },
+}
+
+impl PlaybackStep {
+    #[expect(
+        clippy::rest_pattern_accessible_field,
+        reason = "the id is all the caller needs from either step"
+    )]
+    fn id(self) -> PlaybackId {
+        match self {
+            Self::Start { id, .. } | Self::Next { id } => id,
+        }
+    }
+}
+
+/// The child's playback cursor for one playing page; the session owns
+/// the loop policy.
+struct PlaybackSession {
+    id: PlaybackId,
+    role: Role,
+    animation: Animation,
+    passes: u32,
+}
+
+impl PlaybackSession {
+    /// `None` once every allowed pass has been played.
+    fn advance(&mut self) -> Result<Option<Frame>, DecodeError> {
+        let mut rewound = false;
+        loop {
+            if let Some(frame) = self.animation.next_frame().transpose()? {
+                return Ok(Some(frame));
+            }
+            if rewound {
+                return Ok(None);
+            }
+            self.passes = self.passes.saturating_add(1);
+            if !self.should_repeat() {
+                return Ok(None);
+            }
+            self.animation.rewind()?;
+            rewound = true;
+        }
+    }
+
+    fn should_repeat(&self) -> bool {
+        match self.animation.loops() {
+            Loops::Infinite => true,
+            Loops::Finite(total) => self.passes < total,
+        }
+    }
 }
 
 /// A page and the roles to produce. A `requested` job is delivered; a
@@ -115,6 +180,8 @@ struct Session {
     requests_at: Instant,
     /// Requests already handed over since they last entered the set.
     served: HashSet<Request>,
+    playing_pages: HashMap<usize, PlaybackSession>,
+    playback_steps: VecDeque<PlaybackStep>,
     preload_allowed: bool,
 }
 
@@ -130,13 +197,20 @@ impl Session {
             requests: Vec::new(),
             requests_at: Instant::now(),
             served: HashSet::new(),
+            playing_pages: HashMap::new(),
+            playback_steps: VecDeque::new(),
             preload_allowed: false,
         }
     }
 
     /// Apply one message. `false` means the loop must stop.
     fn apply(&mut self, message: WorkerCommand) -> bool {
-        if !matches!(message, WorkerCommand::Stop) {
+        // Playback is not a page turn: it must not reset the quiet window
+        // that lets the prefetch tail run.
+        if !matches!(
+            message,
+            WorkerCommand::Stop | WorkerCommand::Playback(_)
+        ) {
             self.preload_allowed = false;
         }
         match message {
@@ -158,9 +232,37 @@ impl Session {
                 self.requests = requests;
                 self.requests_at = Instant::now();
             }
+            WorkerCommand::Playback(command) => {
+                self.apply_playback(command);
+            }
             WorkerCommand::Stop => return false,
         }
         true
+    }
+
+    fn apply_playback(&mut self, command: PlaybackCommand) {
+        match command {
+            PlaybackCommand::Start { id, role } => {
+                // A restart replaces everything still queued for the page.
+                self.playback_steps
+                    .retain(|step| step.id().page != id.page);
+                self.playback_steps
+                    .push_back(PlaybackStep::Start { id, role });
+            }
+            PlaybackCommand::Next { id } => {
+                self.playback_steps.push_back(PlaybackStep::Next { id });
+            }
+            PlaybackCommand::Stop { id } => {
+                if self
+                    .playing_pages
+                    .get(&id.page)
+                    .is_some_and(|session| session.id == id)
+                {
+                    self.playing_pages.remove(&id.page);
+                }
+                self.playback_steps.retain(|step| step.id() != id);
+            }
+        }
     }
 
     fn next_prefetch_job(&self) -> Option<Job> {
@@ -416,6 +518,164 @@ impl Session {
             }
         }
     }
+
+    fn serve_playback(
+        &mut self,
+        source: &Source,
+        step: PlaybackStep,
+        notify: &dyn Fn(Update),
+    ) {
+        match step {
+            PlaybackStep::Start { id, role } => {
+                self.start_playback(source, id, role, notify);
+            }
+            PlaybackStep::Next { id } => self.next_playback(id, notify),
+        }
+    }
+
+    /// A successful start emits nothing; the first `Next` produces the
+    /// first frame. A start that cannot open the stream answers `Failed`.
+    fn start_playback(
+        &mut self,
+        source: &Source,
+        id: PlaybackId,
+        role: Role,
+        notify: &dyn Fn(Update),
+    ) {
+        let page = id.page;
+        let bytes = match source.bytes(page) {
+            PageRead::NotYet => {
+                thread::sleep(FILL_POLL);
+                self.playback_steps
+                    .push_front(PlaybackStep::Start { id, role });
+                return;
+            }
+            PageRead::Failed(_) => {
+                tracing::debug!(?id, "playback source failed");
+                self.fail_playback(id, notify);
+                return;
+            }
+            PageRead::Ready(bytes) => bytes,
+        };
+        let Some(name) = source.name(page) else {
+            self.fail_playback(id, notify);
+            return;
+        };
+
+        self.playing_pages.remove(&page);
+        let opened = panic::catch_unwind(AssertUnwindSafe(|| {
+            decode::open_animation(Arc::clone(&bytes), name)
+        }));
+        match opened {
+            Ok(Ok(Some(animation))) => {
+                let loops = animation.loops();
+                self.playing_pages.insert(
+                    page,
+                    PlaybackSession {
+                        id,
+                        role,
+                        animation,
+                        passes: 0,
+                    },
+                );
+                tracing::debug!(?id, ?role, ?loops, "playback start");
+            }
+            Ok(Ok(None)) => {
+                tracing::debug!(?id, ?role, "no playback path");
+                self.fail_playback(id, notify);
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    ?id,
+                    ?role,
+                    %error,
+                    "playback open failed"
+                );
+                self.fail_playback(id, notify);
+            }
+            Err(payload) => {
+                let fault =
+                    PanicFault::from_payload("animation", payload.as_ref());
+                tracing::warn!(
+                    ?id,
+                    ?role,
+                    fault = %fault,
+                    "playback open panicked"
+                );
+                self.fail_playback(id, notify);
+            }
+        }
+    }
+
+    fn next_playback(&mut self, id: PlaybackId, notify: &dyn Fn(Update)) {
+        let page = id.page;
+        let Some(session) = self.playing_pages.get_mut(&page) else {
+            tracing::debug!(?id, "playback frame without a session");
+            return;
+        };
+        if session.id != id {
+            tracing::debug!(?id, "stale playback frame");
+            return;
+        }
+        let role = session.role;
+        let produced =
+            panic::catch_unwind(AssertUnwindSafe(|| session.advance()));
+        match produced {
+            Ok(Ok(Some(frame))) => {
+                let image = cache::derive(&frame.image, role);
+                tracing::debug!(
+                    ?id,
+                    ?role,
+                    delay = ?frame.delay,
+                    width = image.width(),
+                    height = image.height(),
+                    "playback frame"
+                );
+                notify(Update::Playback(DecodedEvent::Frame {
+                    id,
+                    delay: frame.delay,
+                    image: Box::new(image),
+                }));
+            }
+            Ok(Ok(None)) => {
+                tracing::debug!(?id, ?role, "playback finished");
+                self.playing_pages.remove(&page);
+                notify(Update::Playback(DecodedEvent::Finished { id }));
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    ?id,
+                    ?role,
+                    %error,
+                    "playback frame failed"
+                );
+                self.fail_playback(id, notify);
+            }
+            Err(payload) => {
+                let fault =
+                    PanicFault::from_payload("animation", payload.as_ref());
+                tracing::warn!(
+                    ?id,
+                    ?role,
+                    fault = %fault,
+                    "playback frame panicked"
+                );
+                self.fail_playback(id, notify);
+            }
+        }
+    }
+
+    fn fail_playback(&mut self, id: PlaybackId, notify: &dyn Fn(Update)) {
+        if self
+            .playing_pages
+            .get(&id.page)
+            .is_some_and(|session| session.id == id)
+        {
+            self.playing_pages.remove(&id.page);
+        }
+        self.playback_steps.retain(|step| step.id() != id);
+        notify(Update::Playback(DecodedEvent::Failed { id }));
+    }
 }
 
 /// Handle to the decode thread. Every control is a send; the last
@@ -487,6 +747,10 @@ impl Worker {
         self.tell(WorkerCommand::Requests(requests));
     }
 
+    pub fn playback(&self, command: PlaybackCommand) {
+        self.tell(WorkerCommand::Playback(command));
+    }
+
     /// Stop the worker without joining it, so the caller returns while an
     /// in-flight decode finishes. The thread owns its state.
     pub fn detach(&mut self) {
@@ -537,6 +801,10 @@ fn run(
                 "request"
             );
             session.serve(source, job, notify);
+            continue;
+        }
+        if let Some(step) = session.playback_steps.pop_front() {
+            session.serve_playback(source, step, notify);
             continue;
         }
         if let Some(job) = session.next_prefetch_job() {
@@ -616,9 +884,16 @@ fn into_message(update: Update) -> ChildMsg {
             page,
             fault: PageFault::from(error),
         },
+        Update::Playback(event) => {
+            ChildMsg::Playback(wire_event(event))
+        }
         Update::Unpacked => ChildMsg::Unpacked,
         Update::Fatal(summary) => ChildMsg::Fatal(summary),
     }
+}
+
+fn wire_event(event: DecodedEvent) -> PlaybackEvent<WireImage> {
+    event.map_image(|image| WireImage::from_decoded(&image))
 }
 
 /// Whether this message ends the writer's run.
@@ -780,6 +1055,16 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     );
                 }
             }
+            ParentMsg::Playback(command) => {
+                if let Some(running) = worker.as_ref() {
+                    running.playback(command);
+                } else {
+                    tracing::debug!(
+                        ?command,
+                        "playback arrived before the first view"
+                    );
+                }
+            }
         }
     }
     if let Some(mut running) = worker {
@@ -833,6 +1118,8 @@ mod tests {
     use crate::browse::Direction;
     use crate::cache::Store;
     use crate::testkit::eventually;
+    use image::codecs::gif::Repeat;
+    use crate::testkit::tiny_animated_gif;
     use crate::testkit::tiny_png;
     use crate::testkit::TempDir;
     use crate::browse::PageCount;
@@ -853,6 +1140,24 @@ mod tests {
             ReadingMode::Normal,
             PageCount::new(count).expect("test book is non-empty"),
         )
+    }
+
+    fn start_playback(
+        worker: &Worker,
+        page: usize,
+        role: Role,
+        generation: u32,
+    ) {
+        worker.playback(PlaybackCommand::Start {
+            id: PlaybackId { page, generation },
+            role,
+        });
+    }
+
+    fn next_frame(worker: &Worker, page: usize, generation: u32) {
+        worker.playback(PlaybackCommand::Next {
+            id: PlaybackId { page, generation },
+        });
     }
 
     /// A directory of distinct solid pages, `size` pixels square.
@@ -887,6 +1192,15 @@ mod tests {
 
     fn long_edge(image: &Decoded) -> u32 {
         image.width().max(image.height())
+    }
+
+    fn first_pixel(image: &Decoded) -> [u8; 4] {
+        let decode::Pixels::Rgba8(bytes) = image.pixels() else {
+            panic!("a gif frame decodes to rgba");
+        };
+        let mut pixel = [0; 4];
+        pixel.copy_from_slice(bytes.get(..4).expect("one pixel"));
+        pixel
     }
 
     fn is_thumb(role: Role) -> bool {
@@ -967,6 +1281,7 @@ mod tests {
                     }
                     Update::Ready { .. }
                     | Update::Failed { .. }
+                    | Update::Playback(_)
                     | Update::Unpacked
                     | Update::Fatal(_) => None,
                 })
@@ -984,6 +1299,7 @@ mod tests {
                     } if *failed == page => Some(Arc::clone(error)),
                     Update::Ready { .. }
                     | Update::Failed { .. }
+                    | Update::Playback(_)
                     | Update::Unpacked
                     | Update::Fatal(_) => None,
                 })
@@ -1016,10 +1332,57 @@ mod tests {
                     } if *failed == page => Some(error),
                     Update::Ready { .. }
                     | Update::Failed { .. }
+                    | Update::Playback(_)
                     | Update::Unpacked
                     | Update::Fatal(_) => None,
                 })
                 .count()
+        }
+
+        /// The `offset`-th frame delivered for `page`, counting from
+        /// zero in arrival order.
+        fn frame(
+            &self,
+            page: usize,
+            offset: usize,
+        ) -> (Duration, Decoded) {
+            eventually(20, "no animation frame", || {
+                self.drain();
+                let seen = self.seen.lock();
+                seen.iter()
+                    .filter_map(|event| match event {
+                        Update::Playback(DecodedEvent::Frame {
+                            id,
+                            delay,
+                            image,
+                        }) if id.page == page => {
+                            Some((*delay, (**image).clone()))
+                        }
+                        Update::Ready { .. }
+                        | Update::Failed { .. }
+                        | Update::Playback(_)
+                        | Update::Unpacked
+                        | Update::Fatal(_) => None,
+                    })
+                    .nth(offset)
+            })
+        }
+
+        fn finished(&self, page: usize) {
+            eventually(20, "no animation finish", || {
+                self.drain();
+                let seen = self.seen.lock();
+                seen.iter()
+                    .any(|event| {
+                        matches!(
+                            event,
+                            Update::Playback(DecodedEvent::Finished {
+                                id,
+                            }) if id.page == page
+                        )
+                    })
+                    .then_some(())
+            });
         }
     }
 
@@ -1233,6 +1596,79 @@ mod tests {
             (BIG, BIG),
             "full must carry the page's own pixels"
         );
+    }
+
+    #[test]
+    fn animation_frames_stream_in_order() {
+        let colors = [
+            [255, 0, 0, 255],
+            [0, 255, 0, 255],
+            [0, 0, 255, 255],
+        ];
+        let dir = TempDir::new("worker-animation");
+        dir.write(
+            "p000.gif",
+            &tiny_animated_gif(8, 8, &colors, 50, Repeat::Infinite),
+        );
+        let source =
+            Arc::new(Source::open(dir.path()).expect("temp source opens"));
+        let root = TempDir::new("worker-animation-store");
+        let (events, notify) = Updates::new();
+        let worker = Worker::spawn_at(
+            Arc::clone(&source),
+            prefetch_for(0, 1),
+            root.path(),
+            notify,
+        )
+        .expect("worker spawns");
+
+        start_playback(&worker, 0, Role::Fit, 9);
+        for (offset, color) in colors.into_iter().enumerate() {
+            next_frame(&worker, 0, 9);
+            let (delay, image) = events.frame(0, offset);
+            assert_eq!(delay, Duration::from_millis(50));
+            assert_eq!((image.width(), image.height()), (8, 8));
+            assert_eq!(first_pixel(&image), color);
+        }
+        // The fourth frame crosses the pass boundary and repeats the
+        // first, without ending the playback.
+        next_frame(&worker, 0, 9);
+        let (_, image) = events.frame(0, 3);
+        assert_eq!(first_pixel(&image), colors[0]);
+    }
+
+    #[test]
+    fn a_finite_animation_finishes_after_its_last_pass() {
+        let colors = [
+            [255, 0, 0, 255],
+            [0, 255, 0, 255],
+            [0, 0, 255, 255],
+        ];
+        let dir = TempDir::new("worker-animation-finite");
+        dir.write(
+            "p000.gif",
+            &tiny_animated_gif(8, 8, &colors, 50, Repeat::Finite(0)),
+        );
+        let source =
+            Arc::new(Source::open(dir.path()).expect("temp source opens"));
+        let root = TempDir::new("worker-animation-finite-store");
+        let (events, notify) = Updates::new();
+        let worker = Worker::spawn_at(
+            Arc::clone(&source),
+            prefetch_for(0, 1),
+            root.path(),
+            notify,
+        )
+        .expect("worker spawns");
+
+        start_playback(&worker, 0, Role::Fit, 3);
+        for (offset, color) in colors.into_iter().enumerate() {
+            next_frame(&worker, 0, 3);
+            let (_, image) = events.frame(0, offset);
+            assert_eq!(first_pixel(&image), color);
+        }
+        next_frame(&worker, 0, 3);
+        events.finished(0);
     }
 
     #[test]

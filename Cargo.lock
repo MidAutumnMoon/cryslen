@@ -414,6 +414,7 @@ dependencies = [
  "egui_system_font_provider",
  "eros",
  "fast_image_resize",
+ "gif",
  "glutin",
  "glutin-winit",
  "image",

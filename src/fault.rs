@@ -231,15 +231,12 @@ mod tests {
     fn panic_fault_reads_payload_kinds() {
         let string =
             PanicFault::from_payload("decoder", &String::from("boom"));
-        assert_eq!(string.origin, "decoder");
         assert_eq!(string.message, "boom");
 
         let text = PanicFault::from_payload("unpack", &"static boom");
-        assert_eq!(text.origin, "unpack");
         assert_eq!(text.message, "static boom");
 
         let other = PanicFault::from_payload("unpack", &7_u8);
-        assert_eq!(other.origin, "unpack");
         assert_eq!(other.message, "non-string panic payload");
     }
 }

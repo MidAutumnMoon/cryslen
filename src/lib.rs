@@ -8,6 +8,7 @@ use std::process::ExitCode;
 
 pub mod protocol;
 
+mod animation;
 mod app;
 mod book;
 mod browse;

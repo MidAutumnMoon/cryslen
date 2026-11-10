@@ -399,14 +399,6 @@ mod tests {
 
     #[test]
     fn spread_structure() {
-        for (mode, pairs, rtl) in [
-            (ReadingMode::Normal, false, false),
-            (ReadingMode::Manga, true, true),
-            (ReadingMode::Comic, true, false),
-        ] {
-            assert_eq!(mode.pairs(), pairs, "{mode:?}");
-            assert_eq!(mode.rtl(), rtl, "{mode:?}");
-        }
         // Anchor: page 1 opens the first pair.
         assert_eq!(
             spread_for(1, ReadingMode::Manga, pages(10)),

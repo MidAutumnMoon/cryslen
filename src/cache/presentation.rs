@@ -35,6 +35,7 @@ pub struct Frame {
     demand: Spread,
     requests: Vec<Request>,
     retention: Retention,
+    playback: [Option<(usize, Role)>; 2],
 }
 
 struct Retention {
@@ -65,6 +66,12 @@ impl Frame {
     #[must_use]
     pub fn into_requests(self) -> Vec<Request> {
         self.requests
+    }
+
+    /// The pages a still frame animates.
+    #[must_use]
+    pub fn playback_targets(&self) -> [Option<(usize, Role)>; 2] {
+        self.playback
     }
 
     /// Every request, plus the role-bounded extras. It always covers
@@ -115,6 +122,22 @@ pub fn build_frame(
         },
     );
     let on_screen = shown.unwrap_or(input.target);
+    let playback = if input.motion == Motion::Still {
+        on_screen.seats(input.mode).map(|seat| {
+            let page = seat?;
+            if input.faults.contains_key(&page) {
+                return None;
+            }
+            let info = input.facts.get(&page)?;
+            if !info.format.may_animate() {
+                return None;
+            }
+            let role = roles(page).best()?;
+            (role != Role::Thumb).then_some((page, role))
+        })
+    } else {
+        [None, None]
+    };
     let demand = demand_spread(
         input.target,
         on_screen,
@@ -149,6 +172,7 @@ pub fn build_frame(
             target: input.target,
             on_screen,
         },
+        playback,
     }
 }
 
@@ -566,5 +590,75 @@ mod tests {
         assert_eq!(frame.shown, Some(Spread::lone(2)));
         assert_eq!(frame.demand, Spread::lone(3));
         assert_ne!(frame.demand, Spread::lone(20));
+    }
+
+    #[test]
+    fn playback_targets_need_an_animated_page_and_a_still_frame() {
+        let len = PageCount::new(20).expect("the test book is not empty");
+        let gif_page = PageInfo {
+            dims: (2, 2),
+            format: Format::Gif,
+        };
+        let still_image = PageInfo {
+            dims: (2, 2),
+            format: Format::Png,
+        };
+        let facts: BTreeMap<usize, PageInfo> = [4, 6, 10, 12]
+            .into_iter()
+            .map(|page| (page, gif_page))
+            .chain([(8, still_image)])
+            .collect();
+        let faults: BTreeMap<usize, PageFault> =
+            BTreeMap::from([(10, PageFault::new("unreadable"))]);
+        let roles = |page: usize| {
+            let mut page_roles = Roles::default();
+            page_roles.set(if page == 6 { Role::Thumb } else { Role::Fit });
+            page_roles
+        };
+        let frame_at = |page: usize, motion: Motion| {
+            build_frame(
+                &FrameInput {
+                    target: Spread::lone(page),
+                    shown: Some(ShownSpread {
+                        mode: ReadingMode::Normal,
+                        spread: Spread::lone(page),
+                    }),
+                    mode: ReadingMode::Normal,
+                    motion,
+                    direction: Direction::Forward,
+                    len,
+                    facts: &facts,
+                    faults: &faults,
+                    measurable: false,
+                },
+                roles,
+                |_| 1.0,
+            )
+        };
+
+        assert_eq!(
+            frame_at(4, Motion::Still).playback_targets(),
+            [Some((4, Role::Fit)), None]
+        );
+        assert_eq!(
+            frame_at(6, Motion::Still).playback_targets(),
+            [None, None],
+            "a thumb-only page never plays"
+        );
+        assert_eq!(
+            frame_at(8, Motion::Still).playback_targets(),
+            [None, None],
+            "a still image never plays"
+        );
+        assert_eq!(
+            frame_at(10, Motion::Still).playback_targets(),
+            [None, None],
+            "a faulted page never plays"
+        );
+        assert_eq!(
+            frame_at(12, Motion::Skimming).playback_targets(),
+            [None, None],
+            "skimming never plays"
+        );
     }
 }

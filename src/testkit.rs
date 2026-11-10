@@ -6,6 +6,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use eros::ErrorUnion;
+use image::codecs::gif::Repeat;
 
 use crate::fault::DecodeRefusal;
 use crate::fault::PageError;
@@ -47,6 +48,38 @@ pub fn tiny_gif(width: u32, height: u32, rgb: [u8; 3]) -> Vec<u8> {
         &image::DynamicImage::ImageRgb8(img),
         image::ImageFormat::Gif,
     )
+}
+
+/// A GIF whose frames are solid colors, all with the same delay.
+pub fn tiny_animated_gif(
+    width: u32,
+    height: u32,
+    colors: &[[u8; 4]],
+    delay_ms: u32,
+    repeat: Repeat,
+) -> Vec<u8> {
+    use image::codecs::gif::GifEncoder;
+
+    let mut bytes = Vec::new();
+    {
+        let mut encoder = GifEncoder::new(&mut bytes);
+        encoder.set_repeat(repeat).expect("repeat is accepted");
+        for &color in colors {
+            let image = image::RgbaImage::from_pixel(
+                width,
+                height,
+                image::Rgba(color),
+            );
+            let frame = image::Frame::from_parts(
+                image,
+                0,
+                0,
+                image::Delay::from_numer_denom_ms(delay_ms, 1),
+            );
+            encoder.encode_frame(frame).expect("frame encodes");
+        }
+    }
+    bytes
 }
 
 pub fn tiny_bmp(width: u32, height: u32, rgb: [u8; 3]) -> Vec<u8> {

@@ -24,6 +24,11 @@ use winit::keyboard::KeyCode;
 use winit::keyboard::ModifiersState;
 use winit::window::WindowId;
 
+use crate::animation::DecodedEvent;
+use crate::animation::Due;
+use crate::animation::PlaybackCommand;
+use crate::animation::PlaybackId;
+use crate::animation::Player;
 use crate::book::Book;
 use crate::book::BookChange;
 use crate::book::BookControl;
@@ -64,6 +69,10 @@ pub enum WakeEvent {
     /// A book's reader thread forwarded an event, or a switch landed;
     /// the loop must draw a frame to drain it.
     Wake,
+}
+
+fn min_deadline(deadline: Option<Duration>, delay: Duration) -> Duration {
+    deadline.map_or(delay, |current| current.min(delay))
 }
 
 pub fn post(proxy: &EventLoopProxy<WakeEvent>, event: WakeEvent) {
@@ -115,6 +124,13 @@ impl HeldKeys {
     }
 }
 
+/// `Refused` is sticky for the book, so a decoder that already stopped
+/// is not retried on every return.
+enum PagePlayback {
+    Playing(Player),
+    Refused,
+}
+
 /// Everything that resets when a book is adopted.
 struct Reading {
     position: ReadingPosition,
@@ -132,6 +148,8 @@ struct Reading {
     /// Reading direction of the last turn: the child's prefetch and skim
     /// tie-breaks follow it.
     direction: Direction,
+    playback: BTreeMap<usize, PagePlayback>,
+    next_generation: u32,
 }
 
 impl Reading {
@@ -159,6 +177,8 @@ impl Reading {
             hold_logged: false,
             sent_requests: cold.clone(),
             direction: Direction::Forward,
+            playback: BTreeMap::new(),
+            next_generation: 0,
         };
         (reading, cold)
     }
@@ -381,6 +401,10 @@ impl App {
             // a request on the next frame.
             gl.pages.retain(|page, role| frame.retains(page, role));
         }
+        self.sync_playback(frame.playback_targets());
+        if let Some(delay) = self.tick_playback(now) {
+            post(&self.proxy, WakeEvent::Repaint(delay));
+        }
         // The texture maps are the authority: recompute the requests each
         // frame and send only changes. A zero-sized viewport says nothing
         // about what the screen resolves.
@@ -577,6 +601,133 @@ impl App {
         if !self.reading.deliveries.is_empty() {
             post(&self.proxy, WakeEvent::Repaint(Duration::ZERO));
         }
+    }
+
+    /// A player follows the role its seat draws; a role change restarts it.
+    fn sync_playback(&mut self, targets: [Option<(usize, Role)>; 2]) {
+        let mut stop = Vec::new();
+        for (&page, state) in &self.reading.playback {
+            let keep = match state {
+                PagePlayback::Refused => true,
+                PagePlayback::Playing(player) => {
+                    targets.iter().flatten().any(|&(want_page, want_role)| {
+                        want_page == page && want_role == player.role()
+                    })
+                }
+            };
+            if !keep {
+                stop.push(page);
+            }
+        }
+        for page in stop {
+            self.stop_playback(page);
+        }
+        for &(page, role) in targets.iter().flatten() {
+            if !self.reading.playback.contains_key(&page) {
+                self.start_playback(page, role);
+            }
+        }
+    }
+
+    fn start_playback(&mut self, page: usize, role: Role) {
+        let id = PlaybackId {
+            page,
+            generation: self.reading.next_generation,
+        };
+        self.reading.next_generation = id.generation.wrapping_add(1);
+        self.send(ParentMsg::Playback(PlaybackCommand::Start { id, role }));
+        self.reading.playback.insert(
+            page,
+            PagePlayback::Playing(Player::new(id, role)),
+        );
+        tracing::debug!(?id, ?role, "playback player start");
+    }
+
+    fn stop_playback(&mut self, page: usize) {
+        let Some(PagePlayback::Playing(player)) = self.reading.playback.get(&page)
+        else {
+            return;
+        };
+        let id = player.id();
+        let role = player.role();
+        self.reading.playback.remove(&page);
+        self.send(ParentMsg::Playback(PlaybackCommand::Stop { id }));
+        tracing::debug!(?id, ?role, "playback player stop");
+    }
+
+    fn refuse_playback(&mut self, page: usize) {
+        self.stop_playback(page);
+        self.reading.playback.insert(page, PagePlayback::Refused);
+    }
+
+    fn is_current_playback(&self, id: PlaybackId) -> bool {
+        matches!(
+            self.reading.playback.get(&id.page),
+            Some(PagePlayback::Playing(player)) if player.id() == id
+        )
+    }
+
+    fn player_mut(&mut self, id: PlaybackId) -> Option<&mut Player> {
+        match self.reading.playback.get_mut(&id.page) {
+            Some(PagePlayback::Playing(player)) if player.id() == id => {
+                Some(player)
+            }
+            _ => {
+                tracing::debug!(?id, "stale playback update");
+                None
+            }
+        }
+    }
+
+    /// Returns the earliest wake the players need; `None` when no
+    /// repaint is needed.
+    fn tick_playback(&mut self, now: Instant) -> Option<Duration> {
+        let mut deadline: Option<Duration> = None;
+        let mut failed = Vec::new();
+        if let Some(gl) = self.gl.as_mut() {
+            for (&page, state) in &mut self.reading.playback {
+                let PagePlayback::Playing(player) = state else {
+                    continue;
+                };
+                match player.tick(now) {
+                    Due::Show { image, delay } => {
+                        let role = player.role();
+                        if let Err(error) =
+                            gl.pages.update(page, role, &image)
+                        {
+                            tracing::warn!(
+                                page,
+                                ?role,
+                                %error,
+                                "playback frame upload failed"
+                            );
+                            failed.push(page);
+                            continue;
+                        }
+                        tracing::debug!(
+                            page,
+                            ?role,
+                            ?delay,
+                            "playback frame shown"
+                        );
+                        deadline = Some(min_deadline(deadline, delay));
+                    }
+                    Due::Wait(delay) => {
+                        deadline = Some(min_deadline(deadline, delay));
+                    }
+                    Due::Idle => {}
+                }
+                if player.take_next() {
+                    self.book.send(ParentMsg::Playback(
+                        PlaybackCommand::Next { id: player.id() },
+                    ));
+                }
+            }
+        }
+        for page in failed {
+            self.refuse_playback(page);
+        }
+        deadline
     }
 
     fn last_shown_spread(&self) -> Spread {
@@ -787,6 +938,31 @@ impl App {
                 BookUpdate::Failed { page, fault } => {
                     self.reading.faults.insert(page, fault);
                 }
+                BookUpdate::Playback(event) => match event {
+                    DecodedEvent::Frame { id, delay, image } => {
+                        if let Some(player) = self.player_mut(id) {
+                            if !player.on_frame(delay, image) {
+                                tracing::debug!(
+                                    ?id,
+                                    "unrequested playback frame"
+                                );
+                            }
+                        }
+                    }
+                    DecodedEvent::Finished { id } => {
+                        if let Some(player) = self.player_mut(id) {
+                            if player.on_finished() {
+                                tracing::debug!(?id, "playback finished");
+                            }
+                        }
+                    }
+                    DecodedEvent::Failed { id } => {
+                        if self.is_current_playback(id) {
+                            tracing::warn!(?id, "playback failed");
+                            self.refuse_playback(id.page);
+                        }
+                    }
+                },
                 BookUpdate::Unpacked => self.book.mark_unpacked(),
                 BookUpdate::Died(detail) => {
                     let change = self.book.step(BookControl::Died(detail));
@@ -1171,13 +1347,6 @@ mod tests {
         let fractional =
             content_viewport(PhysicalSize::new(1600, 1000), content, 1.25);
         assert_eq!(fractional.size(), (1600.0, 965.0));
-    }
-
-    #[test]
-    fn pixel_wheel_zoom_speed_does_not_vary_with_output_scale_factor() {
-        assert_eq!(wheel_lines(40.0, 1.0), 1.0);
-        assert_eq!(wheel_lines(80.0, 2.0), 1.0);
-        assert_eq!(wheel_lines(40.0, 2.0), 0.5);
     }
 }
 

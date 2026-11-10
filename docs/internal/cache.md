@@ -8,6 +8,8 @@ Thumbs serve skims, fit images serve settled reading at fit, and full images are
 
 A decoded image's dimensions can differ from its page's; layout and status use the page's, so promoting a thumb to a full image leaves the layout unchanged.
 
+Animated pages store only frame 0; later frames are not persisted.
+
 ## Store
 
 `$TMPDIR/cryslen-cache/{thumb,view}/<xxh3-128 of the encoded page bytes>`. Content addressing gives free invalidation and shares pages across books. Every child opens the same tree, so switches keep its entries. The `view` namespace stores the fit role; the name is kept for existing entries.

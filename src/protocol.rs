@@ -18,6 +18,9 @@ use crate::decode::Plane;
 use crate::decode::YuvImage;
 use crate::fault::DecodeRefusal;
 
+pub use crate::animation::PlaybackCommand;
+pub use crate::animation::PlaybackEvent;
+pub use crate::animation::PlaybackId;
 pub use crate::decode::Format;
 pub use crate::decode::Matrix;
 pub use crate::decode::Subsampling;
@@ -165,6 +168,7 @@ pub enum ParentMsg {
     },
     SetMotion(Motion),
     SetRequests(Vec<Request>),
+    Playback(PlaybackCommand),
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -180,6 +184,7 @@ pub enum ChildMsg {
         page: usize,
         fault: PageFault,
     },
+    Playback(PlaybackEvent<WireImage>),
     Unpacked,
     Fatal(String),
 }
@@ -202,9 +207,10 @@ mod tests {
 
     #[test]
     fn rgba_image_round_trips_through_the_wire() {
-        let pixels = [PIXEL; 4].concat().into_boxed_slice();
+        // Non-square, so a width/height swap cannot pass.
+        let pixels = [PIXEL; 6].concat().into_boxed_slice();
         let decoded = Decoded::rgba(
-            2,
+            3,
             2,
             Format::Png,
             Transfer::Srgb,
@@ -215,13 +221,13 @@ mod tests {
         let wire = WireImage::from_decoded(&decoded);
         assert_eq!(
             (wire.width, wire.height),
-            (2, 2),
+            (3, 2),
             "the wire keeps the pixel extents",
         );
         assert_eq!(wire.format, Format::Png, "the wire keeps the format");
         assert_eq!(
             wire.page_dims,
-            (2, 2),
+            (3, 2),
             "the wire keeps the page dimensions",
         );
         let WirePixels::Rgba8(bytes) = &wire.pixels else {
@@ -236,12 +242,12 @@ mod tests {
         let back = wire.to_decoded().expect("the wire image decodes");
         assert_eq!(
             (back.width(), back.height()),
-            (2, 2),
+            (3, 2),
             "the pixels decode back at the same extents",
         );
         assert_eq!(
             back.page_dims(),
-            (2, 2),
+            (3, 2),
             "the page dimensions survive the trip",
         );
         assert_eq!(

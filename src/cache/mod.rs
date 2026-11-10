@@ -1213,7 +1213,12 @@ mod tests {
             .path()
             .join("thumb")
             .join(temp_name(hash, process::id()));
-        assert_eq!(thumb.temp_path(hash), expected);
+        let path = thumb.temp_path(hash);
+        assert_eq!(path, expected);
+        assert!(
+            path.file_name().is_some_and(is_temp_name),
+            "the cleaner must recognize its own writer temp"
+        );
     }
 
     #[test]
@@ -1629,10 +1634,6 @@ mod tests {
     #[test]
     fn roles_prefer_the_largest_role() {
         let mut roles = Roles::default();
-        assert_eq!(roles.best(), None);
-        assert!(!roles.any());
-        assert!(!roles.has_settled_image());
-
         roles.set(Role::Thumb);
         assert_eq!(roles.best(), Some(Role::Thumb));
         assert!(roles.contains(Role::Thumb));

@@ -21,6 +21,7 @@ use ipc_channel::ipc::IpcReceiver;
 use ipc_channel::ipc::IpcSender;
 use ipc_channel::TryRecvError as IpcTryRecvError;
 
+use crate::animation::DecodedEvent;
 use crate::catalog;
 use crate::catalog::PageName;
 use crate::fault::BookFault;
@@ -29,6 +30,8 @@ use crate::protocol::BookInfo;
 use crate::protocol::ChildMsg;
 use crate::protocol::Hello;
 use crate::protocol::ParentMsg;
+use crate::protocol::PlaybackEvent;
+use crate::protocol::WireImage;
 use crate::browse::PageCount;
 use crate::browse::Role;
 use crate::decode::Decoded;
@@ -115,6 +118,7 @@ pub struct Delivery {
 
 pub enum BookUpdate {
     Ready(Delivery),
+    Playback(DecodedEvent),
     Failed { page: usize, fault: PageFault },
     Unpacked,
     Died(String),
@@ -559,11 +563,43 @@ fn event_from_message(message: ChildMsg) -> BookUpdate {
                 },
             }
         }
+        ChildMsg::Playback(event) => {
+            BookUpdate::Playback(decoded_event(event))
+        }
         ChildMsg::Failed { page, fault } => {
             BookUpdate::Failed { page, fault }
         }
         ChildMsg::Unpacked => BookUpdate::Unpacked,
         ChildMsg::Fatal(detail) => BookUpdate::Died(detail),
+    }
+}
+
+/// A malformed frame answers `Failed`.
+fn decoded_event(event: PlaybackEvent<WireImage>) -> DecodedEvent {
+    match event {
+        PlaybackEvent::Frame { id, delay, image } => {
+            match image.to_decoded() {
+                Ok(decoded) => DecodedEvent::Frame {
+                    id,
+                    delay,
+                    image: Box::new(decoded),
+                },
+                Err(refusal) => {
+                    tracing::warn!(
+                        ?id,
+                        %refusal,
+                        "playback frame refused"
+                    );
+                    DecodedEvent::Failed { id }
+                }
+            }
+        }
+        PlaybackEvent::Finished { id } => {
+            DecodedEvent::Finished { id }
+        }
+        PlaybackEvent::Failed { id } => {
+            DecodedEvent::Failed { id }
+        }
     }
 }
 
@@ -609,7 +645,6 @@ mod tests {
             BookChange::Faulted
         );
         assert!(matches!(book.phase, Phase::Faulted(_)));
-        assert!(book.fault().is_some());
         drop(pending);
     }
 

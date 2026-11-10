@@ -22,6 +22,11 @@ The ratios here are one laptop's measurements; benchmark rules are in `build-and
 - Keep YUV planes and convert in the display shader. A full-frame YUV-to-RGB conversion is a second pass over the image; the shader path also cuts 4:2:0 upload size.
 - Map matrix coefficients, range, depth (8/10/12/16), and subsampling (400/420/422/444).
 
+## Animation
+
+- GIF playback uses the `image` crate's `AnimationDecoder`, which composites frames to the logical screen. Do not add a second compositor.
+- Loop counts come from `gif::Decoder::repeat()`; the `image` wrapper reports a file without the extension as infinite.
+
 ## Guards
 
 The decode entry point rejects a pixel count over the 512 MiB allocation ceiling and an edge over the decoder's limit before allocating. The renderer's maximum texture size is the final GPU check.

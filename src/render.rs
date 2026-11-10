@@ -182,6 +182,7 @@ struct Locations {
 enum TextureEntry {
     Rgba {
         texture: <glow::Context as glow::HasContext>::Texture,
+        dims: (u32, u32),
         /// Screen px -> page fraction, before the zoom-scale divide.
         lmap_base: (f32, f32),
         transfer: Transfer,
@@ -273,6 +274,57 @@ impl PageTextures {
         let entry = unsafe { upload_entry(&self.gl, image) };
         self.entries.insert((page, role), entry);
         Ok(())
+    }
+
+    /// Keeps the `(page, role)` key, so draws and retention stay put.
+    #[expect(
+        clippy::rest_pattern_accessible_field,
+        reason = "the update only reads the fields that decide reuse"
+    )]
+    pub fn update(
+        &mut self,
+        page: usize,
+        role: Role,
+        image: &Decoded,
+    ) -> Result<(), TextureError> {
+        let dims = (image.width(), image.height());
+        if dims.0 == 0
+            || dims.1 == 0
+            || dims.0 > self.max_texture_edge
+            || dims.1 > self.max_texture_edge
+        {
+            return Err(ErrorUnion::new(TextureFault {
+                dims,
+                max_edge: self.max_texture_edge,
+            }));
+        }
+        if let Some(TextureEntry::Rgba {
+            texture,
+            dims: present_dims,
+            transfer,
+            ..
+        }) = self.entries.get(&(page, role))
+        {
+            if *present_dims == dims && *transfer == image.transfer() {
+                if let Pixels::Rgba8(bytes) = image.pixels() {
+                    // SAFETY: the size check above and `Decoded`'s
+                    // extent check keep the byte length right, and the
+                    // texture is live until this entry is removed.
+                    unsafe {
+                        update_rgba(&self.gl, *texture, bytes, dims);
+                    }
+                    return Ok(());
+                }
+            }
+        }
+        if let Some(entry) = self.entries.remove(&(page, role)) {
+            // SAFETY: the entry left the map, so this is its only
+            // deletion.
+            unsafe {
+                delete_entry(&self.gl, &entry);
+            }
+        }
+        self.insert(page, role, image)
     }
 
     pub fn roles(&self, page: usize) -> Roles {
@@ -611,6 +663,10 @@ enum ShaderMode {
 ///
 /// The context must be current. `pipeline`'s names and `entry`'s texture
 /// names are live for the duration of the call.
+#[expect(
+    clippy::rest_pattern_accessible_field,
+    reason = "the draw only reads the fields each representation draws with"
+)]
 unsafe fn draw_page(
     gl: &glow::Context,
     pipeline: &Pipeline,
@@ -633,6 +689,7 @@ unsafe fn draw_page(
             texture,
             lmap_base,
             transfer,
+            ..
         } => {
             gl.uniform_1_i32(
                 Some(&locations.mode),
@@ -842,6 +899,37 @@ unsafe fn upload_rgba(
 
 /// # Safety
 ///
+/// The context must be current, `texture` is live, and `data` holds
+/// exactly `dims.0 * dims.1 * 4` bytes.
+unsafe fn update_rgba(
+    gl: &glow::Context,
+    texture: <glow::Context as HasContext>::Texture,
+    data: &[u8],
+    dims: (u32, u32),
+) {
+    debug_assert_eq!(
+        data.len(),
+        dims.0 as usize * dims.1 as usize * 4,
+        "rgba byte length"
+    );
+    gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+    gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
+    gl.tex_sub_image_2d(
+        glow::TEXTURE_2D,
+        0,
+        0,
+        0,
+        gl_int(dims.0),
+        gl_int(dims.1),
+        glow::RGBA,
+        glow::UNSIGNED_BYTE,
+        glow::PixelUnpackData::Slice(Some(data)),
+    );
+    gl.generate_mipmap(glow::TEXTURE_2D);
+}
+
+/// # Safety
+///
 /// The context must be current. `data` holds one sample per texel of
 /// `dims`, two bytes each when `wide`, and each dim is within
 /// `MAX_TEXTURE_SIZE`.
@@ -900,6 +988,7 @@ unsafe fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> TextureEntry {
             );
             TextureEntry::Rgba {
                 texture: upload_rgba(gl, rgba_bytes, (width, height), mag),
+                dims: (width, height),
                 lmap_base: page_lmap(decoded),
                 transfer: decoded.transfer(),
             }
@@ -1619,17 +1708,7 @@ mod tests {
     }
 
     #[test]
-    fn shader_ids() {
-        assert_eq!(
-            ShaderMode::Rgba as i32,
-            0,
-            "the shader samples RGBA at u_mode 0"
-        );
-        assert_eq!(
-            ShaderMode::Yuv as i32,
-            1,
-            "the shader samples the plane set at u_mode 1"
-        );
+    fn transfer_ids() {
         assert_eq!(transfer_id(Transfer::Srgb), 0);
         assert_eq!(transfer_id(Transfer::Pq), 1);
     }

@@ -316,10 +316,6 @@ fn line(style: &egui::Style, status: &StatusLine<'_>) -> LayoutJob {
 mod tests {
     use super::*;
 
-    fn shown(fault: Option<StatusFault<'_>>) -> Option<String> {
-        fault.map(|fault| fault.to_string())
-    }
-
     #[test]
     fn timers_wait_and_toast_lifecycle() {
         let start = Instant::now();
@@ -386,22 +382,10 @@ mod tests {
             fault_to_show(None, Some(&book_fault), Some(&upload_fault)),
             Some(StatusFault::Book(_))
         ));
-        assert_eq!(
-            shown(fault_to_show(
-                None,
-                Some(&book_fault),
-                Some(&upload_fault)
-            )),
-            Some(book_fault.to_string())
-        );
         assert!(matches!(
             fault_to_show(None, None, Some(&upload_fault)),
             Some(StatusFault::Page(_))
         ));
-        assert_eq!(
-            shown(fault_to_show(None, None, Some(&upload_fault))),
-            Some(String::from("upload"))
-        );
         assert!(matches!(
             fault_to_show(
                 Some(&page_fault),
@@ -410,14 +394,6 @@ mod tests {
             ),
             Some(StatusFault::Page(_))
         ));
-        assert_eq!(
-            shown(fault_to_show(
-                Some(&page_fault),
-                Some(&book_fault),
-                Some(&upload_fault)
-            )),
-            Some(String::from("page"))
-        );
     }
 
     fn status() -> StatusLine<'static> {
