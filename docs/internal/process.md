@@ -1,6 +1,6 @@
 # Processes: one child per book
 
-`cy` is the windowed parent; `cy --worker` is the child that serves one book. `src/parent.rs` and `src/child.rs` are the two modes, `src/book.rs` owns the parent's handle to a child, and `src/protocol.rs` is the wire vocabulary.
+`cy` is the windowed parent; `cy --worker` is the child that serves one book. `src/app.rs` is the parent mode, `src/worker.rs` is the child mode, `src/book.rs` owns the parent's handle to a child, and `src/protocol.rs` is the wire vocabulary.
 
 The boundary follows ownership. The parent owns the window, UI, GL, `App`, the request set, and the texture maps. The child owns its book's `Source`, `Store`, decode, derivation, and archive unpack. A switch kills the old book's process, so its queue dies with it. The child decodes; the UI thread draws. A child crash becomes a book fault.
 
@@ -8,7 +8,7 @@ The boundary follows ownership. The parent owns the window, UI, GL, `App`, the r
 
 - `BookProcess::open` / `PendingBookOpen::{begin, finish}` — spawn and handshake. `begin` must run on the event-loop thread: the child's parent-death signal follows the thread that forked it.
 - `Book::step` / `App::poll_book_updates` — the asynchronous switch and adoption. `Book` owns the lifecycle; `App` keeps the frame.
-- `child::main` — the child's message loop and its single writer.
+- `worker::main` — the child's message loop and its single writer.
 - `BookUpdate` — the only update type the UI thread sees; `ChildMsg` stops at the reader thread.
 - `fault.rs` — `PageFault` is text, `BookFault` is the process.
 - `docs/internal/cache.md` — the store, the prefetch, and retention.

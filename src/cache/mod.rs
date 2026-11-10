@@ -3,6 +3,10 @@
 //! file format is described in `docs/internal/cache.md`.
 
 #![expect(
+    clippy::definition_in_module_root,
+    reason = "the cache's store and derivation live in its module root by design"
+)]
+#![expect(
     clippy::little_endian_bytes,
     reason = "the cache file format is defined little-endian"
 )]
@@ -51,6 +55,9 @@ use crate::decode::Subsampling;
 use crate::decode::Transfer;
 use crate::decode::YuvImage;
 use crate::fault::DecodeRefusal;
+
+pub mod prefetch;
+pub mod presentation;
 
 pub const THUMB_EDGE: u32 = 192;
 /// The settled reading image; it must cover the fitted page's long edge in

@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::browse;
 use crate::browse::Direction;
 use crate::browse::ReadingMode;
 use crate::browse::Motion;
@@ -15,8 +16,7 @@ use crate::browse::Roles;
 use crate::browse::ShownSpread;
 use crate::browse::Spread;
 use crate::fault::PageFault;
-use crate::preview::FIT_EDGE;
-use crate::geometry;
+use crate::cache::FIT_EDGE;
 
 pub struct FrameInput<'frame> {
     pub target: Spread,
@@ -189,8 +189,8 @@ fn demand_spread(
         return target;
     }
     let next_start =
-        geometry::advance(on_screen.first, direction, mode, len);
-    geometry::spread_for(next_start, mode, len)
+        browse::advance(on_screen.first, direction, mode, len);
+    browse::spread_for(next_start, mode, len)
 }
 
 fn request_roles(
@@ -252,7 +252,7 @@ fn fit_kept(
     mode: ReadingMode,
     len: PageCount,
 ) -> bool {
-    let start = geometry::spread_for(page, mode, len).first;
+    let start = browse::spread_for(page, mode, len).first;
     start.abs_diff(on_screen.first) <= FIT_KEEP_SPREADS
         || start.abs_diff(target.first) <= FIT_KEEP_SPREADS
 }
@@ -284,7 +284,7 @@ fn choose_presented(
     });
     let mut best: Option<Spread> = None;
     for &page in cached.keys() {
-        let spread = geometry::spread_for(page, mode, len);
+        let spread = browse::spread_for(page, mode, len);
         if spread.first < low
             || spread.first > high
             || !presentable(spread)

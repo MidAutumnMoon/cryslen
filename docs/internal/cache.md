@@ -1,6 +1,6 @@
 # Cache: representations, prefetch, store
 
-Reference for `src/preview.rs`, `src/prefetch.rs`, `src/worker.rs`, `src/presentation.rs`, and `src/render.rs`. Process ownership and transport are in `docs/internal/process.md`.
+Reference for `src/cache/` (store, prefetch, presentation), `src/worker.rs`, and `src/render.rs`. Process ownership and transport are in `docs/internal/process.md`.
 
 ## Direction
 
@@ -14,7 +14,7 @@ The parent holds `BookView` and the GPU textures. The child holds one book's sou
 
 `$TMPDIR/cryslen-cache/{thumb,view}/<xxh3-128 of the encoded page bytes>`. Content addressing gives free invalidation and shares pages across books. Every child opens the same tree, so switches keep its entries. The `view` namespace stores the fit role; the name is kept for existing entries.
 
-The format is defined in `preview.rs`: little-endian, versioned, with the target edge in the header. A changed edge is a miss that re-derives; a corrupt file is a miss. Writes are atomic (`<hash>.<pid>.tmp` then rename), and `Store::open` sweeps temps left by dead writers.
+The format is defined in `cache/mod.rs`: little-endian, versioned, with the target edge in the header. A changed edge is a miss that re-derives; a corrupt file is a miss. Writes are atomic (`<hash>.<pid>.tmp` then rename), and `Store::open` sweeps temps left by dead writers.
 
 Entry identity is the format version, page hash, role, and target edge; the resampling kernel is outside it, so cached entries keep their look until pruned.
 

@@ -1,6 +1,6 @@
 # Rendering: Wayland, GL, egui
 
-Reference for `src/render.rs`, `src/window.rs`, and the frame loop in `src/app.rs`. The stack is winit + glutin + glow + egui_glow, wired by hand: winit owns the window and events, glutin binds EGL, glow calls GL, egui-winit feeds events, and egui_glow paints egui. That wiring keeps page textures outside egui's paint list and the repaint policy local. `Cargo.toml` sets `default-features = false` and enables `wayland` on the GUI crates, keeping the dependency tree Wayland-only. Role policy and retention are in `docs/internal/cache.md`.
+Reference for `src/render.rs` and the frame loop in `src/app.rs`. The stack is winit + glutin + glow + egui_glow, wired by hand: winit owns the window and events, glutin binds EGL, glow calls GL, egui-winit feeds events, and egui_glow paints egui. That wiring keeps page textures outside egui's paint list and the repaint policy local. `Cargo.toml` sets `default-features = false` and enables `wayland` on the GUI crates, keeping the dependency tree Wayland-only. Role policy and retention are in `docs/internal/cache.md`.
 
 ## Frame loop
 
@@ -29,4 +29,4 @@ A seat rect is in page pixels and a texture's UV spans the page; `PageTextures::
 
 ## Uploads
 
-An upload costs one texture per plane plus mipmaps. Decoded images queue in the app and drain under a per-frame budget; a non-empty queue re-arms. `PageTextures::insert` keeps a present entry, adds a new texture, and refuses an oversize page as a `TextureFault`; `retain` applies `presentation::Frame::retains` and owns removal. A seat draws full, then fit, then thumb; `clear_all` runs on a book switch. A retained page is a texture hit.
+An upload costs one texture per plane plus mipmaps. Decoded images queue in the app and drain under a per-frame budget; a non-empty queue re-arms. `PageTextures::insert` keeps a present entry, adds a new texture, and refuses an oversize page as a `TextureFault`; `retain` applies `cache::presentation::Frame::retains` and owns removal. A seat draws full, then fit, then thumb; `clear_all` runs on a book switch. A retained page is a texture hit.

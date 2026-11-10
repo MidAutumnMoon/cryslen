@@ -1,8 +1,13 @@
-//! App: winit event handling, state transitions, frame composition.
+//! App: the windowed parent process. Parses the command line, runs the
+//! event loop, owns the reading state and input, and composes frames.
 
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
+use std::ffi::OsString;
+use std::path::Path;
+use std::path::PathBuf;
+use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -22,34 +27,36 @@ use winit::window::WindowId;
 use crate::book::Book;
 use crate::book::BookChange;
 use crate::book::BookControl;
-use crate::book::BookUpdate;
 use crate::book::BookProcess;
+use crate::book::BookUpdate;
 use crate::book::BookView;
 use crate::book::Delivery;
 use crate::book::Wake;
-use crate::decode;
-use crate::fault::PageFault;
-use crate::keys::Action;
+use crate::browse;
 use crate::browse::Direction;
-use crate::browse::ReadingMode;
 use crate::browse::Motion;
 use crate::browse::PageInfo;
+use crate::browse::ReadingMode;
 use crate::browse::ReadingPosition;
 use crate::browse::Request;
 use crate::browse::Role;
 use crate::browse::Roles;
 use crate::browse::Spread;
-use crate::presentation;
-use crate::presentation::FrameInput;
-use crate::protocol::ParentMsg;
-use crate::render::PageTextures;
-use crate::ui;
-use crate::ui::PageStatus;
-use crate::ui::StatusLine;
+use crate::cache::presentation;
+use crate::cache::presentation::FrameInput;
+use crate::catalog;
+use crate::decode;
+use crate::fault;
+use crate::fault::PageFault;
 use crate::geometry;
 use crate::geometry::FitMode;
 use crate::geometry::Viewport;
-use crate::window::Window;
+use crate::protocol::ParentMsg;
+use crate::render::PageTextures;
+use crate::render::Window;
+use crate::ui;
+use crate::ui::PageStatus;
+use crate::ui::StatusLine;
 
 pub enum WakeEvent {
     /// Arms a wake; `new_events` requests the redraw at the deadline.
@@ -136,7 +143,7 @@ impl Reading {
         index: usize,
     ) -> (Self, Vec<Request>) {
         let cold = presentation::cold_requests(
-            geometry::spread_for(index, mode, view.len()),
+            browse::spread_for(index, mode, view.len()),
             mode,
         );
         let reading = Self {
@@ -254,7 +261,7 @@ impl App {
     }
 
     fn target_spread(&self) -> Spread {
-        geometry::spread_for(
+        browse::spread_for(
             self.reading.position.target(),
             self.mode,
             self.book.view().len(),
@@ -279,7 +286,7 @@ impl App {
         let now = Instant::now();
 
         let len = self.book.view().len();
-        let target = geometry::spread_for(
+        let target = browse::spread_for(
             self.reading.position.target(),
             self.mode,
             len,
@@ -668,7 +675,7 @@ impl App {
                         );
                     }
                 }
-                let switch = geometry::switch_mode(
+                let switch = browse::switch_mode(
                     self.mode,
                     mode,
                     self.reading.position.target(),
@@ -706,9 +713,9 @@ impl App {
             Action::First | Action::Last => {
                 let first = matches!(action, Action::First);
                 let index = if first {
-                    geometry::first_spread()
+                    browse::first_spread()
                 } else {
-                    geometry::last_spread(self.mode, self.book.view().len())
+                    browse::last_spread(self.mode, self.book.view().len())
                 };
                 self.reading.position.set_target(index);
                 let direction = if first {
@@ -731,7 +738,7 @@ impl App {
                 let Some(direction) = action.direction(self.mode) else {
                     return;
                 };
-                let next = geometry::advance(
+                let next = browse::advance(
                     self.reading.position.target(),
                     direction,
                     self.mode,
@@ -749,7 +756,7 @@ impl App {
         match change {
             BookChange::None => {}
             BookChange::Adopted => {
-                let index = geometry::first_spread();
+                let index = browse::first_spread();
                 self.reading =
                     Reading::start(&self.book, self.mode, index);
                 self.fit.refit();
@@ -1171,5 +1178,373 @@ mod tests {
         assert_eq!(wheel_lines(40.0, 1.0), 1.0);
         assert_eq!(wheel_lines(80.0, 2.0), 1.0);
         assert_eq!(wheel_lines(40.0, 2.0), 0.5);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    Quit,
+    /// Leave fullscreen when fullscreen, quit otherwise.
+    Escape,
+    SelectMode(ReadingMode),
+    ToggleFullscreen,
+    ResetView,
+    SelectFit(FitMode),
+    /// The book's first spread.
+    First,
+    /// The book's last spread.
+    Last,
+    /// The next sibling book in the parent directory.
+    NextBook,
+    /// The previous sibling book in the parent directory.
+    PrevBook,
+    /// Page one spread toward the screen right.
+    Right,
+    /// Page one spread toward the screen left.
+    Left,
+    /// Page one spread forward in reading order.
+    Forward,
+    /// Page one spread backward in reading order.
+    Back,
+}
+
+impl Action {
+    /// Bindings answer only to bare keys, `Shift+Space` and `Shift+B`
+    /// excepted; every other modifier combo (anything the desktop owns)
+    /// stays with the desktop.
+    #[expect(
+        clippy::wildcard_enum_match_arm,
+        reason = "winit's unmapped KeyCode variants map to no action"
+    )]
+    pub fn from_key(
+        code: KeyCode,
+        modifiers: ModifiersState,
+    ) -> Option<Self> {
+        let bare_shift = modifiers.shift_key()
+            && !modifiers.control_key()
+            && !modifiers.alt_key()
+            && !modifiers.super_key();
+        if bare_shift {
+            return match code {
+                KeyCode::Space => Some(Self::Back),
+                KeyCode::KeyB => Some(Self::PrevBook),
+                _ => None,
+            };
+        }
+        if !modifiers.is_empty() {
+            return None;
+        }
+        #[expect(
+            clippy::wildcard_enum_match_arm,
+            reason = "winit's unmapped KeyCode variants map to no action"
+        )]
+        match code {
+            KeyCode::KeyQ => Some(Self::Quit),
+            KeyCode::Escape => Some(Self::Escape),
+            KeyCode::KeyN => Some(Self::SelectMode(ReadingMode::Normal)),
+            KeyCode::KeyM => Some(Self::SelectMode(ReadingMode::Manga)),
+            KeyCode::KeyC => Some(Self::SelectMode(ReadingMode::Comic)),
+            KeyCode::KeyF => Some(Self::ToggleFullscreen),
+            KeyCode::KeyR => Some(Self::ResetView),
+            KeyCode::KeyW => Some(Self::SelectFit(FitMode::Width)),
+            KeyCode::KeyH => Some(Self::SelectFit(FitMode::Height)),
+            KeyCode::Digit1 => Some(Self::SelectFit(FitMode::Actual)),
+            KeyCode::KeyB => Some(Self::NextBook),
+            KeyCode::Home => Some(Self::First),
+            KeyCode::End => Some(Self::Last),
+            KeyCode::ArrowRight => Some(Self::Right),
+            KeyCode::ArrowLeft => Some(Self::Left),
+            KeyCode::Space | KeyCode::PageDown => Some(Self::Forward),
+            KeyCode::PageUp => Some(Self::Back),
+            _ => None,
+        }
+    }
+
+    /// Whether a held key keeps firing this action.
+    pub fn repeats(self) -> bool {
+        matches!(
+            self,
+            Self::Right | Self::Left | Self::Forward | Self::Back
+        )
+    }
+
+    /// The reading direction this action advances in `mode`, if it turns
+    /// pages. Manga flips the arrows (Left advances). The reading-order
+    /// keys never flip.
+    pub fn direction(self, mode: ReadingMode) -> Option<Direction> {
+        match self {
+            Self::Forward => Some(Direction::Forward),
+            Self::Right => Some(if mode.rtl() {
+                Direction::Backward
+            } else {
+                Direction::Forward
+            }),
+            Self::Left => Some(if mode.rtl() {
+                Direction::Forward
+            } else {
+                Direction::Backward
+            }),
+            Self::Back => Some(Direction::Backward),
+            Self::Quit
+            | Self::Escape
+            | Self::SelectMode(_)
+            | Self::ToggleFullscreen
+            | Self::ResetView
+            | Self::SelectFit(_)
+            | Self::First
+            | Self::Last
+            | Self::NextBook
+            | Self::PrevBook => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod input_tests {
+    use super::*;
+
+    #[test]
+    fn key_map() {
+        let bindings: &[(KeyCode, Option<Action>)] = &[
+            (KeyCode::Escape, Some(Action::Escape)),
+            (KeyCode::KeyQ, Some(Action::Quit)),
+            (KeyCode::KeyN, Some(Action::SelectMode(ReadingMode::Normal))),
+            (KeyCode::KeyM, Some(Action::SelectMode(ReadingMode::Manga))),
+            (KeyCode::KeyC, Some(Action::SelectMode(ReadingMode::Comic))),
+            (KeyCode::KeyF, Some(Action::ToggleFullscreen)),
+            (KeyCode::KeyR, Some(Action::ResetView)),
+            (KeyCode::KeyW, Some(Action::SelectFit(FitMode::Width))),
+            (KeyCode::KeyH, Some(Action::SelectFit(FitMode::Height))),
+            (KeyCode::Digit1, Some(Action::SelectFit(FitMode::Actual))),
+            (KeyCode::KeyB, Some(Action::NextBook)),
+            (KeyCode::ShiftLeft, None), // the Shift+Space pairing lives on Space
+            (KeyCode::Home, Some(Action::First)),
+            (KeyCode::End, Some(Action::Last)),
+            (KeyCode::ArrowRight, Some(Action::Right)),
+            (KeyCode::ArrowLeft, Some(Action::Left)),
+            (KeyCode::Space, Some(Action::Forward)),
+            (KeyCode::PageDown, Some(Action::Forward)),
+            (KeyCode::PageUp, Some(Action::Back)),
+            (KeyCode::KeyA, None),
+            (KeyCode::KeyD, None),
+            (KeyCode::ArrowUp, None),
+        ];
+        for (code, action) in bindings {
+            assert_eq!(
+                Action::from_key(*code, ModifiersState::empty()),
+                *action,
+                "{code:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn modifier_interactions() {
+        let bindings: &[(KeyCode, ModifiersState, Option<Action>)] = &[
+            (KeyCode::Space, ModifiersState::SHIFT, Some(Action::Back)),
+            (KeyCode::KeyB, ModifiersState::SHIFT, Some(Action::PrevBook)),
+            (KeyCode::KeyQ, ModifiersState::CONTROL, None),
+            (KeyCode::KeyQ, ModifiersState::SUPER, None),
+            (KeyCode::KeyC, ModifiersState::CONTROL, None),
+            (KeyCode::Space, ModifiersState::CONTROL, None),
+            (KeyCode::ArrowRight, ModifiersState::ALT, None),
+            (
+                KeyCode::Space,
+                ModifiersState::SHIFT | ModifiersState::CONTROL,
+                None,
+            ),
+            (KeyCode::PageDown, ModifiersState::SHIFT, None),
+            (KeyCode::PageUp, ModifiersState::SHIFT, None),
+        ];
+        for (code, modifiers, action) in bindings {
+            assert_eq!(
+                Action::from_key(*code, *modifiers),
+                *action,
+                "{code:?} {modifiers:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn action_semantics() {
+        assert!(Action::Right.repeats());
+        assert!(Action::Left.repeats());
+        assert!(Action::Forward.repeats());
+        assert!(Action::Back.repeats());
+        let one_shot = [
+            Action::Quit,
+            Action::Escape,
+            Action::SelectMode(ReadingMode::Normal),
+            Action::SelectMode(ReadingMode::Manga),
+            Action::SelectMode(ReadingMode::Comic),
+            Action::ToggleFullscreen,
+            Action::ResetView,
+            Action::SelectFit(FitMode::Page),
+            Action::SelectFit(FitMode::Width),
+            Action::SelectFit(FitMode::Height),
+            Action::SelectFit(FitMode::Actual),
+            Action::First,
+            Action::Last,
+            Action::NextBook,
+            Action::PrevBook,
+        ];
+        for action in one_shot {
+            assert!(!action.repeats(), "{action:?} is one-shot");
+        }
+        let forwards: &[(Action, ReadingMode, Direction)] = &[
+            (Action::Right, ReadingMode::Normal, Direction::Forward),
+            (Action::Left, ReadingMode::Normal, Direction::Backward),
+            (Action::Forward, ReadingMode::Normal, Direction::Forward),
+            (Action::Back, ReadingMode::Normal, Direction::Backward),
+            (Action::Right, ReadingMode::Manga, Direction::Backward),
+            (Action::Left, ReadingMode::Manga, Direction::Forward),
+            (Action::Forward, ReadingMode::Manga, Direction::Forward),
+            (Action::Back, ReadingMode::Manga, Direction::Backward),
+            (Action::Right, ReadingMode::Comic, Direction::Forward),
+            (Action::Left, ReadingMode::Comic, Direction::Backward),
+            (Action::Forward, ReadingMode::Comic, Direction::Forward),
+            (Action::Back, ReadingMode::Comic, Direction::Backward),
+        ];
+        for &(action, mode, want) in forwards {
+            assert_eq!(
+                action.direction(mode),
+                Some(want),
+                "{action:?} in {mode:?}"
+            );
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum Argument {
+    Book(PathBuf),
+    Image { dir: PathBuf, name: String },
+}
+
+#[expect(
+    clippy::use_debug,
+    reason = "the fatal exit prints the full error report"
+)]
+pub fn main(args: &[OsString]) -> ExitCode {
+    let Some(argument) = args.get(1) else {
+        eprintln!("usage: cy <dir | archive | image-file>");
+        return ExitCode::from(2);
+    };
+    let open = match classify(Path::new(argument)) {
+        Ok(open) => open,
+        Err(error) => {
+            eprintln!("cy: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (open_path, land_on) = match &open {
+        Argument::Book(path) => (path.as_path(), None),
+        Argument::Image { dir, name } => {
+            (dir.as_path(), Some(name.as_str()))
+        }
+    };
+
+    match run(open_path, land_on) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            // `RUST_BACKTRACE` arms the backtrace in the Debug report.
+            eprintln!("cy: {error:?}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn classify(path: &Path) -> Result<Argument, fault::OpenRefusal> {
+    let Some(name) = path.file_name() else {
+        return Ok(Argument::Book(path.to_path_buf()));
+    };
+    if !path.is_file() || catalog::is_archive(path) {
+        return Ok(Argument::Book(path.to_path_buf()));
+    }
+    let name = name.to_string_lossy().into_owned();
+    if decode::format_from_name(&name).is_none() {
+        return Err(fault::OpenRefusal::Unsupported(path.to_path_buf()));
+    }
+    // Path::parent() yields Some("") for bare relative names ("pic.jpg").
+    let dir = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    Ok(Argument::Image {
+        dir: dir.to_path_buf(),
+        name,
+    })
+}
+
+fn run(open_path: &Path, land_on: Option<&str>) -> eros::Result<()> {
+    use egui_winit::winit::event_loop::EventLoop;
+
+    // The loop exists before the first open, so the book's reader thread
+    // can wake it like any later book's does.
+    let event_loop = EventLoop::<WakeEvent>::with_user_event().build()?;
+    let wake: Wake = {
+        let proxy = event_loop.create_proxy();
+        Arc::new(move || post(&proxy, WakeEvent::Wake))
+    };
+    // The initial open is the one blocking open; every switch after it
+    // runs off the event loop.
+    let (view, process) = BookProcess::open(open_path, wake)?;
+    let index = land_on.map_or(0, |name| {
+        // Every page index below `len` has a name, so the indices survive
+        // the filter.
+        catalog::landing(
+            (0..view.len().get()).filter_map(|page| view.name(page)),
+            name,
+        )
+    });
+
+    let mut app =
+        App::new(view, process, index, event_loop.create_proxy());
+    event_loop.run_app(&mut app)?;
+    if let Some(error) = app.take_fatal_error() {
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod argv_tests {
+    use super::*;
+    use crate::testkit::TempDir;
+
+    #[test]
+    fn classify_argument_kinds() {
+        // classify never reads the content, only the extension.
+        let dir = TempDir::new("parent-arg");
+        dir.write("page.png", b"x");
+        dir.write("book.cbz", b"not really a zip");
+        dir.write("notes.txt", b"not a page");
+
+        let rows = [
+            (
+                dir.path().join("page.png"),
+                Ok(Argument::Image {
+                    dir: dir.path().to_path_buf(),
+                    name: String::from("page.png"),
+                }),
+            ),
+            (
+                dir.path().join("book.cbz"),
+                Ok(Argument::Book(dir.path().join("book.cbz"))),
+            ),
+            (
+                dir.path().to_path_buf(),
+                Ok(Argument::Book(dir.path().to_path_buf())),
+            ),
+            (
+                dir.path().join("notes.txt"),
+                Err(fault::OpenRefusal::Unsupported(
+                    dir.path().join("notes.txt"),
+                )),
+            ),
+        ];
+        for (path, expected) in rows {
+            assert_eq!(classify(&path), expected, "{}", path.display());
+        }
     }
 }

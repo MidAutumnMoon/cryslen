@@ -1,10 +1,15 @@
-//! Decode worker: serves the app's [`Request`]s and fills the preview
-//! store from the prefetch. Nothing decoded survives here.
+//! Decode worker: the per-book child process. It owns the book's source,
+//! decode loop, and preview store; the parent starts it as `cy --worker`
+//! and talks to it over [`protocol`]. Nothing decoded survives here.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::panic;
 use std::panic::AssertUnwindSafe;
+use std::path::Path;
+use std::process::ExitCode;
 use std::sync::mpsc;
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::Arc;
@@ -14,11 +19,15 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 use std::time::Instant;
 
-#[cfg(test)]
-use std::path::Path;
-
+use crossbeam_channel::Receiver;
 use eros::ErrorUnion;
+use ipc_channel::ipc;
+use ipc_channel::ipc::IpcSender;
+use nix::sys::prctl;
+use nix::sys::signal::Signal;
+use nix::unistd::getppid;
 
+use crate::browse::spread_for;
 use crate::browse::Motion;
 use crate::browse::Request;
 use crate::browse::Role;
@@ -27,11 +36,17 @@ use crate::decode;
 use crate::decode::Decoded;
 use crate::fault::BadIndex;
 use crate::fault::PageError;
+use crate::fault::PageFault;
 use crate::fault::PanicFault;
 use crate::fault::SpawnError;
-use crate::prefetch::Prefetch;
-use crate::preview;
-use crate::preview::Store;
+use crate::cache;
+use crate::cache::prefetch::Prefetch;
+use crate::cache::Store;
+use crate::protocol::BookInfo;
+use crate::protocol::ChildMsg;
+use crate::protocol::Hello;
+use crate::protocol::ParentMsg;
+use crate::protocol::WireImage;
 use crate::source::PageRead;
 use crate::source::Source;
 
@@ -224,7 +239,7 @@ impl Session {
         *self
             .hashes
             .entry(page)
-            .or_insert_with(|| preview::content_hash(bytes))
+            .or_insert_with(|| cache::content_hash(bytes))
     }
 
     /// Hand one role to the app and mark it served for the current set.
@@ -347,7 +362,7 @@ impl Session {
             );
             if roles.contains(Role::Fit) && view.is_none() {
                 let started = Instant::now();
-                let derived = preview::derive(&native, Role::Fit);
+                let derived = cache::derive(&native, Role::Fit);
                 tracing::debug!(
                     page,
                     elapsed = ?started.elapsed(),
@@ -359,7 +374,7 @@ impl Session {
             if roles.contains(Role::Thumb) && thumb.is_none() {
                 let started = Instant::now();
                 let from = view.as_ref().unwrap_or(&native);
-                let derived = preview::derive(from, Role::Thumb);
+                let derived = cache::derive(from, Role::Thumb);
                 tracing::debug!(
                     page,
                     elapsed = ?started.elapsed(),
@@ -584,6 +599,226 @@ fn decode_page(
     }
 }
 
+/// Messages a producer may queue for the writer. Small because the
+/// parent consumes at frame pace; this bounds updates awaiting
+/// conversion, while the request set bounds images in flight.
+const WRITER_QUEUE_DEPTH: usize = 2;
+
+fn into_message(update: Update) -> ChildMsg {
+    match update {
+        Update::Ready { page, role, image } => ChildMsg::Ready {
+            page,
+            role,
+            image: WireImage::from_decoded(&image),
+        },
+        Update::Failed { page, error } => ChildMsg::Failed {
+            page,
+            fault: PageFault::from(error),
+        },
+        Update::Unpacked => ChildMsg::Unpacked,
+        Update::Fatal(summary) => ChildMsg::Fatal(summary),
+    }
+}
+
+/// Whether this message ends the writer's run.
+fn last(update: &Update) -> bool {
+    matches!(update, Update::Fatal(_))
+}
+
+pub fn main(args: &[OsString]) -> ExitCode {
+    let Some((server, path)) = parse(args) else {
+        tracing::error!(
+            "--worker needs an ipc server name and a book path"
+        );
+        return ExitCode::FAILURE;
+    };
+    // The kernel kills this process with SIGKILL once the parent dies, so a
+    // parent crash ends the decode.
+    if let Err(error) = prctl::set_pdeathsig(Signal::SIGKILL) {
+        tracing::error!(?error, "could not arm the parent-death signal");
+        return ExitCode::FAILURE;
+    }
+    // The parent may have died before the signal was armed; exit.
+    if getppid().as_raw() == 1 {
+        tracing::warn!("the parent already exited");
+        return ExitCode::FAILURE;
+    }
+
+    let Some(server_name) = server.to_str() else {
+        tracing::error!("the ipc server name is not utf-8");
+        return ExitCode::FAILURE;
+    };
+    let (child_tx, child_rx) = match ipc::channel::<ChildMsg>() {
+        Ok(channels) => channels,
+        Err(error) => {
+            tracing::error!(?error, "could not create the child channel");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (parent_tx, parent_rx) = match ipc::channel::<ParentMsg>() {
+        Ok(channels) => channels,
+        Err(error) => {
+            tracing::error!(?error, "could not create the parent channel");
+            return ExitCode::FAILURE;
+        }
+    };
+    let hello = match IpcSender::<Hello>::connect(server_name.to_owned()) {
+        Ok(hello) => hello,
+        Err(error) => {
+            tracing::error!(?error, "could not connect to the parent");
+            return ExitCode::FAILURE;
+        }
+    };
+    if hello.send((child_rx, parent_tx)).is_err() {
+        tracing::error!("could not hand the channels to the parent");
+        return ExitCode::FAILURE;
+    }
+
+    let opened = match Source::open(path) {
+        Ok(source) => source,
+        Err(error) => {
+            tracing::warn!(?error, "book open refused");
+            if child_tx
+                .send(ChildMsg::OpenFailed(error.to_string()))
+                .is_err()
+            {
+                tracing::warn!("the parent left before the open verdict");
+            }
+            return ExitCode::FAILURE;
+        }
+    };
+    let info = BookInfo {
+        names: opened.names().to_vec(),
+        unpacking: opened.unpacking(),
+    };
+    if child_tx.send(ChildMsg::BookInfo(info)).is_err() {
+        tracing::warn!("the parent left before the book info");
+        return ExitCode::FAILURE;
+    }
+
+    // One thread owns the child's only `IpcSender`, so messages reach the
+    // parent in the order they were queued.
+    let (to_parent_tx, to_parent_rx) =
+        crossbeam_channel::bounded::<Update>(WRITER_QUEUE_DEPTH);
+    let writer = match thread::Builder::new()
+        .name("cy-writer".into())
+        .spawn(move || write(&child_tx, &to_parent_rx))
+    {
+        Ok(writer) => writer,
+        Err(error) => {
+            tracing::error!(?error, "could not start the writer thread");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let len = opened.len();
+    let source = Arc::new(opened);
+    let mut worker: Option<Worker> = None;
+    let mut worker_failed = false;
+    while let Ok(message) = parent_rx.recv() {
+        match message {
+            ParentMsg::SetView {
+                page,
+                mode,
+                direction,
+            } => {
+                let prefetch = Prefetch::build(
+                    spread_for(page, mode, len),
+                    direction,
+                    mode,
+                    len,
+                );
+                if let Some(running) = worker.as_ref() {
+                    running.set_prefetch(prefetch);
+                } else {
+                    let queue = to_parent_tx.clone();
+                    let notify = move |event| {
+                        // A disconnected queue only means the writer
+                        // already left, so the update has no reader.
+                        let Ok(()) = queue.send(event) else {
+                            return;
+                        };
+                    };
+                    match Worker::spawn(Arc::clone(&source), prefetch, notify)
+                    {
+                        Ok(spawned) => worker = Some(spawned),
+                        Err(error) => {
+                            tracing::error!(
+                                ?error,
+                                "could not start the decode worker"
+                            );
+                            if to_parent_tx
+                                .send(Update::Fatal(error.to_string()))
+                                .is_err()
+                            {
+                                tracing::debug!(
+                                    "the writer already exited"
+                                );
+                            }
+                            worker_failed = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            ParentMsg::SetMotion(motion) => {
+                if let Some(running) = worker.as_ref() {
+                    running.set_motion(motion);
+                }
+            }
+            ParentMsg::SetRequests(requests) => {
+                // The parent always sends its first view before any
+                // request, so a request without a worker has no prefetch to
+                // serve.
+                if let Some(running) = worker.as_ref() {
+                    running.set_requests(requests);
+                } else {
+                    tracing::debug!(
+                        "requests arrived before the first view"
+                    );
+                }
+            }
+        }
+    }
+    if let Some(mut running) = worker {
+        // The parent is switching or quitting; waiting out an in-flight
+        // decode would only delay the exit.
+        running.detach();
+    }
+    if worker_failed {
+        // The writer delivers the verdict before the process goes away.
+        if writer.join().is_err() {
+            tracing::warn!("the writer thread panicked");
+        }
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
+}
+
+fn parse(args: &[OsString]) -> Option<(&OsStr, &Path)> {
+    let [_program, flag, server, path] = args else {
+        return None;
+    };
+    if flag.as_os_str() != OsStr::new("--worker") {
+        return None;
+    }
+    Some((server.as_os_str(), Path::new(path)))
+}
+
+/// Serialize updates onto the parent channel until a fatal verdict
+/// ends the run.
+fn write(child_tx: &IpcSender<ChildMsg>, queue: &Receiver<Update>) {
+    while let Ok(update) = queue.recv() {
+        let last = last(&update);
+        let Ok(()) = child_tx.send(into_message(update)) else {
+            return;
+        };
+        if last {
+            return;
+        }
+    }
+}
+
 #[cfg(test)]
 #[expect(
     clippy::expect_used,
@@ -594,7 +829,7 @@ mod tests {
     use super::*;
     use crate::fault::DecodeRefusal;
     use crate::browse::Direction;
-    use crate::preview::Store;
+    use crate::cache::Store;
     use crate::testkit::eventually;
     use crate::testkit::tiny_png;
     use crate::testkit::TempDir;
@@ -641,7 +876,7 @@ mod tests {
     /// The worker's content hash for one page of a directory source.
     fn page_hash(source: &Source, page: usize) -> u128 {
         match source.bytes(page) {
-            PageRead::Ready(bytes) => preview::content_hash(&bytes),
+            PageRead::Ready(bytes) => cache::content_hash(&bytes),
             PageRead::NotYet | PageRead::Failed(_) => {
                 panic!("page {page} did not read")
             }
@@ -808,10 +1043,10 @@ mod tests {
             .ready("the target never delivered a fit image", |page, role| {
                 page == 0 && is_fit(role)
             });
-        assert_eq!(long_edge(&thumb), preview::THUMB_EDGE);
+        assert_eq!(long_edge(&thumb), cache::THUMB_EDGE);
         assert_eq!(
             long_edge(&view),
-            preview::FIT_EDGE.min(BIG),
+            cache::FIT_EDGE.min(BIG),
             "the fit image's long edge matches the target edge"
         );
 
@@ -1022,10 +1257,10 @@ mod tests {
             .ready("the first session never delivered a fit image", |page, role| {
                 page == 0 && is_fit(role)
             });
-        assert_eq!(long_edge(&thumb), preview::THUMB_EDGE);
+        assert_eq!(long_edge(&thumb), cache::THUMB_EDGE);
         assert_eq!(
             long_edge(&view),
-            preview::FIT_EDGE.min(BIG),
+            cache::FIT_EDGE.min(BIG),
             "the fit image's long edge matches the target edge"
         );
         drop(worker);
@@ -1089,3 +1324,4 @@ mod tests {
         assert_eq!((kept.width(), kept.height()), (7, 7));
     }
 }
+

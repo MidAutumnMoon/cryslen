@@ -34,4 +34,4 @@ Reduced-resolution JXL and AVIF, hardware AV1 or JXL for stills, and a pure-Rust
 
 ## Where to look
 
-`worker.rs` owns requests, prefetch scheduling, and the panic boundary; `source.rs` owns archive unpack. Scheduling and retention are in `cache.md`; transport is in `process.md`.
+`worker.rs` is the child process: its message loop, requests, prefetch scheduling, and the panic boundary. `source.rs` owns archive unpack. Scheduling and retention are in `cache.md`; transport is in `process.md`.

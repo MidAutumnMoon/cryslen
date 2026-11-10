@@ -1,10 +1,10 @@
 //! Prefetch planning: which spreads the worker should have ready.
 
+use crate::browse;
 use crate::browse::Direction;
 use crate::browse::ReadingMode;
 use crate::browse::PageCount;
 use crate::browse::Spread;
-use crate::geometry;
 
 pub const AHEAD_PAGES: usize = 512;
 pub const BEHIND_PAGES: usize = 64;
@@ -73,7 +73,7 @@ fn walk(
     let mut spreads = Vec::new();
     let mut current = start;
     loop {
-        let next = geometry::advance(current, direction, mode, len);
+        let next = browse::advance(current, direction, mode, len);
         let forward = direction == Direction::Forward;
         let wrapped = if forward {
             next <= current
@@ -87,7 +87,7 @@ fn walk(
         if distance > limit {
             break;
         }
-        spreads.push(geometry::spread_for(next, mode, len));
+        spreads.push(browse::spread_for(next, mode, len));
         current = next;
     }
     spreads
@@ -114,7 +114,7 @@ mod tests {
     #[test]
     fn single_mode_walks_out_from_the_origin() {
         let book = pages(10);
-        let origin = geometry::spread_for(4, ReadingMode::Normal, book);
+        let origin = browse::spread_for(4, ReadingMode::Normal, book);
         let forward = Prefetch::build(
             origin,
             Direction::Forward,
@@ -139,7 +139,7 @@ mod tests {
     #[test]
     fn the_ends_do_not_wrap() {
         let long_book = pages(1200);
-        let opening = geometry::spread_for(0, ReadingMode::Normal, long_book);
+        let opening = browse::spread_for(0, ReadingMode::Normal, long_book);
         let before = Prefetch::build(
             opening,
             Direction::Backward,
@@ -153,7 +153,7 @@ mod tests {
             .iter()
             .all(|spread| spread.first <= BEHIND_PAGES));
 
-        let closing = geometry::spread_for(1199, ReadingMode::Normal, long_book);
+        let closing = browse::spread_for(1199, ReadingMode::Normal, long_book);
         let after = Prefetch::build(
             closing,
             Direction::Forward,
@@ -168,7 +168,7 @@ mod tests {
             .all(|spread| spread.first >= 1199 - BEHIND_PAGES));
 
         let single = pages(1);
-        let only = geometry::spread_for(0, ReadingMode::Manga, single);
+        let only = browse::spread_for(0, ReadingMode::Manga, single);
         for direction in [Direction::Forward, Direction::Backward] {
             let alone =
                 Prefetch::build(only, direction, ReadingMode::Manga, single);
@@ -180,7 +180,7 @@ mod tests {
     #[test]
     fn bounds_are_respected_and_unique() {
         let book = pages(1200);
-        let origin = geometry::spread_for(600, ReadingMode::Normal, book);
+        let origin = browse::spread_for(600, ReadingMode::Normal, book);
         let prefetch = Prefetch::build(
             origin,
             Direction::Forward,
