@@ -32,9 +32,9 @@ One decode thread per book. Wants come first, grouped per page so one decode ser
 
 A spread is presentable when every seat has a page fact plus a resident texture, or the page failed. Draw the requested spread when presentable; otherwise the nearest presentable start between shown and requested; otherwise the shown spread. Seats use `page_dims`, so pairing survives promotion.
 
-Each frame recomputes wants for the requested and shown spreads from the texture maps: view and thumb while still, thumb while skimming, native for a shown upscaled page. Send the set on change.
+Each frame wants the missing artifacts for the shown spread and a demand spread: the requested spread while still, the next spread in the travel direction while skimming. Still frames want views and thumbs, plus native for a shown upscaled page; skims want thumbs.
 
-Ending a skim commits `shown` into `requested`, so the thumb being looked at promotes in place. `requested` is lookahead for the plan and wants; `shown` is the last spread on screen and carries its mode, so a pairing change cannot commit it. A still turn moves `requested` ahead; a gesture's unseen turns are discarded at exit.
+Ending a skim commits `shown` into `requested`, promoting the looked-at thumb in place. `requested` is the plan's lookahead; `shown` carries its mode, so a pairing change cannot commit it. A still turn moves `requested` ahead; unseen turns are discarded at exit.
 
 Retention is role-bounded: thumbs for the book, views within `VIEW_KEEP_SPREADS` of shown or requested, natives for the shown spread. `kept` covers every want, so an artifact leaves the sent set before retention drops it. Uploads drain on a per-frame budget (`UPLOAD_BUDGET_*`); a backlog re-arms the next frame.
 

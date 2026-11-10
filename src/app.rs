@@ -417,8 +417,16 @@ impl App {
         // the screen resolves.
         let (view_width, view_height) = self.last_viewport.size();
         let measurable = view_width > 0.0 && view_height > 0.0;
-        let wants = wants(
+        let demand = demand_spread(
             requested,
+            shown,
+            self.motion,
+            self.direction,
+            self.mode,
+            self.view.len(),
+        );
+        let wants = wants(
+            demand,
             shown,
             self.mode,
             self.motion == Motion::Still,
@@ -959,11 +967,30 @@ fn native_wanted(scale: f32, page_dims: (u32, u32)) -> bool {
     page_edge > VIEW_EDGE && scale > VIEW_EDGE as f32 / page_edge as f32
 }
 
-/// Every artifact the frame's presentation is missing, in service order:
-/// requested spread, then shown. A still frame wants views and thumbs; a
-/// skim wants thumbs; a native only for a page on screen.
-fn wants(
+/// While skimming, demand the next spread instead of the far requested one:
+/// serving a far pair splits it before both pages arrive.
+fn demand_spread(
     requested: Spread,
+    shown: Spread,
+    motion: Motion,
+    direction: Direction,
+    mode: ViewMode,
+    len: PageCount,
+) -> Spread {
+    if motion == Motion::Still {
+        return requested;
+    }
+    let next_start = view::advance(
+        shown.first,
+        direction == Direction::Forward,
+        mode,
+        len,
+    );
+    view::spread_for(next_start, mode, len)
+}
+
+fn wants(
+    demand: Spread,
     shown: Spread,
     mode: ViewMode,
     still: bool,
@@ -975,7 +1002,7 @@ fn wants(
         has(page, Artifact::View) || has(page, Artifact::Native)
     };
     let mut wants = Vec::new();
-    for spread in [requested, shown] {
+    for spread in [demand, shown] {
         for page in spread.seats(mode).into_iter().flatten() {
             if errored(page) {
                 continue;
