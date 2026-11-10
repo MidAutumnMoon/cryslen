@@ -64,18 +64,7 @@ took 643 ms on the same page.
 
 ### 1. Derivation is the first lever
 
-Replace the hand-written filter with a maintained SIMD resizer
-(`fast_image_resize`), keeping the current contract: a per-artifact kernel (box
-for thumbs, Hamming for views), one call per plane, page dims/format/transfer
-preserved. Box is near-exact and cheapest at thumb ratios; Hamming stays
-closest to the area average at view ratios. The store format does not need a
-version bump because dimensions and format do not change.
-Keep straight-alpha averaging (see `docs/internal/cache.md`).
-
-Target: 4k view derive 90 → ~16 ms, thumb 28 → ~8 ms; 10k view 345 → ~58 ms.
-
-Landed: 3840×2160 view 90 → 12 ms, thumb 28 → 1.2 ms; 10080×5640 view 345 →
-22 ms (release, same machine). A cold 4k page prepared in 80 ms end to end.
+Landed in xvplzwtv: 3840×2160 view 90 → 12 ms, thumb 28 → 1.2 ms; 10080×5640 view 345 → 22 ms (release, same machine). A cold 4k page prepared in 80 ms end to end.
 
 ### 2. Speculative work must not precede delivery
 
