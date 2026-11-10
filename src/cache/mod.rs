@@ -18,6 +18,7 @@ use std::fmt;
 use std::fs;
 use std::fs::File;
 use std::fs::FileTimes;
+use std::fs::TryLockError;
 use std::io;
 use std::io::Read as _;
 use std::io::Write as _;
@@ -26,7 +27,6 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process;
-use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 
@@ -39,9 +39,6 @@ use fast_image_resize::ResizeAlg;
 use fast_image_resize::ResizeError;
 use fast_image_resize::ResizeOptions;
 use fast_image_resize::Resizer;
-use rustix::io::Errno;
-use rustix::process::test_kill_process;
-use rustix::process::Pid;
 use xxhash_rust::xxh3::xxh3_128;
 
 use crate::browse::Role;
@@ -534,14 +531,8 @@ fn is_hash_name(name: &OsStr) -> bool {
     })
 }
 
-/// How long an unchecked temp file may survive. Only a liveness check
-/// that cannot answer (a pid this process may not signal) falls back to
-/// age; a live writer's file stays, however old it is.
-const STALE_TEMP_AGE: Duration = Duration::from_hours(1);
-
-/// Drop temp files whose writer can no longer rename them: a killed child
-/// leaves `<hash:032x>.<pid>.tmp`, and no later writer claims another pid's
-/// name. Other names are left alone.
+/// Drop temp files no writer holds: the kernel releases a dead writer's
+/// lock, so a lock that can be taken proves the temp is unclaimed.
 fn clean_temps(dir: &Path) {
     let Ok(read) = fs::read_dir(dir) else {
         return;
@@ -555,24 +546,28 @@ fn clean_temps(dir: &Path) {
             continue;
         }
         let name = entry.file_name();
-        let Some(pid) = temp_pid(&name) else {
+        if !is_temp_name(&name) {
+            continue;
+        }
+        let path = dir.join(&name);
+        let Ok(file) = File::open(&path) else {
             continue;
         };
-        let stale = match liveness(pid) {
-            Liveness::Alive => false,
-            Liveness::Dead => true,
-            Liveness::Unknown => {
-                metadata.modified().is_ok_and(|modified| {
-                    modified
-                        .elapsed()
-                        .is_ok_and(|age| age >= STALE_TEMP_AGE)
-                })
+        let stale = match file.try_lock() {
+            Ok(()) => true,
+            Err(TryLockError::WouldBlock) => false,
+            Err(TryLockError::Error(error)) => {
+                tracing::debug!(
+                    %error,
+                    path = %path.display(),
+                    "preview temp lock failed"
+                );
+                false
             }
         };
         if !stale {
             continue;
         }
-        let path = entry.path();
         if let Err(error) = fs::remove_file(&path) {
             tracing::debug!(
                 %error,
@@ -592,38 +587,21 @@ fn clean_temps(dir: &Path) {
     }
 }
 
-/// The writer pid of a `<hash:032x>.<pid>.tmp` name.
-fn temp_pid(name: &OsStr) -> Option<Pid> {
-    let name = name.to_str()?;
-    let (hash, rest) = name.split_once('.')?;
-    let (pid, suffix) = rest.split_once('.')?;
-    if suffix != "tmp" || !is_hash_name(OsStr::new(hash)) {
-        return None;
-    }
-    if pid.is_empty() || !pid.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    // A pid the OS can hand out is positive; zero would check a process
-    // group, so `Pid` rejects it.
-    let pid = pid.parse::<i32>().ok()?;
-    Pid::from_raw(pid)
-}
-
-/// What `kill(pid, 0)` can tell about a temp file's writer.
-enum Liveness {
-    Alive,
-    Dead,
-    /// The check itself failed, e.g. a process this one may not signal,
-    /// so liveness must not be concluded either way.
-    Unknown,
-}
-
-fn liveness(pid: Pid) -> Liveness {
-    match test_kill_process(pid) {
-        Ok(()) => Liveness::Alive,
-        Err(Errno::SRCH) => Liveness::Dead,
-        Err(_) => Liveness::Unknown,
-    }
+/// Whether `name` is a writer's temp: `<hash:032x>.<pid>.tmp`.
+fn is_temp_name(name: &OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let Some((hash, rest)) = name.split_once('.') else {
+        return false;
+    };
+    let Some((pid, suffix)) = rest.split_once('.') else {
+        return false;
+    };
+    suffix == "tmp"
+        && is_hash_name(OsStr::new(hash))
+        && !pid.is_empty()
+        && pid.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 /// Create the store's directories, refusing a root that is not a plain
@@ -672,6 +650,9 @@ fn write_atomic(
             .truncate(true)
             .mode(0o600)
             .open(temp)?;
+        // Hold until the rename: clean_temps treats a free lock as a dead
+        // writer.
+        file.lock()?;
         file.write_all(bytes)?;
         fs::rename(temp, final_path)
     })();
@@ -1074,7 +1055,6 @@ fn sample_count(dims: (u32, u32)) -> Option<usize> {
     reason = "a panic in test code is inconsequential"
 )]
 mod tests {
-    use std::fmt;
     use std::time::Duration;
 
     use super::*;
@@ -1220,17 +1200,7 @@ mod tests {
             .expect("set mtime");
     }
 
-    /// A pid no process owns: spawn something that exits at once, reap
-    /// it, and reuse its number.
-    fn dead_pid() -> u32 {
-        let mut child =
-            process::Command::new("true").spawn().expect("spawn");
-        let pid = child.id();
-        child.wait().expect("wait");
-        pid
-    }
-
-    fn temp_name(hash: u128, pid: impl fmt::Display) -> String {
+    fn temp_name(hash: u128, pid: u32) -> String {
         format!("{hash:032x}.{pid}.tmp")
     }
 
@@ -1248,7 +1218,7 @@ mod tests {
     }
 
     #[test]
-    fn open_cleans_dead_writer_temps() {
+    fn open_cleans_unlocked_writer_temps() {
         let dir = TempDir::new("preview-stale-temps");
         let root = dir.path().join("cache");
         let page = rgba_page(2, 2);
@@ -1257,16 +1227,22 @@ mod tests {
         assert!(store.save(hash, Role::Thumb, &page).persisted);
         drop(store);
 
-        let dead = dead_pid();
-        let stale_thumb = root.join("thumb").join(temp_name(hash, dead));
+        // A dead writer leaves its temp unlocked.
+        let stale_pid = 4242;
+        let stale_thumb = root.join("thumb").join(temp_name(hash, stale_pid));
         fs::write(&stale_thumb, b"partial").expect("thumb temp");
-        let stale_view = root.join("view").join(temp_name(hash, dead));
+        let stale_view = root.join("view").join(temp_name(hash, stale_pid));
         fs::write(&stale_view, b"partial").expect("view temp");
 
-        // A live writer owns its temp however old the file is.
-        let live = root.join("thumb").join(temp_name(hash, process::id()));
-        fs::write(&live, b"partial").expect("live temp");
-        set_modified(&live, 0);
+        // A live writer's temp stays while it holds the lock.
+        let live_pid = 4243;
+        let live_temp = root.join("thumb").join(temp_name(hash, live_pid));
+        let locked_temp = File::options()
+            .write(true)
+            .create_new(true)
+            .open(&live_temp)
+            .expect("live temp");
+        locked_temp.lock().expect("lock live temp");
 
         let malformed = [
             "not-a-hash.123.tmp",
@@ -1281,11 +1257,17 @@ mod tests {
         let reopened = Store::at(&root);
         assert!(!stale_thumb.exists());
         assert!(!stale_view.exists());
-        assert!(live.exists());
+        assert!(live_temp.exists());
         for name in malformed {
             assert!(root.join("thumb").join(name).exists(), "{name}");
         }
         assert!(reopened.load(hash, Role::Thumb).is_some());
+
+        // Closing the handle releases the lock, so the next open claims
+        // the temp.
+        drop(locked_temp);
+        Store::at(&root);
+        assert!(!live_temp.exists());
     }
 
     #[test]

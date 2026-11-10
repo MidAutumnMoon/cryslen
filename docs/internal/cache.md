@@ -12,7 +12,7 @@ A decoded image's dimensions can differ from its page's; layout and status use t
 
 `$TMPDIR/cryslen-cache/{thumb,view}/<xxh3-128 of the encoded page bytes>`. Content addressing gives free invalidation and shares pages across books. Every child opens the same tree, so switches keep its entries. The `view` namespace stores the fit role; the name is kept for existing entries.
 
-Entries are little-endian, versioned, and carry the target edge in the header. A changed edge is a miss that re-derives, as is a corrupt file. Writes are atomic (temp file, then rename); opening the store sweeps temps left by dead writers.
+Entries are little-endian, versioned, and carry the target edge in the header. A changed edge is a miss that re-derives, as is a corrupt file. Writes are atomic (temp file, then rename); a writer holds an exclusive lock on its temp until the rename, so opening the store sweeps temps no live writer holds.
 
 Entry identity is the format version, page hash, role, and target edge; the resampling kernel is outside it, so cached entries keep their look until pruned.
 
