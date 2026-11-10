@@ -13,8 +13,6 @@ pub struct PageName {
     pub file: String,
 }
 
-/// The archive family; source opening and argument classification share
-/// this table.
 pub enum ArchiveKind {
     Zip,
     SevenZip,

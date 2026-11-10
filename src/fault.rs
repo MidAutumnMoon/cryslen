@@ -157,9 +157,7 @@ pub type TextureError = ErrorUnion<(TextureFault,)>;
 
 pub type SpawnError = ErrorUnion<(io::Error,)>;
 
-/// A page's failure as the text the status line shows, wherever it was
-/// detected: the parent has no copy of the child's error types, so the
-/// wire carries only the summary.
+/// A page's failure as text; the error types stay in the child.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PageFault {
     summary: String,

@@ -1,6 +1,6 @@
 //! Child process: owns one book's source, worker, and preview store.
-//! The parent starts it as `cy --worker`; it never touches winit or GL,
-//! and learns about the UI only from [`ParentMsg`].
+//! The parent starts it as `cy --worker`; the book is its whole state, and
+//! UI requests arrive as [`ParentMsg`].
 
 use std::ffi::OsStr;
 use std::ffi::OsString;
@@ -33,8 +33,6 @@ use crate::worker::Worker;
 /// conversion, while the want set bounds images in flight.
 const WRITER_QUEUE_DEPTH: usize = 2;
 
-/// One message on its way to the parent, from the worker or the main
-/// thread.
 enum ToParent {
     Event(Event),
     Fatal(String),
@@ -59,7 +57,7 @@ impl ToParent {
         }
     }
 
-    /// Whether nothing follows this message, so the writer can finish.
+    /// Whether this message ends the writer's run.
     fn last(&self) -> bool {
         matches!(self, Self::Fatal(_))
     }
@@ -72,14 +70,13 @@ pub fn main(args: &[OsString]) -> ExitCode {
         );
         return ExitCode::FAILURE;
     };
-    // The kernel kills this process with SIGKILL once the parent dies, so
-    // a parent crash never leaves a decode running.
+    // The kernel kills this process with SIGKILL once the parent dies, so a
+    // parent crash ends the decode.
     if let Err(error) = prctl::set_pdeathsig(Signal::SIGKILL) {
         tracing::error!(?error, "could not arm the parent-death signal");
         return ExitCode::FAILURE;
     }
-    // The parent may have died before the signal was armed, which leaves
-    // nothing to open the book for.
+    // The parent may have died before the signal was armed; exit.
     if getppid().as_raw() == 1 {
         tracing::warn!("the parent already exited");
         return ExitCode::FAILURE;
@@ -234,7 +231,6 @@ pub fn main(args: &[OsString]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// The two arguments the parent passes after `--worker`.
 fn parse(args: &[OsString]) -> Option<(&OsStr, &Path)> {
     let [_program, flag, server, path] = args else {
         return None;

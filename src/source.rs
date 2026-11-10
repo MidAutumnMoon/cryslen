@@ -42,7 +42,8 @@ pub enum PageRead {
 #[derive(Debug)]
 struct Fill {
     pages: HashMap<usize, Result<Arc<[u8]>, Arc<PageError>>>,
-    /// `None` while the pass runs, `Some(Ok(()))` when it ended whole, `Some(Err(reason))` when it ended early.
+    /// `None` while the pass runs, `Some(Ok(()))` when it ended whole,
+    /// `Some(Err(reason))` when it ended early.
     pass: Option<Result<(), Arc<PageError>>>,
 }
 
@@ -61,7 +62,7 @@ impl Fill {
             None => match &self.pass {
                 None => PageRead::NotYet,
                 // Every listed member is inserted by the pass that
-                // ended whole, so a miss names the caller, not the book.
+                // ended whole, so a miss is a caller bug.
                 Some(Ok(())) => {
                     PageRead::Failed(Arc::new(ErrorUnion::new(BadIndex)))
                 }
@@ -85,7 +86,6 @@ pub struct Source {
 }
 
 impl Source {
-    /// Listing is filtered to image extensions and natural-sorted.
     pub fn open(path: &Path) -> Result<Self, OpenError> {
         let metadata = match fs::metadata(path) {
             Ok(metadata) => metadata,
@@ -128,9 +128,8 @@ impl Source {
         Self::from_names(Backend::Directory(dir.to_path_buf()), names)
     }
 
-    /// Listing reads the central directory, so a damaged local header
-    /// does not refuse the whole book: that member fails when the fill
-    /// reaches it.
+    /// Listing reads the central directory, so a damaged local header fails
+    /// only that member when the fill reaches it.
     fn open_zip(path: &Path) -> Result<Self, OpenError> {
         let zip = zip::ZipArchive::new(BufReader::new(
             File::open(path).union()?,
@@ -240,8 +239,8 @@ impl Source {
         }
     }
 
-    /// Whether this source has an unpack pass at all, unlike
-    /// `unpacking()`.
+    /// Whether the source runs an unpack pass; `unpacking()` reports its
+    /// progress.
     pub(crate) fn unpacks(&self) -> bool {
         matches!(self.backend, Backend::Archive(_))
     }
@@ -265,8 +264,8 @@ fn sort_page_names(names: &mut [String]) {
 fn validated_listing(
     listed: Vec<(String, u64)>,
 ) -> Result<(Vec<String>, u64), OpenRefusal> {
-    // Header sizes are claims, so the sum saturates rather than wraps
-    // a liar archive past the guard.
+    // Header sizes are claims; saturating addition keeps the sum within
+    // the guard even for a liar archive.
     let unpacked_bytes: u64 = listed
         .iter()
         .map(|&(_, size)| size)
@@ -332,8 +331,8 @@ fn spawn_zip_fill(
 }
 
 /// Start the unpack thread for one pass body. Dropping the handle
-/// detaches the thread, so quitting never waits on it. A failed spawn
-/// settles the pass, so no page can wait on a thread that never ran.
+/// detaches the thread, so quitting proceeds immediately. A failed spawn
+/// settles the pass with the spawn error, so every page gets a verdict.
 fn spawn_pass(
     fill: &Arc<Mutex<Fill>>,
     body: impl FnOnce(&Arc<Mutex<Fill>>) -> Result<(), PageError>
@@ -377,8 +376,7 @@ fn spawn_sevenzip_fill(
                     }
                     None => {
                         // A solid block yields its later members only
-                        // after this one is consumed, so non-pages are
-                        // drained rather than buffered.
+                        // after this one is consumed, so non-pages are drained.
                         io::copy(data, &mut io::sink())?;
                     }
                 }
@@ -389,7 +387,7 @@ fn spawn_sevenzip_fill(
 }
 
 /// Settle the pass: from here on, an unfilled page answers the pass's
-/// verdict instead of `NotYet`.
+/// verdict.
 fn settle_pass(
     fill: &Arc<Mutex<Fill>>,
     body: impl FnOnce(&Arc<Mutex<Fill>>) -> Result<(), PageError>,
@@ -536,7 +534,7 @@ mod tests {
 
     #[test]
     fn natural_order_compares_digit_runs_by_value() {
-        // Mixed padding widths order by value, not byte-wise.
+        // Mixed padding widths order by numeric value.
         let mut names = vec![
             "9.png".to_owned(),
             "010.png".to_owned(),
@@ -577,7 +575,7 @@ mod tests {
             compare_names("第1話.cbz", "第10話.cbz"),
             Ordering::Less
         );
-        // Code-point order, not pinyin.
+        // Code-point order for non-ASCII text.
         assert_eq!(compare_names("阿", "白"), Ordering::Greater);
         assert_eq!(
             compare_names("06-漫画.jpg", "漫画-06.jpg"),
@@ -983,7 +981,7 @@ mod tests {
             Some(OpenRefusal::Unsupported(_))
         ));
         dir.write("plain.txt", b"not a directory");
-        // A path under a regular file reports io, not NotFound.
+        // A path under a regular file reports io.
         let under_file =
             Source::open(&dir.path().join("plain.txt").join("page.png"))
                 .expect_err("a path under a regular file must fail as io");

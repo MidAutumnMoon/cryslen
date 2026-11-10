@@ -42,7 +42,7 @@ use cryslen::protocol::WirePixels;
 use ipc_channel::ipc::IpcOneShotServer;
 
 /// The page is one solid color, so the decoded pixels prove a real
-/// decode rather than a stub.
+/// decode.
 const PIXEL: [u8; 4] = [0x40, 0x80, 0xc0, 0xff];
 
 /// The page's edge. Small enough that the thumb mint is the page itself.
@@ -81,7 +81,7 @@ impl TempRoot {
 
 impl Drop for TempRoot {
     fn drop(&mut self) {
-        // A failed removal is a leaked scratch dir, never a test failure.
+        // Removal is best-effort; a leaked scratch dir is acceptable.
         let Ok(()) = fs::remove_dir_all(&self.0) else {
             return;
         };
@@ -252,7 +252,7 @@ fn child_serves_a_decoded_thumb() {
         "the child preserved the page's format",
     );
     let WirePixels::Rgba8(bytes) = &image.pixels else {
-        panic!("a png page arrives as rgba, not yuv");
+        panic!("a png page arrived as yuv");
     };
     assert_eq!(
         bytes.len(),

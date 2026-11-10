@@ -66,7 +66,6 @@ pub struct WireImage {
 }
 
 impl WireImage {
-    /// Copy every plane into shared memory.
     pub(crate) fn from_decoded(image: &Decoded) -> Self {
         let pixels = match image.pixels() {
             Pixels::Rgba8(bytes) => {

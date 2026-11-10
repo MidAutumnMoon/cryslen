@@ -58,7 +58,6 @@ pub enum UserEvent {
     Wake,
 }
 
-/// A failed send means the loop is gone, leaving the event with no consumer.
 pub fn post(proxy: &EventLoopProxy<UserEvent>, event: UserEvent) {
     let Ok(()) = proxy.send_event(event) else {
         return;
@@ -79,33 +78,29 @@ impl Drop for Gl {
     }
 }
 
-/// A drained page's own dims and format, not its representation's.
+/// The page's own dims and format, independent of the stored representation.
 #[derive(Clone, Copy)]
 struct CachedPage {
     dims: (u32, u32),
     format: Format,
 }
 
-/// Two presses closer than this are a flip, not a read; a held key flips
-/// by its repeat events.
+/// Two presses closer than this are a flip; a held key flips by its
+/// repeat events.
 const SKIM_GAP: Duration = Duration::from_millis(100);
 
 /// How long after the last navigation a skim becomes a still read.
 const SKIM_DECAY: Duration = Duration::from_millis(250);
 
-/// Per-frame upload budget; one artifact always goes through, so a big
-/// page stalls at most one frame.
+/// One artifact always goes through, so a big page stalls at most one frame.
 const UPLOAD_BUDGET_COUNT: usize = 16;
 const UPLOAD_BUDGET_BYTES: usize = 8 * 1024 * 1024;
 
-/// Spread starts around the shown and requested spreads whose views
-/// stay resident.
 const VIEW_KEEP_SPREADS: usize = 2;
 
 pub struct App {
     /// What the UI shows; it outlives a dead child until a switch lands.
     view: BookView,
-    /// The live child, or `None` once it died or was killed.
     process: Option<BookProcess>,
     /// The one switch in flight; a switch while it runs is ignored.
     pending_open:
@@ -117,24 +112,15 @@ pub struct App {
     fit: view::Fit,
     /// Set only when every seat resolves; frames draw only this.
     presented: Option<Spread>,
-    /// Page facts, written at the first artifact that leaves the queue.
     cached: BTreeMap<usize, CachedPage>,
     /// Page faults, sticky per page so a blip cannot erase them.
     faults: BTreeMap<usize, PageFault>,
-    /// Decoded artifacts waiting for an upload, in arrival order.
     queue: VecDeque<worker::Ready>,
-    /// The page whose texture the GPU last refused, held until a book
-    /// switch; the fault itself lives in `faults`.
     upload_fault_page: Option<usize>,
-    /// Whether the worker produces skim thumbs or full views.
     motion: Motion,
-    /// When the last navigation was dispatched, for the skim window.
     last_nav: Option<Instant>,
-    /// When the still-frame "waiting for a view" hold began, and whether
-    /// it was logged.
     hold_since: Option<Instant>,
     hold_logged: bool,
-    /// The want set last sent to the child.
     sent_wants: Vec<Want>,
     /// Reading direction of the last turn: the child's plan and skim
     /// tie-breaks follow it.
@@ -148,7 +134,6 @@ pub struct App {
     /// Held modifier state; winit 0.30 key events carry none, only
     /// `ModifiersChanged` does.
     modifiers: ModifiersState,
-    /// The viewport the last frame painted into, read by input between frames.
     last_viewport: Viewport,
     /// Wakes the parked loop from egui, timed waits, and book readers,
     /// which all run outside the event loop's handlers.
@@ -205,8 +190,6 @@ impl App {
         }
     }
 
-    /// Store `error` and exit so `main` can report it after `run_app`
-    /// returns.
     fn fail(
         &mut self,
         error: eros::ErrorUnion,
@@ -250,8 +233,6 @@ impl App {
         self.gl.as_ref().is_some_and(|gl| gl.pages.has(page, kind))
     }
 
-    /// The largest representation a seat can draw, for the presentation
-    /// log.
     fn artifact_name(&self, page: Option<usize>) -> &'static str {
         let Some(page) = page else {
             return "empty";
@@ -330,7 +311,6 @@ impl App {
             self.presented = chosen;
             self.fit.commit();
         }
-        // A long still-frame hold is the frozen-page report; log it once.
         if self.motion == Motion::Still && chosen != Some(requested) {
             let since = *self.hold_since.get_or_insert(now);
             let waited = now.saturating_duration_since(since);
@@ -362,9 +342,9 @@ impl App {
                 kept(page, kind, shown, requested, mode, len)
             });
         }
-        // The texture maps are the authority, not the worker's ledger:
-        // recompute the wants each frame and send only changes. A
-        // zero-sized viewport says nothing about what the screen resolves.
+        // The texture maps are the authority: recompute the wants each frame
+        // and send only changes. A zero-sized viewport says nothing about what
+        // the screen resolves.
         let (view_width, view_height) = self.last_viewport.size();
         let measurable = view_width > 0.0 && view_height > 0.0;
         let wants = wants(
@@ -589,7 +569,6 @@ impl App {
         })
     }
 
-    /// One flip starts a skim; every nav opens a fresh decay window.
     fn note_navigation(&mut self, now: Instant, repeat: bool) {
         let gap = self
             .last_nav
@@ -691,13 +670,10 @@ impl App {
                 self.direction = Direction::Forward;
                 self.timers.toast(Instant::now());
                 if switch.pairing_changed {
-                    // The fit begins the new pairing; the switch is not
-                    // a navigation, so the skim does not open.
+                    // The fit begins the new pairing; a mode switch skips
+                    // the skim.
                     self.fit.begin_turn();
                 }
-                // The view carries the seating order and the spread, so
-                // both kinds of switch retune; only a pairing change
-                // restarts the fit.
                 self.set_view();
                 self.request_redraw();
             }
@@ -775,7 +751,6 @@ impl App {
         let spawned = thread::Builder::new()
             .name(String::from("cy-book-open"))
             .spawn(move || {
-                // A receiver that is gone means the app is gone too.
                 if opened_tx.send(opened.finish()).is_ok() {
                     post(&proxy, UserEvent::Wake);
                 }
@@ -882,7 +857,6 @@ impl App {
         }
     }
 
-    /// Retune the child to the current spread, mode, and direction.
     fn set_view(&self) {
         self.send(ParentMsg::SetView {
             index: self.index,
@@ -1019,7 +993,7 @@ fn view_kept(
 
 /// The requested spread once every page clears `can_show`; otherwise the
 /// nearest presentable start between the shown and requested spreads, so
-/// a skim never replays a passed page; otherwise the shown spread.
+/// a skim advances monotonically; otherwise the shown spread.
 fn choose_presented(
     requested: Spread,
     shown: Option<Spread>,
@@ -1091,7 +1065,8 @@ impl ApplicationHandler<UserEvent> for App {
                 return;
             }
         };
-        // `EguiGlow::new` panics if its painter cannot initialize; accepted upstream risk.
+        // `EguiGlow::new` panics if its painter cannot initialize; accepted
+        // upstream risk.
         let egui = egui_glow::EguiGlow::new(
             event_loop,
             Arc::clone(&gl),
@@ -1099,7 +1074,8 @@ impl ApplicationHandler<UserEvent> for App {
             None,
             true,
         );
-        // System fonts cover filename characters the built-in fonts cannot render.
+        // System fonts cover filename characters the built-in fonts cannot
+        // render.
         egui.egui_ctx.add_font_provider(Arc::new(
             egui_system_font_provider::SystemFontProvider::new(),
         ));
@@ -1160,8 +1136,8 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
-        // Quit must not wait out an in-flight decode; the child dies, and
-        // a pending open's book dies with its own result if it lands.
+        // Quit kills the child, so an in-flight decode ends with it; a pending
+        // open's book dies with its own result if it lands.
         self.kill_process();
         self.pending_open = None;
         self.gl = None;
@@ -1193,10 +1169,9 @@ impl ApplicationHandler<UserEvent> for App {
 
         let egui_wants_pointer =
             if matches!(event, WindowEvent::RedrawRequested) {
-                // RedrawRequested carries nothing for egui, and egui-winit
-                // answers it with `repaint: true`; honoring that answer would
-                // re-request the redraw and self-sustain the loop at
-                // compositor refresh while idle.
+                // egui-winit answers RedrawRequested with `repaint: true`;
+                // honoring that answer would re-request the redraw and
+                // self-sustain the loop at compositor refresh while idle.
                 gl.egui.egui_ctx.egui_wants_pointer_input()
             } else {
                 let response =
@@ -1210,7 +1185,6 @@ impl ApplicationHandler<UserEvent> for App {
 
         match &event {
             WindowEvent::Resized(_) => {
-                // The refit happens in `frame()` when the viewport notices the new size.
                 self.sync_surface_size();
                 self.request_redraw();
             }
@@ -1281,7 +1255,6 @@ impl ApplicationHandler<UserEvent> for App {
                     self.fail(error, event_loop);
                     return;
                 }
-                // Park until the next input or wake, so idle costs nothing.
                 event_loop.set_control_flow(ControlFlow::Wait);
             }
             _ => {}
@@ -1324,8 +1297,7 @@ fn content_viewport(
     Viewport::above_bottom_bar(win, bar_top)
 }
 
-/// The glass in egui's u8 color: a conversion of [`clear_color`], never a
-/// second premultiplication.
+/// The glass in egui's premultiplied u8 color, converted from [`clear_color`].
 #[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -1350,7 +1322,7 @@ const WHEEL_ZOOM_SENSITIVITY: f32 = 0.15;
 const PIXELS_PER_WHEEL_LINE: f32 = 40.0;
 
 /// Pixel-mode wheel motion as zoom lines, divided by scale factor so
-/// zoom speed does not vary with output scaling.
+/// zoom speed stays constant across output scaling.
 #[expect(
     clippy::cast_possible_truncation,
     reason = "wheel lines feed an exponential zoom sensitivity, so one f64-to-f32 rounding is immaterial"
@@ -1508,7 +1480,7 @@ mod tests {
             ),
             Some(lone(4))
         );
-        // A cold start with nothing decoded presents nothing.
+        // A cold start presents only decoded spreads.
         assert_eq!(
             choose_presented(
                 lone(5),

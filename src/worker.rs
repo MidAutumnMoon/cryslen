@@ -42,7 +42,6 @@ const FILL_POLL: Duration = Duration::from_millis(15);
 /// reader leaves the worker idle between turns.
 const IDLE_PRELOAD: Duration = Duration::from_millis(300);
 
-/// What the reader is doing; only a still reader is worth a view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub enum Motion {
     /// The reader is looking at the spread; its head is worth a view.
@@ -152,7 +151,6 @@ struct Session {
     targets_at: Instant,
     /// Wants already handed over since they last entered the set.
     delivered: HashSet<Want>,
-    /// Whether an idle preload burst is running.
     preloading: bool,
 }
 
@@ -409,8 +407,8 @@ impl Session {
             }
             if needs.thumb && thumb.is_none() {
                 let started = Instant::now();
-                // The view is the cheaper source: one area pass over the
-                // view instead of a second over the full page.
+                // The view is the cheaper source: one area pass over the view
+                // covers the thumb.
                 let from = view.as_ref().unwrap_or(&native);
                 let minted = preview::mint(from, preview::THUMB_EDGE);
                 tracing::debug!(
@@ -421,7 +419,7 @@ impl Session {
                 thumb =
                     Some(self.keep(page, hash, Artifact::Thumb, minted));
             }
-            // Natives are never stored; only a demand job delivers them.
+            // Natives bypass the store; a demand job delivers them.
             if needs.native && demand {
                 self.publish(page, Artifact::Native, native, notify);
             }
@@ -524,8 +522,8 @@ impl Worker {
         self.tell(ToWorker::Targets(targets));
     }
 
-    /// Stop the worker without joining it, so the caller never waits out
-    /// an in-flight decode. The thread owns its state.
+    /// Stop the worker without joining it, so the caller returns while an
+    /// in-flight decode finishes. The thread owns its state.
     pub fn detach(&mut self) {
         self.tell(ToWorker::Stop);
         self.handle = None;
@@ -589,9 +587,8 @@ fn run(
                 session.serve(source, job, notify);
                 continue;
             }
-            // Preload must not make the app wait. Let the app speak
-            // first: a reader who is turning pages must never wait for
-            // a page they have not asked for.
+            // Preload yields to the app. Let the app speak first: a turning
+            // reader gets its own pages ahead of speculative work.
             match rx.recv_timeout(IDLE_PRELOAD) {
                 Ok(message) => {
                     if !session.apply(message) {
@@ -624,7 +621,7 @@ fn decode_page(
 ) -> Result<Decoded, Arc<PageError>> {
     let Some(name) = source.name(page) else {
         // `Source::bytes` answers every page under its length, so a name
-        // miss names a caller bug, not bad input.
+        // miss is a caller bug.
         return Err(Arc::new(ErrorUnion::new(BadIndex)));
     };
     match panic::catch_unwind(AssertUnwindSafe(|| {
@@ -861,7 +858,7 @@ mod tests {
         assert_eq!(
             long_edge(&view),
             preview::VIEW_EDGE.min(BIG),
-            "the view is minted at the view edge, never upscaled"
+            "the view's long edge matches the mint edge"
         );
 
         let store = Store::at(root.path());
@@ -940,10 +937,10 @@ mod tests {
         assert!(
             error.downcast_inner_ref::<image::ImageError>().is_some()
                 || error.downcast_inner_ref::<DecodeRefusal>().is_some(),
-            "page 0 must fail as a decode fault, not {error}"
+            "page 0 failed as {error}, expected a decode fault"
         );
-        // The failure does not stall the plan: pages behind it still
-        // reach the store.
+        // The failure leaves the rest of the plan running: pages behind it
+        // still reach the store.
         let store = Store::at(root.path());
         eventually(20, "the failure stalled the plan", || {
             store
@@ -1003,8 +1000,7 @@ mod tests {
         events.ready("the target never delivered a view", |ready| {
             ready.page == 0 && is_view(ready)
         });
-        // An unchanged set is the app still waiting for its own upload,
-        // not a new demand.
+        // An unchanged set is the app still waiting for its own upload.
         worker.retarget(vec![want_view(0)]);
         thread::sleep(Duration::from_millis(50));
         assert_eq!(
@@ -1076,7 +1072,7 @@ mod tests {
         assert_eq!(
             long_edge(&view),
             preview::VIEW_EDGE.min(BIG),
-            "the view is minted at the view edge, never upscaled"
+            "the view's long edge matches the mint edge"
         );
         drop(worker);
 
@@ -1103,7 +1099,7 @@ mod tests {
         assert!(store.save(hash, Artifact::View, &sentinel).landed);
         drop(store);
 
-        // A second worker on the same root loads instead of decoding.
+        // A second worker on the same root loads the cached artifacts.
         let (second, notify_second) = Events::new();
         let warm = Worker::spawn_at(
             Arc::clone(&source),
@@ -1124,15 +1120,15 @@ mod tests {
         assert_eq!(
             (warm_thumb.width(), warm_thumb.height()),
             (7, 7),
-            "the thumb was decoded again instead of loaded"
+            "the thumb missed the warm store"
         );
         assert_eq!(
             (warm_view.width(), warm_view.height()),
             (7, 7),
-            "the view was decoded again instead of loaded"
+            "the view missed the warm store"
         );
 
-        // Loading saves nothing over the artifacts it read.
+        // Loading leaves the artifacts it read unchanged.
         let kept = Store::at(store_root)
             .load(hash, Artifact::View)
             .expect("the sentinel view stays");

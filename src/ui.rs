@@ -20,7 +20,6 @@ pub struct StatusLine<'fault> {
     pub mode: ViewMode,
     pub toast: bool,
     pub name: PageName,
-    /// Facts of the page the line speaks for, once it has decoded.
     pub page: Option<PageFacts>,
     /// Placement scale, screen px per image px.
     pub zoom: f32,
@@ -135,8 +134,6 @@ impl Wait {
     }
 }
 
-/// One page's state as the status line reads it: the format the decoder
-/// identified, the page's pixel size, and its failure, each once known.
 #[derive(Clone)]
 pub struct PageState<'fault> {
     pub format: Option<Format>,
@@ -154,9 +151,6 @@ pub struct FoldedStatus<'fault> {
     pub speaker: usize,
 }
 
-/// Fold one spread's page states. The first failure waits no longer and
-/// speaks for the spread; otherwise the first decoded page supplies the
-/// facts and the name.
 pub fn fold_status<'fault>(
     spread: Spread,
     state: impl Fn(usize) -> PageState<'fault>,
@@ -212,8 +206,8 @@ pub struct PageFacts {
 }
 
 /// Render the status bar into `ui` and return the content rect: what
-/// the chrome has not consumed, the only legal page viewport. A hidden
-/// bar (`fullscreen`) consumes nothing, so the rect is the whole window.
+/// the chrome leaves, the only legal page viewport. A hidden
+/// bar (`fullscreen`) leaves the whole window as content.
 pub fn show(
     ui: &mut egui::Ui,
     status: &StatusLine<'_>,
@@ -375,7 +369,7 @@ mod tests {
             timers.wait_word(start + WAIT_GRACE * 2, || true),
             Some(Wait::Unpacking)
         );
-        // A decided spread clears the wait; nothing arms.
+        // A decided spread clears the wait and disarms its wake.
         assert_eq!(timers.tick_wait(start + WAIT_GRACE * 2, false), None);
         assert_eq!(
             timers.wait_word(start + WAIT_GRACE * 3, || false),

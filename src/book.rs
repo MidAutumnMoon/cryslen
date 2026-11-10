@@ -31,13 +31,14 @@ use crate::view::PageCount;
 use crate::worker;
 
 /// A child that has not answered by now is wedged; the parent reports a
-/// fault instead of waiting on it forever.
+/// fault.
 const OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Tells the event loop that a [`BookEvent`] is waiting to be drained.
 pub type Wake = Box<dyn Fn() + Send + Sync + 'static>;
 
-/// Everything the UI knows about a book; nothing that lives in the child.
+/// The parent's complete book state; source, store, and worker live in
+/// the child.
 pub struct BookView {
     pub path: PathBuf,
     pub archive: bool,
@@ -48,8 +49,6 @@ pub struct BookView {
 }
 
 impl BookView {
-    /// The count derives from `names` and the archive flag from `path`;
-    /// the child sends only what it discovered.
     pub fn from_info(
         path: PathBuf,
         info: BookInfo,
@@ -60,8 +59,6 @@ impl BookView {
             )));
         };
         let archive = catalog::is_archive(&path);
-        // Archives name pages by their inner path; a directory book's
-        // pages belong to the source directory itself.
         let dir_name = if archive {
             None
         } else {
@@ -103,7 +100,6 @@ impl BookView {
     }
 }
 
-/// One child's message as the app consumes it.
 pub enum BookEvent {
     Ready(worker::Ready),
     Failed { page: usize, fault: PageFault },
@@ -119,8 +115,7 @@ pub struct BookProcess {
 }
 
 impl BookProcess {
-    /// Spawn the child for `path`, hand it the channels, and wait for its
-    /// [`BookInfo`]. A failure leaves no process behind.
+    /// A failure reaps the child.
     pub fn open(
         path: &Path,
         wake: Wake,
@@ -129,7 +124,7 @@ impl BookProcess {
     }
 
     pub fn send(&self, message: ParentMsg) {
-        // A dead child is reported through the event stream, not here.
+        // Send failures are ignored; the closed event stream reports the death.
         if let Err(error) = self.to_child.send(message) {
             tracing::debug!(?error, "the book process is gone");
         }
@@ -178,7 +173,6 @@ impl PendingBookOpen {
             .map_err(|error| BookFault::Spawn(error.to_string()))?;
         let exe = env::current_exe()
             .map_err(|error| BookFault::Spawn(error.to_string()))?;
-        // The path travels in argv, so a non-UTF-8 path survives.
         let child = Command::new(exe)
             .arg("--worker")
             .arg(&server_name)
@@ -196,7 +190,6 @@ impl PendingBookOpen {
         })
     }
 
-    /// Accept the child's channels, read its book info, and start the reader.
     /// A blocking `accept(2)` on a child that never connected cannot be
     /// woken, so it runs on its own thread under the first message's deadline.
     pub fn finish(self) -> Result<(BookView, BookProcess), BookFault> {
@@ -226,7 +219,6 @@ impl PendingBookOpen {
                 wake_accept(&server_name, accept_thread);
                 return Err(BookFault::Timeout);
             }
-            // The thread cannot end without sending, but a panic would.
             Err(RecvTimeoutError::Disconnected) => {
                 return Err(BookFault::Handshake(String::from(
                     "the book accept thread stopped",
@@ -239,8 +231,6 @@ impl PendingBookOpen {
                 return Err(BookFault::Handshake(error.to_string()))
             }
         };
-        // The child's info or its refusal is the only possible first
-        // message; anything else is a broken handshake.
         let info = match child_rx.try_recv_timeout(remaining(deadline)) {
             Ok(ChildMsg::BookInfo(info)) => info,
             Ok(ChildMsg::OpenFailed(detail)) => {
@@ -293,7 +283,6 @@ fn wake_accept(server_name: &str, accept_thread: JoinHandle<()>) {
 struct ForkedChild(Option<Child>);
 
 impl ForkedChild {
-    /// Hand the process to its permanent owner, disarming the guard.
     fn release(mut self) -> Option<Child> {
         self.0.take()
     }
@@ -342,14 +331,11 @@ fn read_events(
     wake: &dyn Fn(),
 ) {
     loop {
-        // The app learns about a dead child from the closed stream.
         let event = child_rx.recv().map_or_else(
             |_| BookEvent::Died(String::from("the book process exited")),
             event_from_message,
         );
         let last = matches!(event, BookEvent::Died(_));
-        // A failed send means the receiver is gone with the book, and
-        // nobody is left to wake.
         if event_sender.send(event).is_err() {
             return;
         }
@@ -363,7 +349,7 @@ fn read_events(
 fn event_from_message(message: ChildMsg) -> BookEvent {
     match message {
         // The handshake is read before this thread starts; a repeat is a
-        // protocol violation, not an event.
+        // protocol violation.
         ChildMsg::BookInfo(_) | ChildMsg::OpenFailed(_) => {
             BookEvent::Died(String::from(
                 "the child repeated its handshake",

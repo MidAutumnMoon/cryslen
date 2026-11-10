@@ -51,7 +51,7 @@ pub const THUMB_CAP_BYTES: u64 = 512 * 1024 * 1024;
 pub const VIEW_CAP_BYTES: u64 = 3 * 512 * 1024 * 1024;
 
 /// Which derived image a cache entry holds. `Native` is the decoded page
-/// itself and is never cached.
+/// itself and bypasses the store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 pub enum Artifact {
     Thumb,
@@ -60,8 +60,8 @@ pub enum Artifact {
 }
 
 impl Artifact {
-    /// The mint edge, stored in the entry header so a changed constant
-    /// misses old entries instead of serving the wrong size.
+    /// The mint edge, stored in the entry header, so a changed constant
+    /// invalidates old entries.
     pub(crate) fn edge(self) -> Option<u32> {
         match self {
             Self::Thumb => Some(THUMB_EDGE),
@@ -145,7 +145,7 @@ pub fn mint(page: &Decoded, edge: u32) -> Decoded {
 }
 
 /// The target dimensions for a long edge of at most `edge`. Ratios below
-/// one are identity, so the result is never larger than the input.
+/// one are identity, so the result is at most the input size.
 #[expect(
     clippy::integer_division,
     reason = "edge scaling is integer pixel arithmetic"
@@ -352,7 +352,7 @@ struct State {
 
 /// What a save did: whether the entry reached the store, and the
 /// entries its prune removed (oldest first), so a caller that tracks the
-/// store's contents can forget them instead of trusting a stale ledger.
+/// store's contents can keep its ledger current.
 #[derive(Debug, Default)]
 pub struct Saved {
     pub landed: bool,
@@ -534,16 +534,14 @@ impl Namespace {
     }
 }
 
-/// One cache file, ordered by modification time.
 struct Entry {
     modified: SystemTime,
     name: OsString,
     size: u64,
 }
 
-/// The cache files of `dir`, least recently used first. Anything that is
-/// not a plain hashed entry is left alone: a `.tmp` file belongs to a
-/// writer that has not renamed it yet.
+/// The cache files of `dir`, least recently used first. A `.tmp` file
+/// belongs to a writer that has not renamed it yet; skip it.
 fn entries(dir: &Path) -> Vec<Entry> {
     let Ok(read) = fs::read_dir(dir) else {
         return Vec::new();
@@ -586,7 +584,7 @@ fn is_hash_name(name: &OsStr) -> bool {
 
 /// How long an unchecked temp file may survive. Only a liveness check
 /// that cannot answer (a pid this process may not signal) falls back to
-/// age; a live writer's file is never removed, however old it is.
+/// age; a live writer's file stays, however old it is.
 const STALE_TEMP_AGE: Duration = Duration::from_hours(1);
 
 /// Drop temp files whose writer can no longer rename them: a killed child
@@ -654,7 +652,7 @@ fn temp_pid(name: &OsStr) -> Option<i32> {
         return None;
     }
     // A pid the OS can hand out is positive; zero would check a process
-    // group instead of a process.
+    // group.
     let pid = pid.parse::<i32>().ok()?;
     (pid > 0).then_some(pid)
 }
