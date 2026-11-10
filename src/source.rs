@@ -241,7 +241,7 @@ impl Source {
 
     /// Whether the source runs an unpack pass; `unpacking()` reports its
     /// progress.
-    pub(crate) fn unpacks(&self) -> bool {
+    pub fn unpacks(&self) -> bool {
         matches!(self.backend, Backend::Archive(_))
     }
 }

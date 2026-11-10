@@ -66,7 +66,7 @@ pub struct WireImage {
 }
 
 impl WireImage {
-    pub(crate) fn from_decoded(image: &Decoded) -> Self {
+    pub fn from_decoded(image: &Decoded) -> Self {
         let pixels = match image.pixels() {
             Pixels::Rgba8(bytes) => {
                 WirePixels::Rgba8(IpcSharedMemory::from_bytes(bytes))
@@ -94,7 +94,7 @@ impl WireImage {
 
     /// Rebuild the decoded image, validating extents through
     /// [`Decoded::rgba`] / [`Decoded::yuv`].
-    pub(crate) fn to_decoded(&self) -> Result<Decoded, DecodeRefusal> {
+    pub fn to_decoded(&self) -> Result<Decoded, DecodeRefusal> {
         let decoded = match &self.pixels {
             WirePixels::Rgba8(bytes) => Decoded::rgba(
                 self.width,

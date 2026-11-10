@@ -62,7 +62,7 @@ pub enum Artifact {
 impl Artifact {
     /// The target edge, stored in the entry header, so a changed constant
     /// invalidates old entries.
-    pub(crate) fn edge(self) -> Option<u32> {
+    pub fn edge(self) -> Option<u32> {
         match self {
             Self::Thumb => Some(THUMB_EDGE),
             Self::View => Some(VIEW_EDGE),
@@ -369,14 +369,14 @@ struct Namespace {
 
 impl Store {
     /// Open the shared store under `env::temp_dir()/cryslen-cache`.
-    pub(crate) fn open() -> Self {
+    pub fn open() -> Self {
         Self::at(&env::temp_dir().join("cryslen-cache"))
     }
 
     /// Open the store rooted at `root`, creating it if absent. A `root`
     /// that cannot be created, or that resolves through a symlink, leaves
     /// the store disabled.
-    pub(crate) fn at(root: &Path) -> Self {
+    pub fn at(root: &Path) -> Self {
         Self::with_caps(root, THUMB_CAP_BYTES, VIEW_CAP_BYTES)
     }
 
@@ -390,7 +390,7 @@ impl Store {
 
     /// Load `hash`, or `None` when absent, damaged, or not cached; a hit
     /// refreshes the entry's mtime for LRU.
-    pub(crate) fn load(
+    pub fn load(
         &self,
         hash: u128,
         kind: Artifact,
@@ -419,7 +419,7 @@ impl Store {
 
     /// Store `page` under `hash`, replacing the same key. Crossing the
     /// namespace's cap prunes it; the result names the removed entries.
-    pub(crate) fn save(
+    pub fn save(
         &mut self,
         hash: u128,
         kind: Artifact,
