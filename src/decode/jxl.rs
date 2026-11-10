@@ -136,13 +136,12 @@ impl JxlParallelRunner for Pool {
         num: usize,
         fun: &JxlParallelRunnerFun<'_>,
     ) -> JxlResult<()> {
+        use std::sync::OnceLock;
         use std::thread;
-
-        use parking_lot::Mutex;
 
         let thread_count = self.0.min(num);
         let chunk = num.div_ceil(thread_count);
-        let failure: Mutex<Option<JxlError>> = Mutex::new(None);
+        let failure: OnceLock<JxlError> = OnceLock::new();
         thread::scope(|scope| {
             for thread_index in 0..thread_count {
                 let fun: &JxlParallelRunnerFun = fun;
@@ -152,7 +151,9 @@ impl JxlParallelRunner for Pool {
                         ..((thread_index + 1) * chunk).min(num)
                     {
                         if let Err(task_error) = fun(task_index) {
-                            failure.lock().get_or_insert(task_error);
+                            // The first failure wins; a later one has
+                            // nothing to add.
+                            failure.get_or_init(|| task_error);
                             break;
                         }
                     }

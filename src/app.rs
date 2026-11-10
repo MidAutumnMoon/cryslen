@@ -1468,7 +1468,7 @@ fn classify(path: &Path) -> Result<Argument, fault::OpenRefusal> {
     // Path::parent() yields Some("") for bare relative names ("pic.jpg").
     let dir = path
         .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
+        .filter(|parent| !parent.is_empty())
         .unwrap_or_else(|| Path::new("."));
     Ok(Argument::Image {
         dir: dir.to_path_buf(),

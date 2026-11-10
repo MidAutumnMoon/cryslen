@@ -1193,10 +1193,9 @@ mod tests {
     }
 
     fn set_modified(path: &Path, seconds: u64) {
-        let file = File::options().write(true).open(path).expect("open");
         let modified =
             SystemTime::UNIX_EPOCH + Duration::from_secs(seconds);
-        file.set_times(FileTimes::new().set_modified(modified))
+        fs::set_times(path, FileTimes::new().set_modified(modified))
             .expect("set mtime");
     }
 
