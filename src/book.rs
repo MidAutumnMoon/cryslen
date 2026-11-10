@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::process::Child;
 use std::process::Command;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -14,10 +15,11 @@ use std::time::Instant;
 use crossbeam_channel::Receiver;
 use crossbeam_channel::RecvTimeoutError;
 use crossbeam_channel::Sender;
+use crossbeam_channel::TryRecvError;
 use ipc_channel::ipc::IpcOneShotServer;
 use ipc_channel::ipc::IpcReceiver;
 use ipc_channel::ipc::IpcSender;
-use ipc_channel::TryRecvError;
+use ipc_channel::TryRecvError as IpcTryRecvError;
 
 use crate::catalog;
 use crate::catalog::PageName;
@@ -35,7 +37,9 @@ use crate::worker;
 const OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Tells the event loop that a [`BookEvent`] is waiting to be drained.
-pub type Wake = Box<dyn Fn() + Send + Sync + 'static>;
+pub type Wake = Arc<dyn Fn() + Send + Sync + 'static>;
+
+type OpenedBook = Result<(BookView, BookProcess), BookFault>;
 
 /// The parent's complete book state; source, store, and worker live in
 /// the child.
@@ -154,6 +158,184 @@ impl Drop for BookProcess {
     }
 }
 
+/// The parent's book and its lifecycle. The view outlives every phase.
+pub struct Book {
+    view: BookView,
+    phase: Phase,
+    wake: Wake,
+}
+
+enum Phase {
+    Live(BookProcess),
+    Opening(Receiver<OpenedBook>),
+    Faulted(BookFault),
+    Closed,
+}
+
+pub enum BookControl {
+    /// A switch to a sibling; `true` is forward.
+    Switch(bool),
+    Opened(OpenedBook),
+    Died(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BookChange {
+    None,
+    Adopted,
+    Faulted,
+}
+
+impl Book {
+    pub fn new(view: BookView, process: BookProcess, wake: Wake) -> Self {
+        Self {
+            view,
+            phase: Phase::Live(process),
+            wake,
+        }
+    }
+
+    pub fn view(&self) -> &BookView {
+        &self.view
+    }
+
+    pub fn fault(&self) -> Option<&BookFault> {
+        if let Phase::Faulted(fault) = &self.phase {
+            Some(fault)
+        } else {
+            None
+        }
+    }
+
+    pub fn send(&self, message: ParentMsg) {
+        if let Phase::Live(process) = &self.phase {
+            process.send(message);
+        }
+    }
+
+    pub fn drain(&self) -> Vec<BookEvent> {
+        if let Phase::Live(process) = &self.phase {
+            process.drain()
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub fn take_opened(&self) -> Option<OpenedBook> {
+        let Phase::Opening(pending) = &self.phase else {
+            return None;
+        };
+        match pending.try_recv() {
+            Ok(opened) => Some(opened),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => Some(Err(BookFault::Died(
+                String::from("the book switch ended without a book"),
+            ))),
+        }
+    }
+
+    pub fn mark_unpacked(&mut self) {
+        self.view.unpacking = false;
+    }
+
+    pub fn step(&mut self, control: BookControl) -> BookChange {
+        use std::mem;
+
+        let phase = mem::replace(&mut self.phase, Phase::Closed);
+        let (next, change) = match phase {
+            Phase::Live(process) => match control {
+                BookControl::Switch(forward) => {
+                    match self.view.sibling(forward) {
+                        None => (Phase::Live(process), BookChange::None),
+                        Some(path) => {
+                            drop(process);
+                            self.open_sibling(&path)
+                        }
+                    }
+                }
+                BookControl::Opened(_) => {
+                    (Phase::Live(process), BookChange::None)
+                }
+                BookControl::Died(detail) => {
+                    tracing::warn!(%detail, "the book process failed");
+                    (
+                        Phase::Faulted(BookFault::Died(detail)),
+                        BookChange::Faulted,
+                    )
+                }
+            },
+            Phase::Faulted(fault) => match control {
+                BookControl::Switch(forward) => {
+                    self.view.sibling(forward).map_or_else(
+                        || (Phase::Faulted(fault), BookChange::None),
+                        |path| self.open_sibling(&path),
+                    )
+                }
+                BookControl::Opened(_) | BookControl::Died(_) => {
+                    (Phase::Faulted(fault), BookChange::None)
+                }
+            },
+            Phase::Opening(pending) => match control {
+                BookControl::Switch(_) | BookControl::Died(_) => {
+                    (Phase::Opening(pending), BookChange::None)
+                }
+                BookControl::Opened(Ok((view, process))) => {
+                    self.view = view;
+                    (Phase::Live(process), BookChange::Adopted)
+                }
+                BookControl::Opened(Err(fault)) => {
+                    tracing::warn!(?fault, "book open failed");
+                    (Phase::Faulted(fault), BookChange::Faulted)
+                }
+            },
+            Phase::Closed => match control {
+                BookControl::Switch(_)
+                | BookControl::Opened(_)
+                | BookControl::Died(_) => {
+                    (Phase::Closed, BookChange::None)
+                }
+            },
+        };
+        self.phase = next;
+        change
+    }
+
+    pub fn shutdown(&mut self) {
+        self.phase = Phase::Closed;
+    }
+
+    fn open_sibling(&self, path: &Path) -> (Phase, BookChange) {
+        tracing::debug!(path = %path.display(), "book switch");
+        match PendingBookOpen::begin(path, Arc::clone(&self.wake)) {
+            Err(fault) => {
+                tracing::warn!(?fault, "book open failed");
+                (Phase::Faulted(fault), BookChange::Faulted)
+            }
+            Ok(opened) => {
+                let (opened_tx, pending) = crossbeam_channel::bounded(1);
+                let waker = Arc::clone(&self.wake);
+                let spawned = thread::Builder::new()
+                    .name(String::from("cy-book-open"))
+                    .spawn(move || {
+                        if opened_tx.send(opened.finish()).is_ok() {
+                            waker();
+                        }
+                    });
+                match spawned {
+                    Ok(_detached) => {
+                        (Phase::Opening(pending), BookChange::None)
+                    }
+                    Err(error) => {
+                        let fault = BookFault::Spawn(error.to_string());
+                        tracing::warn!(?fault, "book open failed");
+                        (Phase::Faulted(fault), BookChange::Faulted)
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// A forked child whose open has not finished; dropping it kills the
 /// child, so an abandoned handshake cannot leak a process.
 pub struct PendingBookOpen {
@@ -241,7 +423,7 @@ impl PendingBookOpen {
                     "the child sent {message:?} before its book info"
                 )))
             }
-            Err(TryRecvError::Empty) => return Err(BookFault::Timeout),
+            Err(IpcTryRecvError::Empty) => return Err(BookFault::Timeout),
             Err(error) => {
                 return Err(BookFault::Handshake(error.to_string()))
             }
@@ -383,6 +565,63 @@ fn event_from_message(message: ChildMsg) -> BookEvent {
 )]
 mod tests {
     use super::*;
+
+    fn wake() -> Wake {
+        Arc::new(|| {})
+    }
+
+    fn view() -> BookView {
+        BookView::from_info(
+            PathBuf::from("/nonexistent-cryslen-book/book"),
+            BookInfo {
+                names: vec![String::from("page.png")],
+                unpacking: false,
+            },
+        )
+        .expect("a one-page book view")
+    }
+
+    fn opening() -> (Book, Sender<OpenedBook>) {
+        let (opened, pending) = crossbeam_channel::bounded(1);
+        let book = Book {
+            view: view(),
+            phase: Phase::Opening(pending),
+            wake: wake(),
+        };
+        (book, opened)
+    }
+
+    #[test]
+    fn opened_error_faults() {
+        let (mut book, pending) = opening();
+        let fault = BookFault::Open(String::from("missing"));
+        assert_eq!(
+            book.step(BookControl::Opened(Err(fault))),
+            BookChange::Faulted
+        );
+        assert!(matches!(book.phase, Phase::Faulted(_)));
+        assert!(book.fault().is_some());
+        drop(pending);
+    }
+
+    #[test]
+    fn take_opened_reports_empty_and_disconnect() {
+        let (book, pending) = opening();
+        assert!(book.take_opened().is_none());
+        drop(pending);
+        assert!(matches!(
+            book.take_opened(),
+            Some(Err(BookFault::Died(_)))
+        ));
+    }
+
+    #[test]
+    fn switch_while_opening_is_ignored() {
+        let (mut book, pending) = opening();
+        assert_eq!(book.step(BookControl::Switch(true)), BookChange::None);
+        assert!(matches!(book.phase, Phase::Opening(_)));
+        drop(pending);
+    }
 
     #[test]
     fn wake_accept_unblocks_a_waiting_listener() {

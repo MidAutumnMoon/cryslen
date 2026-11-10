@@ -23,6 +23,7 @@ use crate::decode::Transfer;
 use crate::fault::TextureError;
 use crate::fault::TextureFault;
 use crate::preview::Artifact;
+use crate::preview::Artifacts;
 use crate::view;
 use crate::view::Placement;
 use crate::view::SpreadLayout;
@@ -137,6 +138,10 @@ shader_variants!(
         color = vec4((display(u_mat * yuv - u_off) + dither) * a, a);
     }"
 );
+
+/// A seat rect spanning the page maps to a UV extent of 1. Page dims
+/// are whole pixels, so only float rounding can move that extent.
+const SEAT_UV_TOLERANCE: f32 = 1e-3;
 
 /// Page-keyed texture cache plus the spread draw. Seat binding is the
 /// app's fact; a seat draws the largest size present.
@@ -262,14 +267,26 @@ impl PageTextures {
         Ok(())
     }
 
+    pub fn artifacts(&self, page: usize) -> Artifacts {
+        let mut artifacts = Artifacts::default();
+        if self.thumbs.contains_key(&page) {
+            artifacts.set(Artifact::Thumb);
+        }
+        if self.views.contains_key(&page) {
+            artifacts.set(Artifact::View);
+        }
+        if self.natives.contains_key(&page) {
+            artifacts.set(Artifact::Native);
+        }
+        artifacts
+    }
+
     pub fn has(&self, page: usize, kind: Artifact) -> bool {
-        self.map(kind).contains_key(&page)
+        self.artifacts(page).contains(kind)
     }
 
     pub fn has_any(&self, page: usize) -> bool {
-        self.has(page, Artifact::Thumb)
-            || self.has(page, Artifact::View)
-            || self.has(page, Artifact::Native)
+        self.artifacts(page).any()
     }
 
     /// Drop every entry `keep` rejects, at every size, freeing its
@@ -303,6 +320,10 @@ impl PageTextures {
 
     /// Draw the presented spread, clipped to `viewport`; each seat draws
     /// its page's largest resident texture. Does not clear the framebuffer.
+    #[expect(
+        clippy::rest_pattern_accessible_field,
+        reason = "the match only reads `lmap_base`; the texture fields are unrelated"
+    )]
     pub fn draw(
         &self,
         size: (u32, u32),
@@ -343,11 +364,36 @@ impl PageTextures {
         for (rect, page) in layout.rects.iter().zip(seat_pages.iter()) {
             let Some(rect) = rect else { continue };
             let Some(page) = page else { continue };
-            let Some(entry) =
-                pick(&self.thumbs, &self.views, &self.natives, *page)
+            let Some(entry) = self
+                .artifacts(*page)
+                .best()
+                .and_then(|kind| self.map(kind).get(page))
             else {
                 continue;
             };
+            let lmap_base = match entry {
+                Entry::Rgba { lmap_base, .. }
+                | Entry::Yuv { lmap_base, .. } => *lmap_base,
+            };
+            // A seat rect is in page pixels; a texture's UV spans the page.
+            let uv_extent =
+                (rect.size.0 * lmap_base.0, rect.size.1 * lmap_base.1);
+            let aligned = (uv_extent.0 - 1.0).abs() <= SEAT_UV_TOLERANCE
+                && (uv_extent.1 - 1.0).abs() <= SEAT_UV_TOLERANCE;
+            if !aligned {
+                tracing::debug!(
+                    page = *page,
+                    rect = ?rect.size,
+                    ?lmap_base,
+                    "seat layout disagrees with the texture's page dims"
+                );
+            }
+            debug_assert!(
+                aligned,
+                "seat rect and texture page dims disagree for page \
+                 {page}: rect {:?}, lmap {lmap_base:?}",
+                rect.size
+            );
             // Whole-pixel rect origin: at 1:1 zoom a fractional origin
             // makes NEAREST draw uneven texel rows.
             let screen_origin = (
@@ -418,21 +464,6 @@ fn retain_map(
         }
         false
     });
-}
-
-/// The entry a seat draws for `page`: the native page beats the view,
-/// which beats the thumb. Callers keep the three maps apart by size, so
-/// the order is the only policy here.
-fn pick<'map>(
-    thumbs: &'map HashMap<usize, Entry>,
-    views: &'map HashMap<usize, Entry>,
-    natives: &'map HashMap<usize, Entry>,
-    page: usize,
-) -> Option<&'map Entry> {
-    natives
-        .get(&page)
-        .or_else(|| views.get(&page))
-        .or_else(|| thumbs.get(&page))
 }
 
 /// # Safety

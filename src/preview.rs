@@ -75,11 +75,79 @@ impl Artifact {
         self.derivation().map(|(edge, _)| edge)
     }
 
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Thumb => "thumb",
+            Self::View => "view",
+            Self::Native => "native",
+        }
+    }
+
     fn derivation(self) -> Option<(u32, FilterType)> {
         match self {
             Self::Thumb => Some((THUMB_EDGE, FilterType::Box)),
             Self::View => Some((VIEW_EDGE, FilterType::Hamming)),
             Self::Native => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Artifacts {
+    thumb: bool,
+    view: bool,
+    native: bool,
+}
+
+impl Artifacts {
+    pub fn set(&mut self, kind: Artifact) {
+        match kind {
+            Artifact::Thumb => self.thumb = true,
+            Artifact::View => self.view = true,
+            Artifact::Native => self.native = true,
+        }
+    }
+
+    pub fn clear(&mut self, kind: Artifact) {
+        match kind {
+            Artifact::Thumb => self.thumb = false,
+            Artifact::View => self.view = false,
+            Artifact::Native => self.native = false,
+        }
+    }
+
+    #[must_use]
+    pub fn contains(self, kind: Artifact) -> bool {
+        match kind {
+            Artifact::Thumb => self.thumb,
+            Artifact::View => self.view,
+            Artifact::Native => self.native,
+        }
+    }
+
+    #[must_use]
+    pub fn any(self) -> bool {
+        self.thumb || self.view || self.native
+    }
+
+    /// A view or native fills the seat at a settled size.
+    #[must_use]
+    pub fn readable(self) -> bool {
+        self.view || self.native
+    }
+
+    /// The largest kind present: native, then view, then thumb.
+    #[must_use]
+    pub fn best(self) -> Option<Artifact> {
+        if self.native {
+            Some(Artifact::Native)
+        } else if self.view {
+            Some(Artifact::View)
+        } else if self.thumb {
+            Some(Artifact::Thumb)
+        } else {
+            None
         }
     }
 }
@@ -1647,5 +1715,39 @@ mod tests {
         let saved = store.save(first, Artifact::View, &page);
         assert!(saved.landed && saved.evicted.is_empty());
         assert!(store.load(third, Artifact::Thumb).is_some());
+    }
+
+    #[test]
+    fn artifact_set_prefers_the_largest_role() {
+        let mut artifacts = Artifacts::default();
+        assert_eq!(artifacts.best(), None);
+        assert!(!artifacts.any());
+        assert!(!artifacts.readable());
+
+        artifacts.set(Artifact::Thumb);
+        assert_eq!(artifacts.best(), Some(Artifact::Thumb));
+        assert!(artifacts.contains(Artifact::Thumb));
+        assert!(artifacts.any());
+        assert!(!artifacts.readable());
+
+        artifacts.set(Artifact::View);
+        assert_eq!(artifacts.best(), Some(Artifact::View));
+        assert!(artifacts.readable());
+
+        artifacts.set(Artifact::Native);
+        assert_eq!(artifacts.best(), Some(Artifact::Native));
+
+        artifacts.clear(Artifact::Native);
+        assert_eq!(artifacts.best(), Some(Artifact::View));
+        assert!(!artifacts.contains(Artifact::Native));
+
+        artifacts.clear(Artifact::View);
+        assert_eq!(artifacts.best(), Some(Artifact::Thumb));
+        assert!(!artifacts.readable());
+        assert!(artifacts.any());
+
+        artifacts.clear(Artifact::Thumb);
+        assert_eq!(artifacts.best(), None);
+        assert!(!artifacts.any());
     }
 }

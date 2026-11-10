@@ -30,6 +30,7 @@ use crate::fault::SpawnError;
 use crate::plan::Plan;
 use crate::preview;
 use crate::preview::Artifact;
+use crate::preview::Artifacts;
 use crate::preview::Store;
 use crate::source::PageRead;
 use crate::source::Source;
@@ -93,35 +94,6 @@ enum ToWorker {
     /// artifact.
     Targets(Vec<Want>),
     Stop,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct Artifacts {
-    thumb: bool,
-    view: bool,
-    native: bool,
-}
-
-impl Artifacts {
-    fn set(&mut self, kind: Artifact) {
-        match kind {
-            Artifact::Thumb => self.thumb = true,
-            Artifact::View => self.view = true,
-            Artifact::Native => self.native = true,
-        }
-    }
-
-    fn clear(&mut self, kind: Artifact) {
-        match kind {
-            Artifact::Thumb => self.thumb = false,
-            Artifact::View => self.view = false,
-            Artifact::Native => self.native = false,
-        }
-    }
-
-    fn any(self) -> bool {
-        self.thumb || self.view || self.native
-    }
 }
 
 /// A page and the artifacts to produce. A `demand` job is delivered; a
@@ -215,13 +187,16 @@ impl Session {
                     .and_then(|hash| self.produced.get(hash))
                     .copied()
                     .unwrap_or_default();
-                let needs = Artifacts {
-                    thumb: !produced.thumb,
-                    view: in_head
-                        && self.motion == Motion::Still
-                        && !produced.view,
-                    native: false,
-                };
+                let mut needs = Artifacts::default();
+                if !produced.contains(Artifact::Thumb) {
+                    needs.set(Artifact::Thumb);
+                }
+                if in_head
+                    && self.motion == Motion::Still
+                    && !produced.contains(Artifact::View)
+                {
+                    needs.set(Artifact::View);
+                }
                 if needs.any() {
                     return Some(Job {
                         page,
@@ -363,11 +338,11 @@ impl Session {
         let serve_started = Instant::now();
         let hash = self.hash(page, &bytes);
         let mut thumb = needs
-            .thumb
+            .contains(Artifact::Thumb)
             .then(|| self.store.load(hash, Artifact::Thumb))
             .flatten();
         let mut view = needs
-            .view
+            .contains(Artifact::View)
             .then(|| self.store.load(hash, Artifact::View))
             .flatten();
         let thumb_hit = thumb.is_some();
@@ -378,9 +353,9 @@ impl Session {
         if view.is_some() {
             self.mark_produced(hash, Artifact::View);
         }
-        if needs.native
-            || (needs.view && view.is_none())
-            || (needs.thumb && thumb.is_none())
+        if needs.contains(Artifact::Native)
+            || (needs.contains(Artifact::View) && view.is_none())
+            || (needs.contains(Artifact::Thumb) && thumb.is_none())
         {
             let decode_started = Instant::now();
             let native = match decode_page(source, page, &bytes) {
@@ -395,7 +370,7 @@ impl Session {
                 elapsed = ?decode_started.elapsed(),
                 "decoded"
             );
-            if needs.view && view.is_none() {
+            if needs.contains(Artifact::View) && view.is_none() {
                 let started = Instant::now();
                 let derived = preview::derive(&native, Artifact::View);
                 tracing::debug!(
@@ -406,7 +381,7 @@ impl Session {
                 view =
                     Some(self.keep(page, hash, Artifact::View, derived));
             }
-            if needs.thumb && thumb.is_none() {
+            if needs.contains(Artifact::Thumb) && thumb.is_none() {
                 let started = Instant::now();
                 let from = view.as_ref().unwrap_or(&native);
                 let derived = preview::derive(from, Artifact::Thumb);
@@ -419,16 +394,16 @@ impl Session {
                     Some(self.keep(page, hash, Artifact::Thumb, derived));
             }
             // Natives bypass the store; a demand job delivers them.
-            if needs.native && demand {
+            if needs.contains(Artifact::Native) && demand {
                 self.publish(page, Artifact::Native, native, notify);
             }
         }
         if demand {
             tracing::debug!(
                 page,
-                thumb = needs.thumb,
-                view = needs.view,
-                native = needs.native,
+                thumb = needs.contains(Artifact::Thumb),
+                view = needs.contains(Artifact::View),
+                native = needs.contains(Artifact::Native),
                 thumb_hit,
                 view_hit,
                 waited = ?self.targets_at.elapsed(),
@@ -438,12 +413,12 @@ impl Session {
             // The view goes first: a still frame waits on it, and the
             // app's upload budget would otherwise defer it behind the
             // thumb by a frame.
-            if needs.view {
+            if needs.contains(Artifact::View) {
                 if let Some(view) = view {
                     self.publish(page, Artifact::View, view, notify);
                 }
             }
-            if needs.thumb {
+            if needs.contains(Artifact::Thumb) {
                 if let Some(thumb) = thumb {
                     self.publish(page, Artifact::Thumb, thumb, notify);
                 }
@@ -576,8 +551,8 @@ fn run(
         if let Some(job) = session.next_job() {
             tracing::debug!(
                 page = job.page,
-                thumb = job.needs.thumb,
-                view = job.needs.view,
+                thumb = job.needs.contains(Artifact::Thumb),
+                view = job.needs.contains(Artifact::View),
                 motion = ?session.motion,
                 preload = job.preload,
                 "job"

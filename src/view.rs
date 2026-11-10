@@ -424,13 +424,31 @@ impl Fit {
         if self.settled == Some(total) {
             return self.placement;
         }
-        self.placement = if self.user_moved {
+        self.placement = self.placement_for(total, viewport);
+        self.settled = Some(total);
+        self.placement
+    }
+
+    /// The scale [`Self::resolve`] would return for `total`, without
+    /// changing the fit.
+    #[must_use]
+    pub fn scale_for(&self, total: (f32, f32), viewport: Viewport) -> f32 {
+        self.placement_for(total, viewport).scale
+    }
+
+    fn placement_for(
+        &self,
+        total: (f32, f32),
+        viewport: Viewport,
+    ) -> Placement {
+        if self.settled == Some(total) {
+            return self.placement;
+        }
+        if self.user_moved {
             clamp(self.placement, total, viewport)
         } else {
             fit_as(self.mode, total, viewport)
-        };
-        self.settled = Some(total);
-        self.placement
+        }
     }
 
     /// Zoom by `factor` around `cursor` (viewport px), clamped so the

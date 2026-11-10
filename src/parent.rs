@@ -5,6 +5,7 @@ use std::ffi::OsString;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use crate::app;
 use crate::app::App;
@@ -84,7 +85,7 @@ fn run(open_path: &Path, land_on: Option<&str>) -> eros::Result<()> {
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     let wake: Wake = {
         let proxy = event_loop.create_proxy();
-        Box::new(move || app::post(&proxy, UserEvent::Wake))
+        Arc::new(move || app::post(&proxy, UserEvent::Wake))
     };
     // The initial open is the one blocking open; every switch after it
     // runs off the event loop.

@@ -1,6 +1,6 @@
 # Cache: representations, plan, store
 
-Reference for `src/preview.rs`, `src/plan.rs`, `src/worker.rs`, and the presentation half of `src/app.rs` and `src/render.rs`. Process ownership and transport are in `docs/internal/process.md`.
+Reference for `src/preview.rs`, `src/plan.rs`, `src/worker.rs`, `src/presentation.rs`, and `src/render.rs`. Process ownership and transport are in `docs/internal/process.md`.
 
 ## Direction
 
@@ -30,13 +30,13 @@ One decode thread per book. Wants come first, grouped per page so one decode ser
 
 ## Presentation
 
-A spread is presentable when every seat has a page fact plus a resident texture, or the page failed. Draw the requested spread when presentable; otherwise the nearest presentable start between shown and requested; otherwise the shown spread. Seats use `page_dims`, so pairing survives promotion.
+A spread is presentable when every seat has a page fact plus a resident texture, or the page failed. Draw the target spread when presentable; otherwise the nearest presentable start between presented and target; otherwise the presented spread. Seats use `page_dims`, so pairing survives promotion.
 
-Each frame wants the missing artifacts for the shown spread and a demand spread: the requested spread while still, the next spread in the travel direction while skimming. Still frames want views and thumbs, plus native for a shown upscaled page; skims want thumbs.
+Each frame wants the missing artifacts for the anchor spread (the presented spread, or the target while nothing is presentable) and a demand spread: the target spread while still, the next spread in the travel direction while skimming. Still frames want views and thumbs, plus native for an upscaled anchor page; skims want thumbs.
 
-Ending a skim commits `shown` into `requested`, promoting the looked-at thumb in place. `requested` is the plan's lookahead; `shown` carries its mode, so a pairing change cannot commit it. A still turn moves `requested` ahead; unseen turns are discarded at exit.
+Ending a skim commits the presented spread into the target, promoting the looked-at thumb in place. The target is the plan's lookahead; the presented spread carries its mode, so a pairing change cannot commit it. A still turn moves the target ahead; unseen turns are discarded at exit.
 
-Retention is role-bounded: thumbs for the book, views within `VIEW_KEEP_SPREADS` of shown or requested, natives for the shown spread. `kept` covers every want, so an artifact leaves the sent set before retention drops it. Uploads drain on a per-frame budget (`UPLOAD_BUDGET_*`); a backlog re-arms the next frame.
+Retention is derived from the plan: every want, plus role-bounded extras (thumbs for the book, views within `VIEW_KEEP_SPREADS` of the anchor or the target, natives for the anchor). Because the plan retains every want, an artifact leaves the sent set before retention drops it. Uploads drain on a per-frame budget (`UPLOAD_BUDGET_*`); a backlog re-arms the next frame.
 
 ## Limits
 

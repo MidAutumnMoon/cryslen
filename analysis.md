@@ -30,9 +30,9 @@ Item numbers stay fixed because other documents cite them. Items 1 and 7 are des
 
 3. **A held-key skim ends at the release.** A page-turn key the platform repeats starts a skim; `Released` or focus loss ends it. The final page's view want is sent in the release frame, so the store hit or decode starts there instead of after `SKIM_DECAY`. Rapid taps demand their own view.
 
-7. **`switch_book` no longer opens the source on the UI thread.** It kills the old child, returns, and starts a thread that runs `PendingBookOpen::finish`; the app adopts the result when it arrives, and the old `BookView` and textures stay on screen while it runs. A slow archive listing now delays only the new book, never input or drawing. The session's initial open is still synchronous, a residual limit in `docs/internal/process.md`.
+7. **`Book::step` no longer opens the source on the UI thread.** It kills the old child, returns, and starts a thread that runs `PendingBookOpen::finish`; the app adopts the result when it arrives, and the old `BookView` and textures stay on screen while it runs. A slow archive listing now delays only the new book, never input or drawing. The session's initial open is still synchronous, a residual limit in `docs/internal/process.md`.
 
 ## Considered and left as is
 
-- No hard byte ceiling on the GPU maps: retention is role-bounded (natives for the shown spread only, views within ±2 spread starts of shown/requested, thumbs for the session). Revisit only on OOM.
+- No hard byte ceiling on the GPU maps: retention is role-bounded (natives for the anchor only, views within `VIEW_KEEP_SPREADS` spread starts of anchor/target, thumbs for the session). Revisit only on OOM.
 - Failures are sticky per session, with no retry/backoff. Revisit only if transient I/O errors appear.

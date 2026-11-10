@@ -17,6 +17,7 @@ mod fault;
 mod keys;
 mod parent;
 mod plan;
+mod presentation;
 mod preview;
 mod render;
 mod source;

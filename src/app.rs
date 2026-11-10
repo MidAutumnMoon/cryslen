@@ -4,12 +4,9 @@ use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
-use crossbeam_channel::Receiver;
-use crossbeam_channel::TryRecvError;
 use egui_winit::winit;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -22,19 +19,21 @@ use winit::keyboard::KeyCode;
 use winit::keyboard::ModifiersState;
 use winit::window::WindowId;
 
+use crate::book::Book;
+use crate::book::BookChange;
+use crate::book::BookControl;
 use crate::book::BookEvent;
 use crate::book::BookProcess;
 use crate::book::BookView;
-use crate::book::PendingBookOpen;
 use crate::book::Wake;
 use crate::decode;
-use crate::decode::Format;
-use crate::fault::BookFault;
 use crate::fault::PageFault;
 use crate::keys::Action;
 use crate::plan::Direction;
+use crate::presentation;
+use crate::presentation::FrameInput;
 use crate::preview::Artifact;
-use crate::preview::VIEW_EDGE;
+use crate::preview::Artifacts;
 use crate::protocol::ParentMsg;
 use crate::render::PageTextures;
 use crate::ui;
@@ -42,7 +41,6 @@ use crate::ui::PageFacts;
 use crate::ui::StatusLine;
 use crate::view;
 use crate::view::FitMode;
-use crate::view::PageCount;
 use crate::view::Spread;
 use crate::view::ViewMode;
 use crate::view::Viewport;
@@ -79,18 +77,9 @@ impl Drop for Gl {
     }
 }
 
-/// The page's own dims and format, independent of the stored representation.
-#[derive(Clone, Copy)]
-struct CachedPage {
-    dims: (u32, u32),
-    format: Format,
-}
-
 /// One artifact always goes through, so a big page stalls at most one frame.
 const UPLOAD_BUDGET_COUNT: usize = 16;
 const UPLOAD_BUDGET_BYTES: usize = 8 * 1024 * 1024;
-
-const VIEW_KEEP_SPREADS: usize = 2;
 
 /// Page-turn keys currently down, and whether the platform has repeated
 /// them.
@@ -117,67 +106,10 @@ impl HeldKeys {
     }
 }
 
-#[derive(Debug)]
-struct Position {
-    requested: usize,
-    shown: Option<ShownSpread>,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct ShownSpread {
-    mode: ViewMode,
-    spread: Spread,
-}
-
-impl Position {
-    fn new(requested: usize) -> Self {
-        Self {
-            requested,
-            shown: None,
-        }
-    }
-
-    fn requested(&self) -> usize {
-        self.requested
-    }
-
-    fn shown(&self) -> Option<Spread> {
-        self.shown.map(|shown| shown.spread)
-    }
-
-    fn set_requested(&mut self, requested: usize) {
-        self.requested = requested;
-    }
-
-    fn record_shown(&mut self, mode: ViewMode, shown: Option<Spread>) {
-        self.shown = shown.map(|spread| ShownSpread { mode, spread });
-    }
-
-    fn commit_shown(&mut self, mode: ViewMode) -> bool {
-        let Some(shown) = self.shown else {
-            return false;
-        };
-        if shown.mode != mode || shown.spread.first == self.requested {
-            return false;
-        }
-        self.requested = shown.spread.first;
-        true
-    }
-}
-
-pub struct App {
-    /// What the UI shows; it outlives a dead child until a switch lands.
-    view: BookView,
-    process: Option<BookProcess>,
-    /// The one switch in flight; a switch while it runs is ignored.
-    pending_open:
-        Option<Receiver<Result<(BookView, BookProcess), BookFault>>>,
-    gl: Option<Gl>,
-    fatal_error: Option<eros::ErrorUnion>,
-    position: Position,
-    mode: ViewMode,
-    fit: view::Fit,
-    cached: BTreeMap<usize, CachedPage>,
+/// Everything that resets when a book is adopted.
+struct Session {
+    navigation: presentation::Navigation,
+    cached: BTreeMap<usize, presentation::CachedPage>,
     /// Page faults, sticky per page so a blip cannot erase them.
     faults: BTreeMap<usize, PageFault>,
     queue: VecDeque<worker::Ready>,
@@ -191,8 +123,61 @@ pub struct App {
     /// Reading direction of the last turn: the child's plan and skim
     /// tie-breaks follow it.
     direction: Direction,
-    /// A failed switch or a dead child, held until the next book lands.
-    book_fault: Option<BookFault>,
+}
+
+impl Session {
+    /// The first frame is a frame away, so compute the cold wants up
+    /// front: the child serves the visible page before it starts the plan.
+    fn new(
+        view: &BookView,
+        mode: ViewMode,
+        index: usize,
+    ) -> (Self, Vec<Want>) {
+        let cold = presentation::cold_wants(
+            view::spread_for(index, mode, view.len()),
+            mode,
+        );
+        let session = Self {
+            navigation: presentation::Navigation::new(index),
+            cached: BTreeMap::new(),
+            faults: BTreeMap::new(),
+            queue: VecDeque::new(),
+            upload_fault_page: None,
+            motion: Motion::Still,
+            held_keys: HeldKeys::default(),
+            last_nav: None,
+            hold_since: None,
+            hold_logged: false,
+            sent_wants: cold.clone(),
+            direction: Direction::Forward,
+        };
+        (session, cold)
+    }
+
+    /// Start a book: build its session, then send the view before the
+    /// cold wants so the child has a plan to serve.
+    fn start(book: &Book, mode: ViewMode, index: usize) -> Self {
+        let (session, cold) = Self::new(book.view(), mode, index);
+        book.send(ParentMsg::SetView {
+            index,
+            mode,
+            direction: Direction::Forward,
+        });
+        book.send(ParentMsg::SetWants(cold));
+        session
+    }
+}
+
+pub struct App {
+    /// The book and its lifecycle; it outlives a dead child until a switch
+    /// lands.
+    book: Book,
+    gl: Option<Gl>,
+    fatal_error: Option<eros::ErrorUnion>,
+    mode: ViewMode,
+    /// The fit mode survives a book switch; its placement does not.
+    fit: view::Fit,
+    session: Session,
     timers: ui::Timers,
     /// Cursor position in viewport px, same as window px.
     cursor: (f32, f32),
@@ -214,39 +199,19 @@ impl App {
         proxy: EventLoopProxy<UserEvent>,
     ) -> Self {
         let mode = ViewMode::Normal;
-        let direction = Direction::Forward;
-        // The first frame is a frame away; declare what a cold start
-        // lacks now, so the child serves the visible page before it
-        // starts the plan.
-        let cold =
-            cold_wants(view::spread_for(index, mode, view.len()), mode);
-        process.send(ParentMsg::SetView {
-            index,
-            mode,
-            direction,
+        let wake: Wake = Arc::new({
+            let proxy = proxy.clone();
+            move || post(&proxy, UserEvent::Wake)
         });
-        process.send(ParentMsg::SetWants(cold.clone()));
+        let book = Book::new(view, process, wake);
+        let session = Session::start(&book, mode, index);
         Self {
-            view,
-            process: Some(process),
-            pending_open: None,
+            book,
             gl: None,
             fatal_error: None,
-            position: Position::new(index),
             mode,
             fit: view::Fit::default(),
-            cached: BTreeMap::new(),
-            faults: BTreeMap::new(),
-            queue: VecDeque::new(),
-            upload_fault_page: None,
-            motion: Motion::Still,
-            held_keys: HeldKeys::default(),
-            last_nav: None,
-            hold_since: None,
-            hold_logged: false,
-            sent_wants: cold,
-            direction,
-            book_fault: None,
+            session,
             timers: ui::Timers::default(),
             cursor: (0.0, 0.0),
             dragging: false,
@@ -270,58 +235,28 @@ impl App {
     }
 
     fn send(&self, message: ParentMsg) {
-        if let Some(process) = self.process.as_ref() {
-            process.send(message);
-        }
+        self.book.send(message);
     }
 
-    fn kill_process(&mut self) {
-        if let Some(mut process) = self.process.take() {
-            process.kill();
-        }
-    }
-
-    fn drain_events(&self) -> Vec<BookEvent> {
-        self.process
+    fn artifacts(&self, page: usize) -> Artifacts {
+        self.gl
             .as_ref()
-            .map_or_else(Vec::new, BookProcess::drain)
-    }
-
-    fn spread(&self) -> Spread {
-        view::spread_for(
-            self.position.requested(),
-            self.mode,
-            self.view.len(),
-        )
-    }
-
-    fn has_any(&self, page: usize) -> bool {
-        self.gl.as_ref().is_some_and(|gl| gl.pages.has_any(page))
-    }
-
-    fn has(&self, page: usize, kind: Artifact) -> bool {
-        self.gl.as_ref().is_some_and(|gl| gl.pages.has(page, kind))
+            .map_or_else(Artifacts::default, |gl| gl.pages.artifacts(page))
     }
 
     fn artifact_name(&self, page: Option<usize>) -> &'static str {
         let Some(page) = page else {
             return "empty";
         };
-        if self.has(page, Artifact::Native) {
-            "native"
-        } else if self.has(page, Artifact::View) {
-            "view"
-        } else if self.has(page, Artifact::Thumb) {
-            "thumb"
-        } else {
-            "none"
-        }
+        self.artifacts(page).best().map_or("none", Artifact::name)
     }
 
-    /// A still frame presents only a view or native; a thumb is a motion
-    /// artifact, so the previous spread stays up until the view arrives.
-    fn readable(&self, page: usize) -> bool {
-        self.has(page, Artifact::View) || self.has(page, Artifact::Native)
+    fn target_spread(&self) -> Spread {
+        view::spread_for(
+            self.session.navigation.target(),
+            self.mode,
+            self.book.view().len(),
+        )
     }
 
     fn is_fullscreen(&self) -> bool {
@@ -341,38 +276,50 @@ impl App {
         let drained = frame_started.elapsed();
         let now = Instant::now();
 
-        let requested = self.spread();
-        let skimming = self.motion == Motion::Skimming;
-        let chosen = choose_presented(
-            requested,
-            self.position.shown(),
+        let len = self.book.view().len();
+        let target = view::spread_for(
+            self.session.navigation.target(),
             self.mode,
-            self.view.len(),
-            &self.cached,
-            self.direction == Direction::Forward,
-            |page| {
-                self.faults.contains_key(&page)
-                    || (self.cached.contains_key(&page)
-                        && if skimming {
-                            self.has_any(page)
-                        } else {
-                            self.readable(page)
-                        })
+            len,
+        );
+
+        let (view_width, view_height) = self.last_viewport.size();
+        let measurable = view_width > 0.0 && view_height > 0.0;
+        let plan = presentation::plan_frame(
+            &FrameInput {
+                target,
+                presented: self.session.navigation.presented_with_mode(),
+                mode: self.mode,
+                motion: self.session.motion,
+                direction: self.session.direction,
+                len,
+                facts: &self.session.cached,
+                faults: &self.session.faults,
+                measurable,
+            },
+            |page| self.artifacts(page),
+            |anchor| {
+                let total =
+                    view::layout(self.seat_dims_for(anchor)).total();
+                self.fit.scale_for(total, self.last_viewport)
             },
         );
-        if chosen != self.position.shown() {
-            let seats = chosen.map(|spread| {
+        let presented = plan.presented();
+        let changed = presented != self.session.navigation.presented();
+        if changed {
+            let seats = presented.map(|spread| {
                 spread
                     .seats(self.mode)
                     .map(|seat| self.artifact_name(seat))
             });
             let took = self
+                .session
                 .last_nav
                 .map(|last| now.saturating_duration_since(last));
             tracing::debug!(
-                from = ?self.position.shown(),
-                to = ?chosen,
-                motion = ?self.motion,
+                from = ?self.session.navigation.presented(),
+                to = ?presented,
+                motion = ?self.session.motion,
                 ?seats,
                 ?took,
                 "presented"
@@ -380,84 +327,66 @@ impl App {
             self.fit.commit();
         }
         // Record every frame so a mode switch retags an unchanged spread.
-        self.position.record_shown(self.mode, chosen);
-        if self.motion == Motion::Still && chosen != Some(requested) {
-            let since = *self.hold_since.get_or_insert(now);
+        self.session
+            .navigation
+            .record_presented(self.mode, presented);
+        let anchor = plan.anchor();
+        // The layout must describe the anchor the plan presents; a stale
+        // layout clamps one edge.
+        let layout = view::layout(self.seat_dims_for(anchor));
+        let spread_size = layout.total();
+        let placed = self.fit.resolve(spread_size, self.last_viewport);
+        if changed {
+            tracing::debug!(
+                ?anchor,
+                ?presented,
+                total = ?spread_size,
+                dims = ?self.seat_dims_for(anchor),
+                scale = placed.scale,
+                "placement"
+            );
+        }
+        if self.session.motion == Motion::Still
+            && presented != Some(target)
+        {
+            let since = *self.session.hold_since.get_or_insert(now);
             let waited = now.saturating_duration_since(since);
-            if !self.hold_logged && waited >= Duration::from_millis(250) {
-                self.hold_logged = true;
+            if !self.session.hold_logged
+                && waited >= Duration::from_millis(250)
+            {
+                self.session.hold_logged = true;
                 tracing::info!(
-                    requested = ?requested,
-                    shown = ?chosen,
+                    target = ?target,
+                    presented = ?presented,
                     waited = ?waited,
-                    queue = self.queue.len(),
+                    queue = self.session.queue.len(),
                     "holding for a view"
                 );
             }
         } else {
-            self.hold_since = None;
-            self.hold_logged = false;
+            self.session.hold_since = None;
+            self.session.hold_logged = false;
         }
-        let shown = chosen.unwrap_or(requested);
-
-        let layout = view::layout(self.seat_dims());
-        let spread_size = layout.total();
-        let placed = self.fit.resolve(spread_size, self.last_viewport);
-
-        let (mode, len) = (self.mode, self.view.len());
         if let Some(gl) = self.gl.as_mut() {
             // Retention is a performance policy: a dropped artifact is
             // just a want on the next frame.
-            gl.pages.retain(|page, kind| {
-                kept(page, kind, shown, requested, mode, len)
-            });
+            gl.pages.retain(|page, kind| plan.retains(page, kind));
         }
         // The texture maps are the authority: recompute the wants each frame
         // and send only changes. A zero-sized viewport says nothing about what
         // the screen resolves.
-        let (view_width, view_height) = self.last_viewport.size();
-        let measurable = view_width > 0.0 && view_height > 0.0;
-        let demand = demand_spread(
-            requested,
-            shown,
-            self.motion,
-            self.direction,
-            self.mode,
-            self.view.len(),
-        );
-        let wants = wants(
-            demand,
-            shown,
-            self.mode,
-            self.motion == Motion::Still,
-            // A native is the page's own pixels; the shown spread
-            // is the only one up, so `wants` only asks for those.
-            |page| {
-                measurable
-                    && self.cached.get(&page).is_some_and(|entry| {
-                        native_wanted(placed.scale, entry.dims)
-                    })
-            },
-            |page, kind| self.has(page, kind),
-            |page| self.faults.contains_key(&page),
-        );
-        debug_assert!(
-            wants.iter().all(|want| kept(
-                want.page, want.kind, shown, requested, mode, len
-            )),
-            "retention must cover every want; a want that never leaves \
-             the sent set can never be re-served"
-        );
-        if wants != self.sent_wants {
-            tracing::debug!(?wants, "requested");
+        let demand = plan.demand();
+        let wants = plan.into_wants();
+        if wants != self.session.sent_wants {
+            tracing::debug!(?wants, ?demand, "sent wants");
             self.send(ParentMsg::SetWants(wants.clone()));
-            self.sent_wants = wants;
+            self.session.sent_wants = wants;
         }
 
-        let faults = &self.faults;
-        let cached = &self.cached;
+        let faults = &self.session.faults;
+        let cached = &self.session.cached;
         let pages = self.gl.as_ref().map(|gl| &gl.pages);
-        let folded = ui::fold_status(shown, |page| {
+        let folded = ui::fold_status(anchor, |page| {
             let entry = cached.get(&page);
             // `waiting` means the spread has no pixels yet, so a page
             // counts as decoded only once its texture is cached.
@@ -480,27 +409,31 @@ impl App {
 
         let page = folded.page.map(|(page, decoded, dims)| PageFacts {
             claimed: self
-                .view
+                .book
+                .view()
                 .name(page)
                 .and_then(decode::format_from_name),
             decoded,
             dims,
         });
         let upload_fault = self
+            .session
             .upload_fault_page
-            .and_then(|failed| self.faults.get(&failed));
+            .and_then(|failed| self.session.faults.get(&failed));
         let status = StatusLine {
-            page_count: self.view.len().get(),
-            spread: shown,
+            page_count: self.book.view().len().get(),
+            spread: anchor,
             mode: self.mode,
             toast: self.timers.toasting(),
-            name: self.view.page_name(folded.speaker),
+            name: self.book.view().page_name(folded.speaker),
             page,
             zoom: placed.scale,
-            waiting: self.timers.wait_word(now, || self.view.unpacking),
+            waiting: self
+                .timers
+                .wait_word(now, || self.book.view().unpacking),
             fault: ui::fault_to_show(
                 folded.fault,
-                self.book_fault.as_ref(),
+                self.book.fault(),
                 upload_fault,
             ),
         };
@@ -539,7 +472,7 @@ impl App {
             [size.width, size.height],
             clear_color(gl.window.translucent()),
         );
-        if let Some(spread) = self.position.shown() {
+        if let Some(spread) = self.session.navigation.presented() {
             gl.pages.draw(
                 (size.width, size.height),
                 viewport,
@@ -555,8 +488,8 @@ impl App {
             tracing::info!(
                 total = ?total,
                 drain = ?drained,
-                queue = self.queue.len(),
-                shown = ?self.position.shown(),
+                queue = self.session.queue.len(),
+                presented = ?self.session.navigation.presented(),
                 "slow frame"
             );
         }
@@ -573,22 +506,26 @@ impl App {
         let started = Instant::now();
         let mut uploaded = 0_usize;
         let mut bytes = 0_usize;
-        while let Some(cost) =
-            self.queue.front().map(|ready| ready.image.resident_bytes())
+        while let Some(cost) = self
+            .session
+            .queue
+            .front()
+            .map(|ready| ready.image.resident_bytes())
         {
             let over_budget = uploaded >= UPLOAD_BUDGET_COUNT
                 || bytes.saturating_add(cost) > UPLOAD_BUDGET_BYTES;
             if uploaded > 0 && over_budget {
                 break;
             }
-            let Some(ready) = self.queue.pop_front() else {
+            let Some(ready) = self.session.queue.pop_front() else {
                 break;
             };
             let dims = ready.image.page_dims();
             let format = ready.image.format();
-            match self.cached.entry(ready.page) {
+            match self.session.cached.entry(ready.page) {
                 Entry::Vacant(entry) => {
-                    entry.insert(CachedPage { dims, format });
+                    entry
+                        .insert(presentation::CachedPage { dims, format });
                 }
                 Entry::Occupied(entry) => debug_assert_eq!(
                     (entry.get().dims, entry.get().format),
@@ -619,9 +556,10 @@ impl App {
                 );
             }
             if let Err(error) = refused {
-                self.faults
+                self.session
+                    .faults
                     .insert(ready.page, PageFault::from(error.widen()));
-                self.upload_fault_page = Some(ready.page);
+                self.session.upload_fault_page = Some(ready.page);
             }
             uploaded += 1;
             bytes = bytes.saturating_add(cost);
@@ -634,48 +572,54 @@ impl App {
                 "drained"
             );
         }
-        if !self.queue.is_empty() {
+        if !self.session.queue.is_empty() {
             post(&self.proxy, UserEvent::Repaint(Duration::ZERO));
         }
     }
 
-    fn seat_dims(&self) -> [Option<(u32, u32)>; 2] {
-        let shown = self.position.shown().unwrap_or_else(|| self.spread());
-        shown.seats(self.mode).map(|seat| {
+    fn anchor(&self) -> Spread {
+        self.session
+            .navigation
+            .presented()
+            .unwrap_or_else(|| self.target_spread())
+    }
+
+    fn seat_dims_for(&self, spread: Spread) -> [Option<(u32, u32)>; 2] {
+        spread.seats(self.mode).map(|seat| {
             let page = seat?;
-            self.cached.get(&page).map(|entry| entry.dims)
+            self.session.cached.get(&page).map(|entry| entry.dims)
         })
     }
 
     fn sync_motion(&mut self) {
-        let motion = if self.held_keys.skimming() {
+        let motion = if self.session.held_keys.skimming() {
             Motion::Skimming
         } else {
             Motion::Still
         };
-        if motion == self.motion {
+        if motion == self.session.motion {
             return;
         }
         if motion == Motion::Still {
-            // A turn may not have reached the screen; commit the shown
+            // A turn may not have reached the screen; commit the presented
             // spread so its thumb promotes in place.
-            let from = self.position.requested();
-            if self.position.commit_shown(self.mode) {
+            let from = self.session.navigation.target();
+            if self.session.navigation.commit_presented(self.mode) {
                 tracing::debug!(
                     from,
-                    to = self.position.requested(),
-                    "commit shown"
+                    to = self.session.navigation.target(),
+                    "commit presented"
                 );
                 self.set_view();
             }
         }
         tracing::debug!(
             ?motion,
-            requested = self.position.requested(),
-            shown = ?self.position.shown(),
+            target = self.session.navigation.target(),
+            presented = ?self.session.navigation.presented(),
             "motion"
         );
-        self.motion = motion;
+        self.session.motion = motion;
         self.send(ParentMsg::SetMotion(motion));
         self.request_redraw();
     }
@@ -697,7 +641,10 @@ impl App {
     }
 
     fn geometry(&self) -> ((f32, f32), Viewport) {
-        (view::layout(self.seat_dims()).total(), self.last_viewport)
+        (
+            view::layout(self.seat_dims_for(self.anchor())).total(),
+            self.last_viewport,
+        )
     }
 
     fn dispatch(&mut self, action: Action, event_loop: &ActiveEventLoop) {
@@ -713,27 +660,28 @@ impl App {
                 }
             }
             Action::SelectMode(mode) => {
-                if self.motion == Motion::Skimming {
+                if self.session.motion == Motion::Skimming {
                     // The new pairing is a different coordinate system;
-                    // commit the shown spread before switching.
-                    let from = self.position.requested();
-                    if self.position.commit_shown(self.mode) {
+                    // commit the presented spread before switching.
+                    let from = self.session.navigation.target();
+                    if self.session.navigation.commit_presented(self.mode)
+                    {
                         tracing::debug!(
                             from,
-                            to = self.position.requested(),
-                            "mode switch commits shown"
+                            to = self.session.navigation.target(),
+                            "mode switch commits presented"
                         );
                     }
                 }
                 let switch = view::switch_mode(
                     self.mode,
                     mode,
-                    self.position.requested(),
-                    self.view.len(),
+                    self.session.navigation.target(),
+                    self.book.view().len(),
                 );
                 self.mode = mode;
-                self.position.set_requested(switch.index);
-                self.direction = Direction::Forward;
+                self.session.navigation.set_target(switch.index);
+                self.session.direction = Direction::Forward;
                 self.timers.toast(Instant::now());
                 if switch.pairing_changed {
                     // The fit begins the new pairing; a mode switch skips
@@ -765,13 +713,16 @@ impl App {
                 let index = if first {
                     view::first_spread()
                 } else {
-                    view::last_spread(self.mode, self.view.len())
+                    view::last_spread(self.mode, self.book.view().len())
                 };
-                self.position.set_requested(index);
+                self.session.navigation.set_target(index);
                 self.after_page_change(travel_direction(first));
             }
             Action::NextBook | Action::PrevBook => {
-                self.switch_book(matches!(action, Action::NextBook));
+                let change = self.book.step(BookControl::Switch(
+                    matches!(action, Action::NextBook),
+                ));
+                self.apply_book_change(change);
             }
             Action::Right
             | Action::Left
@@ -779,102 +730,39 @@ impl App {
             | Action::Back => {
                 let forward = action.is_forward(self.mode);
                 let next = view::advance(
-                    self.position.requested(),
+                    self.session.navigation.target(),
                     forward,
                     self.mode,
-                    self.view.len(),
+                    self.book.view().len(),
                 );
-                self.position.set_requested(next);
+                self.session.navigation.set_target(next);
                 self.after_page_change(travel_direction(forward));
             }
         }
     }
 
-    /// Start the next sibling book without blocking the frame. The old child
-    /// dies first, so its queued events cannot outlive the switch; its view
-    /// and textures stay on screen until the new book lands.
-    fn switch_book(&mut self, forward: bool) {
-        if self.pending_open.is_some() {
-            return;
-        }
-        let Some(path) = self.view.sibling(forward) else {
-            return;
-        };
-        tracing::debug!(path = %path.display(), forward, "book switch");
-        self.kill_process();
-        let wake: Wake = {
-            let proxy = self.proxy.clone();
-            Box::new(move || post(&proxy, UserEvent::Wake))
-        };
-        let opened = match PendingBookOpen::begin(&path, wake) {
-            Ok(opened) => opened,
-            Err(error) => {
-                self.book_fault = Some(error);
-                self.request_redraw();
-                return;
-            }
-        };
-        let (opened_tx, opened_rx) = crossbeam_channel::bounded(1);
-        let proxy = self.proxy.clone();
-        let spawned = thread::Builder::new()
-            .name(String::from("cy-book-open"))
-            .spawn(move || {
-                if opened_tx.send(opened.finish()).is_ok() {
-                    post(&proxy, UserEvent::Wake);
+    /// A switch runs off the event loop; the old book's view and textures
+    /// stay on screen until the new one lands.
+    fn apply_book_change(&mut self, change: BookChange) {
+        match change {
+            BookChange::None => {}
+            BookChange::Adopted => {
+                let index = view::first_spread();
+                self.session =
+                    Session::start(&self.book, self.mode, index);
+                self.fit.refit();
+                if let Some(gl) = self.gl.as_mut() {
+                    gl.pages.clear_all();
                 }
-            });
-        match spawned {
-            Ok(_detached) => {
-                self.pending_open = Some(opened_rx);
+                tracing::debug!(
+                    path = %self.book.view().path.display(),
+                    count = self.book.view().len().get(),
+                    "book adopted"
+                );
             }
-            Err(error) => {
-                // A failed spawn drops the pending open, which kills the
-                // child that was just forked for it.
-                self.book_fault =
-                    Some(BookFault::Spawn(error.to_string()));
+            BookChange::Faulted => {
                 self.request_redraw();
             }
-        }
-    }
-
-    /// Put a freshly opened book on screen. Page numbering restarts, so
-    /// no artifact, fault, or want of the old book may survive.
-    fn adopt_book(&mut self, view: BookView, process: BookProcess) {
-        let index = view::first_spread();
-        let cold = cold_wants(
-            view::spread_for(index, self.mode, view.len()),
-            self.mode,
-        );
-        process.send(ParentMsg::SetView {
-            index,
-            mode: self.mode,
-            direction: Direction::Forward,
-        });
-        process.send(ParentMsg::SetWants(cold.clone()));
-        tracing::debug!(
-            path = %view.path.display(),
-            count = view.len().get(),
-            "book adopted"
-        );
-        self.view = view;
-        // Assigning drops the old process, whose `Drop` kills it.
-        self.process = Some(process);
-        self.position = Position::new(index);
-        self.direction = Direction::Forward;
-        self.sent_wants = cold;
-        self.cached.clear();
-        self.faults.clear();
-        self.queue.clear();
-        self.upload_fault_page = None;
-        self.motion = Motion::Still;
-        self.held_keys.clear();
-        self.last_nav = None;
-        self.hold_since = None;
-        self.hold_logged = false;
-        self.fit.refit();
-        self.book_fault = None;
-        if let Some(gl) = self.gl.as_mut() {
-            gl.pages.clear_all();
         }
     }
 
@@ -882,66 +770,44 @@ impl App {
     /// child's receiver went with it, so no stale event of a book that
     /// already left the screen can arrive here.
     fn poll_book_updates(&mut self) {
-        for event in self.drain_events() {
+        for event in self.book.drain() {
             match event {
-                BookEvent::Ready(ready) => self.queue.push_back(ready),
-                BookEvent::Failed { page, fault } => {
-                    self.faults.insert(page, fault);
+                BookEvent::Ready(ready) => {
+                    self.session.queue.push_back(ready);
                 }
-                BookEvent::Unpacked => self.view.unpacking = false,
+                BookEvent::Failed { page, fault } => {
+                    self.session.faults.insert(page, fault);
+                }
+                BookEvent::Unpacked => self.book.mark_unpacked(),
                 BookEvent::Died(detail) => {
-                    tracing::warn!(%detail, "the book process failed");
-                    // The process is gone; taking it reaps it and joins
-                    // the reader that just reported the death.
-                    self.kill_process();
-                    self.book_fault.get_or_insert(BookFault::Died(detail));
+                    let change = self.book.step(BookControl::Died(detail));
+                    self.apply_book_change(change);
                 }
             }
         }
-        let Some(in_flight) = self.pending_open.take() else {
-            return;
-        };
-        let opened = match in_flight.try_recv() {
-            Ok(opened) => opened,
-            Err(TryRecvError::Empty) => {
-                self.pending_open = Some(in_flight);
-                return;
-            }
-            Err(TryRecvError::Disconnected) => {
-                self.book_fault.get_or_insert_with(|| {
-                    BookFault::Died(String::from(
-                        "the book switch ended without a book",
-                    ))
-                });
-                return;
-            }
-        };
-        match opened {
-            Ok((view, process)) => self.adopt_book(view, process),
-            Err(fault) => {
-                tracing::warn!(?fault, "book switch failed");
-                self.book_fault = Some(fault);
-            }
+        if let Some(opened) = self.book.take_opened() {
+            let change = self.book.step(BookControl::Opened(opened));
+            self.apply_book_change(change);
         }
     }
 
     fn set_view(&self) {
         self.send(ParentMsg::SetView {
-            index: self.position.requested(),
+            index: self.session.navigation.target(),
             mode: self.mode,
-            direction: self.direction,
+            direction: self.session.direction,
         });
     }
 
     fn after_page_change(&mut self, direction: Direction) {
-        self.direction = direction;
+        self.session.direction = direction;
         self.set_view();
         self.fit.begin_turn();
-        self.last_nav = Some(Instant::now());
+        self.session.last_nav = Some(Instant::now());
         tracing::debug!(
-            index = self.position.requested(),
+            index = self.session.navigation.target(),
             ?direction,
-            motion = ?self.motion,
+            motion = ?self.session.motion,
             "turn"
         );
         self.request_redraw();
@@ -954,182 +820,6 @@ fn travel_direction(forward: bool) -> Direction {
     } else {
         Direction::Backward
     }
-}
-
-/// Whether the placement needs more pixels than the view holds: only when
-/// the page's long edge and the fitted edge both exceed [`VIEW_EDGE`].
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "page edges and the fixed view edge stay far below f32's exact-integer range, so the threshold comparison holds"
-)]
-fn native_wanted(scale: f32, page_dims: (u32, u32)) -> bool {
-    let page_edge = page_dims.0.max(page_dims.1);
-    page_edge > VIEW_EDGE && scale > VIEW_EDGE as f32 / page_edge as f32
-}
-
-/// While skimming, demand the next spread instead of the far requested one:
-/// serving a far pair splits it before both pages arrive.
-fn demand_spread(
-    requested: Spread,
-    shown: Spread,
-    motion: Motion,
-    direction: Direction,
-    mode: ViewMode,
-    len: PageCount,
-) -> Spread {
-    if motion == Motion::Still {
-        return requested;
-    }
-    let next_start = view::advance(
-        shown.first,
-        direction == Direction::Forward,
-        mode,
-        len,
-    );
-    view::spread_for(next_start, mode, len)
-}
-
-fn wants(
-    demand: Spread,
-    shown: Spread,
-    mode: ViewMode,
-    still: bool,
-    upscaled: impl Fn(usize) -> bool,
-    has: impl Fn(usize, Artifact) -> bool,
-    errored: impl Fn(usize) -> bool,
-) -> Vec<Want> {
-    let readable = |page: usize| {
-        has(page, Artifact::View) || has(page, Artifact::Native)
-    };
-    let mut wants = Vec::new();
-    for spread in [demand, shown] {
-        for page in spread.seats(mode).into_iter().flatten() {
-            if errored(page) {
-                continue;
-            }
-            if still {
-                if !readable(page) {
-                    push_want(&mut wants, page, Artifact::View);
-                }
-                if !has(page, Artifact::Thumb) {
-                    push_want(&mut wants, page, Artifact::Thumb);
-                }
-                if shown.contains(page)
-                    && upscaled(page)
-                    && !has(page, Artifact::Native)
-                {
-                    push_want(&mut wants, page, Artifact::Native);
-                }
-                continue;
-            }
-            if !has(page, Artifact::Thumb) {
-                push_want(&mut wants, page, Artifact::Thumb);
-            }
-        }
-    }
-    wants
-}
-
-/// What a spread with no textures is missing, used before the first
-/// frame can measure the placement.
-fn cold_wants(spread: Spread, mode: ViewMode) -> Vec<Want> {
-    wants(
-        spread,
-        spread,
-        mode,
-        true,
-        |_| false,
-        |_, _| false,
-        |_| false,
-    )
-}
-
-fn push_want(wants: &mut Vec<Want>, page: usize, kind: Artifact) {
-    let want = Want { page, kind };
-    if !wants.contains(&want) {
-        wants.push(want);
-    }
-}
-
-/// Whether the frame keeps `page`'s `kind` resident. Must cover every
-/// [`wants`] entry, or the worker never learns the artifact is missing
-/// again.
-fn kept(
-    page: usize,
-    kind: Artifact,
-    shown: Spread,
-    requested: Spread,
-    mode: ViewMode,
-    len: PageCount,
-) -> bool {
-    match kind {
-        Artifact::Thumb => true,
-        Artifact::View => view_kept(page, shown, requested, mode, len),
-        Artifact::Native => shown.contains(page),
-    }
-}
-
-fn view_kept(
-    page: usize,
-    shown: Spread,
-    requested: Spread,
-    mode: ViewMode,
-    len: PageCount,
-) -> bool {
-    let start = view::spread_for(page, mode, len).first;
-    start.abs_diff(shown.first) <= VIEW_KEEP_SPREADS
-        || start.abs_diff(requested.first) <= VIEW_KEEP_SPREADS
-}
-
-/// The requested spread once every page clears `can_show`; otherwise the
-/// nearest presentable start between the shown and requested spreads, so
-/// a skim advances monotonically; otherwise the shown spread.
-fn choose_presented(
-    requested: Spread,
-    shown: Option<Spread>,
-    mode: ViewMode,
-    len: PageCount,
-    cached: &BTreeMap<usize, CachedPage>,
-    forward: bool,
-    can_show: impl Fn(usize) -> bool,
-) -> Option<Spread> {
-    let presentable = |spread: Spread| {
-        spread.seats(mode).into_iter().flatten().all(&can_show)
-    };
-    if presentable(requested) {
-        return Some(requested);
-    }
-    let (low, high) = shown.map_or((0, usize::MAX), |shown| {
-        (
-            shown.first.min(requested.first),
-            shown.first.max(requested.first),
-        )
-    });
-    let mut best: Option<Spread> = None;
-    for &page in cached.keys() {
-        let spread = view::spread_for(page, mode, len);
-        if spread.first < low
-            || spread.first > high
-            || !presentable(spread)
-        {
-            continue;
-        }
-        let distance = spread.first.abs_diff(requested.first);
-        let closer = best.is_none_or(|current| {
-            let current_distance = current.first.abs_diff(requested.first);
-            distance < current_distance
-                || (distance == current_distance
-                    && if forward {
-                        spread.first > current.first
-                    } else {
-                        spread.first < current.first
-                    })
-        });
-        if closer {
-            best = Some(spread);
-        }
-    }
-    best.or(shown)
 }
 
 #[expect(
@@ -1226,10 +916,9 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
-        // Quit kills the child, so an in-flight decode ends with it; a pending
-        // open's book dies with its own result if it lands.
-        self.kill_process();
-        self.pending_open = None;
+        // Quit kills the child, so an in-flight decode ends with it; a
+        // pending open's book dies with its own result if it lands.
+        self.book.shutdown();
         self.gl = None;
     }
 
@@ -1301,20 +990,20 @@ impl ApplicationHandler<UserEvent> for App {
                             return;
                         }
                         if action.repeats() {
-                            self.held_keys.press(code, key.repeat);
+                            self.session.held_keys.press(code, key.repeat);
                             self.sync_motion();
                         }
                         self.dispatch(action, event_loop);
                     }
                     ElementState::Released => {
-                        self.held_keys.release(code);
+                        self.session.held_keys.release(code);
                         self.sync_motion();
                     }
                     ElementState::Pressed => {}
                 }
             }
             WindowEvent::Focused(false) => {
-                self.held_keys.clear();
+                self.session.held_keys.clear();
                 self.sync_motion();
             }
             WindowEvent::MouseWheel { delta, .. }
@@ -1441,10 +1130,6 @@ fn wheel_lines(dy: f64, scale_factor: f64) -> f32 {
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::expect_used,
-    reason = "a panic in test code is inconsequential"
-)]
 mod tests {
     use super::*;
 
@@ -1457,22 +1142,6 @@ mod tests {
         assert!(held_keys.skimming());
         held_keys.release(KeyCode::ArrowRight);
         assert!(!held_keys.skimming());
-    }
-
-    #[test]
-    fn commit_shown_requires_a_spread_shown_in_the_current_mode() {
-        let mut position = Position::new(5);
-        assert!(!position.commit_shown(ViewMode::Normal));
-        assert_eq!(position.requested(), 5);
-
-        position.record_shown(ViewMode::Normal, Some(Spread::lone(4)));
-        assert!(position.commit_shown(ViewMode::Normal));
-        assert_eq!(position.requested(), 4);
-        assert!(!position.commit_shown(ViewMode::Normal));
-
-        position.set_requested(5);
-        assert!(!position.commit_shown(ViewMode::Manga));
-        assert_eq!(position.requested(), 5);
     }
 
     #[test]
@@ -1508,180 +1177,5 @@ mod tests {
         assert_eq!(wheel_lines(40.0, 1.0), 1.0);
         assert_eq!(wheel_lines(80.0, 2.0), 1.0);
         assert_eq!(wheel_lines(40.0, 2.0), 0.5);
-    }
-
-    #[test]
-    fn a_native_is_only_wanted_when_the_view_has_fewer_pixels() {
-        assert!(!native_wanted(16.0, (1920, 1080)));
-        assert!(!native_wanted(16.0, (VIEW_EDGE, 1440)));
-        let four_k = (3840, 2160);
-        assert!(!native_wanted(0.66, four_k));
-        assert!(native_wanted(0.67, four_k));
-        let ten_k = (10080, 5640);
-        assert!(!native_wanted(0.25, ten_k));
-        assert!(native_wanted(0.26, ten_k));
-    }
-
-    #[test]
-    fn retention_covers_every_want() {
-        let len = PageCount::new(120).expect("the test book is not empty");
-        let missing = |_: usize, _: Artifact| false;
-        let nowhere = |_: usize| false;
-        for mode in [ViewMode::Normal, ViewMode::Manga, ViewMode::Comic] {
-            for index in (0..len.get()).step_by(7) {
-                let requested = view::spread_for(index, mode, len);
-                for anchor in [
-                    0,
-                    index.saturating_sub(4),
-                    index,
-                    (index + 4).min(len.get() - 1),
-                ] {
-                    let shown = view::spread_for(anchor, mode, len);
-                    for still in [true, false] {
-                        for want in wants(
-                            requested,
-                            shown,
-                            mode,
-                            still,
-                            |_| true,
-                            missing,
-                            nowhere,
-                        ) {
-                            assert!(
-                                kept(
-                                    want.page, want.kind, shown,
-                                    requested, mode, len
-                                ),
-                                "{want:?} is wanted but {shown:?} / \
-                                 {requested:?} would drop it in {mode:?}"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn presentation_advances_through_presentable_spreads() {
-        let len = PageCount::new(12).expect("the test book is not empty");
-        let mode = ViewMode::Normal;
-        let entry = CachedPage {
-            dims: (2, 2),
-            format: Format::Png,
-        };
-        let cached: BTreeMap<usize, CachedPage> =
-            [0, 2, 4, 8].into_iter().map(|page| (page, entry)).collect();
-        let can_show = |page: usize| matches!(page, 0 | 2 | 4);
-        let lone = Spread::lone;
-
-        // The request wins as soon as it has a pixel.
-        assert_eq!(
-            choose_presented(
-                lone(4),
-                Some(lone(0)),
-                mode,
-                len,
-                &cached,
-                true,
-                can_show
-            ),
-            Some(lone(4))
-        );
-        // Otherwise the nearest presentable spread between the shown
-        // and the requested one; page 8 is cached but has no pixels.
-        assert_eq!(
-            choose_presented(
-                lone(9),
-                Some(lone(0)),
-                mode,
-                len,
-                &cached,
-                true,
-                can_show
-            ),
-            Some(lone(4))
-        );
-        // Nothing between the two: the shown spread keeps its pixels.
-        assert_eq!(
-            choose_presented(
-                lone(9),
-                Some(lone(2)),
-                mode,
-                len,
-                &cached,
-                true,
-                |page| page == 0
-            ),
-            Some(lone(2))
-        );
-        // A cold start picks the nearest presentable spread.
-        assert_eq!(
-            choose_presented(
-                lone(5),
-                None,
-                mode,
-                len,
-                &cached,
-                true,
-                can_show
-            ),
-            Some(lone(4))
-        );
-        // A cold start presents only decoded spreads.
-        assert_eq!(
-            choose_presented(
-                lone(5),
-                None,
-                mode,
-                len,
-                &cached,
-                true,
-                |_| false
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn paired_spread_waits_for_every_seat() {
-        let len = PageCount::new(12).expect("the test book is not empty");
-        let mode = ViewMode::Manga;
-        let entry = CachedPage {
-            dims: (2, 2),
-            format: Format::Png,
-        };
-        let cached: BTreeMap<usize, CachedPage> =
-            [0, 2].into_iter().map(|page| (page, entry)).collect();
-        let pair = Spread {
-            first: 1,
-            second: Some(2),
-        };
-        let shown = Spread::lone(0);
-
-        assert_eq!(
-            choose_presented(
-                pair,
-                Some(shown),
-                mode,
-                len,
-                &cached,
-                true,
-                |page| page == 2
-            ),
-            Some(shown)
-        );
-        assert_eq!(
-            choose_presented(
-                pair,
-                Some(shown),
-                mode,
-                len,
-                &cached,
-                true,
-                |page| matches!(page, 1 | 2)
-            ),
-            Some(pair)
-        );
     }
 }
