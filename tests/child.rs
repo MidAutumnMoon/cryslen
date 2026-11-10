@@ -30,14 +30,14 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
-use cryslen::protocol::Artifact;
+use cryslen::protocol::Role;
 use cryslen::protocol::ChildMsg;
 use cryslen::protocol::Direction;
 use cryslen::protocol::Format;
 use cryslen::protocol::Hello;
 use cryslen::protocol::ParentMsg;
-use cryslen::protocol::ViewMode;
-use cryslen::protocol::Want;
+use cryslen::protocol::ReadingMode;
+use cryslen::protocol::Request;
 use cryslen::protocol::WirePixels;
 use ipc_channel::ipc::IpcOneShotServer;
 
@@ -216,19 +216,19 @@ fn child_serves_a_decoded_thumb() {
 
     commands
         .send(ParentMsg::SetView {
-            index: 0,
-            mode: ViewMode::Normal,
+            page: 0,
+            mode: ReadingMode::Normal,
             direction: Direction::Forward,
         })
         .expect("send SetView");
     commands
-        .send(ParentMsg::SetWants(vec![Want::new(0, Artifact::Thumb)]))
-        .expect("send SetWants");
+        .send(ParentMsg::SetRequests(vec![Request::new(0, Role::Thumb)]))
+        .expect("send SetRequests");
 
     let image = match messages.try_recv_timeout(STEP_TIMEOUT) {
         Ok(ChildMsg::Ready {
             page: 0,
-            kind: Artifact::Thumb,
+            role: Role::Thumb,
             image,
         }) => image,
         Ok(message) => {

@@ -1,7 +1,8 @@
 //! The baked-in key map: physical keys to `Action`s.
 
-use crate::view::FitMode;
-use crate::view::ViewMode;
+use crate::geometry::FitMode;
+use crate::browse::Direction;
+use crate::browse::ReadingMode;
 use egui_winit::winit;
 use winit::keyboard::KeyCode;
 use winit::keyboard::ModifiersState;
@@ -11,7 +12,7 @@ pub enum Action {
     Quit,
     /// Leave fullscreen when fullscreen, quit otherwise.
     Escape,
-    SelectMode(ViewMode),
+    SelectMode(ReadingMode),
     ToggleFullscreen,
     ResetView,
     SelectFit(FitMode),
@@ -66,9 +67,9 @@ impl Action {
         match code {
             KeyCode::KeyQ => Some(Self::Quit),
             KeyCode::Escape => Some(Self::Escape),
-            KeyCode::KeyN => Some(Self::SelectMode(ViewMode::Normal)),
-            KeyCode::KeyM => Some(Self::SelectMode(ViewMode::Manga)),
-            KeyCode::KeyC => Some(Self::SelectMode(ViewMode::Comic)),
+            KeyCode::KeyN => Some(Self::SelectMode(ReadingMode::Normal)),
+            KeyCode::KeyM => Some(Self::SelectMode(ReadingMode::Manga)),
+            KeyCode::KeyC => Some(Self::SelectMode(ReadingMode::Comic)),
             KeyCode::KeyF => Some(Self::ToggleFullscreen),
             KeyCode::KeyR => Some(Self::ResetView),
             KeyCode::KeyW => Some(Self::SelectFit(FitMode::Width)),
@@ -93,16 +94,24 @@ impl Action {
         )
     }
 
-    /// Whether this action advances reading order in `mode`. Manga
-    /// flips the arrows (Left advances). The reading-order keys never
-    /// flip.
-    pub fn is_forward(self, mode: ViewMode) -> bool {
+    /// The reading direction this action advances in `mode`, if it turns
+    /// pages. Manga flips the arrows (Left advances). The reading-order
+    /// keys never flip.
+    pub fn direction(self, mode: ReadingMode) -> Option<Direction> {
         match self {
-            Self::Forward => true,
-            Self::Right => !mode.rtl(),
-            Self::Left => mode.rtl(),
-            Self::Back
-            | Self::Quit
+            Self::Forward => Some(Direction::Forward),
+            Self::Right => Some(if mode.rtl() {
+                Direction::Backward
+            } else {
+                Direction::Forward
+            }),
+            Self::Left => Some(if mode.rtl() {
+                Direction::Forward
+            } else {
+                Direction::Backward
+            }),
+            Self::Back => Some(Direction::Backward),
+            Self::Quit
             | Self::Escape
             | Self::SelectMode(_)
             | Self::ToggleFullscreen
@@ -111,7 +120,7 @@ impl Action {
             | Self::First
             | Self::Last
             | Self::NextBook
-            | Self::PrevBook => false,
+            | Self::PrevBook => None,
         }
     }
 }
@@ -125,9 +134,9 @@ mod tests {
         let bindings: &[(KeyCode, Option<Action>)] = &[
             (KeyCode::Escape, Some(Action::Escape)),
             (KeyCode::KeyQ, Some(Action::Quit)),
-            (KeyCode::KeyN, Some(Action::SelectMode(ViewMode::Normal))),
-            (KeyCode::KeyM, Some(Action::SelectMode(ViewMode::Manga))),
-            (KeyCode::KeyC, Some(Action::SelectMode(ViewMode::Comic))),
+            (KeyCode::KeyN, Some(Action::SelectMode(ReadingMode::Normal))),
+            (KeyCode::KeyM, Some(Action::SelectMode(ReadingMode::Manga))),
+            (KeyCode::KeyC, Some(Action::SelectMode(ReadingMode::Comic))),
             (KeyCode::KeyF, Some(Action::ToggleFullscreen)),
             (KeyCode::KeyR, Some(Action::ResetView)),
             (KeyCode::KeyW, Some(Action::SelectFit(FitMode::Width))),
@@ -191,9 +200,9 @@ mod tests {
         let one_shot = [
             Action::Quit,
             Action::Escape,
-            Action::SelectMode(ViewMode::Normal),
-            Action::SelectMode(ViewMode::Manga),
-            Action::SelectMode(ViewMode::Comic),
+            Action::SelectMode(ReadingMode::Normal),
+            Action::SelectMode(ReadingMode::Manga),
+            Action::SelectMode(ReadingMode::Comic),
             Action::ToggleFullscreen,
             Action::ResetView,
             Action::SelectFit(FitMode::Page),
@@ -208,24 +217,24 @@ mod tests {
         for action in one_shot {
             assert!(!action.repeats(), "{action:?} is one-shot");
         }
-        let forwards: &[(Action, ViewMode, bool)] = &[
-            (Action::Right, ViewMode::Normal, true),
-            (Action::Left, ViewMode::Normal, false),
-            (Action::Forward, ViewMode::Normal, true),
-            (Action::Back, ViewMode::Normal, false),
-            (Action::Right, ViewMode::Manga, false),
-            (Action::Left, ViewMode::Manga, true),
-            (Action::Forward, ViewMode::Manga, true),
-            (Action::Back, ViewMode::Manga, false),
-            (Action::Right, ViewMode::Comic, true),
-            (Action::Left, ViewMode::Comic, false),
-            (Action::Forward, ViewMode::Comic, true),
-            (Action::Back, ViewMode::Comic, false),
+        let forwards: &[(Action, ReadingMode, Direction)] = &[
+            (Action::Right, ReadingMode::Normal, Direction::Forward),
+            (Action::Left, ReadingMode::Normal, Direction::Backward),
+            (Action::Forward, ReadingMode::Normal, Direction::Forward),
+            (Action::Back, ReadingMode::Normal, Direction::Backward),
+            (Action::Right, ReadingMode::Manga, Direction::Backward),
+            (Action::Left, ReadingMode::Manga, Direction::Forward),
+            (Action::Forward, ReadingMode::Manga, Direction::Forward),
+            (Action::Back, ReadingMode::Manga, Direction::Backward),
+            (Action::Right, ReadingMode::Comic, Direction::Forward),
+            (Action::Left, ReadingMode::Comic, Direction::Backward),
+            (Action::Forward, ReadingMode::Comic, Direction::Forward),
+            (Action::Back, ReadingMode::Comic, Direction::Backward),
         ];
         for &(action, mode, want) in forwards {
             assert_eq!(
-                action.is_forward(mode),
-                want,
+                action.direction(mode),
+                Some(want),
                 "{action:?} in {mode:?}"
             );
         }

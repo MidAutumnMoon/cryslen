@@ -1,13 +1,13 @@
 # Rendering: Wayland, GL, egui
 
-Reference for `src/render.rs`, `src/window.rs`, and the frame loop in `src/app.rs`. The stack is winit + glutin + glow + egui_glow, wired by hand: winit owns the window and events, glutin binds EGL, glow calls GL, egui-winit feeds events, and egui_glow paints egui. That wiring keeps page textures outside egui's paint list and the repaint policy local. `Cargo.toml` sets `default-features = false` and enables `wayland` on the GUI crates, keeping the dependency tree Wayland-only. Artifact roles and retention policy are in `docs/internal/cache.md`.
+Reference for `src/render.rs`, `src/window.rs`, and the frame loop in `src/app.rs`. The stack is winit + glutin + glow + egui_glow, wired by hand: winit owns the window and events, glutin binds EGL, glow calls GL, egui-winit feeds events, and egui_glow paints egui. That wiring keeps page textures outside egui's paint list and the repaint policy local. `Cargo.toml` sets `default-features = false` and enables `wayland` on the GUI crates, keeping the dependency tree Wayland-only. Role policy and retention are in `docs/internal/cache.md`.
 
 ## Frame loop
 
 - Present with `SwapInterval::DontWait` and `pre_present_notify`; a blocking swap owns the event loop.
 - Park in `ControlFlow::Wait`; delayed work arms `WaitUntil`, and `new_events(ResumeTimeReached)` redraws. Keep arm and fire separate, or a repaint clobbers the tighter deadline.
 - egui's repaint callback posts a user event through a proxy created before `run_app`.
-- While no seat of the anchor spread has a texture and none failed, arm the status grace so the wait word can appear.
+- While no seat of the on-screen spread has a texture and none failed, arm the status grace so the wait word can appear.
 
 ## GL rules
 
@@ -25,8 +25,8 @@ Reference for `src/render.rs`, `src/window.rs`, and the frame loop in `src/app.r
 
 A fixed -1..1 strip is placed by the vertex shader from uniforms, so pan, zoom, and rect changes update uniforms only. One program handles RGBA and YUV, sRGB and PQ. Per-draw constants are folded on the CPU (`page_conversion`, `upload_entry`): range anchors, depth normalization, the KR/KB matrix, the mono chroma stub, and alpha normalization. Chroma samples bilinearly at centered positions; declared co-sited metadata carries a half-texel bias, invisible in practice. Render tests pin black and white at every depth and the preview page-to-texture mapping.
 
-A seat rect is in page pixels and a texture's UV spans the page; `PageTextures::draw` checks that the two agree, since a stale rect clamps one edge into a band. The app derives layout and placement from `FramePlan::anchor`, so the rects and their textures always describe the same spread.
+A seat rect is in page pixels and a texture's UV spans the page; `PageTextures::draw` checks that the two agree, since a stale rect clamps one edge into a band. The app derives layout and placement from `Frame::on_screen`, so the rects and their textures always describe the same spread.
 
 ## Uploads
 
-An upload costs one texture per plane plus mipmaps. Decoded artifacts queue in the app and drain under a per-frame budget; a non-empty queue re-arms. `PageTextures::insert` keeps a present slot, adds a new texture, and refuses an oversize page as a `TextureFault`; `retain` applies `presentation::FramePlan::retains` and owns removal. A seat draws native, then view, then thumb; `clear_all` runs on a book switch. A retained page is a texture hit.
+An upload costs one texture per plane plus mipmaps. Decoded images queue in the app and drain under a per-frame budget; a non-empty queue re-arms. `PageTextures::insert` keeps a present entry, adds a new texture, and refuses an oversize page as a `TextureFault`; `retain` applies `presentation::Frame::retains` and owns removal. A seat draws full, then fit, then thumb; `clear_all` runs on a book switch. A retained page is a texture hit.

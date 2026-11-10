@@ -23,11 +23,11 @@ pub use crate::decode::Matrix;
 pub use crate::decode::Subsampling;
 pub use crate::decode::Transfer;
 pub use crate::fault::PageFault;
-pub use crate::plan::Direction;
-pub use crate::preview::Artifact;
-pub use crate::view::ViewMode;
-pub use crate::worker::Motion;
-pub use crate::worker::Want;
+pub use crate::browse::Direction;
+pub use crate::browse::ReadingMode;
+pub use crate::browse::Motion;
+pub use crate::browse::Request;
+pub use crate::browse::Role;
 
 /// What a freshly opened child knows about its book.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -159,12 +159,12 @@ fn plane_from_shared(shared: &IpcSharedMemory, depth: u8) -> Plane {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub enum ParentMsg {
     SetView {
-        index: usize,
-        mode: ViewMode,
+        page: usize,
+        mode: ReadingMode,
         direction: Direction,
     },
     SetMotion(Motion),
-    SetWants(Vec<Want>),
+    SetRequests(Vec<Request>),
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -173,7 +173,7 @@ pub enum ChildMsg {
     OpenFailed(String),
     Ready {
         page: usize,
-        kind: Artifact,
+        role: Role,
         image: WireImage,
     },
     Failed {

@@ -1,85 +1,14 @@
-//! View math: the view modes, the spread-pairing model, and the
-//! placement of a composed spread in the viewport. Pure data, no GL.
+//! Geometry: spread-pairing arithmetic and the placement of a composed
+//! spread in the viewport. Pure data, no GL.
 
-use std::num::NonZeroUsize;
-
-use serde::Deserialize;
-use serde::Serialize;
-
-/// A book's page count. A live source lists at least one page, so the
-/// count is nonzero by shape and the spread math never clamps it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PageCount(NonZeroUsize);
-
-impl PageCount {
-    pub fn new(count: usize) -> Option<Self> {
-        NonZeroUsize::new(count).map(Self)
-    }
-
-    pub fn get(self) -> usize {
-        self.0.get()
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-pub enum ViewMode {
-    Normal,
-    Manga,
-    Comic,
-}
-
-impl ViewMode {
-    pub const ALL: [Self; 3] = [Self::Normal, Self::Manga, Self::Comic];
-
-    #[must_use]
-    pub fn pairs(self) -> bool {
-        matches!(self, Self::Manga | Self::Comic)
-    }
-
-    #[must_use]
-    pub fn rtl(self) -> bool {
-        self == Self::Manga
-    }
-
-    #[must_use]
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Normal => "Normal",
-            Self::Manga => "Manga",
-            Self::Comic => "Comic",
-        }
-    }
-
-    #[must_use]
-    pub fn shortcut(self) -> &'static str {
-        match self {
-            Self::Normal => "n",
-            Self::Manga => "m",
-            Self::Comic => "c",
-        }
-    }
-
-    #[must_use]
-    pub fn effect(self) -> &'static str {
-        match self {
-            Self::Normal => "left to right, single page",
-            Self::Manga => "right to left, double page",
-            Self::Comic => "left to right, double page",
-        }
-    }
-}
-
-/// Which pages one screen shows. The cover is alone, then pairs,
-/// 0-based: `0`, `1+2`, `3+4`, ...
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Spread {
-    pub first: usize,
-    pub second: Option<usize>,
-}
+use crate::browse::Direction;
+use crate::browse::ReadingMode;
+use crate::browse::PageCount;
+use crate::browse::Spread;
 
 /// Spread containing `index` under `mode`, clamped to the book. An
 /// odd tail shows one page (`second: None`).
-pub fn spread_for(index: usize, mode: ViewMode, len: PageCount) -> Spread {
+pub fn spread_for(index: usize, mode: ReadingMode, len: PageCount) -> Spread {
     let len = len.get();
     let index = index.min(len - 1);
     if !mode.pairs() {
@@ -99,10 +28,11 @@ pub fn spread_for(index: usize, mode: ViewMode, len: PageCount) -> Spread {
 /// Always returns a spread *start*.
 pub fn advance(
     current: usize,
-    forward: bool,
-    mode: ViewMode,
+    direction: Direction,
+    mode: ReadingMode,
     len: PageCount,
 ) -> usize {
+    let forward = direction == Direction::Forward;
     let len = len.get();
     let current = current.min(len - 1);
     if !mode.pairs() {
@@ -132,8 +62,8 @@ pub struct ModeSwitch {
 /// Where a switch from `old` to `new` lands. A pairing change moves
 /// to the new spread's start. A direction-only change keeps the page.
 pub fn switch_mode(
-    old: ViewMode,
-    new: ViewMode,
+    old: ReadingMode,
+    new: ReadingMode,
     index: usize,
     len: PageCount,
 ) -> ModeSwitch {
@@ -164,37 +94,6 @@ fn spread_start(number: usize) -> usize {
 
 fn spread_count(len: usize) -> usize {
     1 + (len - 1).div_ceil(2)
-}
-
-/// Seat order as [left, right] under `mode`. Western reads first-left.
-/// Manga reads first-right, so a lone page sits on the right.
-pub fn seating<T>(
-    first: T,
-    second: Option<T>,
-    mode: ViewMode,
-) -> [Option<T>; 2] {
-    if mode.rtl() {
-        [second, Some(first)]
-    } else {
-        [Some(first), second]
-    }
-}
-
-impl Spread {
-    pub const fn lone(first: usize) -> Self {
-        Self {
-            first,
-            second: None,
-        }
-    }
-
-    pub fn seats(&self, mode: ViewMode) -> [Option<usize>; 2] {
-        seating(self.first, self.second, mode)
-    }
-
-    pub fn contains(&self, page: usize) -> bool {
-        self.first == page || self.second == Some(page)
-    }
 }
 
 /// Where pages live: the window area left after egui chrome, in physical
@@ -333,7 +232,7 @@ pub fn first_spread() -> usize {
     0
 }
 
-pub fn last_spread(mode: ViewMode, len: PageCount) -> usize {
+pub fn last_spread(mode: ReadingMode, len: PageCount) -> usize {
     if !mode.pairs() {
         return len.get() - 1;
     }
@@ -494,7 +393,7 @@ impl Fit {
         self.user_moved = false;
     }
 
-    /// The app presented a new spread: the next `resolve` places it. Moves
+    /// The app showed a new spread: the next `resolve` places it. Moves
     /// made during the hold carry into it.
     pub fn commit(&mut self) {
         self.settled = None;
@@ -523,22 +422,22 @@ mod tests {
     #[test]
     fn spread_structure() {
         for (mode, pairs, rtl) in [
-            (ViewMode::Normal, false, false),
-            (ViewMode::Manga, true, true),
-            (ViewMode::Comic, true, false),
+            (ReadingMode::Normal, false, false),
+            (ReadingMode::Manga, true, true),
+            (ReadingMode::Comic, true, false),
         ] {
             assert_eq!(mode.pairs(), pairs, "{mode:?}");
             assert_eq!(mode.rtl(), rtl, "{mode:?}");
         }
         // Anchor: page 1 opens the first pair.
         assert_eq!(
-            spread_for(1, ViewMode::Manga, pages(10)),
+            spread_for(1, ReadingMode::Manga, pages(10)),
             Spread {
                 first: 1,
                 second: Some(2)
             }
         );
-        for &mode in &ViewMode::ALL {
+        for &mode in &ReadingMode::ALL {
             for len in 1_usize..=10 {
                 for page in 0..=(len + 2) {
                     let clamped = page.min(len - 1);
@@ -575,57 +474,70 @@ mod tests {
     #[test]
     fn advance_steps_between_spread_starts() {
         for len in [1_usize, 2, 3, 6, 9, 10] {
-            for &mode in &ViewMode::ALL {
+            for &mode in &ReadingMode::ALL {
                 for page in 0..=len {
-                    for &forward in &[false, true] {
+                    for &direction in &[Direction::Backward, Direction::Forward] {
                         let stepped =
-                            advance(page, forward, mode, pages(len));
+                            advance(page, direction, mode, pages(len));
                         assert_eq!(
                             spread_for(stepped, mode, pages(len)).first,
                             stepped,
-                            "stepped page must be a spread start: len {len} mode {mode:?} page {page} forward {forward}"
+                            "stepped page must be a spread start: len {len} mode {mode:?} page {page} direction {direction:?}"
                         );
+                        let back = match direction {
+                            Direction::Forward => Direction::Backward,
+                            Direction::Backward => Direction::Forward,
+                        };
                         assert_eq!(
-                            advance(stepped, !forward, mode, pages(len)),
+                            advance(stepped, back, mode, pages(len)),
                             spread_for(page, mode, pages(len)).first,
-                            "step then step back must round-trip: len {len} mode {mode:?} page {page} forward {forward}"
+                            "step then step back must round-trip: len {len} mode {mode:?} page {page} direction {direction:?}"
                         );
                     }
                 }
             }
         }
         // Direction anchors: a mid-spread step lands on the neighbor spread's start.
-        assert_eq!(advance(1, true, ViewMode::Manga, pages(10)), 3);
-        assert_eq!(advance(4, true, ViewMode::Normal, pages(10)), 5);
+        assert_eq!(
+            advance(1, Direction::Forward, ReadingMode::Manga, pages(10)),
+            3
+        );
+        assert_eq!(
+            advance(4, Direction::Forward, ReadingMode::Normal, pages(10)),
+            5
+        );
         // The cover's next spread starts at 1, not 2.
-        assert_eq!(advance(0, true, ViewMode::Manga, pages(10)), 1);
+        assert_eq!(
+            advance(0, Direction::Forward, ReadingMode::Manga, pages(10)),
+            1
+        );
     }
 
     #[test]
     fn mode_switch_relands_only_on_pairing_change() {
         assert_eq!(
-            switch_mode(ViewMode::Normal, ViewMode::Manga, 2, pages(10)),
+            switch_mode(ReadingMode::Normal, ReadingMode::Manga, 2, pages(10)),
             ModeSwitch {
                 index: 1,
                 pairing_changed: true
             }
         );
         assert_eq!(
-            switch_mode(ViewMode::Normal, ViewMode::Comic, 0, pages(10)),
+            switch_mode(ReadingMode::Normal, ReadingMode::Comic, 0, pages(10)),
             ModeSwitch {
                 index: 0,
                 pairing_changed: true
             }
         );
         assert_eq!(
-            switch_mode(ViewMode::Manga, ViewMode::Comic, 5, pages(10)),
+            switch_mode(ReadingMode::Manga, ReadingMode::Comic, 5, pages(10)),
             ModeSwitch {
                 index: 5,
                 pairing_changed: false
             }
         );
         assert_eq!(
-            switch_mode(ViewMode::Manga, ViewMode::Manga, 5, pages(10)),
+            switch_mode(ReadingMode::Manga, ReadingMode::Manga, 5, pages(10)),
             ModeSwitch {
                 index: 5,
                 pairing_changed: false
@@ -639,14 +551,14 @@ mod tests {
             first: 1,
             second: Some(2),
         };
-        assert_eq!(spread.seats(ViewMode::Normal), [Some(1), Some(2)]);
-        assert_eq!(spread.seats(ViewMode::Comic), [Some(1), Some(2)]);
-        assert_eq!(spread.seats(ViewMode::Manga), [Some(2), Some(1)]);
+        assert_eq!(spread.seats(ReadingMode::Normal), [Some(1), Some(2)]);
+        assert_eq!(spread.seats(ReadingMode::Comic), [Some(1), Some(2)]);
+        assert_eq!(spread.seats(ReadingMode::Manga), [Some(2), Some(1)]);
         let lone = Spread::lone(5);
-        assert_eq!(lone.seats(ViewMode::Normal), [Some(5), None]);
+        assert_eq!(lone.seats(ReadingMode::Normal), [Some(5), None]);
         // A lone Comic page mirrors Normal, not the rtl modes.
-        assert_eq!(lone.seats(ViewMode::Comic), [Some(5), None]);
-        assert_eq!(lone.seats(ViewMode::Manga), [None, Some(5)]);
+        assert_eq!(lone.seats(ReadingMode::Comic), [Some(5), None]);
+        assert_eq!(lone.seats(ReadingMode::Manga), [None, Some(5)]);
     }
 
     #[test]
@@ -798,18 +710,18 @@ mod tests {
     #[test]
     fn first_and_last_spreads() {
         // Single page: both ends are the cover.
-        for mode in ViewMode::ALL {
+        for mode in ReadingMode::ALL {
             assert_eq!(last_spread(mode, pages(1)), 0);
         }
         // Pairs: the final spread starts on the last odd page.
-        assert_eq!(last_spread(ViewMode::Manga, pages(10)), 9);
-        assert_eq!(last_spread(ViewMode::Comic, pages(11)), 9);
+        assert_eq!(last_spread(ReadingMode::Manga, pages(10)), 9);
+        assert_eq!(last_spread(ReadingMode::Comic, pages(11)), 9);
         // An odd tail ends alone on the previous pair start.
-        assert_eq!(last_spread(ViewMode::Manga, pages(12)), 11);
+        assert_eq!(last_spread(ReadingMode::Manga, pages(12)), 11);
         // Normal: the last page.
-        assert_eq!(last_spread(ViewMode::Normal, pages(10)), 9);
+        assert_eq!(last_spread(ReadingMode::Normal, pages(10)), 9);
         for len in 1_usize..=12 {
-            for &mode in &ViewMode::ALL {
+            for &mode in &ReadingMode::ALL {
                 let last = last_spread(mode, pages(len));
                 assert_eq!(
                     spread_for(last, mode, pages(len)).first,

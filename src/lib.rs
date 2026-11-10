@@ -10,19 +10,20 @@ pub mod protocol;
 
 mod app;
 mod book;
+mod browse;
 mod catalog;
 mod child;
 mod decode;
 mod fault;
 mod keys;
 mod parent;
-mod plan;
+mod prefetch;
 mod presentation;
 mod preview;
 mod render;
 mod source;
 mod ui;
-mod view;
+mod geometry;
 mod window;
 mod worker;
 

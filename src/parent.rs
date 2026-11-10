@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use crate::app;
 use crate::app::App;
-use crate::app::UserEvent;
+use crate::app::WakeEvent;
 use crate::book::BookProcess;
 use crate::book::Wake;
 use crate::catalog;
@@ -82,10 +82,10 @@ fn run(open_path: &Path, land_on: Option<&str>) -> eros::Result<()> {
 
     // The loop exists before the first open, so the book's reader thread
     // can wake it like any later book's does.
-    let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
+    let event_loop = EventLoop::<WakeEvent>::with_user_event().build()?;
     let wake: Wake = {
         let proxy = event_loop.create_proxy();
-        Arc::new(move || app::post(&proxy, UserEvent::Wake))
+        Arc::new(move || app::post(&proxy, WakeEvent::Wake))
     };
     // The initial open is the one blocking open; every switch after it
     // runs off the event loop.

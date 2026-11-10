@@ -17,50 +17,41 @@ use nix::sys::signal::Signal;
 use nix::unistd::getppid;
 
 use crate::fault::PageFault;
-use crate::plan::Plan;
+use crate::prefetch::Prefetch;
 use crate::protocol::BookInfo;
 use crate::protocol::ChildMsg;
 use crate::protocol::Hello;
 use crate::protocol::ParentMsg;
 use crate::protocol::WireImage;
 use crate::source::Source;
-use crate::view;
-use crate::worker::Event;
+use crate::geometry;
+use crate::worker::Update;
 use crate::worker::Worker;
 
 /// Messages a producer may queue for the writer. Small because the
-/// parent consumes at frame pace; this bounds events awaiting
-/// conversion, while the want set bounds images in flight.
+/// parent consumes at frame pace; this bounds updates awaiting
+/// conversion, while the request set bounds images in flight.
 const WRITER_QUEUE_DEPTH: usize = 2;
 
-enum ToParent {
-    Event(Event),
-    Fatal(String),
+fn into_message(update: Update) -> ChildMsg {
+    match update {
+        Update::Ready { page, role, image } => ChildMsg::Ready {
+            page,
+            role,
+            image: WireImage::from_decoded(&image),
+        },
+        Update::Failed { page, error } => ChildMsg::Failed {
+            page,
+            fault: PageFault::from(error),
+        },
+        Update::Unpacked => ChildMsg::Unpacked,
+        Update::Fatal(summary) => ChildMsg::Fatal(summary),
+    }
 }
 
-impl ToParent {
-    fn into_message(self) -> ChildMsg {
-        match self {
-            Self::Event(Event::Ready(ready)) => ChildMsg::Ready {
-                page: ready.page,
-                kind: ready.kind,
-                image: WireImage::from_decoded(&ready.image),
-            },
-            Self::Event(Event::Failed { page, error }) => {
-                ChildMsg::Failed {
-                    page,
-                    fault: PageFault::from(error),
-                }
-            }
-            Self::Event(Event::Unpacked) => ChildMsg::Unpacked,
-            Self::Fatal(summary) => ChildMsg::Fatal(summary),
-        }
-    }
-
-    /// Whether this message ends the writer's run.
-    fn last(&self) -> bool {
-        matches!(self, Self::Fatal(_))
-    }
+/// Whether this message ends the writer's run.
+fn last(update: &Update) -> bool {
+    matches!(update, Update::Fatal(_))
 }
 
 pub fn main(args: &[OsString]) -> ExitCode {
@@ -137,7 +128,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
     // One thread owns the child's only `IpcSender`, so messages reach the
     // parent in the order they were queued.
     let (to_parent_tx, to_parent_rx) =
-        crossbeam_channel::bounded::<ToParent>(WRITER_QUEUE_DEPTH);
+        crossbeam_channel::bounded::<Update>(WRITER_QUEUE_DEPTH);
     let writer = match thread::Builder::new()
         .name("cy-writer".into())
         .spawn(move || write(&child_tx, &to_parent_rx))
@@ -156,29 +147,28 @@ pub fn main(args: &[OsString]) -> ExitCode {
     while let Ok(message) = parent_rx.recv() {
         match message {
             ParentMsg::SetView {
-                index,
+                page,
                 mode,
                 direction,
             } => {
-                let plan = Plan::build(
-                    view::spread_for(index, mode, len),
+                let prefetch = Prefetch::build(
+                    geometry::spread_for(page, mode, len),
                     direction,
                     mode,
                     len,
                 );
                 if let Some(running) = worker.as_ref() {
-                    running.retune(plan);
+                    running.set_prefetch(prefetch);
                 } else {
                     let queue = to_parent_tx.clone();
                     let notify = move |event| {
                         // A disconnected queue only means the writer
-                        // already left, so the event has no reader.
-                        let Ok(()) = queue.send(ToParent::Event(event))
-                        else {
+                        // already left, so the update has no reader.
+                        let Ok(()) = queue.send(event) else {
                             return;
                         };
                     };
-                    match Worker::spawn(Arc::clone(&source), plan, notify)
+                    match Worker::spawn(Arc::clone(&source), prefetch, notify)
                     {
                         Ok(spawned) => worker = Some(spawned),
                         Err(error) => {
@@ -187,7 +177,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
                                 "could not start the decode worker"
                             );
                             if to_parent_tx
-                                .send(ToParent::Fatal(error.to_string()))
+                                .send(Update::Fatal(error.to_string()))
                                 .is_err()
                             {
                                 tracing::debug!(
@@ -205,13 +195,16 @@ pub fn main(args: &[OsString]) -> ExitCode {
                     running.set_motion(motion);
                 }
             }
-            ParentMsg::SetWants(wants) => {
-                // The parent always sends its first view before any want,
-                // so a want without a worker has no plan to serve.
+            ParentMsg::SetRequests(requests) => {
+                // The parent always sends its first view before any
+                // request, so a request without a worker has no prefetch to
+                // serve.
                 if let Some(running) = worker.as_ref() {
-                    running.retarget(wants);
+                    running.set_requests(requests);
                 } else {
-                    tracing::debug!("wants arrived before the first view");
+                    tracing::debug!(
+                        "requests arrived before the first view"
+                    );
                 }
             }
         }
@@ -241,12 +234,12 @@ fn parse(args: &[OsString]) -> Option<(&OsStr, &Path)> {
     Some((server.as_os_str(), Path::new(path)))
 }
 
-/// Serialize `ToParent` onto the parent channel until a fatal verdict
+/// Serialize updates onto the parent channel until a fatal verdict
 /// ends the run.
-fn write(child_tx: &IpcSender<ChildMsg>, queue: &Receiver<ToParent>) {
-    while let Ok(message) = queue.recv() {
-        let last = message.last();
-        let Ok(()) = child_tx.send(message.into_message()) else {
+fn write(child_tx: &IpcSender<ChildMsg>, queue: &Receiver<Update>) {
+    while let Ok(update) = queue.recv() {
+        let last = last(&update);
+        let Ok(()) = child_tx.send(into_message(update)) else {
             return;
         };
         if last {

@@ -22,12 +22,12 @@ use crate::decode::Subsampling;
 use crate::decode::Transfer;
 use crate::fault::TextureError;
 use crate::fault::TextureFault;
-use crate::preview::Artifact;
-use crate::preview::Artifacts;
-use crate::view;
-use crate::view::Placement;
-use crate::view::SpreadLayout;
-use crate::view::Viewport;
+use crate::browse::Role;
+use crate::browse::Roles;
+use crate::geometry;
+use crate::geometry::Placement;
+use crate::geometry::SpreadLayout;
+use crate::geometry::Viewport;
 
 /// Both dialect variants of one shader source, so the pair cannot drift.
 macro_rules! shader_variants {
@@ -148,9 +148,7 @@ const SEAT_UV_TOLERANCE: f32 = 1e-3;
 pub struct PageTextures {
     gl: Arc<glow::Context>,
     pipeline: Pipeline,
-    thumbs: HashMap<usize, Entry>,
-    views: HashMap<usize, Entry>,
-    natives: HashMap<usize, Entry>,
+    entries: HashMap<(usize, Role), TextureEntry>,
     max_texture_edge: u32,
 }
 
@@ -169,7 +167,7 @@ struct Locations {
 
 /// One cached page's GPU state, freed by [`PageTextures::retain`] and on
 /// drop.
-enum Entry {
+enum TextureEntry {
     Rgba {
         texture: <glow::Context as glow::HasContext>::Texture,
         /// Screen px -> page fraction, before the zoom-scale divide.
@@ -229,23 +227,21 @@ impl PageTextures {
         Ok(Self {
             gl,
             pipeline,
-            thumbs: HashMap::new(),
-            views: HashMap::new(),
-            natives: HashMap::new(),
+            entries: HashMap::new(),
             max_texture_edge,
         })
     }
 
-    /// Upload `image` as `page`'s `kind`; no-op if present, never evicts.
+    /// Upload `image` as `page`'s `role`; no-op if present, never evicts.
     /// A page over `MAX_TEXTURE_SIZE` would upload black, so it returns
     /// the page's error instead.
     pub fn insert(
         &mut self,
         page: usize,
-        kind: Artifact,
+        role: Role,
         image: &Decoded,
     ) -> Result<(), TextureError> {
-        if self.has(page, kind) {
+        if self.has(page, role) {
             return Ok(());
         }
         let (width, height) = (image.width(), image.height());
@@ -263,62 +259,50 @@ impl PageTextures {
         // context's texture limit, and `upload_entry` asserts its own
         // plane byte extents.
         let entry = unsafe { upload_entry(&self.gl, image) };
-        self.map_mut(kind).insert(page, entry);
+        self.entries.insert((page, role), entry);
         Ok(())
     }
 
-    pub fn artifacts(&self, page: usize) -> Artifacts {
-        let mut artifacts = Artifacts::default();
-        if self.thumbs.contains_key(&page) {
-            artifacts.set(Artifact::Thumb);
+    pub fn roles(&self, page: usize) -> Roles {
+        let mut roles = Roles::default();
+        for role in [Role::Thumb, Role::Fit, Role::Full] {
+            if self.entries.contains_key(&(page, role)) {
+                roles.set(role);
+            }
         }
-        if self.views.contains_key(&page) {
-            artifacts.set(Artifact::View);
-        }
-        if self.natives.contains_key(&page) {
-            artifacts.set(Artifact::Native);
-        }
-        artifacts
+        roles
     }
 
-    pub fn has(&self, page: usize, kind: Artifact) -> bool {
-        self.artifacts(page).contains(kind)
+    pub fn has(&self, page: usize, role: Role) -> bool {
+        self.entries.contains_key(&(page, role))
     }
 
     pub fn has_any(&self, page: usize) -> bool {
-        self.artifacts(page).any()
+        self.roles(page).any()
     }
 
-    /// Drop every entry `keep` rejects, at every size, freeing its
+    /// Drop every entry `keep` rejects, at every role, freeing its
     /// textures.
-    pub fn retain(&mut self, keep: impl Fn(usize, Artifact) -> bool) {
+    pub fn retain(&mut self, keep: impl Fn(usize, Role) -> bool) {
         let gl = &self.gl;
-        retain_map(gl, &mut self.thumbs, Artifact::Thumb, &keep);
-        retain_map(gl, &mut self.views, Artifact::View, &keep);
-        retain_map(gl, &mut self.natives, Artifact::Native, &keep);
+        self.entries.retain(|&(page, role), entry| {
+            if keep(page, role) {
+                return true;
+            }
+            // SAFETY: the entry leaves the map in this same step, so this
+            // is its only deletion.
+            unsafe {
+                delete_entry(gl, entry);
+            }
+            false
+        });
     }
 
     pub fn clear_all(&mut self) {
         self.retain(|_, _| false);
     }
 
-    fn map(&self, kind: Artifact) -> &HashMap<usize, Entry> {
-        match kind {
-            Artifact::Thumb => &self.thumbs,
-            Artifact::View => &self.views,
-            Artifact::Native => &self.natives,
-        }
-    }
-
-    fn map_mut(&mut self, kind: Artifact) -> &mut HashMap<usize, Entry> {
-        match kind {
-            Artifact::Thumb => &mut self.thumbs,
-            Artifact::View => &mut self.views,
-            Artifact::Native => &mut self.natives,
-        }
-    }
-
-    /// Draw the presented spread, clipped to `viewport`; each seat draws
+    /// Draw the shown spread, clipped to `viewport`; each seat draws
     /// its page's largest resident texture. Does not clear the framebuffer.
     #[expect(
         clippy::rest_pattern_accessible_field,
@@ -365,15 +349,15 @@ impl PageTextures {
             let Some(rect) = rect else { continue };
             let Some(page) = page else { continue };
             let Some(entry) = self
-                .artifacts(*page)
+                .roles(*page)
                 .best()
-                .and_then(|kind| self.map(kind).get(page))
+                .and_then(|role| self.entries.get(&(*page, role)))
             else {
                 continue;
             };
             let lmap_base = match entry {
-                Entry::Rgba { lmap_base, .. }
-                | Entry::Yuv { lmap_base, .. } => *lmap_base,
+                TextureEntry::Rgba { lmap_base, .. }
+                | TextureEntry::Yuv { lmap_base, .. } => *lmap_base,
             };
             // A seat rect is in page pixels; a texture's UV spans the page.
             let uv_extent =
@@ -444,26 +428,6 @@ impl Drop for PageTextures {
             delete_pipeline(&self.gl, &self.pipeline);
         }
     }
-}
-
-/// Free the entries `keep` rejects from one kind's map.
-fn retain_map(
-    gl: &glow::Context,
-    map: &mut HashMap<usize, Entry>,
-    kind: Artifact,
-    keep: &impl Fn(usize, Artifact) -> bool,
-) {
-    map.retain(|&page, entry| {
-        if keep(page, kind) {
-            return true;
-        }
-        // SAFETY: the entry leaves the map in this same step, so this is
-        // its only deletion.
-        unsafe {
-            delete_entry(gl, entry);
-        }
-        false
-    });
 }
 
 /// # Safety
@@ -617,7 +581,7 @@ unsafe fn begin_frame(
     );
     gl.use_program(Some(pipeline.program));
     gl.bind_vertex_array(Some(pipeline.vao));
-    let win = view::px_f32(size);
+    let win = geometry::px_f32(size);
     gl.uniform_2_f32(Some(&pipeline.locations.win), win.0, win.1);
 }
 
@@ -638,7 +602,7 @@ enum ShaderMode {
 unsafe fn draw_page(
     gl: &glow::Context,
     pipeline: &Pipeline,
-    entry: &Entry,
+    entry: &TextureEntry,
     screen_origin: (f32, f32),
     screen_size: (f32, f32),
     scale: f32,
@@ -653,7 +617,7 @@ unsafe fn draw_page(
     gl.uniform_2_f32(Some(&locations.size), screen_size.0, screen_size.1);
     gl.active_texture(glow::TEXTURE0);
     match entry {
-        Entry::Rgba {
+        TextureEntry::Rgba {
             texture,
             lmap_base,
             transfer,
@@ -673,7 +637,7 @@ unsafe fn draw_page(
             );
             gl.bind_texture(glow::TEXTURE_2D, Some(*texture));
         }
-        Entry::Yuv {
+        TextureEntry::Yuv {
             luma,
             cb,
             cr,
@@ -742,10 +706,10 @@ unsafe fn delete_pipeline(gl: &glow::Context, pipeline: &Pipeline) {
     clippy::rest_pattern_accessible_field,
     reason = "deletion touches the texture names only, so the folded draw state stays unnamed"
 )]
-unsafe fn delete_entry(gl: &glow::Context, entry: &Entry) {
+unsafe fn delete_entry(gl: &glow::Context, entry: &TextureEntry) {
     match entry {
-        Entry::Rgba { texture, .. } => gl.delete_texture(*texture),
-        Entry::Yuv {
+        TextureEntry::Rgba { texture, .. } => gl.delete_texture(*texture),
+        TextureEntry::Yuv {
             luma,
             cb,
             cr,
@@ -912,7 +876,7 @@ unsafe fn upload_plane(
     clippy::similar_names,
     reason = "Cb and Cr are the YUV plane names the two textures hold"
 )]
-unsafe fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> Entry {
+unsafe fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> TextureEntry {
     let mag = magnification(decoded);
     let (width, height) = (decoded.width(), decoded.height());
     match &decoded.pixels() {
@@ -922,7 +886,7 @@ unsafe fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> Entry {
                 width as usize * height as usize * 4,
                 "rgba byte length"
             );
-            Entry::Rgba {
+            TextureEntry::Rgba {
                 texture: upload_rgba(gl, rgba_bytes, (width, height), mag),
                 lmap_base: page_lmap(decoded),
                 transfer: decoded.transfer(),
@@ -1041,7 +1005,7 @@ unsafe fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> Entry {
                     )
                 },
             );
-            Entry::Yuv {
+            TextureEntry::Yuv {
                 luma: luma_texture,
                 cb: cb_texture,
                 cr: cr_texture,
@@ -1071,13 +1035,13 @@ fn page_cmap(decoded: &Decoded, subsampling: Subsampling) -> (f32, f32) {
 /// the page's dims: a texture may be a smaller rendering, but its UV
 /// still spans the whole page.
 fn lmap_base(size: (u32, u32)) -> (f32, f32) {
-    let img = view::px_f32(size);
+    let img = geometry::px_f32(size);
     (1.0 / img.0, 1.0 / img.1)
 }
 
 fn cmap_base(size: (u32, u32), subsampling: Subsampling) -> (f32, f32) {
     let (_, (chroma_w, chroma_h)) = plane_dims(size, subsampling);
-    let chroma = view::px_f32((chroma_w, chroma_h));
+    let chroma = geometry::px_f32((chroma_w, chroma_h));
     let ratio = subsampling.chroma_ratio();
     (ratio.0 / chroma.0, ratio.1 / chroma.1)
 }

@@ -1,122 +1,60 @@
-//! Frame planning: the spread the screen presents and the artifacts the
-//! frame keeps or asks for. Pure: no clocks, GL, or IO.
+//! Frame planning: the spread the screen shows and the roles the frame
+//! keeps or asks for. Pure: no clocks, GL, or IO.
 
 use std::collections::BTreeMap;
 
-use crate::decode::Format;
+use crate::browse::Direction;
+use crate::browse::ReadingMode;
+use crate::browse::Motion;
+use crate::browse::PageCount;
+use crate::browse::PageInfo;
+
+use crate::browse::Request;
+use crate::browse::Role;
+use crate::browse::Roles;
+use crate::browse::ShownSpread;
+use crate::browse::Spread;
 use crate::fault::PageFault;
-use crate::plan::Direction;
-use crate::preview::Artifact;
-use crate::preview::Artifacts;
-use crate::preview::VIEW_EDGE;
-use crate::view;
-use crate::view::PageCount;
-use crate::view::Spread;
-use crate::view::ViewMode;
-use crate::worker::Motion;
-use crate::worker::Want;
-
-/// The page's own dims and format, independent of the stored representation.
-#[derive(Clone, Copy)]
-pub struct CachedPage {
-    pub dims: (u32, u32),
-    pub format: Format,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PresentedSpread {
-    pub mode: ViewMode,
-    pub spread: Spread,
-}
-
-pub struct Navigation {
-    target: usize,
-    presented: Option<PresentedSpread>,
-}
-
-impl Navigation {
-    pub fn new(target: usize) -> Self {
-        Self {
-            target,
-            presented: None,
-        }
-    }
-
-    pub fn target(&self) -> usize {
-        self.target
-    }
-
-    pub fn presented(&self) -> Option<Spread> {
-        self.presented.map(|presented| presented.spread)
-    }
-
-    pub fn presented_with_mode(&self) -> Option<PresentedSpread> {
-        self.presented
-    }
-
-    pub fn set_target(&mut self, target: usize) {
-        self.target = target;
-    }
-
-    pub fn record_presented(
-        &mut self,
-        mode: ViewMode,
-        presented: Option<Spread>,
-    ) {
-        self.presented =
-            presented.map(|spread| PresentedSpread { mode, spread });
-    }
-
-    pub fn commit_presented(&mut self, mode: ViewMode) -> bool {
-        let Some(presented) = self.presented else {
-            return false;
-        };
-        if presented.mode != mode || presented.spread.first == self.target
-        {
-            return false;
-        }
-        self.target = presented.spread.first;
-        true
-    }
-}
+use crate::preview::FIT_EDGE;
+use crate::geometry;
 
 pub struct FrameInput<'frame> {
     pub target: Spread,
-    pub presented: Option<PresentedSpread>,
-    pub mode: ViewMode,
+    pub shown: Option<ShownSpread>,
+    pub mode: ReadingMode,
     pub motion: Motion,
     pub direction: Direction,
     pub len: PageCount,
-    pub facts: &'frame BTreeMap<usize, CachedPage>,
+    pub facts: &'frame BTreeMap<usize, PageInfo>,
     pub faults: &'frame BTreeMap<usize, PageFault>,
     pub measurable: bool,
 }
 
-pub struct FramePlan {
-    presented: Option<Spread>,
+pub struct Frame {
+    shown: Option<Spread>,
     demand: Spread,
-    wants: Vec<Want>,
-    keep: Keep,
+    requests: Vec<Request>,
+    retention: Retention,
 }
 
-struct Keep {
-    mode: ViewMode,
+struct Retention {
+    mode: ReadingMode,
     len: PageCount,
     target: Spread,
-    anchor: Spread,
+    on_screen: Spread,
 }
 
-impl FramePlan {
+impl Frame {
     #[must_use]
-    pub fn presented(&self) -> Option<Spread> {
-        self.presented
+    pub fn shown(&self) -> Option<Spread> {
+        self.shown
     }
 
-    /// The spread the frame treats as on screen: the presented one, or the
+    /// The spread the frame treats as on screen: the shown one, or the
     /// target while nothing is presentable.
     #[must_use]
-    pub fn anchor(&self) -> Spread {
-        self.keep.anchor
+    pub fn on_screen(&self) -> Spread {
+        self.retention.on_screen
     }
 
     #[must_use]
@@ -125,226 +63,228 @@ impl FramePlan {
     }
 
     #[must_use]
-    pub fn into_wants(self) -> Vec<Want> {
-        self.wants
+    pub fn into_requests(self) -> Vec<Request> {
+        self.requests
     }
 
-    /// Every want, plus the role-bounded extras. It always covers `wants`.
-    pub fn retains(&self, page: usize, kind: Artifact) -> bool {
-        self.wants.contains(&Want::new(page, kind))
-            || self.keep.retains(page, kind)
+    /// Every request, plus the role-bounded extras. It always covers
+    /// `requests`.
+    pub fn retains(&self, page: usize, role: Role) -> bool {
+        self.requests.contains(&Request::new(page, role))
+            || self.retention.retains(page, role)
     }
 }
 
-impl Keep {
-    fn retains(&self, page: usize, kind: Artifact) -> bool {
-        match kind {
-            Artifact::Thumb => true,
-            Artifact::View => view_kept(
+impl Retention {
+    fn retains(&self, page: usize, role: Role) -> bool {
+        match role {
+            Role::Thumb => true,
+            Role::Fit => fit_kept(
                 page,
-                self.anchor,
+                self.on_screen,
                 self.target,
                 self.mode,
                 self.len,
             ),
-            Artifact::Native => self.anchor.contains(page),
+            Role::Full => self.on_screen.contains(page),
         }
     }
 }
 
-pub fn plan_frame(
+pub fn build_frame(
     input: &FrameInput<'_>,
-    artifacts: impl Fn(usize) -> Artifacts,
+    roles: impl Fn(usize) -> Roles,
     scale_for: impl Fn(Spread) -> f32,
-) -> FramePlan {
+) -> Frame {
     let skimming = input.motion == Motion::Skimming;
-    let presented = choose_presented(
+    let shown = choose_presented(
         input.target,
-        input.presented.map(|presented| presented.spread),
+        input.shown.map(|shown| shown.spread),
         input.mode,
         input.len,
         input.facts,
-        input.direction == Direction::Forward,
+        input.direction,
         |page| {
             input.faults.contains_key(&page)
                 || (input.facts.contains_key(&page)
                     && if skimming {
-                        artifacts(page).any()
+                        roles(page).any()
                     } else {
-                        artifacts(page).readable()
+                        roles(page).has_settled_image()
                     })
         },
     );
-    let anchor = presented.unwrap_or(input.target);
+    let on_screen = shown.unwrap_or(input.target);
     let demand = demand_spread(
         input.target,
-        anchor,
+        on_screen,
         input.motion,
         input.direction,
         input.mode,
         input.len,
     );
-    let anchor_scale = scale_for(anchor);
-    let wants = wants(
+    let on_screen_scale = scale_for(on_screen);
+    let requests = request_roles(
         demand,
-        anchor,
+        on_screen,
         input.mode,
         input.motion == Motion::Still,
-        // Natives key off the anchor, not the demand spread.
+        // Full images key off the on-screen spread, not the demand spread.
         |page| {
             input.measurable
                 && input.facts.get(&page).is_some_and(|entry| {
-                    native_wanted(anchor_scale, entry.dims)
+                    full_wanted(on_screen_scale, entry.dims)
                 })
         },
-        artifacts,
+        roles,
         |page| input.faults.contains_key(&page),
     );
-    FramePlan {
-        presented,
+    Frame {
+        shown,
         demand,
-        wants,
-        keep: Keep {
+        requests,
+        retention: Retention {
             mode: input.mode,
             len: input.len,
             target: input.target,
-            anchor,
+            on_screen,
         },
     }
 }
 
-/// Wants for a spread with no textures, before the frame can measure
+/// Requests for a spread with no textures, before the frame can measure
 /// placement.
-pub fn cold_wants(spread: Spread, mode: ViewMode) -> Vec<Want> {
-    wants(
+pub fn cold_requests(spread: Spread, mode: ReadingMode) -> Vec<Request> {
+    request_roles(
         spread,
         spread,
         mode,
         true,
         |_| false,
-        |_| Artifacts::default(),
+        |_| Roles::default(),
         |_| false,
     )
 }
 
 #[expect(
     clippy::cast_precision_loss,
-    reason = "page edges and the fixed view edge stay far below f32's exact-integer range, so the threshold comparison holds"
+    reason = "page edges and the fixed fit edge stay far below f32's exact-integer range, so the threshold comparison holds"
 )]
-fn native_wanted(scale: f32, page_dims: (u32, u32)) -> bool {
+fn full_wanted(scale: f32, page_dims: (u32, u32)) -> bool {
     let page_edge = page_dims.0.max(page_dims.1);
-    page_edge > VIEW_EDGE && scale > VIEW_EDGE as f32 / page_edge as f32
+    page_edge > FIT_EDGE && scale > FIT_EDGE as f32 / page_edge as f32
 }
 
 /// While skimming, demand the next spread instead of the far target:
 /// serving a far pair splits it before both pages arrive.
 fn demand_spread(
     target: Spread,
-    anchor: Spread,
+    on_screen: Spread,
     motion: Motion,
     direction: Direction,
-    mode: ViewMode,
+    mode: ReadingMode,
     len: PageCount,
 ) -> Spread {
     if motion == Motion::Still {
         return target;
     }
-    let next_start = view::advance(
-        anchor.first,
-        direction == Direction::Forward,
-        mode,
-        len,
-    );
-    view::spread_for(next_start, mode, len)
+    let next_start =
+        geometry::advance(on_screen.first, direction, mode, len);
+    geometry::spread_for(next_start, mode, len)
 }
 
-fn wants(
+fn request_roles(
     demand: Spread,
-    anchor: Spread,
-    mode: ViewMode,
+    on_screen: Spread,
+    mode: ReadingMode,
     still: bool,
     upscaled: impl Fn(usize) -> bool,
-    artifacts: impl Fn(usize) -> Artifacts,
+    roles: impl Fn(usize) -> Roles,
     faulted: impl Fn(usize) -> bool,
-) -> Vec<Want> {
-    let mut wants = Vec::new();
-    for spread in [demand, anchor] {
+) -> Vec<Request> {
+    let mut requests = Vec::new();
+    for spread in [demand, on_screen] {
         for page in spread.seats(mode).into_iter().flatten() {
             if faulted(page) {
                 continue;
             }
-            let resident = artifacts(page);
+            let resident = roles(page);
             if still {
-                if !resident.readable() {
-                    push_want(&mut wants, page, Artifact::View);
+                if !resident.has_settled_image() {
+                    push_request(&mut requests, page, Role::Fit);
                 }
-                if !resident.contains(Artifact::Thumb) {
-                    push_want(&mut wants, page, Artifact::Thumb);
+                if !resident.contains(Role::Thumb) {
+                    push_request(&mut requests, page, Role::Thumb);
                 }
-                if anchor.contains(page)
+                if on_screen.contains(page)
                     && upscaled(page)
-                    && !resident.contains(Artifact::Native)
+                    && !resident.contains(Role::Full)
                 {
-                    push_want(&mut wants, page, Artifact::Native);
+                    push_request(&mut requests, page, Role::Full);
                 }
                 continue;
             }
-            if !resident.contains(Artifact::Thumb) {
-                push_want(&mut wants, page, Artifact::Thumb);
+            if !resident.contains(Role::Thumb) {
+                push_request(&mut requests, page, Role::Thumb);
             }
         }
     }
-    wants
+    requests
 }
 
-fn push_want(wants: &mut Vec<Want>, page: usize, kind: Artifact) {
-    let want = Want { page, kind };
-    if !wants.contains(&want) {
-        wants.push(want);
+fn push_request(
+    requests: &mut Vec<Request>,
+    page: usize,
+    role: Role,
+) {
+    let request = Request { page, role };
+    if !requests.contains(&request) {
+        requests.push(request);
     }
 }
 
-const VIEW_KEEP_SPREADS: usize = 2;
+const FIT_KEEP_SPREADS: usize = 2;
 
-fn view_kept(
+fn fit_kept(
     page: usize,
-    anchor: Spread,
+    on_screen: Spread,
     target: Spread,
-    mode: ViewMode,
+    mode: ReadingMode,
     len: PageCount,
 ) -> bool {
-    let start = view::spread_for(page, mode, len).first;
-    start.abs_diff(anchor.first) <= VIEW_KEEP_SPREADS
-        || start.abs_diff(target.first) <= VIEW_KEEP_SPREADS
+    let start = geometry::spread_for(page, mode, len).first;
+    start.abs_diff(on_screen.first) <= FIT_KEEP_SPREADS
+        || start.abs_diff(target.first) <= FIT_KEEP_SPREADS
 }
 
 /// The target spread once every page clears `can_show`; otherwise the
-/// nearest presentable start between the presented and target spreads, so
-/// a skim advances monotonically; otherwise the presented spread.
+/// nearest presentable start between the shown and target spreads, so
+/// a skim advances monotonically; otherwise the shown spread.
 fn choose_presented(
     target: Spread,
-    presented: Option<Spread>,
-    mode: ViewMode,
+    shown: Option<Spread>,
+    mode: ReadingMode,
     len: PageCount,
-    cached: &BTreeMap<usize, CachedPage>,
-    forward: bool,
+    cached: &BTreeMap<usize, PageInfo>,
+    direction: Direction,
     can_show: impl Fn(usize) -> bool,
 ) -> Option<Spread> {
+    let forward = direction == Direction::Forward;
     let presentable = |spread: Spread| {
         spread.seats(mode).into_iter().flatten().all(&can_show)
     };
     if presentable(target) {
         return Some(target);
     }
-    let (low, high) = presented.map_or((0, usize::MAX), |presented| {
+    let (low, high) = shown.map_or((0, usize::MAX), |shown| {
         (
-            presented.first.min(target.first),
-            presented.first.max(target.first),
+            shown.first.min(target.first),
+            shown.first.max(target.first),
         )
     });
     let mut best: Option<Spread> = None;
     for &page in cached.keys() {
-        let spread = view::spread_for(page, mode, len);
+        let spread = geometry::spread_for(page, mode, len);
         if spread.first < low
             || spread.first > high
             || !presentable(spread)
@@ -366,7 +306,7 @@ fn choose_presented(
             best = Some(spread);
         }
     }
-    best.or(presented)
+    best.or(shown)
 }
 
 #[cfg(test)]
@@ -376,32 +316,34 @@ fn choose_presented(
 )]
 mod tests {
     use super::*;
+    use crate::browse::ReadingPosition;
+    use crate::decode::Format;
 
     #[test]
-    fn a_native_is_only_wanted_when_the_view_has_fewer_pixels() {
-        assert!(!native_wanted(16.0, (1920, 1080)));
-        assert!(!native_wanted(16.0, (VIEW_EDGE, 1440)));
+    fn a_full_image_is_only_requested_when_the_fit_has_fewer_pixels() {
+        assert!(!full_wanted(16.0, (1920, 1080)));
+        assert!(!full_wanted(16.0, (FIT_EDGE, 1440)));
         let four_k = (3840, 2160);
-        assert!(!native_wanted(0.66, four_k));
-        assert!(native_wanted(0.67, four_k));
+        assert!(!full_wanted(0.66, four_k));
+        assert!(full_wanted(0.67, four_k));
         let ten_k = (10080, 5640);
-        assert!(!native_wanted(0.25, ten_k));
-        assert!(native_wanted(0.26, ten_k));
+        assert!(!full_wanted(0.25, ten_k));
+        assert!(full_wanted(0.26, ten_k));
     }
 
     #[test]
-    fn retention_keeps_views_within_the_role_bounds() {
+    fn retention_keeps_fit_images_within_the_role_bounds() {
         let len = PageCount::new(20).expect("the test book is not empty");
         let facts = BTreeMap::new();
         let faults = BTreeMap::new();
-        let plan = plan_frame(
+        let frame = build_frame(
             &FrameInput {
                 target: Spread::lone(10),
-                presented: Some(PresentedSpread {
-                    mode: ViewMode::Normal,
+                shown: Some(ShownSpread {
+                    mode: ReadingMode::Normal,
                     spread: Spread::lone(10),
                 }),
-                mode: ViewMode::Normal,
+                mode: ReadingMode::Normal,
                 motion: Motion::Still,
                 direction: Direction::Forward,
                 len,
@@ -409,34 +351,34 @@ mod tests {
                 faults: &faults,
                 measurable: false,
             },
-            |_| Artifacts::default(),
+            |_| Roles::default(),
             |_| 1.0,
         );
-        assert!(plan.retains(10, Artifact::Native));
-        assert!(!plan.retains(12, Artifact::Native));
-        assert!(plan.retains(12, Artifact::View));
-        assert!(!plan.retains(13, Artifact::View));
-        assert!(plan.retains(0, Artifact::Thumb));
+        assert!(frame.retains(10, Role::Full));
+        assert!(!frame.retains(12, Role::Full));
+        assert!(frame.retains(12, Role::Fit));
+        assert!(!frame.retains(13, Role::Fit));
+        assert!(frame.retains(0, Role::Thumb));
     }
 
     #[test]
-    fn native_wants_follow_the_anchor_scale() {
+    fn full_requests_follow_the_on_screen_scale() {
         let len = PageCount::new(12).expect("the test book is not empty");
-        let entry = CachedPage {
+        let entry = PageInfo {
             dims: (4000, 6000),
             format: Format::Png,
         };
-        let facts: BTreeMap<usize, CachedPage> =
+        let facts: BTreeMap<usize, PageInfo> =
             [1, 2].into_iter().map(|page| (page, entry)).collect();
         let faults = BTreeMap::new();
-        let plan = plan_frame(
+        let frame = build_frame(
             &FrameInput {
                 target: Spread::lone(2),
-                presented: Some(PresentedSpread {
-                    mode: ViewMode::Normal,
+                shown: Some(ShownSpread {
+                    mode: ReadingMode::Normal,
                     spread: Spread::lone(1),
                 }),
-                mode: ViewMode::Normal,
+                mode: ReadingMode::Normal,
                 motion: Motion::Still,
                 direction: Direction::Forward,
                 len,
@@ -444,16 +386,16 @@ mod tests {
                 faults: &faults,
                 measurable: true,
             },
-            |_| Artifacts::default(),
+            |_| Roles::default(),
             |spread| if spread.first == 1 { 1.0 } else { 0.1 },
         );
-        assert_eq!(plan.anchor(), Spread::lone(1));
+        assert_eq!(frame.on_screen(), Spread::lone(1));
         assert!(
-            plan.wants.contains(&Want::new(1, Artifact::Native)),
-            "the on-screen page asks for its native at the anchor scale"
+            frame.requests.contains(&Request::new(1, Role::Full)),
+            "the on-screen page asks for its full image at the on-screen scale"
         );
         assert!(
-            !plan.wants.contains(&Want::new(2, Artifact::Native)),
+            !frame.requests.contains(&Request::new(2, Role::Full)),
             "the target page is not upscaled"
         );
     }
@@ -461,12 +403,12 @@ mod tests {
     #[test]
     fn presentation_advances_through_presentable_spreads() {
         let len = PageCount::new(12).expect("the test book is not empty");
-        let mode = ViewMode::Normal;
-        let entry = CachedPage {
+        let mode = ReadingMode::Normal;
+        let entry = PageInfo {
             dims: (2, 2),
             format: Format::Png,
         };
-        let cached: BTreeMap<usize, CachedPage> =
+        let cached: BTreeMap<usize, PageInfo> =
             [0, 2, 4, 8].into_iter().map(|page| (page, entry)).collect();
         let can_show = |page: usize| matches!(page, 0 | 2 | 4);
         let lone = Spread::lone;
@@ -479,12 +421,12 @@ mod tests {
                 mode,
                 len,
                 &cached,
-                true,
+                Direction::Forward,
                 can_show
             ),
             Some(lone(4))
         );
-        // Otherwise the nearest presentable spread between the presented
+        // Otherwise the nearest presentable spread between the shown
         // and the target; page 8 is cached but has no pixels.
         assert_eq!(
             choose_presented(
@@ -493,12 +435,12 @@ mod tests {
                 mode,
                 len,
                 &cached,
-                true,
+                Direction::Forward,
                 can_show
             ),
             Some(lone(4))
         );
-        // Nothing between the two: the presented spread keeps its pixels.
+        // Nothing between the two: the shown spread keeps its pixels.
         assert_eq!(
             choose_presented(
                 lone(9),
@@ -506,7 +448,7 @@ mod tests {
                 mode,
                 len,
                 &cached,
-                true,
+                Direction::Forward,
                 |page| page == 0
             ),
             Some(lone(2))
@@ -519,7 +461,7 @@ mod tests {
                 mode,
                 len,
                 &cached,
-                true,
+                Direction::Forward,
                 can_show
             ),
             Some(lone(4))
@@ -532,7 +474,7 @@ mod tests {
                 mode,
                 len,
                 &cached,
-                true,
+                Direction::Forward,
                 |_| false
             ),
             None
@@ -542,39 +484,39 @@ mod tests {
     #[test]
     fn paired_spread_waits_for_every_seat() {
         let len = PageCount::new(12).expect("the test book is not empty");
-        let mode = ViewMode::Manga;
-        let entry = CachedPage {
+        let mode = ReadingMode::Manga;
+        let entry = PageInfo {
             dims: (2, 2),
             format: Format::Png,
         };
-        let cached: BTreeMap<usize, CachedPage> =
+        let cached: BTreeMap<usize, PageInfo> =
             [0, 2].into_iter().map(|page| (page, entry)).collect();
         let pair = Spread {
             first: 1,
             second: Some(2),
         };
-        let presented = Spread::lone(0);
+        let shown = Spread::lone(0);
 
         assert_eq!(
             choose_presented(
                 pair,
-                Some(presented),
+                Some(shown),
                 mode,
                 len,
                 &cached,
-                true,
+                Direction::Forward,
                 |page| page == 2
             ),
-            Some(presented)
+            Some(shown)
         );
         assert_eq!(
             choose_presented(
                 pair,
-                Some(presented),
+                Some(shown),
                 mode,
                 len,
                 &cached,
-                true,
+                Direction::Forward,
                 |page| matches!(page, 1 | 2)
             ),
             Some(pair)
@@ -582,20 +524,20 @@ mod tests {
     }
 
     #[test]
-    fn commit_presented_requires_the_current_mode() {
-        let mut navigation = Navigation::new(5);
-        assert!(!navigation.commit_presented(ViewMode::Normal));
-        assert_eq!(navigation.target(), 5);
+    fn commit_shown_requires_the_current_mode() {
+        let mut position = ReadingPosition::new(5);
+        assert!(!position.commit_shown(ReadingMode::Normal));
+        assert_eq!(position.target(), 5);
 
-        navigation
-            .record_presented(ViewMode::Normal, Some(Spread::lone(4)));
-        assert!(navigation.commit_presented(ViewMode::Normal));
-        assert_eq!(navigation.target(), 4);
-        assert!(!navigation.commit_presented(ViewMode::Normal));
+        position
+            .record_shown(ReadingMode::Normal, Some(Spread::lone(4)));
+        assert!(position.commit_shown(ReadingMode::Normal));
+        assert_eq!(position.target(), 4);
+        assert!(!position.commit_shown(ReadingMode::Normal));
 
-        navigation.set_target(5);
-        assert!(!navigation.commit_presented(ViewMode::Manga));
-        assert_eq!(navigation.target(), 5);
+        position.set_target(5);
+        assert!(!position.commit_shown(ReadingMode::Manga));
+        assert_eq!(position.target(), 5);
     }
 
     #[test]
@@ -603,14 +545,14 @@ mod tests {
         let len = PageCount::new(40).expect("the test book is not empty");
         let facts = BTreeMap::new();
         let faults = BTreeMap::new();
-        let plan = plan_frame(
+        let frame = build_frame(
             &FrameInput {
                 target: Spread::lone(20),
-                presented: Some(PresentedSpread {
-                    mode: ViewMode::Normal,
+                shown: Some(ShownSpread {
+                    mode: ReadingMode::Normal,
                     spread: Spread::lone(2),
                 }),
-                mode: ViewMode::Normal,
+                mode: ReadingMode::Normal,
                 motion: Motion::Skimming,
                 direction: Direction::Forward,
                 len,
@@ -618,11 +560,11 @@ mod tests {
                 faults: &faults,
                 measurable: true,
             },
-            |_| Artifacts::default(),
+            |_| Roles::default(),
             |_| 1.0,
         );
-        assert_eq!(plan.presented, Some(Spread::lone(2)));
-        assert_eq!(plan.demand, Spread::lone(3));
-        assert_ne!(plan.demand, Spread::lone(20));
+        assert_eq!(frame.shown, Some(Spread::lone(2)));
+        assert_eq!(frame.demand, Spread::lone(3));
+        assert_ne!(frame.demand, Spread::lone(20));
     }
 }

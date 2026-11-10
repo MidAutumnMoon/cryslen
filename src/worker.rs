@@ -1,5 +1,5 @@
-//! Decode worker: serves the app's [`Want`]s and fills the preview store
-//! from the plan. Nothing decoded survives here.
+//! Decode worker: serves the app's [`Request`]s and fills the preview
+//! store from the prefetch. Nothing decoded survives here.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -18,51 +18,40 @@ use std::time::Instant;
 use std::path::Path;
 
 use eros::ErrorUnion;
-use serde::Deserialize;
-use serde::Serialize;
 
+use crate::browse::Motion;
+use crate::browse::Request;
+use crate::browse::Role;
+use crate::browse::Roles;
 use crate::decode;
 use crate::decode::Decoded;
 use crate::fault::BadIndex;
 use crate::fault::PageError;
 use crate::fault::PanicFault;
 use crate::fault::SpawnError;
-use crate::plan::Plan;
+use crate::prefetch::Prefetch;
 use crate::preview;
-use crate::preview::Artifact;
-use crate::preview::Artifacts;
 use crate::preview::Store;
 use crate::source::PageRead;
 use crate::source::Source;
 
 /// Nap between checks while a page unpacks; the loop drains the channel
-/// after each, so a stop or target waits at most this long.
+/// after each, so a stop or request waits at most this long.
 const FILL_POLL: Duration = Duration::from_millis(15);
 
 /// Silence required before preload beyond the head starts, so a turning
 /// reader leaves the worker idle between turns.
 const IDLE_PRELOAD: Duration = Duration::from_millis(300);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-pub enum Motion {
-    /// The reader is looking at the spread; its head is worth a view.
-    Still,
-    /// The reader is turning pages faster than a view could arrive, so
-    /// thumbs are all that can be shown.
-    Skimming,
-}
-
-/// One artifact for the app. `image` is what the renderer uploads: the
-/// stored preview for `Thumb` and `View`, the page's own pixels for
-/// `Native`.
-pub struct Ready {
-    pub page: usize,
-    pub kind: Artifact,
-    pub image: Box<Decoded>,
-}
-
-pub enum Event {
-    Ready(Ready),
+/// One role for the app. `image` is what the renderer uploads: the
+/// stored preview for `Thumb` and `Fit`, the page's own pixels for
+/// `Full`. `Fatal` ends the child's writer run.
+pub enum Update {
+    Ready {
+        page: usize,
+        role: Role,
+        image: Box<Decoded>,
+    },
     Failed {
         page: usize,
         error: Arc<PageError>,
@@ -70,110 +59,97 @@ pub enum Event {
     /// Every page now reads without waiting on an unpack pass. Sent
     /// once, on the first loop iteration that observes it.
     Unpacked,
+    Fatal(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
-#[non_exhaustive]
-pub struct Want {
-    pub page: usize,
-    pub kind: Artifact,
-}
-
-impl Want {
-    #[must_use]
-    pub fn new(page: usize, kind: Artifact) -> Self {
-        Self { page, kind }
-    }
-}
-
-enum ToWorker {
-    Retune(Plan),
+enum WorkerCommand {
+    SetPrefetch(Prefetch),
     Motion(Motion),
-    /// Replace the set of artifacts the app is missing. The app sends
-    /// it on change; a want leaving the set is how it says it got the
-    /// artifact.
-    Targets(Vec<Want>),
+    /// Replace the set of roles the app is missing. The app sends
+    /// it on change; a request leaving the set is how it says it got the
+    /// role.
+    Requests(Vec<Request>),
     Stop,
 }
 
-/// A page and the artifacts to produce. A `demand` job is delivered; a
+/// A page and the roles to produce. A `requested` job is delivered; a
 /// `preload` job is speculative.
 #[derive(Clone, Copy, Debug)]
 struct Job {
     page: usize,
-    needs: Artifacts,
-    demand: bool,
+    roles: Roles,
+    requested: bool,
     preload: bool,
 }
 
 struct Session {
-    plan: Plan,
+    prefetch: Prefetch,
     motion: Motion,
     store: Store,
     /// Content hash of each page's bytes, computed once per session.
     hashes: HashMap<usize, u128>,
-    /// Artifacts this session put in the store or loaded, by content
-    /// hash. Evictions clear the entry, and a failed save still counts so
-    /// a refusing store cannot make the plan spin.
-    produced: HashMap<u128, Artifacts>,
+    /// Roles this session put in the store or loaded, by content hash.
+    /// Evictions clear the entry, and a failed save still counts so a
+    /// refusing store cannot make the worker spin.
+    stored: HashMap<u128, Roles>,
     /// A page's first failure is its verdict for the session.
     failed: HashMap<usize, Arc<PageError>>,
     /// What the app is missing, in its priority order.
-    targets: Vec<Want>,
-    targets_at: Instant,
-    /// Wants already handed over since they last entered the set.
-    delivered: HashSet<Want>,
-    preloading: bool,
+    requests: Vec<Request>,
+    requests_at: Instant,
+    /// Requests already handed over since they last entered the set.
+    served: HashSet<Request>,
+    preload_allowed: bool,
 }
 
 impl Session {
-    fn new(plan: Plan, store: Store) -> Self {
+    fn new(prefetch: Prefetch, store: Store) -> Self {
         Self {
-            plan,
+            prefetch,
             motion: Motion::Still,
             store,
             hashes: HashMap::new(),
-            produced: HashMap::new(),
+            stored: HashMap::new(),
             failed: HashMap::new(),
-            targets: Vec::new(),
-            targets_at: Instant::now(),
-            delivered: HashSet::new(),
-            preloading: false,
+            requests: Vec::new(),
+            requests_at: Instant::now(),
+            served: HashSet::new(),
+            preload_allowed: false,
         }
     }
 
     /// Apply one message. `false` means the loop must stop.
-    fn apply(&mut self, message: ToWorker) -> bool {
-        if !matches!(message, ToWorker::Stop) {
-            self.preloading = false;
+    fn apply(&mut self, message: WorkerCommand) -> bool {
+        if !matches!(message, WorkerCommand::Stop) {
+            self.preload_allowed = false;
         }
         match message {
-            ToWorker::Retune(plan) => {
+            WorkerCommand::SetPrefetch(prefetch) => {
                 tracing::debug!(
-                    anchor = ?plan.spreads().first(),
+                    origin = ?prefetch.spreads().first(),
                     motion = ?self.motion,
-                    "plan retuned"
+                    "prefetch set"
                 );
-                self.plan = plan;
+                self.prefetch = prefetch;
             }
-            ToWorker::Motion(motion) => {
+            WorkerCommand::Motion(motion) => {
                 tracing::debug!(?motion, "motion");
                 self.motion = motion;
             }
-            ToWorker::Targets(targets) => {
-                tracing::debug!(count = targets.len(), "targets");
-                self.delivered.retain(|want| targets.contains(want));
-                self.targets = targets;
-                self.targets_at = Instant::now();
+            WorkerCommand::Requests(requests) => {
+                tracing::debug!(count = requests.len(), "requests");
+                self.served.retain(|request| requests.contains(request));
+                self.requests = requests;
+                self.requests_at = Instant::now();
             }
-            ToWorker::Stop => return false,
+            WorkerCommand::Stop => return false,
         }
         true
     }
 
-    fn next_job(&self) -> Option<Job> {
-        let head = self.plan.head();
-        for spread in self.plan.spreads() {
+    fn next_prefetch_job(&self) -> Option<Job> {
+        let head = self.prefetch.head();
+        for spread in self.prefetch.spreads() {
             let in_head = head.contains(spread);
             for page in
                 [Some(spread.first), spread.second].into_iter().flatten()
@@ -181,27 +157,27 @@ impl Session {
                 if self.failed.contains_key(&page) {
                     continue;
                 }
-                let produced = self
+                let stored = self
                     .hashes
                     .get(&page)
-                    .and_then(|hash| self.produced.get(hash))
+                    .and_then(|hash| self.stored.get(hash))
                     .copied()
                     .unwrap_or_default();
-                let mut needs = Artifacts::default();
-                if !produced.contains(Artifact::Thumb) {
-                    needs.set(Artifact::Thumb);
+                let mut roles = Roles::default();
+                if !stored.contains(Role::Thumb) {
+                    roles.set(Role::Thumb);
                 }
                 if in_head
                     && self.motion == Motion::Still
-                    && !produced.contains(Artifact::View)
+                    && !stored.contains(Role::Fit)
                 {
-                    needs.set(Artifact::View);
+                    roles.set(Role::Fit);
                 }
-                if needs.any() {
+                if roles.any() {
                     return Some(Job {
                         page,
-                        needs,
-                        demand: false,
+                        roles,
+                        requested: false,
                         preload: !in_head,
                     });
                 }
@@ -210,28 +186,28 @@ impl Session {
         None
     }
 
-    /// The first wanted page with an undelivered kind, with the page's whole
+    /// The first requested page with an unserved role, with the page's whole
     /// group so one decode serves it.
-    fn next_target(&self) -> Option<Job> {
+    fn next_request(&self) -> Option<Job> {
         let mut found: Option<Job> = None;
-        for want in &self.targets {
-            if self.delivered.contains(want)
-                || self.failed.contains_key(&want.page)
+        for request in &self.requests {
+            if self.served.contains(request)
+                || self.failed.contains_key(&request.page)
             {
                 continue;
             }
             match found.as_mut() {
-                Some(job) if job.page == want.page => {
-                    job.needs.set(want.kind);
+                Some(job) if job.page == request.page => {
+                    job.roles.set(request.role);
                 }
                 Some(_) => break,
                 None => {
-                    let mut needs = Artifacts::default();
-                    needs.set(want.kind);
+                    let mut roles = Roles::default();
+                    roles.set(request.role);
                     found = Some(Job {
-                        page: want.page,
-                        needs,
-                        demand: true,
+                        page: request.page,
+                        roles,
+                        requested: true,
                         preload: false,
                     });
                 }
@@ -240,8 +216,8 @@ impl Session {
         found
     }
 
-    fn target_wait(&self) -> Duration {
-        self.targets_at.elapsed()
+    fn request_wait(&self) -> Duration {
+        self.requests_at.elapsed()
     }
 
     fn hash(&mut self, page: usize, bytes: &[u8]) -> u128 {
@@ -251,52 +227,51 @@ impl Session {
             .or_insert_with(|| preview::content_hash(bytes))
     }
 
-    /// Hand one artifact to the app and mark it delivered for the current
-    /// set.
+    /// Hand one role to the app and mark it served for the current set.
     fn publish(
         &mut self,
         page: usize,
-        kind: Artifact,
+        role: Role,
         image: Decoded,
-        notify: &dyn Fn(Event),
+        notify: &dyn Fn(Update),
     ) {
-        self.delivered.insert(Want { page, kind });
+        self.served.insert(Request { page, role });
         tracing::debug!(
             page,
-            ?kind,
+            ?role,
             width = image.width(),
             height = image.height(),
             "publish"
         );
-        notify(Event::Ready(Ready {
+        notify(Update::Ready {
             page,
-            kind,
+            role,
             image: Box::new(image),
-        }));
+        });
     }
 
-    fn mark_produced(&mut self, hash: u128, kind: Artifact) {
-        self.produced.entry(hash).or_default().set(kind);
+    fn mark_stored(&mut self, hash: u128, role: Role) {
+        self.stored.entry(hash).or_default().set(role);
     }
 
-    /// Save one artifact; the evictions it reports leave the ledger.
-    fn keep(
+    /// Save one role; the evictions it reports leave the ledger.
+    fn persist(
         &mut self,
         page: usize,
         hash: u128,
-        kind: Artifact,
+        role: Role,
         image: Decoded,
     ) -> Decoded {
-        let saved = self.store.save(hash, kind, &image);
-        if !saved.landed {
-            tracing::debug!(page, ?kind, "preview save missed the store");
+        let saved = self.store.save(hash, role, &image);
+        if !saved.persisted {
+            tracing::debug!(page, ?role, "preview save missed the store");
         }
-        for (evicted_kind, evicted_hash) in saved.evicted {
-            if let Some(artifacts) = self.produced.get_mut(&evicted_hash) {
-                artifacts.clear(evicted_kind);
+        for (evicted_role, evicted_hash) in saved.evicted {
+            if let Some(roles) = self.stored.get_mut(&evicted_hash) {
+                roles.clear(evicted_role);
             }
         }
-        self.mark_produced(hash, kind);
+        self.mark_stored(hash, role);
         image
     }
 
@@ -305,25 +280,25 @@ impl Session {
         &mut self,
         page: usize,
         error: Arc<PageError>,
-        notify: &dyn Fn(Event),
+        notify: &dyn Fn(Update),
     ) {
         if self.failed.insert(page, Arc::clone(&error)).is_some() {
             return;
         }
-        notify(Event::Failed { page, error });
+        notify(Update::Failed { page, error });
     }
 
     /// Load what the store answers, decode once for the rest, and save every
-    /// preview; a demand job also publishes.
+    /// preview; a requested job also publishes.
     fn serve(
         &mut self,
         source: &Source,
         job: Job,
-        notify: &dyn Fn(Event),
+        notify: &dyn Fn(Update),
     ) {
         let page = job.page;
-        let needs = job.needs;
-        let demand = job.demand;
+        let roles = job.roles;
+        let requested = job.requested;
         let bytes = match source.bytes(page) {
             PageRead::NotYet => {
                 thread::sleep(FILL_POLL);
@@ -337,25 +312,25 @@ impl Session {
         };
         let serve_started = Instant::now();
         let hash = self.hash(page, &bytes);
-        let mut thumb = needs
-            .contains(Artifact::Thumb)
-            .then(|| self.store.load(hash, Artifact::Thumb))
+        let mut thumb = roles
+            .contains(Role::Thumb)
+            .then(|| self.store.load(hash, Role::Thumb))
             .flatten();
-        let mut view = needs
-            .contains(Artifact::View)
-            .then(|| self.store.load(hash, Artifact::View))
+        let mut view = roles
+            .contains(Role::Fit)
+            .then(|| self.store.load(hash, Role::Fit))
             .flatten();
         let thumb_hit = thumb.is_some();
         let view_hit = view.is_some();
         if thumb.is_some() {
-            self.mark_produced(hash, Artifact::Thumb);
+            self.mark_stored(hash, Role::Thumb);
         }
         if view.is_some() {
-            self.mark_produced(hash, Artifact::View);
+            self.mark_stored(hash, Role::Fit);
         }
-        if needs.contains(Artifact::Native)
-            || (needs.contains(Artifact::View) && view.is_none())
-            || (needs.contains(Artifact::Thumb) && thumb.is_none())
+        if roles.contains(Role::Full)
+            || (roles.contains(Role::Fit) && view.is_none())
+            || (roles.contains(Role::Thumb) && thumb.is_none())
         {
             let decode_started = Instant::now();
             let native = match decode_page(source, page, &bytes) {
@@ -370,57 +345,57 @@ impl Session {
                 elapsed = ?decode_started.elapsed(),
                 "decoded"
             );
-            if needs.contains(Artifact::View) && view.is_none() {
+            if roles.contains(Role::Fit) && view.is_none() {
                 let started = Instant::now();
-                let derived = preview::derive(&native, Artifact::View);
+                let derived = preview::derive(&native, Role::Fit);
                 tracing::debug!(
                     page,
                     elapsed = ?started.elapsed(),
-                    "view derived"
+                    "fit derived"
                 );
                 view =
-                    Some(self.keep(page, hash, Artifact::View, derived));
+                    Some(self.persist(page, hash, Role::Fit, derived));
             }
-            if needs.contains(Artifact::Thumb) && thumb.is_none() {
+            if roles.contains(Role::Thumb) && thumb.is_none() {
                 let started = Instant::now();
                 let from = view.as_ref().unwrap_or(&native);
-                let derived = preview::derive(from, Artifact::Thumb);
+                let derived = preview::derive(from, Role::Thumb);
                 tracing::debug!(
                     page,
                     elapsed = ?started.elapsed(),
                     "thumb derived"
                 );
                 thumb =
-                    Some(self.keep(page, hash, Artifact::Thumb, derived));
+                    Some(self.persist(page, hash, Role::Thumb, derived));
             }
-            // Natives bypass the store; a demand job delivers them.
-            if needs.contains(Artifact::Native) && demand {
-                self.publish(page, Artifact::Native, native, notify);
+            // Natives bypass the store; a requested job delivers them.
+            if roles.contains(Role::Full) && requested {
+                self.publish(page, Role::Full, native, notify);
             }
         }
-        if demand {
+        if requested {
             tracing::debug!(
                 page,
-                thumb = needs.contains(Artifact::Thumb),
-                view = needs.contains(Artifact::View),
-                native = needs.contains(Artifact::Native),
+                thumb = roles.contains(Role::Thumb),
+                view = roles.contains(Role::Fit),
+                native = roles.contains(Role::Full),
                 thumb_hit,
                 view_hit,
-                waited = ?self.targets_at.elapsed(),
+                waited = ?self.requests_at.elapsed(),
                 elapsed = ?serve_started.elapsed(),
                 "target served"
             );
-            // The view goes first: a still frame waits on it, and the
+            // The fit image goes first: a still frame waits on it, and the
             // app's upload budget would otherwise defer it behind the
             // thumb by a frame.
-            if needs.contains(Artifact::View) {
+            if roles.contains(Role::Fit) {
                 if let Some(view) = view {
-                    self.publish(page, Artifact::View, view, notify);
+                    self.publish(page, Role::Fit, view, notify);
                 }
             }
-            if needs.contains(Artifact::Thumb) {
+            if roles.contains(Role::Thumb) {
                 if let Some(thumb) = thumb {
-                    self.publish(page, Artifact::Thumb, thumb, notify);
+                    self.publish(page, Role::Thumb, thumb, notify);
                 }
             }
         }
@@ -428,19 +403,19 @@ impl Session {
 }
 
 /// Handle to the decode thread. Every control is a send; the last
-/// retune wins, and a newer plan overtakes the old one's tail.
+/// prefetch wins, and a newer prefetch overtakes the old one's tail.
 pub struct Worker {
-    tx: mpsc::Sender<ToWorker>,
+    tx: mpsc::Sender<WorkerCommand>,
     handle: Option<JoinHandle<()>>,
 }
 
 impl Worker {
-    /// Spawn the worker for `source` with `initial` as its plan. `notify`
-    /// fires from the worker thread with each artifact or failure.
+    /// Spawn the worker for `source` with `initial` as its prefetch. `notify`
+    /// fires from the worker thread with each role or failure.
     pub fn spawn(
         source: Arc<Source>,
-        initial: Plan,
-        notify: impl Fn(Event) + Send + Sync + 'static,
+        initial: Prefetch,
+        notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, SpawnError> {
         Self::launch(source, initial, Store::open(), notify)
     }
@@ -449,20 +424,20 @@ impl Worker {
     #[cfg(test)]
     fn spawn_at(
         source: Arc<Source>,
-        initial: Plan,
+        initial: Prefetch,
         root: &Path,
-        notify: impl Fn(Event) + Send + Sync + 'static,
+        notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, SpawnError> {
         Self::launch(source, initial, Store::at(root), notify)
     }
 
     fn launch(
         source: Arc<Source>,
-        initial: Plan,
+        initial: Prefetch,
         store: Store,
-        notify: impl Fn(Event) + Send + Sync + 'static,
+        notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, SpawnError> {
-        let (tx, rx) = mpsc::channel::<ToWorker>();
+        let (tx, rx) = mpsc::channel::<WorkerCommand>();
         let handle =
             Builder::new().name("cy-decode".into()).spawn(move || {
                 run(&source, &rx, Session::new(initial, store), &notify);
@@ -475,31 +450,31 @@ impl Worker {
 
     /// A failed send means the thread already exited, so the message has
     /// no reader left.
-    fn tell(&self, message: ToWorker) {
+    fn tell(&self, message: WorkerCommand) {
         let Ok(()) = self.tx.send(message) else {
             return;
         };
     }
 
-    /// Replace the plan; the in-flight decode still finishes.
-    pub fn retune(&self, plan: Plan) {
-        self.tell(ToWorker::Retune(plan));
+    /// Replace the prefetch; the in-flight decode still finishes.
+    pub fn set_prefetch(&self, prefetch: Prefetch) {
+        self.tell(WorkerCommand::SetPrefetch(prefetch));
     }
 
     pub fn set_motion(&self, motion: Motion) {
-        self.tell(ToWorker::Motion(motion));
+        self.tell(WorkerCommand::Motion(motion));
     }
 
-    /// Serve these wants in order, ahead of the plan; the app sends only
-    /// changes, and a want that leaves and returns is served again.
-    pub fn retarget(&self, targets: Vec<Want>) {
-        self.tell(ToWorker::Targets(targets));
+    /// Serve these requests in order, ahead of the prefetch; the app sends only
+    /// changes, and a request that leaves and returns is served again.
+    pub fn set_requests(&self, requests: Vec<Request>) {
+        self.tell(WorkerCommand::Requests(requests));
     }
 
     /// Stop the worker without joining it, so the caller returns while an
     /// in-flight decode finishes. The thread owns its state.
     pub fn detach(&mut self) {
-        self.tell(ToWorker::Stop);
+        self.tell(WorkerCommand::Stop);
         self.handle = None;
     }
 }
@@ -507,7 +482,7 @@ impl Worker {
 impl Drop for Worker {
     fn drop(&mut self) {
         // Stop wakes a parked loop so the join returns.
-        self.tell(ToWorker::Stop);
+        self.tell(WorkerCommand::Stop);
         if let Some(handle) = self.handle.take() {
             // A panicked thread leaves nothing to act on at teardown, so
             // debug builds surface the breach.
@@ -518,12 +493,12 @@ impl Drop for Worker {
 }
 
 /// Worker loop: drain the channel before every pick, so Stop and a newer
-/// plan answer between decodes, and one in-flight decode completes.
+/// prefetch answer between decodes, and one in-flight decode completes.
 fn run(
     source: &Source,
-    rx: &mpsc::Receiver<ToWorker>,
+    rx: &mpsc::Receiver<WorkerCommand>,
     mut session: Session,
-    notify: &dyn Fn(Event),
+    notify: &dyn Fn(Update),
 ) {
     // An archive pass that settled before this thread started is still
     // announced; a directory has no pass to announce.
@@ -531,33 +506,33 @@ fn run(
     loop {
         if unpack_pending && !source.unpacking() {
             unpack_pending = false;
-            notify(Event::Unpacked);
+            notify(Update::Unpacked);
         }
         while let Ok(message) = rx.try_recv() {
             if !session.apply(message) {
                 return;
             }
         }
-        if let Some(job) = session.next_target() {
+        if let Some(job) = session.next_request() {
             tracing::debug!(
                 page = job.page,
-                needs = ?job.needs,
-                waited = ?session.target_wait(),
-                "target"
+                roles = ?job.roles,
+                waited = ?session.request_wait(),
+                "request"
             );
             session.serve(source, job, notify);
             continue;
         }
-        if let Some(job) = session.next_job() {
+        if let Some(job) = session.next_prefetch_job() {
             tracing::debug!(
                 page = job.page,
-                thumb = job.needs.contains(Artifact::Thumb),
-                view = job.needs.contains(Artifact::View),
+                thumb = job.roles.contains(Role::Thumb),
+                fit = job.roles.contains(Role::Fit),
                 motion = ?session.motion,
                 preload = job.preload,
                 "job"
             );
-            if !job.preload || session.preloading {
+            if !job.preload || session.preload_allowed {
                 session.serve(source, job, notify);
                 continue;
             }
@@ -570,7 +545,7 @@ fn run(
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {
-                    session.preloading = true;
+                    session.preload_allowed = true;
                     session.serve(source, job, notify);
                 }
                 Err(RecvTimeoutError::Disconnected) => return,
@@ -618,27 +593,27 @@ fn decode_page(
 mod tests {
     use super::*;
     use crate::fault::DecodeRefusal;
-    use crate::plan::Direction;
+    use crate::browse::Direction;
     use crate::preview::Store;
     use crate::testkit::eventually;
     use crate::testkit::tiny_png;
     use crate::testkit::TempDir;
-    use crate::view::PageCount;
-    use crate::view::Spread;
-    use crate::view::ViewMode;
+    use crate::browse::PageCount;
+    use crate::browse::Spread;
+    use crate::browse::ReadingMode;
 
     use parking_lot::Mutex;
 
-    /// Page edge for the tests that check derived and native dimensions:
-    /// larger than the thumb edge, smaller than the view edge, so the
-    /// thumb is scaled and the view is the page itself.
+    /// Page edge for the tests that check derived and full dimensions:
+    /// larger than the thumb edge, smaller than the fit edge, so the
+    /// thumb is scaled and the fit image is the page itself.
     const BIG: u32 = 1400;
 
-    fn plan(anchor: usize, count: usize) -> Plan {
-        Plan::build(
-            Spread::lone(anchor),
+    fn prefetch_for(origin: usize, count: usize) -> Prefetch {
+        Prefetch::build(
+            Spread::lone(origin),
             Direction::Forward,
-            ViewMode::Normal,
+            ReadingMode::Normal,
             PageCount::new(count).expect("test book is non-empty"),
         )
     }
@@ -677,48 +652,48 @@ mod tests {
         image.width().max(image.height())
     }
 
-    fn is_thumb(ready: &Ready) -> bool {
-        matches!(ready.kind, Artifact::Thumb)
+    fn is_thumb(role: Role) -> bool {
+        role == Role::Thumb
     }
 
-    fn is_view(ready: &Ready) -> bool {
-        matches!(ready.kind, Artifact::View)
+    fn is_fit(role: Role) -> bool {
+        role == Role::Fit
     }
 
-    fn want_view(page: usize) -> Want {
-        Want {
+    fn request_fit(page: usize) -> Request {
+        Request {
             page,
-            kind: Artifact::View,
+            role: Role::Fit,
         }
     }
 
-    fn want_thumb(page: usize) -> Want {
-        Want {
+    fn request_thumb(page: usize) -> Request {
+        Request {
             page,
-            kind: Artifact::Thumb,
+            role: Role::Thumb,
         }
     }
 
-    fn want_native(page: usize) -> Want {
-        Want {
+    fn request_full(page: usize) -> Request {
+        Request {
             page,
-            kind: Artifact::Native,
+            role: Role::Full,
         }
     }
 
     /// The events the worker delivered, kept so several assertions can
     /// read the same stream.
-    struct Events {
-        rx: mpsc::Receiver<Event>,
-        seen: Mutex<Vec<Event>>,
+    struct Updates {
+        rx: mpsc::Receiver<Update>,
+        seen: Mutex<Vec<Update>>,
     }
 
     #[expect(
         clippy::rest_pattern_accessible_field,
         reason = "the ignored fields are unused; naming them would trip unneeded_field_pattern"
     )]
-    impl Events {
-        fn new() -> (Self, impl Fn(Event) + Send + Sync + 'static) {
+    impl Updates {
+        fn new() -> (Self, impl Fn(Update) + Send + Sync + 'static) {
             let (tx, rx) = mpsc::channel();
             let events = Self {
                 rx,
@@ -742,18 +717,21 @@ mod tests {
         fn ready(
             &self,
             what: &str,
-            want: impl Fn(&Ready) -> bool,
+            want: impl Fn(usize, Role) -> bool,
         ) -> Decoded {
             eventually(20, what, || {
                 self.drain();
                 let seen = self.seen.lock();
                 seen.iter().find_map(|event| match event {
-                    Event::Ready(ready) if want(ready) => {
-                        Some((*ready.image).clone())
+                    Update::Ready { page, role, image }
+                        if want(*page, *role) =>
+                    {
+                        Some((**image).clone())
                     }
-                    Event::Ready(_)
-                    | Event::Failed { .. }
-                    | Event::Unpacked => None,
+                    Update::Ready { .. }
+                    | Update::Failed { .. }
+                    | Update::Unpacked
+                    | Update::Fatal(_) => None,
                 })
             })
         }
@@ -763,13 +741,14 @@ mod tests {
                 self.drain();
                 let seen = self.seen.lock();
                 seen.iter().find_map(|event| match event {
-                    Event::Failed {
+                    Update::Failed {
                         page: failed,
                         error,
                     } if *failed == page => Some(Arc::clone(error)),
-                    Event::Ready(_)
-                    | Event::Failed { .. }
-                    | Event::Unpacked => None,
+                    Update::Ready { .. }
+                    | Update::Failed { .. }
+                    | Update::Unpacked
+                    | Update::Fatal(_) => None,
                 })
             })
         }
@@ -777,14 +756,14 @@ mod tests {
         fn delivered(
             &self,
             page: usize,
-            want: impl Fn(&Ready) -> bool,
+            want: impl Fn(Role) -> bool,
         ) -> usize {
             self.drain();
             let seen = self.seen.lock();
             seen.iter()
                 .filter(|event| {
-                    matches!(event, Event::Ready(ready)
-                        if ready.page == page && want(ready))
+                    matches!(event, Update::Ready { page: delivered, role, .. }
+                        if *delivered == page && want(*role))
                 })
                 .count()
         }
@@ -794,13 +773,14 @@ mod tests {
             let seen = self.seen.lock();
             seen.iter()
                 .filter_map(|event| match event {
-                    Event::Failed {
+                    Update::Failed {
                         page: failed,
                         error,
                     } if *failed == page => Some(error),
-                    Event::Ready(_)
-                    | Event::Failed { .. }
-                    | Event::Unpacked => None,
+                    Update::Ready { .. }
+                    | Update::Failed { .. }
+                    | Update::Unpacked
+                    | Update::Fatal(_) => None,
                 })
                 .count()
         }
@@ -810,40 +790,40 @@ mod tests {
     fn a_target_is_served_and_persisted() {
         let (_dir, source) = page_dir("worker-target", 1, BIG);
         let root = TempDir::new("worker-target-store");
-        let (events, notify) = Events::new();
+        let (events, notify) = Updates::new();
         let worker = Worker::spawn_at(
             Arc::clone(&source),
-            plan(0, 1),
+            prefetch_for(0, 1),
             root.path(),
             notify,
         )
         .expect("worker spawns");
 
-        worker.retarget(vec![want_view(0), want_thumb(0)]);
+        worker.set_requests(vec![request_fit(0), request_thumb(0)]);
         let thumb = events
-            .ready("the target never delivered a thumb", |ready| {
-                ready.page == 0 && is_thumb(ready)
+            .ready("the target never delivered a thumb", |page, role| {
+                page == 0 && is_thumb(role)
             });
         let view = events
-            .ready("the target never delivered a view", |ready| {
-                ready.page == 0 && is_view(ready)
+            .ready("the target never delivered a fit image", |page, role| {
+                page == 0 && is_fit(role)
             });
         assert_eq!(long_edge(&thumb), preview::THUMB_EDGE);
         assert_eq!(
             long_edge(&view),
-            preview::VIEW_EDGE.min(BIG),
-            "the view's long edge matches the target edge"
+            preview::FIT_EDGE.min(BIG),
+            "the fit image's long edge matches the target edge"
         );
 
         let store = Store::at(root.path());
         let hash = page_hash(&source, 0);
         assert!(
-            store.load(hash, Artifact::Thumb).is_some(),
+            store.load(hash, Role::Thumb).is_some(),
             "the thumb was not persisted"
         );
         assert!(
-            store.load(hash, Artifact::View).is_some(),
-            "the view was not persisted"
+            store.load(hash, Role::Fit).is_some(),
+            "the fit image was not persisted"
         );
     }
 
@@ -853,7 +833,7 @@ mod tests {
         let root = TempDir::new("worker-gate-store");
         let _worker = Worker::spawn_at(
             Arc::clone(&source),
-            plan(0, 6),
+            prefetch_for(0, 6),
             root.path(),
             |_| {},
         )
@@ -863,7 +843,7 @@ mod tests {
         for page in [0, 1, 2] {
             eventually(20, "the head never reached the store", || {
                 store
-                    .load(page_hash(&source, page), Artifact::Thumb)
+                    .load(page_hash(&source, page), Role::Thumb)
                     .is_some()
                     .then_some(())
             });
@@ -873,7 +853,7 @@ mod tests {
         // been silent for the preload window.
         eventually(20, "the tail never preloaded", || {
             store
-                .load(page_hash(&source, 3), Artifact::Thumb)
+                .load(page_hash(&source, 3), Role::Thumb)
                 .is_some()
                 .then_some(())
         });
@@ -886,7 +866,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_page_notifies_once_and_the_plan_advances() {
+    fn a_failed_page_notifies_once_and_the_prefetch_advances() {
         let dir = TempDir::new("worker-fail");
         dir.write("p000.png", b"not a png at all");
         for page in 1..5_u8 {
@@ -898,10 +878,10 @@ mod tests {
         let source =
             Arc::new(Source::open(dir.path()).expect("temp source opens"));
         let root = TempDir::new("worker-fail-store");
-        let (events, notify) = Events::new();
+        let (events, notify) = Updates::new();
         let _worker = Worker::spawn_at(
             Arc::clone(&source),
-            plan(0, 5),
+            prefetch_for(0, 5),
             root.path(),
             notify,
         )
@@ -913,12 +893,12 @@ mod tests {
                 || error.downcast_inner_ref::<DecodeRefusal>().is_some(),
             "page 0 failed as {error}, expected a decode fault"
         );
-        // The failure leaves the rest of the plan running: pages behind it
+        // The failure leaves the rest of the prefetch running: pages behind it
         // still reach the store.
         let store = Store::at(root.path());
-        eventually(20, "the failure stalled the plan", || {
+        eventually(20, "the failure stalled the prefetch", || {
             store
-                .load(page_hash(&source, 4), Artifact::Thumb)
+                .load(page_hash(&source, 4), Role::Thumb)
                 .is_some()
                 .then_some(())
         });
@@ -930,22 +910,22 @@ mod tests {
     }
 
     #[test]
-    fn the_plan_warms_the_store_without_delivering() {
-        let (_dir, source) = page_dir("worker-plan", 1, BIG);
-        let root = TempDir::new("worker-plan-store");
-        let (events, notify) = Events::new();
+    fn the_prefetch_warms_the_store_without_delivering() {
+        let (_dir, source) = page_dir("worker-prefetch", 1, BIG);
+        let root = TempDir::new("worker-prefetch-store");
+        let (events, notify) = Updates::new();
         let _worker = Worker::spawn_at(
             Arc::clone(&source),
-            plan(0, 1),
+            prefetch_for(0, 1),
             root.path(),
             notify,
         )
         .expect("worker spawns");
 
         let store = Store::at(root.path());
-        eventually(20, "the plan never produced the head view", || {
+        eventually(20, "the prefetch never produced the head fit image", || {
             store
-                .load(page_hash(&source, 0), Artifact::View)
+                .load(page_hash(&source, 0), Role::Fit)
                 .is_some()
                 .then_some(())
         });
@@ -953,68 +933,68 @@ mod tests {
         assert_eq!(
             events.delivered(0, |_| true),
             0,
-            "the plan delivered an artifact nobody wanted"
+            "the prefetch delivered a role nobody requested"
         );
     }
 
     #[test]
-    fn a_view_leaving_the_target_set_is_served_again() {
+    fn a_fit_leaving_the_request_set_is_served_again() {
         let (_dir, source) = page_dir("worker-recover", 1, BIG);
         let root = TempDir::new("worker-recover-store");
-        let (events, notify) = Events::new();
+        let (events, notify) = Updates::new();
         let worker = Worker::spawn_at(
             Arc::clone(&source),
-            plan(0, 1),
+            prefetch_for(0, 1),
             root.path(),
             notify,
         )
         .expect("worker spawns");
 
-        worker.retarget(vec![want_view(0)]);
-        events.ready("the target never delivered a view", |ready| {
-            ready.page == 0 && is_view(ready)
+        worker.set_requests(vec![request_fit(0)]);
+        events.ready("the target never delivered a fit image", |page, role| {
+            page == 0 && is_fit(role)
         });
         // An unchanged set is the app still waiting for its own upload.
-        worker.retarget(vec![want_view(0)]);
+        worker.set_requests(vec![request_fit(0)]);
         thread::sleep(Duration::from_millis(50));
         assert_eq!(
-            events.delivered(0, is_view),
+            events.delivered(0, is_fit),
             1,
-            "an unchanged target set fetched the view twice"
+            "an unchanged request set fetched the fit image twice"
         );
         // The app uploaded it, so it left the set; asking again later
         // must fetch it again.
-        worker.retarget(Vec::new());
-        worker.retarget(vec![want_view(0)]);
-        eventually(20, "the re-added view was never served", || {
-            (events.delivered(0, is_view) >= 2).then_some(())
+        worker.set_requests(Vec::new());
+        worker.set_requests(vec![request_fit(0)]);
+        eventually(20, "the re-added fit image was never served", || {
+            (events.delivered(0, is_fit) >= 2).then_some(())
         });
     }
 
     #[test]
-    fn a_native_target_carries_the_page_pixels() {
-        let (_dir, source) = page_dir("worker-native", 1, BIG);
-        let root = TempDir::new("worker-native-store");
-        let (events, notify) = Events::new();
+    fn a_full_target_carries_the_page_pixels() {
+        let (_dir, source) = page_dir("worker-full", 1, BIG);
+        let root = TempDir::new("worker-full-store");
+        let (events, notify) = Updates::new();
         let worker = Worker::spawn_at(
             Arc::clone(&source),
-            plan(0, 1),
+            prefetch_for(0, 1),
             root.path(),
             notify,
         )
         .expect("worker spawns");
 
-        worker.retarget(vec![want_native(0)]);
+        worker.set_requests(vec![request_full(0)]);
         let image = events.ready(
-            "the native target was never honoured",
-            |ready| {
-                ready.page == 0 && matches!(ready.kind, Artifact::Native)
+            "the full target was never honoured",
+            |page, role| {
+                page == 0 && role == Role::Full
             },
         );
         assert_eq!(
             (image.width(), image.height()),
             (BIG, BIG),
-            "native must carry the page's own pixels"
+            "full must carry the page's own pixels"
         );
     }
 
@@ -1024,44 +1004,44 @@ mod tests {
         let root = TempDir::new("worker-warm-store");
         let store_root = root.path();
 
-        // The first session derives and persists both artifacts.
-        let (first, notify) = Events::new();
+        // The first session derives and persists both roles.
+        let (first, notify) = Updates::new();
         let worker = Worker::spawn_at(
             Arc::clone(&source),
-            plan(0, 1),
+            prefetch_for(0, 1),
             store_root,
             notify,
         )
         .expect("worker spawns");
-        worker.retarget(vec![want_thumb(0), want_view(0)]);
+        worker.set_requests(vec![request_thumb(0), request_fit(0)]);
         let thumb = first
-            .ready("the first session never delivered a thumb", |ready| {
-                ready.page == 0 && is_thumb(ready)
+            .ready("the first session never delivered a thumb", |page, role| {
+                page == 0 && is_thumb(role)
             });
         let view = first
-            .ready("the first session never delivered a view", |ready| {
-                ready.page == 0 && is_view(ready)
+            .ready("the first session never delivered a fit image", |page, role| {
+                page == 0 && is_fit(role)
             });
         assert_eq!(long_edge(&thumb), preview::THUMB_EDGE);
         assert_eq!(
             long_edge(&view),
-            preview::VIEW_EDGE.min(BIG),
-            "the view's long edge matches the target edge"
+            preview::FIT_EDGE.min(BIG),
+            "the fit image's long edge matches the target edge"
         );
         drop(worker);
 
         let hash = page_hash(&source, 0);
         let mut store = Store::at(store_root);
         assert!(
-            store.load(hash, Artifact::Thumb).is_some(),
+            store.load(hash, Role::Thumb).is_some(),
             "the thumb was not persisted"
         );
         assert!(
-            store.load(hash, Artifact::View).is_some(),
-            "the view was not persisted"
+            store.load(hash, Role::Fit).is_some(),
+            "the fit image was not persisted"
         );
 
-        // Replace both persisted artifacts with a size no decode of this
+        // Replace both persisted roles with a size no decode of this
         // page could produce, so the second session's events say where
         // the pixels came from.
         let sentinel = decode::decode(
@@ -1069,27 +1049,27 @@ mod tests {
             "sentinel.png",
         )
         .expect("sentinel decodes");
-        assert!(store.save(hash, Artifact::Thumb, &sentinel).landed);
-        assert!(store.save(hash, Artifact::View, &sentinel).landed);
+        assert!(store.save(hash, Role::Thumb, &sentinel).persisted);
+        assert!(store.save(hash, Role::Fit, &sentinel).persisted);
         drop(store);
 
-        // A second worker on the same root loads the cached artifacts.
-        let (second, notify_second) = Events::new();
+        // A second worker on the same root loads the cached roles.
+        let (second, notify_second) = Updates::new();
         let warm = Worker::spawn_at(
             Arc::clone(&source),
-            plan(0, 1),
+            prefetch_for(0, 1),
             store_root,
             notify_second,
         )
         .expect("worker spawns");
-        warm.retarget(vec![want_thumb(0), want_view(0)]);
+        warm.set_requests(vec![request_thumb(0), request_fit(0)]);
         let warm_thumb = second.ready(
             "the second session never delivered a thumb",
-            |ready| ready.page == 0 && is_thumb(ready),
+            |page, role| page == 0 && is_thumb(role),
         );
         let warm_view = second
-            .ready("the second session never delivered a view", |ready| {
-                ready.page == 0 && is_view(ready)
+            .ready("the second session never delivered a fit image", |page, role| {
+                page == 0 && is_fit(role)
             });
         assert_eq!(
             (warm_thumb.width(), warm_thumb.height()),
@@ -1099,13 +1079,13 @@ mod tests {
         assert_eq!(
             (warm_view.width(), warm_view.height()),
             (7, 7),
-            "the view missed the warm store"
+            "the fit image missed the warm store"
         );
 
-        // Loading leaves the artifacts it read unchanged.
+        // Loading leaves the roles it read unchanged.
         let kept = Store::at(store_root)
-            .load(hash, Artifact::View)
-            .expect("the sentinel view stays");
+            .load(hash, Role::Fit)
+            .expect("the sentinel fit stays");
         assert_eq!((kept.width(), kept.height()), (7, 7));
     }
 }

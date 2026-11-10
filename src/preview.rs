@@ -1,4 +1,4 @@
-//! Downscaled page previews and the on-disk cache: one directory per kind
+//! Downscaled page previews and the on-disk cache: one directory per role
 //! under `env::temp_dir()`, keyed by [`content_hash`]. The little-endian
 //! file format is described in `docs/internal/cache.md`.
 
@@ -38,10 +38,9 @@ use fast_image_resize::Resizer;
 use nix::errno::Errno;
 use nix::sys::signal;
 use nix::unistd::Pid;
-use serde::Deserialize;
-use serde::Serialize;
 use xxhash_rust::xxh3::xxh3_128;
 
+use crate::browse::Role;
 use crate::decode::plane_dims;
 use crate::decode::Decoded;
 use crate::decode::Format;
@@ -56,99 +55,20 @@ use crate::fault::DecodeRefusal;
 pub const THUMB_EDGE: u32 = 192;
 /// The settled reading image; it must cover the fitted page's long edge in
 /// physical pixels.
-pub const VIEW_EDGE: u32 = 2560;
+pub const FIT_EDGE: u32 = 2560;
 pub const THUMB_CAP_BYTES: u64 = 512 * 1024 * 1024;
-pub const VIEW_CAP_BYTES: u64 = 3 * 512 * 1024 * 1024;
+pub const FIT_CAP_BYTES: u64 = 3 * 512 * 1024 * 1024;
 
-/// Which derived image a cache entry holds. `Native` is the decoded page
-/// itself and bypasses the store.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
-pub enum Artifact {
-    Thumb,
-    View,
-    Native,
+/// The target edge, stored in the entry header.
+fn edge(role: Role) -> Option<u32> {
+    derivation(role).map(|(edge, _)| edge)
 }
 
-impl Artifact {
-    /// The target edge, stored in the entry header.
-    pub fn edge(self) -> Option<u32> {
-        self.derivation().map(|(edge, _)| edge)
-    }
-
-    #[must_use]
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Thumb => "thumb",
-            Self::View => "view",
-            Self::Native => "native",
-        }
-    }
-
-    fn derivation(self) -> Option<(u32, FilterType)> {
-        match self {
-            Self::Thumb => Some((THUMB_EDGE, FilterType::Box)),
-            Self::View => Some((VIEW_EDGE, FilterType::Hamming)),
-            Self::Native => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Artifacts {
-    thumb: bool,
-    view: bool,
-    native: bool,
-}
-
-impl Artifacts {
-    pub fn set(&mut self, kind: Artifact) {
-        match kind {
-            Artifact::Thumb => self.thumb = true,
-            Artifact::View => self.view = true,
-            Artifact::Native => self.native = true,
-        }
-    }
-
-    pub fn clear(&mut self, kind: Artifact) {
-        match kind {
-            Artifact::Thumb => self.thumb = false,
-            Artifact::View => self.view = false,
-            Artifact::Native => self.native = false,
-        }
-    }
-
-    #[must_use]
-    pub fn contains(self, kind: Artifact) -> bool {
-        match kind {
-            Artifact::Thumb => self.thumb,
-            Artifact::View => self.view,
-            Artifact::Native => self.native,
-        }
-    }
-
-    #[must_use]
-    pub fn any(self) -> bool {
-        self.thumb || self.view || self.native
-    }
-
-    /// A view or native fills the seat at a settled size.
-    #[must_use]
-    pub fn readable(self) -> bool {
-        self.view || self.native
-    }
-
-    /// The largest kind present: native, then view, then thumb.
-    #[must_use]
-    pub fn best(self) -> Option<Artifact> {
-        if self.native {
-            Some(Artifact::Native)
-        } else if self.view {
-            Some(Artifact::View)
-        } else if self.thumb {
-            Some(Artifact::Thumb)
-        } else {
-            None
-        }
+fn derivation(role: Role) -> Option<(u32, FilterType)> {
+    match role {
+        Role::Thumb => Some((THUMB_EDGE, FilterType::Box)),
+        Role::Fit => Some((FIT_EDGE, FilterType::Hamming)),
+        Role::Full => None,
     }
 }
 
@@ -157,10 +77,10 @@ pub fn content_hash(bytes: &[u8]) -> u128 {
     xxh3_128(bytes)
 }
 
-/// Downsample to the artifact's long edge; returns `page` unchanged when it
+/// Downsample to the role's long edge; returns `page` unchanged when it
 /// already fits or the resample fails.
-pub fn derive(page: &Decoded, kind: Artifact) -> Decoded {
-    let Some((edge, filter)) = kind.derivation() else {
+pub fn derive(page: &Decoded, role: Role) -> Decoded {
+    let Some((edge, filter)) = derivation(role) else {
         return page.clone();
     };
     derive_to_edge(page, edge, filter)
@@ -383,12 +303,12 @@ struct State {
 /// entries its prune removed (oldest first), so a caller that tracks the
 /// store's contents can keep its ledger current.
 #[derive(Debug, Default)]
-pub struct Saved {
-    pub landed: bool,
-    pub evicted: Vec<(Artifact, u128)>,
+pub struct SaveResult {
+    pub persisted: bool,
+    pub evicted: Vec<(Role, u128)>,
 }
 
-/// One artifact namespace: a directory of entries with its own byte cap.
+/// One role namespace: a directory of entries with its own byte cap.
 struct Namespace {
     dir: PathBuf,
     cap: u64,
@@ -406,7 +326,7 @@ impl Store {
     /// that cannot be created, or that resolves through a symlink, leaves
     /// the store disabled.
     pub fn at(root: &Path) -> Self {
-        Self::with_caps(root, THUMB_CAP_BYTES, VIEW_CAP_BYTES)
+        Self::with_caps(root, THUMB_CAP_BYTES, FIT_CAP_BYTES)
     }
 
     fn with_caps(root: &Path, thumb_cap: u64, view_cap: u64) -> Self {
@@ -419,9 +339,9 @@ impl Store {
 
     /// Load `hash`, or `None` when absent, damaged, or not cached; a hit
     /// refreshes the entry's mtime for LRU.
-    pub fn load(&self, hash: u128, kind: Artifact) -> Option<Decoded> {
+    pub fn load(&self, hash: u128, role: Role) -> Option<Decoded> {
         let started = Instant::now();
-        let loaded = self.namespace(kind).and_then(|namespace| {
+        let loaded = self.namespace(role).and_then(|namespace| {
             let file = File::open(namespace.path(hash)).ok()?;
             #[expect(
                 clippy::let_underscore_must_use,
@@ -431,10 +351,10 @@ impl Store {
             let _ = file.set_times(
                 FileTimes::new().set_modified(SystemTime::now()),
             );
-            read_artifact(file, kind)
+            read_stored(file, role)
         });
         tracing::debug!(
-            ?kind,
+            ?role,
             hit = loaded.is_some(),
             elapsed = ?started.elapsed(),
             "preview load"
@@ -447,24 +367,24 @@ impl Store {
     pub fn save(
         &mut self,
         hash: u128,
-        kind: Artifact,
+        role: Role,
         page: &Decoded,
-    ) -> Saved {
-        let Some(namespace) = self.namespace_mut(kind) else {
-            return Saved::default();
+    ) -> SaveResult {
+        let Some(namespace) = self.namespace_mut(role) else {
+            return SaveResult::default();
         };
         let path = namespace.path(hash);
         let temp = namespace.temp_path(hash);
         let started = Instant::now();
-        let encoded = encode(page, kind);
+        let encoded = encode(page, role);
         let size = u64::try_from(encoded.len()).unwrap_or(u64::MAX);
         if write_atomic(&temp, &path, &encoded).is_err() {
-            return Saved::default();
+            return SaveResult::default();
         }
         namespace.total = namespace.total.saturating_add(size);
         let over = namespace.total > namespace.cap;
         tracing::debug!(
-            ?kind,
+            ?role,
             bytes = size,
             elapsed = ?started.elapsed(),
             "preview save"
@@ -473,32 +393,32 @@ impl Store {
             namespace
                 .prune()
                 .into_iter()
-                .map(|evicted| (kind, evicted))
+                .map(|evicted| (role, evicted))
                 .collect()
         } else {
             Vec::new()
         };
-        Saved {
-            landed: true,
+        SaveResult {
+            persisted: true,
             evicted,
         }
     }
 
-    fn namespace(&self, kind: Artifact) -> Option<&Namespace> {
+    fn namespace(&self, role: Role) -> Option<&Namespace> {
         let state = self.state.as_ref()?;
-        match kind {
-            Artifact::Thumb => Some(&state.thumb),
-            Artifact::View => Some(&state.view),
-            Artifact::Native => None,
+        match role {
+            Role::Thumb => Some(&state.thumb),
+            Role::Fit => Some(&state.view),
+            Role::Full => None,
         }
     }
 
-    fn namespace_mut(&mut self, kind: Artifact) -> Option<&mut Namespace> {
+    fn namespace_mut(&mut self, role: Role) -> Option<&mut Namespace> {
         let state = self.state.as_mut()?;
-        match kind {
-            Artifact::Thumb => Some(&mut state.thumb),
-            Artifact::View => Some(&mut state.view),
-            Artifact::Native => None,
+        match role {
+            Role::Thumb => Some(&mut state.thumb),
+            Role::Fit => Some(&mut state.view),
+            Role::Full => None,
         }
     }
 }
@@ -559,7 +479,7 @@ impl Namespace {
     }
 }
 
-struct Entry {
+struct StoreEntry {
     modified: SystemTime,
     name: OsString,
     size: u64,
@@ -567,7 +487,7 @@ struct Entry {
 
 /// The cache files of `dir`, least recently used first. A `.tmp` file
 /// belongs to a writer that has not renamed it yet; skip it.
-fn entries(dir: &Path) -> Vec<Entry> {
+fn entries(dir: &Path) -> Vec<StoreEntry> {
     let Ok(read) = fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -586,7 +506,7 @@ fn entries(dir: &Path) -> Vec<Entry> {
         let Ok(modified) = metadata.modified() else {
             continue;
         };
-        entries.push(Entry {
+        entries.push(StoreEntry {
             modified,
             name,
             size: metadata.len(),
@@ -782,16 +702,16 @@ const MAX_EDGE: u32 = 0x0001_0000;
 /// Mirror of the decoder's 512 MiB RGBA allocation ceiling, in pixels.
 const MAX_SAMPLES: usize = 128 << 20;
 
-fn encode(page: &Decoded, kind: Artifact) -> Vec<u8> {
+fn encode(page: &Decoded, role: Role) -> Vec<u8> {
     let mut out = Vec::with_capacity(32 + page.resident_bytes());
     out.extend_from_slice(&MAGIC);
     out.extend_from_slice(&VERSION.to_le_bytes());
-    out.push(artifact_tag(kind));
+    out.push(role_tag(role));
     out.push(match page.pixels() {
         Pixels::Rgba8(_) => PIXEL_RGBA,
         Pixels::Yuv(_) => PIXEL_YUV,
     });
-    push_u32(&mut out, kind.edge().unwrap_or(0));
+    push_u32(&mut out, edge(role).unwrap_or(0));
     for value in [
         page.page_dims().0,
         page.page_dims().1,
@@ -862,11 +782,11 @@ fn push_len(out: &mut Vec<u8>, value: usize) {
     push_u32(out, u32::try_from(value).unwrap_or(u32::MAX));
 }
 
-fn artifact_tag(kind: Artifact) -> u8 {
-    match kind {
-        Artifact::Thumb => 0,
-        Artifact::View => 1,
-        Artifact::Native => 2,
+fn role_tag(role: Role) -> u8 {
+    match role {
+        Role::Thumb => 0,
+        Role::Fit => 1,
+        Role::Full => 2,
     }
 }
 
@@ -996,16 +916,16 @@ impl Reader {
     }
 }
 
-fn read_artifact(file: File, kind: Artifact) -> Option<Decoded> {
+fn read_stored(file: File, role: Role) -> Option<Decoded> {
     let mut reader = Reader::new(file)?;
     if reader.array::<4>()? != MAGIC
         || reader.u16()? != VERSION
-        || reader.u8()? != artifact_tag(kind)
+        || reader.u8()? != role_tag(role)
     {
         return None;
     }
     let pixel = reader.u8()?;
-    if reader.u32()? != kind.edge().unwrap_or(0) {
+    if reader.u32()? != edge(role).unwrap_or(0) {
         return None;
     }
     let page_dims = (reader.u32()?, reader.u32()?);
@@ -1151,6 +1071,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::browse::Roles;
     use crate::testkit::TempDir;
 
     fn count(width: u32, height: u32) -> usize {
@@ -1310,7 +1231,7 @@ mod tests {
     fn temp_names_carry_the_writer_pid() {
         let dir = TempDir::new("preview-temp-pid");
         let store = Store::at(dir.path());
-        let thumb = store.namespace(Artifact::Thumb).expect("thumb");
+        let thumb = store.namespace(Role::Thumb).expect("thumb");
         let hash = content_hash(b"temp-pid");
         let expected = dir
             .path()
@@ -1326,7 +1247,7 @@ mod tests {
         let page = rgba_page(2, 2);
         let hash = content_hash(b"page-kept");
         let mut store = Store::at(&root);
-        assert!(store.save(hash, Artifact::Thumb, &page).landed);
+        assert!(store.save(hash, Role::Thumb, &page).persisted);
         drop(store);
 
         let dead = dead_pid();
@@ -1357,7 +1278,7 @@ mod tests {
         for name in malformed {
             assert!(root.join("thumb").join(name).exists(), "{name}");
         }
-        assert!(reopened.load(hash, Artifact::Thumb).is_some());
+        assert!(reopened.load(hash, Role::Thumb).is_some());
     }
 
     #[test]
@@ -1367,12 +1288,12 @@ mod tests {
         let mut store = Store::at(dir.path());
         assert!(store.state.is_some());
         let hash = content_hash(b"page-a");
-        assert!(store.save(hash, Artifact::Thumb, &page).landed);
-        assert!(!store.save(hash, Artifact::Native, &page).landed);
-        assert!(store.load(hash, Artifact::Native).is_none());
+        assert!(store.save(hash, Role::Thumb, &page).persisted);
+        assert!(!store.save(hash, Role::Full, &page).persisted);
+        assert!(store.load(hash, Role::Full).is_none());
 
         let loaded =
-            store.load(hash, Artifact::Thumb).expect("cached thumb");
+            store.load(hash, Role::Thumb).expect("cached thumb");
         assert_eq!((loaded.width(), loaded.height()), (3, 2));
         assert_eq!(loaded.page_dims(), (9, 6));
         assert_eq!(loaded.format(), Format::Png);
@@ -1387,10 +1308,10 @@ mod tests {
             yuv_page(5, 3, Subsampling::Yuv420).with_page_dims((15, 9));
         let mut store = Store::at(dir.path());
         let hash = content_hash(b"page-b");
-        assert!(store.save(hash, Artifact::View, &page).landed);
+        assert!(store.save(hash, Role::Fit, &page).persisted);
 
         let loaded =
-            store.load(hash, Artifact::View).expect("cached view");
+            store.load(hash, Role::Fit).expect("cached view");
         assert_eq!((loaded.width(), loaded.height()), (5, 3));
         assert_eq!(loaded.page_dims(), (15, 9));
         assert_eq!(loaded.format(), Format::Avif);
@@ -1411,10 +1332,10 @@ mod tests {
         let page = yuv_page_with(6, 4, Subsampling::Yuv444, 8, true);
         let mut store = Store::at(dir.path());
         let hash = content_hash(b"page-e");
-        assert!(store.save(hash, Artifact::Thumb, &page).landed);
+        assert!(store.save(hash, Role::Thumb, &page).persisted);
 
         let loaded =
-            store.load(hash, Artifact::Thumb).expect("cached thumb");
+            store.load(hash, Role::Thumb).expect("cached thumb");
         let Pixels::Yuv(yuv) = loaded.pixels() else {
             panic!("expected yuv pixels");
         };
@@ -1429,7 +1350,7 @@ mod tests {
         let page = rgba_page(2, 2);
         let mut store = Store::at(dir.path());
         let hash = content_hash(b"page-c");
-        assert!(store.save(hash, Artifact::Thumb, &page).landed);
+        assert!(store.save(hash, Role::Thumb, &page).persisted);
         let path = dir.path().join("thumb").join(format!("{hash:032x}"));
         let good = fs::read(&path).expect("read cache file");
 
@@ -1438,23 +1359,23 @@ mod tests {
             *byte = b'X';
         }
         fs::write(&path, &bad_magic).expect("write magic");
-        assert!(store.load(hash, Artifact::Thumb).is_none());
+        assert!(store.load(hash, Role::Thumb).is_none());
 
         let mut bad_version = good.clone();
         if let Some(field) = bad_version.get_mut(4..6) {
             field.copy_from_slice(&(VERSION + 1).to_le_bytes());
         }
         fs::write(&path, &bad_version).expect("write version");
-        assert!(store.load(hash, Artifact::Thumb).is_none());
+        assert!(store.load(hash, Role::Thumb).is_none());
 
         // The target edge sits between the pixel tag and the page dims;
-        // a different edge is a different artifact.
+        // a different edge is a different role.
         let mut bad_edge = good.clone();
         if let Some(field) = bad_edge.get_mut(8..12) {
             field.copy_from_slice(&(THUMB_EDGE + 1).to_le_bytes());
         }
         fs::write(&path, &bad_edge).expect("write edge");
-        assert!(store.load(hash, Artifact::Thumb).is_none());
+        assert!(store.load(hash, Role::Thumb).is_none());
 
         // The RGBA payload length sits right after the 30 header bytes.
         let mut bad_length = good.clone();
@@ -1462,20 +1383,20 @@ mod tests {
             field.copy_from_slice(&1_u32.to_le_bytes());
         }
         fs::write(&path, &bad_length).expect("write length");
-        assert!(store.load(hash, Artifact::Thumb).is_none());
+        assert!(store.load(hash, Role::Thumb).is_none());
 
         let mut truncated = good.clone();
         truncated.truncate(good.len() - 1);
         fs::write(&path, &truncated).expect("write truncated");
-        assert!(store.load(hash, Artifact::Thumb).is_none());
+        assert!(store.load(hash, Role::Thumb).is_none());
 
         let mut trailing = good.clone();
         trailing.push(0);
         fs::write(&path, &trailing).expect("write trailing");
-        assert!(store.load(hash, Artifact::Thumb).is_none());
+        assert!(store.load(hash, Role::Thumb).is_none());
 
         fs::write(&path, &good).expect("write intact");
-        assert!(store.load(hash, Artifact::Thumb).is_some());
+        assert!(store.load(hash, Role::Thumb).is_some());
     }
 
     #[test]
@@ -1486,13 +1407,13 @@ mod tests {
         assert!(store.state.is_none());
         let page = rgba_page(2, 2);
         let hash = content_hash(b"page-d");
-        assert!(!store.save(hash, Artifact::Thumb, &page).landed);
-        assert!(store.load(hash, Artifact::Thumb).is_none());
+        assert!(!store.save(hash, Role::Thumb, &page).persisted);
+        assert!(store.load(hash, Role::Thumb).is_none());
 
         let mut nested =
             Store::at(&dir.path().join("not-a-directory/file"));
         assert!(nested.state.is_none());
-        assert!(!nested.save(hash, Artifact::View, &page).landed);
+        assert!(!nested.save(hash, Role::Fit, &page).persisted);
     }
 
     #[test]
@@ -1552,8 +1473,8 @@ mod tests {
         )
         .expect("rgba page");
         for (kind, edge, row_count) in [
-            (Artifact::Thumb, THUMB_EDGE, 5_u32),
-            (Artifact::View, VIEW_EDGE, 64),
+            (Role::Thumb, THUMB_EDGE, 5_u32),
+            (Role::Fit, FIT_EDGE, 64),
         ] {
             let derived = derive(&page, kind);
             let row_width = count(derived.width(), 1);
@@ -1621,8 +1542,8 @@ mod tests {
             [400, 600, 300, 1023],
         );
         for (kind, edge, row_count) in [
-            (Artifact::Thumb, THUMB_EDGE, 5_u32),
-            (Artifact::View, VIEW_EDGE, 64),
+            (Role::Thumb, THUMB_EDGE, 5_u32),
+            (Role::Fit, FIT_EDGE, 64),
         ] {
             let derived = derive(&page, kind);
             assert_eq!(
@@ -1684,17 +1605,17 @@ mod tests {
         let dir = TempDir::new("preview-prune");
         let root = dir.path().join("cache");
         let page = rgba_page(4, 4);
-        let size = u64::try_from(encode(&page, Artifact::Thumb).len())
+        let size = u64::try_from(encode(&page, Role::Thumb).len())
             .expect("size");
-        let mut store = Store::with_caps(&root, size + 1, VIEW_CAP_BYTES);
+        let mut store = Store::with_caps(&root, size + 1, FIT_CAP_BYTES);
 
         let first = content_hash(b"first");
         let second = content_hash(b"second");
         let third = content_hash(b"third");
         let mut evicted = Vec::new();
         for (age, hash) in [(10_u64, first), (11, second), (12, third)] {
-            let saved = store.save(hash, Artifact::Thumb, &page);
-            assert!(saved.landed);
+            let saved = store.save(hash, Role::Thumb, &page);
+            assert!(saved.persisted);
             evicted.extend(saved.evicted);
             let path = root.join("thumb").join(format!("{hash:032x}"));
             set_modified(&path, age);
@@ -1704,50 +1625,50 @@ mod tests {
         // the oldest, and the caller was told which ones.
         assert_eq!(
             evicted,
-            vec![(Artifact::Thumb, first), (Artifact::Thumb, second)]
+            vec![(Role::Thumb, first), (Role::Thumb, second)]
         );
-        assert!(store.load(first, Artifact::Thumb).is_none());
-        assert!(store.load(second, Artifact::Thumb).is_none());
-        assert!(store.load(third, Artifact::Thumb).is_some());
+        assert!(store.load(first, Role::Thumb).is_none());
+        assert!(store.load(second, Role::Thumb).is_none());
+        assert!(store.load(third, Role::Thumb).is_some());
 
-        // The view namespace has its own budget, so a view save cannot
+        // The fit namespace has its own budget, so a fit save cannot
         // evict thumbnails and reports no evictions.
-        let saved = store.save(first, Artifact::View, &page);
-        assert!(saved.landed && saved.evicted.is_empty());
-        assert!(store.load(third, Artifact::Thumb).is_some());
+        let saved = store.save(first, Role::Fit, &page);
+        assert!(saved.persisted && saved.evicted.is_empty());
+        assert!(store.load(third, Role::Thumb).is_some());
     }
 
     #[test]
-    fn artifact_set_prefers_the_largest_role() {
-        let mut artifacts = Artifacts::default();
-        assert_eq!(artifacts.best(), None);
-        assert!(!artifacts.any());
-        assert!(!artifacts.readable());
+    fn roles_prefer_the_largest_role() {
+        let mut roles = Roles::default();
+        assert_eq!(roles.best(), None);
+        assert!(!roles.any());
+        assert!(!roles.has_settled_image());
 
-        artifacts.set(Artifact::Thumb);
-        assert_eq!(artifacts.best(), Some(Artifact::Thumb));
-        assert!(artifacts.contains(Artifact::Thumb));
-        assert!(artifacts.any());
-        assert!(!artifacts.readable());
+        roles.set(Role::Thumb);
+        assert_eq!(roles.best(), Some(Role::Thumb));
+        assert!(roles.contains(Role::Thumb));
+        assert!(roles.any());
+        assert!(!roles.has_settled_image());
 
-        artifacts.set(Artifact::View);
-        assert_eq!(artifacts.best(), Some(Artifact::View));
-        assert!(artifacts.readable());
+        roles.set(Role::Fit);
+        assert_eq!(roles.best(), Some(Role::Fit));
+        assert!(roles.has_settled_image());
 
-        artifacts.set(Artifact::Native);
-        assert_eq!(artifacts.best(), Some(Artifact::Native));
+        roles.set(Role::Full);
+        assert_eq!(roles.best(), Some(Role::Full));
 
-        artifacts.clear(Artifact::Native);
-        assert_eq!(artifacts.best(), Some(Artifact::View));
-        assert!(!artifacts.contains(Artifact::Native));
+        roles.clear(Role::Full);
+        assert_eq!(roles.best(), Some(Role::Fit));
+        assert!(!roles.contains(Role::Full));
 
-        artifacts.clear(Artifact::View);
-        assert_eq!(artifacts.best(), Some(Artifact::Thumb));
-        assert!(!artifacts.readable());
-        assert!(artifacts.any());
+        roles.clear(Role::Fit);
+        assert_eq!(roles.best(), Some(Role::Thumb));
+        assert!(!roles.has_settled_image());
+        assert!(roles.any());
 
-        artifacts.clear(Artifact::Thumb);
-        assert_eq!(artifacts.best(), None);
-        assert!(!artifacts.any());
+        roles.clear(Role::Thumb);
+        assert_eq!(roles.best(), None);
+        assert!(!roles.any());
     }
 }

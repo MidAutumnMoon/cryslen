@@ -11,16 +11,17 @@ use crate::catalog::PageName;
 use crate::decode::Format;
 use crate::fault::BookFault;
 use crate::fault::PageFault;
-use crate::view::Spread;
-use crate::view::ViewMode;
+use crate::browse::PageInfo;
+use crate::browse::Spread;
+use crate::browse::ReadingMode;
 
 pub struct StatusLine<'fault> {
     pub page_count: usize,
     pub spread: Spread,
-    pub mode: ViewMode,
+    pub mode: ReadingMode,
     pub toast: bool,
     pub name: PageName,
-    pub page: Option<PageFacts>,
+    pub page: Option<PageStatus>,
     /// Placement scale, screen px per image px.
     pub zoom: f32,
     /// The wait flag, once a waiting spread has outlived the grace.
@@ -134,39 +135,28 @@ impl Wait {
     }
 }
 
-#[derive(Clone)]
-pub struct PageState<'fault> {
-    pub format: Option<Format>,
-    pub dims: Option<(u32, u32)>,
-    pub fault: Option<&'fault PageFault>,
-}
-
 /// The status line's view of one spread, in page order.
-pub struct FoldedStatus<'fault> {
+pub struct SpreadStatus<'fault> {
     pub waiting: bool,
     pub fault: Option<&'fault PageFault>,
-    pub page: Option<(usize, Format, (u32, u32))>,
+    pub page: Option<(usize, PageInfo)>,
     /// The page the line names: the failed one if any page failed, else
     /// the first decoded page, else the spread's first page.
-    pub speaker: usize,
+    pub named_page: usize,
 }
 
-pub fn fold_status<'fault>(
+pub fn summarize_spread<'fault>(
     spread: Spread,
-    state: impl Fn(usize) -> PageState<'fault>,
-) -> FoldedStatus<'fault> {
-    let mut has_format = false;
+    state: impl Fn(usize) -> (Option<PageInfo>, Option<&'fault PageFault>),
+) -> SpreadStatus<'fault> {
+    let mut has_info = false;
     let mut has_fault = false;
     let mut failure: Option<(usize, &'fault PageFault)> = None;
     let mut facts = None;
     let mut first_decoded = None;
     for page in iter::once(spread.first).chain(spread.second) {
-        let PageState {
-            format,
-            dims,
-            fault,
-        } = state(page);
-        has_format |= format.is_some();
+        let (info, fault) = state(page);
+        has_info |= info.is_some();
         has_fault |= fault.is_some();
         if failure.is_some() {
             continue;
@@ -175,34 +165,29 @@ pub fn fold_status<'fault>(
             failure = Some((page, fault));
             continue;
         }
-        if let Some(format) = format {
+        if let Some(info) = info {
             first_decoded.get_or_insert(page);
-            if facts.is_none() {
-                if let Some(dims) = dims {
-                    facts = Some((page, format, dims));
-                }
-            }
+            facts.get_or_insert((page, info));
         }
     }
-    let (speaker, fault) = match failure {
+    let (named_page, fault) = match failure {
         Some((page, fault)) => (page, Some(fault)),
         None => (first_decoded.unwrap_or(spread.first), None),
     };
-    FoldedStatus {
-        waiting: !has_format && !has_fault,
+    SpreadStatus {
+        waiting: !has_info && !has_fault,
         fault,
         page: facts,
-        speaker,
+        named_page,
     }
 }
 
-pub struct PageFacts {
-    /// Format the decoder identified, the content truth.
-    pub decoded: Format,
+pub struct PageStatus {
+    /// The page's own dims and decoded format.
+    pub info: PageInfo,
     /// Format the filename's extension claims. Listed pages always
     /// carry one.
     pub claimed: Option<Format>,
-    pub dims: (u32, u32),
 }
 
 /// Render the status bar into `ui` and return the content rect: what
@@ -236,7 +221,7 @@ pub fn show(
 /// side lays out right-to-left, so the display order iterates in
 /// reverse.
 fn right_end(ui: &mut egui::Ui, status: &StatusLine<'_>) {
-    for (mode_index, &mode) in ViewMode::ALL.iter().enumerate().rev() {
+    for (mode_index, &mode) in ReadingMode::ALL.iter().enumerate().rev() {
         let text = egui::RichText::new(group_label(mode)).monospace();
         let text = if mode == status.mode {
             text.color(mode_color(mode)).strong()
@@ -253,15 +238,15 @@ fn right_end(ui: &mut egui::Ui, status: &StatusLine<'_>) {
     }
 }
 
-fn group_label(mode: ViewMode) -> String {
+fn group_label(mode: ReadingMode) -> String {
     format!("{} ({})", mode.label(), mode.shortcut())
 }
 
-fn mode_color(mode: ViewMode) -> egui::Color32 {
+fn mode_color(mode: ReadingMode) -> egui::Color32 {
     match mode {
-        ViewMode::Normal => egui::Color32::from_rgb(0x87, 0xb3, 0x7d),
-        ViewMode::Manga => egui::Color32::from_rgb(0xd2, 0x7b, 0x7b),
-        ViewMode::Comic => egui::Color32::from_rgb(0x7b, 0x9f, 0xd2),
+        ReadingMode::Normal => egui::Color32::from_rgb(0x87, 0xb3, 0x7d),
+        ReadingMode::Manga => egui::Color32::from_rgb(0xd2, 0x7b, 0x7b),
+        ReadingMode::Comic => egui::Color32::from_rgb(0x7b, 0x9f, 0xd2),
     }
 }
 
@@ -305,11 +290,11 @@ fn line(style: &egui::Style, status: &StatusLine<'_>) -> LayoutJob {
 
     if let Some(facts) = &status.page {
         section(&mut job, " · ", plain);
-        let (width, height) = facts.dims;
-        let dims_text = if facts.claimed == Some(facts.decoded) {
+        let (width, height) = facts.info.dims;
+        let dims_text = if facts.claimed == Some(facts.info.format) {
             format!("{width}x{height}")
         } else {
-            format!("{} {width}x{height}", facts.decoded.label())
+            format!("{} {width}x{height}", facts.info.format.label())
         };
         section(&mut job, &dims_text, plain);
     }
@@ -442,7 +427,7 @@ mod tests {
                 first: 11,
                 second: Some(12),
             },
-            mode: ViewMode::Manga,
+            mode: ReadingMode::Manga,
             toast: false,
             name: PageName {
                 parent_dir: Some("b".into()),
@@ -450,10 +435,12 @@ mod tests {
             },
             // The name claims png and the page decodes as jxl, so the
             // format label prefixes the dims.
-            page: Some(PageFacts {
-                decoded: Format::Jxl,
+            page: Some(PageStatus {
+                info: PageInfo {
+                    dims: (6000, 4000),
+                    format: Format::Jxl,
+                },
                 claimed: Some(Format::Png),
-                dims: (6000, 4000),
             }),
             zoom: 0.866,
             waiting: None,

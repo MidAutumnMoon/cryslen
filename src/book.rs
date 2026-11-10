@@ -29,14 +29,15 @@ use crate::protocol::BookInfo;
 use crate::protocol::ChildMsg;
 use crate::protocol::Hello;
 use crate::protocol::ParentMsg;
-use crate::view::PageCount;
-use crate::worker;
+use crate::browse::PageCount;
+use crate::browse::Role;
+use crate::decode::Decoded;
 
 /// A child that has not answered by now is wedged; the parent reports a
 /// fault.
 const OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Tells the event loop that a [`BookEvent`] is waiting to be drained.
+/// Tells the event loop that a [`BookUpdate`] is waiting to be drained.
 pub type Wake = Arc<dyn Fn() + Send + Sync + 'static>;
 
 type OpenedBook = Result<(BookView, BookProcess), BookFault>;
@@ -104,8 +105,16 @@ impl BookView {
     }
 }
 
-pub enum BookEvent {
-    Ready(worker::Ready),
+/// One image delivered by the child: the page, its role, and the pixels
+/// the parent uploads.
+pub struct Delivery {
+    pub page: usize,
+    pub role: Role,
+    pub image: Box<Decoded>,
+}
+
+pub enum BookUpdate {
+    Ready(Delivery),
     Failed { page: usize, fault: PageFault },
     Unpacked,
     Died(String),
@@ -114,7 +123,7 @@ pub enum BookEvent {
 pub struct BookProcess {
     child: Option<Child>,
     to_child: IpcSender<ParentMsg>,
-    events: Receiver<BookEvent>,
+    events: Receiver<BookUpdate>,
     reader: Option<JoinHandle<()>>,
 }
 
@@ -134,7 +143,7 @@ impl BookProcess {
         }
     }
 
-    pub fn drain(&self) -> Vec<BookEvent> {
+    pub fn drain(&self) -> Vec<BookUpdate> {
         self.events.try_iter().collect()
     }
 
@@ -213,7 +222,7 @@ impl Book {
         }
     }
 
-    pub fn drain(&self) -> Vec<BookEvent> {
+    pub fn drain(&self) -> Vec<BookUpdate> {
         if let Phase::Live(process) = &self.phase {
             process.drain()
         } else {
@@ -493,12 +502,12 @@ fn kill_and_reap(child: &mut Child) {
     }
 }
 
-/// Forward each message as a [`BookEvent`] and wake the event loop, so a
+/// Forward each message as a [`BookUpdate`] and wake the event loop, so a
 /// frame drains it.
 fn spawn_reader(
     child_rx: IpcReceiver<ChildMsg>,
     wake: Wake,
-) -> Result<(Receiver<BookEvent>, JoinHandle<()>), BookFault> {
+) -> Result<(Receiver<BookUpdate>, JoinHandle<()>), BookFault> {
     let (event_sender, events) = crossbeam_channel::unbounded();
     let handle = thread::Builder::new()
         .name(String::from("cy-book-reader"))
@@ -509,15 +518,15 @@ fn spawn_reader(
 
 fn read_events(
     child_rx: &IpcReceiver<ChildMsg>,
-    event_sender: &Sender<BookEvent>,
+    event_sender: &Sender<BookUpdate>,
     wake: &dyn Fn(),
 ) {
     loop {
         let event = child_rx.recv().map_or_else(
-            |_| BookEvent::Died(String::from("the book process exited")),
+            |_| BookUpdate::Died(String::from("the book process exited")),
             event_from_message,
         );
-        let last = matches!(event, BookEvent::Died(_));
+        let last = matches!(event, BookUpdate::Died(_));
         if event_sender.send(event).is_err() {
             return;
         }
@@ -528,33 +537,33 @@ fn read_events(
     }
 }
 
-fn event_from_message(message: ChildMsg) -> BookEvent {
+fn event_from_message(message: ChildMsg) -> BookUpdate {
     match message {
         // The handshake is read before this thread starts; a repeat is a
         // protocol violation.
         ChildMsg::BookInfo(_) | ChildMsg::OpenFailed(_) => {
-            BookEvent::Died(String::from(
+            BookUpdate::Died(String::from(
                 "the child repeated its handshake",
             ))
         }
-        ChildMsg::Ready { page, kind, image } => {
+        ChildMsg::Ready { page, role, image } => {
             match image.to_decoded() {
-                Ok(decoded) => BookEvent::Ready(worker::Ready {
+                Ok(decoded) => BookUpdate::Ready(Delivery {
                     page,
-                    kind,
+                    role,
                     image: Box::new(decoded),
                 }),
-                Err(refusal) => BookEvent::Failed {
+                Err(refusal) => BookUpdate::Failed {
                     page,
                     fault: PageFault::new(refusal.to_string()),
                 },
             }
         }
         ChildMsg::Failed { page, fault } => {
-            BookEvent::Failed { page, fault }
+            BookUpdate::Failed { page, fault }
         }
-        ChildMsg::Unpacked => BookEvent::Unpacked,
-        ChildMsg::Fatal(detail) => BookEvent::Died(detail),
+        ChildMsg::Unpacked => BookUpdate::Unpacked,
+        ChildMsg::Fatal(detail) => BookUpdate::Died(detail),
     }
 }
 

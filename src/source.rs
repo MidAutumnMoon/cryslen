@@ -27,7 +27,7 @@ use crate::fault::OpenError;
 use crate::fault::OpenRefusal;
 use crate::fault::PageError;
 use crate::fault::PanicFault;
-use crate::view::PageCount;
+use crate::browse::PageCount;
 
 #[derive(Debug)]
 pub enum PageRead {
