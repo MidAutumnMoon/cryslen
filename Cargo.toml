@@ -23,7 +23,7 @@ glutin-winit = { version = "0.5", default-features = false, features = ["egl", "
 
 crossbeam-channel = "0.5"
 ipc-channel = "0.23"
-nix = { version = "0.31", features = ["process", "signal"] }
+rustix = { version = "1", features = ["process"] }
 serde = { version = "1", features = ["derive"] }
 
 eros = { version = "0.8", default-features = false, features = ["context", "backtrace", "location"] }

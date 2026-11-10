@@ -23,9 +23,10 @@ use crossbeam_channel::Receiver;
 use eros::ErrorUnion;
 use ipc_channel::ipc;
 use ipc_channel::ipc::IpcSender;
-use nix::sys::prctl;
-use nix::sys::signal::Signal;
-use nix::unistd::getppid;
+use rustix::process::getppid;
+use rustix::process::set_parent_process_death_signal;
+use rustix::process::Pid;
+use rustix::process::Signal;
 
 use crate::browse::spread_for;
 use crate::browse::Motion;
@@ -634,12 +635,13 @@ pub fn main(args: &[OsString]) -> ExitCode {
     };
     // The kernel kills this process with SIGKILL once the parent dies, so a
     // parent crash ends the decode.
-    if let Err(error) = prctl::set_pdeathsig(Signal::SIGKILL) {
+    if let Err(error) = set_parent_process_death_signal(Some(Signal::KILL))
+    {
         tracing::error!(?error, "could not arm the parent-death signal");
         return ExitCode::FAILURE;
     }
     // The parent may have died before the signal was armed; exit.
-    if getppid().as_raw() == 1 {
+    if getppid() == Some(Pid::INIT) {
         tracing::warn!("the parent already exited");
         return ExitCode::FAILURE;
     }

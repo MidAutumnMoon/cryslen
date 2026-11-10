@@ -39,9 +39,9 @@ use fast_image_resize::ResizeAlg;
 use fast_image_resize::ResizeError;
 use fast_image_resize::ResizeOptions;
 use fast_image_resize::Resizer;
-use nix::errno::Errno;
-use nix::sys::signal;
-use nix::unistd::Pid;
+use rustix::io::Errno;
+use rustix::process::test_kill_process;
+use rustix::process::Pid;
 use xxhash_rust::xxh3::xxh3_128;
 
 use crate::browse::Role;
@@ -593,7 +593,7 @@ fn clean_temps(dir: &Path) {
 }
 
 /// The writer pid of a `<hash:032x>.<pid>.tmp` name.
-fn temp_pid(name: &OsStr) -> Option<i32> {
+fn temp_pid(name: &OsStr) -> Option<Pid> {
     let name = name.to_str()?;
     let (hash, rest) = name.split_once('.')?;
     let (pid, suffix) = rest.split_once('.')?;
@@ -604,9 +604,9 @@ fn temp_pid(name: &OsStr) -> Option<i32> {
         return None;
     }
     // A pid the OS can hand out is positive; zero would check a process
-    // group.
+    // group, so `Pid` rejects it.
     let pid = pid.parse::<i32>().ok()?;
-    (pid > 0).then_some(pid)
+    Pid::from_raw(pid)
 }
 
 /// What `kill(pid, 0)` can tell about a temp file's writer.
@@ -618,10 +618,10 @@ enum Liveness {
     Unknown,
 }
 
-fn liveness(pid: i32) -> Liveness {
-    match signal::kill(Pid::from_raw(pid), None) {
+fn liveness(pid: Pid) -> Liveness {
+    match test_kill_process(pid) {
         Ok(()) => Liveness::Alive,
-        Err(Errno::ESRCH) => Liveness::Dead,
+        Err(Errno::SRCH) => Liveness::Dead,
         Err(_) => Liveness::Unknown,
     }
 }
