@@ -1,125 +1,58 @@
-# Decoding: which libraries to use and why
+# Decoding: choices and traps
 
-Reference for anyone touching decode paths. Speed claims are ratios
-measured on one laptop; remeasure before quoting them externally.
+Reference for `src/decode/`. Treat the ratios here as one laptop's
+measurements; benchmark rules are in `build-and-bench.md`.
 
-## Relative cost of one page turn
+## Choices
 
-- JPEG and PNG are effectively free at any size a viewer meets. The
-  `image` crate decodes JPEG through zune-jpeg, so the classic "image
-  crate is slow" advice is stale. Its png backend also measured faster
-  than zune-png on noise-heavy input.
-- AVIF and JXL cost one to two orders of magnitude more per pixel than
-  JPEG. A full-resolution photo page takes hundreds of milliseconds,
-  not tens. That is inherent to the formats, not the libraries.
-- Within that slow class, decoder choice changes the cost by whole
-  factors.
+- JPEG and PNG use `image`. JPEG runs through zune-jpeg; its PNG backend
+  measured faster than zune-png on noise-heavy input.
+- AVIF uses `libavif-sys` with the dav1d codec (`Cargo.toml`). The libaom
+  wrapper measured about 3x slower.
+- JXL uses the `jxl` crate (jxl-rs) with a runner; jxl-oxide measured about
+  4x slower.
+- AVIF and JXL cost one to two orders more per pixel than JPEG. turbojpeg's
+  1/2..1/8 scaled decode saves little because entropy decode dominates.
 
-## Library selection
+## JXL (`jxl.rs`)
 
-- **AVIF: `libavif-sys` with `default-features = false, features =
-  ["codec-dav1d"]`.** dav1d is the fast decoder browsers use; the
-  `avif-decode` crate wraps libaom and measured about 3x slower. The
-  `codec-rav1e` default only adds an encoder the viewer never calls.
-- **JXL: the `jxl` crate (jxl-rs).** Pure Rust, maintained by the libjxl
-  team, shipped in Chrome and Firefox. With a runner it is roughly 4x
-  faster than jxl-oxide; the `libjxl-sys` binding died years ago.
-- **turbojpeg scaled decode (1/2, 1/4, 1/8) does not pay for a
-  viewer**: the entropy decode dominates, so even 1/8 output costs near
-  half a full decode. It only pays if decode-at-display-size lands.
+- Supply a `JxlParallelRunner`; the default path is single-threaded and
+  several times slower. `Pool` is the scoped-thread model.
+- Decode into RGBA via `JxlOutputBuffer` and
+  `JxlPixelFormat::rgba8(extra_channels)`; the crate interleaves channels
+  and fills opaque alpha.
+- The whole file is in memory, so `NeedMoreInput` means truncation: report
+  a corrupt page.
 
-## jxl-rs integration essentials
+## AVIF (`avif.rs`)
 
-Three non-obvious points:
+- Create the decoder behind an RAII guard, cap `maxThreads`, set IO memory,
+  then parse and take the image.
+- Read `yuvPlanes` row by row using `yuvRowBytes`; depth > 8 means native
+  `u16` samples.
+- Keep YUV planes and convert in the display shader. `avifImageYUVToRGB`
+  is a second full-frame pass; the shader path also cuts 4:2:0 upload size.
+- Map matrix coefficients, range, depth (8/10/12/16), and subsampling
+  (400/420/422/444).
 
-1. **You must supply a `JxlParallelRunner`**, or the decoder takes its
-   single-thread path, several times slower. A ~20-line scoped-thread
-   pool (`std::thread::scope`, static chunking, capped thread count)
-   recovers full speed. `jxl-image-rs-integration` hard-codes no runner,
-   so it is slow too.
-2. Force `JxlPixelFormat::rgba8(basic_info.extra_channels.len())` and
-   read into an RGBA buffer via `JxlOutputBuffer`: the decoder
-   interleaves RGBA and fills opaque alpha itself, and a file's own
-   alpha decodes intact. Higher depths go through `JxlDataFormat`
-   (`U16`, `F16`, `F32`).
-3. **`NeedsMoreInput` with no bytes left is terminal.** The whole file
-   is already in the buffer, so zero remaining bytes means none can
-   arrive. Return a corrupt page rather than retrying the same call.
+## Guards
 
-Guard against hostile headers: `width.checked_mul(height)` against a
-pixel cap (the image crate's own 512 MiB allocation ceiling) before
-allocating, and cap each edge at `DECODE_EDGE_LIMIT`. That is the
-texture edge common desktop GPUs support, so an oversized page fails
-before the costly decode; the authoritative per-GPU check is the
-renderer's runtime query, reported as the page's texture fault.
+`decode/mod.rs` rejects a pixel count over the 512 MiB allocation ceiling
+and an edge over `DECODE_EDGE_LIMIT` before allocating. The renderer's
+`MAX_TEXTURE_SIZE` query is the final GPU check.
 
-## libavif/dav1d integration essentials
+EXIF orientation: read `decoder.orientation()` before constructing the
+`DynamicImage`, then `apply_orientation`. Orientation fixtures need real
+files; the test encoder cannot write EXIF tags.
 
-FFI sequence: `avifDecoderCreate` behind an RAII guard, a modest
-`maxThreads`, `avifDecoderSetIOMemory`, `avifDecoderParse`,
-`avifDecoderNextImage`, then read `(*image).yuvPlanes` row-by-row
-honoring `yuvRowBytes` strides (native-endian `u16` arrays when depth >
-8).
+## Unavailable
 
-**Do not call `avifImageYUVToRGB`.** It is a second full-frame pass,
-single-threaded, costing about as much as the entire dav1d bitstream
-decode. Ship the Y/Cb/Cr planes to the GPU and convert in the display
-shader, which also shrinks texture upload by roughly 2.5x for 4:2:0.
-Map `matrixCoefficients` per `avifCalcYUVCoefficients`
-(unspecified/BT470BG/BT601 all mean BT.601), keep `yuvRange`, support
-8/10/12/16 depths and 400/420/422/444.
+Reduced-resolution JXL and AVIF, hardware AV1 or JXL for stills, and a
+pure-Rust AV1 bitstream decoder are absent. External thumbnail caches and
+EXIF IFD1 thumbs are out of scope; the viewer decodes its own pages.
 
-## EXIF orientation
+## Where to look
 
-`decoder.orientation()` must be read before decoding to a
-`DynamicImage`, then applied with `apply_orientation`. Fixtures for it
-must come from real files: the encoder in tests cannot write orientation
-tags.
-
-## What does not exist (do not search again)
-
-- **Reduced-resolution JXL decode**: no API in libjxl or jxl-rs.
-  `djxl -s 8` is a no-op, and responsive-encoded files do not help.
-  jxl-oxide's `render_loading_frame` still renders full resolution.
-- **AVIF scaled decode**: dav1d has none. Embedded `thmb` items parse
-  in avif-parse but almost no encoder writes them, and progressive AVIF
-  files are absent in the wild.
-- **Hardware AV1 for stills**: decode blocks exist on newer GPUs but are
-  video-shaped (mostly 4:2:0 8-bit, no film-grain synthesis, per-session
-  setup). Older iGPUs expose no AV1 VA-API profile at all.
-- **Hardware JPEG XL**: nothing ships in consumer silicon.
-- **Pure-Rust AV1 bitstream decode**: does not exist. Container parsing
-  (avif-parse) is pure Rust; the codec is not.
-
-## Decode worker pattern
-
-One worker thread serves the app's wants, an ordered `Want { page,
-kind }` set sent on change. Retunes arrive on a channel and are
-observed between decodes, so a newer plan or want set overtakes the
-backlog and one in-flight decode always completes. A want is answered
-from the preview store when the plan, an earlier want, or an earlier
-session left it there, and otherwise by one decode that mints the
-wanted previews (a native is the decode itself). The plan fills the
-store ahead of the reader but delivers nothing. The worker holds no
-decoded pages and no byte budget. Failures are sticky per page.
-Preload beyond the head starts only after 300 ms of app silence, so no
-speculative job starts during a turn; an in-flight one still finishes
-(see `analysis.md` item 1). The budgets, edges, and retention policy
-live in `docs/internal/cache.md`.
-
-An archive unpacks once on its own thread; `Source::bytes` answers
-`NotYet` until a page is filled, and the claimed unpacked sizes are
-guarded against available memory at open. The worker naps 15 ms on
-`NotYet`, so an unpack wait never blocks a stop or a newer retune.
-Decode runs behind `catch_unwind`: a panicking decoder degrades to a
-failed page instead of killing the only worker. After a short grace the
-status line holds the last complete spread and says `unpacking…` or
-`decoding…`; a spinner would force repaints of a parked loop.
-
-## Thumbnail sources (known, currently unused)
-
-The freedesktop thumbnail cache (`~/.cache/thumbnails`, MD5-of-URI
-names, mtime/size freshness) reads and decodes almost instantly and
-Dolphin populates it. Unused by deliberate choice ("the file explorer is
-the gallery"). EXIF IFD1 embedded thumbnails are the only embedded
-previews that exist in real photo collections.
+`worker.rs` owns wants, plan scheduling, and the panic boundary;
+`source.rs` owns archive unpack. Scheduling and retention are in
+`cache.md`; transport is in `process.md`.

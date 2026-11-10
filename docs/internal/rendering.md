@@ -1,142 +1,61 @@
-# Rendering: the Wayland/GL stack and its pitfalls
+# Rendering: Wayland, GL, egui
 
-Reference for anyone touching render.rs, window.rs, or the event loop. The
-working stack is winit + glutin + glow + egui_glow with no eframe and no
-X11.
+Reference for `src/render.rs`, `src/window.rs`, and the frame loop in
+`src/app.rs`. The stack is winit + glutin + glow + egui_glow, wired by
+hand: winit owns the window and events, glutin binds EGL, glow calls GL,
+egui-winit feeds events, and egui_glow paints egui. Wiring it directly
+keeps page textures outside egui's paint list and the repaint policy
+local. `Cargo.toml` sets `default-features = false` and enables `wayland`
+on the GUI crates, keeping the dependency tree Wayland-only. Artifact
+roles and retention policy are in `docs/internal/cache.md`.
 
-## Stack layers (what each crate answers)
+## Frame loop
 
-| crate | question it answers |
-|---|---|
-| winit | "give me a window and its events" (no drawing) |
-| glutin (+ glutin-winit) | "bind an EGL context to that window" |
-| glow | "let me call GL functions" |
-| egui-winit | "feed winit events into egui" |
-| egui_glow | "paint egui's output through GL" |
+- Present with `SwapInterval::DontWait` and `pre_present_notify`; a blocking
+  swap owns the event loop.
+- Park in `ControlFlow::Wait`; delayed work arms `WaitUntil`, and
+  `new_events(ResumeTimeReached)` redraws. Keep arm and fire separate, or a
+  repaint clobbers the tighter deadline.
+- egui's repaint callback posts a user event through a proxy created before
+  `run_app`.
+- While the shown spread waits, arm the status grace so the wait word can
+  appear.
 
-eframe is those five pre-wired. notan is a parallel game-flavored
-packaging of the same layers. Going direct costs the boilerplate in
-render.rs and window.rs and buys page textures outside egui's paint
-list, zero framework opinions about repaint, and no hidden X11.
+## GL rules
 
-## Feature flags that matter
+- Clip space is bottom-origin; flip in the vertex shader and keep the rest
+  top-origin.
+- `begin_frame` sets the viewport and premultiplied blend for page quads;
+  egui paints after and sets its own state.
+- Snap quad origins to whole pixels; NEAREST at 1:1 draws uneven rows at a
+  fractional origin.
+- Minify with mipmaps and `LINEAR_MIPMAP_LINEAR`; magnify with NEAREST.
+  Chroma reconstructs bilinearly.
+- Set `UNPACK_ALIGNMENT` to 1 for single-channel planes.
+- On GLES, R16 samples black under LINEAR; bind it as NEAREST and skip mips
+  for a wide plane.
+- ES fragment shaders need `precision highp`; mediump can be fp16.
+- Refuse a page over `MAX_TEXTURE_SIZE` before upload; an oversized upload
+  samples black.
+- Delete GL objects while the context lives. `Gl` keeps `window` last and
+  calls `egui_glow.destroy()` in `Drop`.
 
-`egui-winit`'s *default* features are `["clipboard", "links",
-"winit/default", "x11", "wayland"]`. `winit/default` re-imports X11 and
-`clipboard` pulls `arboard` → `x11rb`. To get a Wayland-only build,
-every crate needs `default-features = false` plus explicit `wayland`
-features (see Cargo.toml). That trim removes a large fraction of the
-dependency tree and a third of the binary. If clipboard is ever
-wanted, prefer `smithay-clipboard` (Wayland-native) over egui-winit's
-arboard bundle.
+## Quads and YUV
 
-## Frame pacing hazards
+A fixed -1..1 strip is placed by the vertex shader from uniforms, so pan,
+zoom, and rect changes update uniforms only. One program handles RGBA and
+YUV, sRGB and PQ. Per-draw constants are folded on the CPU
+(`page_conversion`, `upload_entry`): range anchors, depth normalization,
+the KR/KB matrix, the mono chroma stub, and alpha normalization. Chroma
+samples bilinearly at centered positions; declared co-sited metadata
+carries a half-texel bias, invisible in practice. Render tests pin black
+and white at every depth and the preview page-to-texture mapping.
 
-- Present with `SwapInterval::DontWait` **and** call
-  `window.pre_present_notify()` before swapping. A blocking
-  eglSwapBuffers owns the event loop. The frame-callback pair is what
-  eframe does and keeps input responsive.
-- The loop parks in `ControlFlow::Wait` after every frame (zero idle
-  CPU). Anything that must happen later arms `WaitUntil`. The redraw
-  fires from `new_events(StartCause::ResumeTimeReached)`. Arming and
-  firing must be separate events, or a repaint request renders
-  immediately and clobbers the tighter deadline it just set.
-- egui repaint requests need a bridge:
-  `egui_ctx.set_request_repaint_callback` → send a user event. The
-  proxy must come from `EventLoop::create_proxy` *before* `run_app`.
-  winit 0.30 has no `create_proxy` on `ActiveEventLoop`.
-- While the shown spread waits, re-arm at the status-grace deadline or
-  the wait word never appears (the loop is parked).
+## Uploads
 
-## GL state gotchas
-
-- GL clip space is bottom-origin, winit coords are top-origin. Do the
-  flip in the vertex shader (`1 - 2*px.y/u_win.y`) and keep everything
-  else top-origin.
-- Set `gl.viewport` before your own draw. egui's paint sets it for
-  itself, runs after you, and nothing resets it on resize.
-- egui's painter leaves `BLEND` enabled with its own blend function. Page
-  quads set theirs in `begin_frame` (`ONE, ONE_MINUS_SRC_ALPHA`: pages
-  draw premultiplied over the clear). egui's paint re-sets its state
-  after, so nothing needs restoring.
-- Snap quad origins to whole pixels. At 1:1 zoom a fractional origin
-  makes NEAREST draw uneven texel rows.
-- Generate mipmaps and use `LINEAR_MIPMAP_LINEAR` for minification.
-  A fit view minifies a photo page several-fold, where LINEAR-only
-  aliases hard. Magnification is `NEAREST` so zoomed-in pixels stay
-  sharp, except chroma planes, which reconstruct bilinearly.
-- `UNPACK_ALIGNMENT = 1` before uploading single-channel planes. Odd
-  row widths desync every row after the first under GL's default
-  4-byte alignment.
-- `R16` is not filterable on GLES contexts: LINEAR makes the texture
-  incomplete (samples black). Fall back to NEAREST without mipmaps
-  when `is_embedded && wide`.
-- `precision highp` in the ES fragment shader. mediump may be fp16,
-  where a large image's coordinate ulp grows to whole texels and
-  breaks the math. ES3 mandates highp support.
-- Check against `MAX_TEXTURE_SIZE` before uploading. GL silently rejects
-  oversized `tex_image_2d` and the texture then samples black, so the
-  cache refuses the page as its own error instead. Decode rejects edges
-  over its own cap first, so only a GPU advertising a smaller limit
-  trips it.
-- GL objects must be deleted while their context is alive. Keep the
-  window/context as the last field of the owning struct (Rust drop
-  order) and call `egui_glow.destroy()` in `Drop` before the painter
-  dies, or it logs a leak warning.
-
-## Quad strategy
-
-A fixed -1..1 strip whose *vertex shader* places it at the seat's
-screen rect from uniforms. Pan/zoom/rect changes never touch vertex
-data or re-upload textures. The rasterizer clips exactly and there is
-no letterbox overdraw (the app owns the clear). The alternative
-(fullscreen quad + fragment bounds-check) works but writes every pixel
-and complicates tiling later.
-
-## YUV-in-shader (why AVIF renders without a CPU conversion)
-
-One program handles RGBA and YUV, sRGB and PQ, via uniforms: the mode
-and transfer ids, the screen-px→page-fraction maps (`u_lmap`/`u_cmap`),
-the folded conversion mat3 and offset, and the alpha depth normalizer.
-Folding every per-draw constant on the CPU keeps the shader trivial:
-
-- KR/KB per standard: BT.601 (0.299, 0.114), BT.709 (0.2126, 0.0722),
-  BT.2020 (0.2627, 0.0593). KG = 1 - KR - KB.
-- Limited range folds the studio-swing scales into the matrix so the
-  anchors stay the plain code values: luma black 16 and chroma neutral
-  128, both shifted by `depth - 8` bits. Full range anchors at 0 and
-  `2^(depth-1)` with an identity scale.
-- Sampling divides an R16 texture by 65535. Only `depth` bits are
-  significant, so multiply by `65535 / (2^depth - 1)` — folded into the
-  matrix for color, the `u_norm` uniform for alpha.
-- Mono pages get a 1×1 midpoint chroma texture (128, or `1 << (depth-1)`
-  as native-endian u16). The folded quantization anchor cancels it
-  exactly.
-- Chroma is sampled bilinearly at centered (interstitial) positions,
-  the JPEG convention and the AVIF default: exact for 444, sub-texel
-  for subsampled. Chroma siting metadata is not applied, so declared
-  co-sited chroma biases by half a texel. The bias is invisible in
-  practice.
-
-Unit-test that studio-swing black and white map to 0.0/1.0 at every
-depth. That catches a whole class of "slightly wrong colors"
-regressions without a GPU.
-
-## Upload policy
-
-Uploads are the expensive operation: a full upload per plane, plus
-mipmap generation for filterable planes (R16 on GLES stays NEAREST,
-no mips). Decoded artifacts wait in the app's queue and
-drain under a per-frame budget, with one artifact always admitted; a
-queue with more left arms the next frame immediately, so a backlog
-keeps draining. A revisit to a retained page is a texture hit, not an
-upload.
-
-`PageTextures::insert(page, kind, image)` uploads one artifact into
-the thumb, view, or native map. It no-ops when that slot already holds
-a texture and never evicts, and it refuses a page over
-`MAX_TEXTURE_SIZE` as the page's `TextureFault`. `retain` applies
-`app::kept`: thumbs stay for the book, views within two spread starts
-of the shown and requested spreads, natives for the shown spread. A
-seat draws the largest representation present (native, then view, then
-thumb), and `clear_all` runs on a book switch.
+An upload costs one texture per plane plus mipmaps. Decoded artifacts
+queue in the app and drain under a per-frame budget; a non-empty queue
+re-arms. `PageTextures::insert` keeps a present slot, adds a new texture,
+and refuses an oversize page as a `TextureFault`; `retain` applies
+`app::kept` and owns removal. A seat draws native, then view, then thumb;
+`clear_all` runs on a book switch. A retained page is a texture hit.
