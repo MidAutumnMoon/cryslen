@@ -33,8 +33,8 @@ show fewer samples.
 
 3. **A held-key skim ends on a timer, not the key release.**
    `SKIM_DECAY` (250 ms) ends it. Handling `Released` (and focus loss)
-   would end the gesture at the release and start the settle mint
-   earlier; the last skim settle in a real run cost one 47 ms mint.
+   would end the gesture at the release and start the settle derivation
+   earlier; the last skim settle in a real run cost one 47 ms derivation.
 
 4. **The derived cache lives in `$TMPDIR` and dies at reboot.**
    Entries survive process restarts, never a reboot. A bounded,

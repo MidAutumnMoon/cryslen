@@ -60,7 +60,7 @@ pub enum Artifact {
 }
 
 impl Artifact {
-    /// The mint edge, stored in the entry header, so a changed constant
+    /// The target edge, stored in the entry header, so a changed constant
     /// invalidates old entries.
     pub(crate) fn edge(self) -> Option<u32> {
         match self {
@@ -80,14 +80,14 @@ pub fn content_hash(bytes: &[u8]) -> u128 {
 /// a copy when it already fits. Preserves page dims, format, and transfer;
 /// YUV planes resample in their own layout from `plane_dims`, which
 /// [`Decoded::yuv`] validates.
-pub fn mint(page: &Decoded, edge: u32) -> Decoded {
+pub fn derive(page: &Decoded, edge: u32) -> Decoded {
     let page_dims = page.page_dims();
     let dims = (page.width(), page.height());
     let target = fit_dims(dims, edge);
     if target == dims {
         return page.clone();
     }
-    let minted = match page.pixels() {
+    let derived = match page.pixels() {
         Pixels::Rgba8(bytes) => {
             let bytes = resample_rgba(bytes, dims, target);
             Decoded::rgba(
@@ -132,8 +132,8 @@ pub fn mint(page: &Decoded, edge: u32) -> Decoded {
             )
         }
     };
-    match minted {
-        Ok(minted) => minted.with_page_dims(page_dims),
+    match derived {
+        Ok(derived) => derived.with_page_dims(page_dims),
         Err(error) => {
             tracing::warn!(
                 %error,
@@ -1389,7 +1389,7 @@ mod tests {
         fs::write(&path, &bad_version).expect("write version");
         assert!(store.load(hash, Artifact::Thumb).is_none());
 
-        // The mint edge sits between the pixel tag and the page dims;
+        // The target edge sits between the pixel tag and the page dims;
         // a different edge is a different artifact.
         let mut bad_edge = good.clone();
         if let Some(field) = bad_edge.get_mut(8..12) {
@@ -1438,9 +1438,9 @@ mod tests {
     }
 
     #[test]
-    fn mint_scales_to_the_edge() {
+    fn derive_scales_to_the_edge() {
         let page = rgba_page(500, 200).with_page_dims((1500, 600));
-        let thumb = mint(&page, 200);
+        let thumb = derive(&page, 200);
         assert_eq!((thumb.width(), thumb.height()), (200, 80));
         assert_eq!(thumb.page_dims(), (1500, 600));
         assert_eq!(thumb.format(), Format::Png);
@@ -1452,21 +1452,21 @@ mod tests {
         );
 
         let wide = rgba_page(1800, 900);
-        let wide_thumb = mint(&wide, 200);
+        let wide_thumb = derive(&wide, 200);
         assert_eq!((wide_thumb.width(), wide_thumb.height()), (200, 100));
 
         let exact = rgba_page(200, 100);
-        let kept = mint(&exact, 200);
+        let kept = derive(&exact, 200);
         assert_eq!((kept.width(), kept.height()), (200, 100));
         assert_eq!(rgba_bytes(&kept), rgba_bytes(&exact));
 
         let small = rgba_page(40, 30);
-        let grown = mint(&small, 1024);
+        let grown = derive(&small, 1024);
         assert_eq!((grown.width(), grown.height()), (40, 30));
     }
 
     #[test]
-    fn mint_averages_area_coverage() {
+    fn derive_averages_area_coverage() {
         // A 3x1 source into 2x1: the first target covers source pixel 0
         // fully and half of pixel 1, so it is (0 * 2 + 255 * 1) / 3.
         let bytes =
@@ -1474,18 +1474,18 @@ mod tests {
                 .into_boxed_slice();
         let page = Decoded::rgba(3, 1, Format::Png, Transfer::Srgb, bytes)
             .expect("rgba page");
-        let minted = mint(&page, 2);
-        assert_eq!((minted.width(), minted.height()), (2, 1));
+        let derived = derive(&page, 2);
+        assert_eq!((derived.width(), derived.height()), (2, 1));
         assert_eq!(
-            rgba_bytes(&minted),
+            rgba_bytes(&derived),
             vec![85_u8, 85, 85, 255, 255, 255, 255, 255]
         );
     }
 
     #[test]
-    fn mint_keeps_yuv_plane_extents_valid() {
+    fn derive_keeps_yuv_plane_extents_valid() {
         let page = yuv_page(500, 200, Subsampling::Yuv420);
-        let thumb = mint(&page, 200);
+        let thumb = derive(&page, 200);
         assert_eq!((thumb.width(), thumb.height()), (200, 80));
         assert_eq!(thumb.page_dims(), (500, 200));
         let Pixels::Yuv(yuv) = thumb.pixels() else {
@@ -1499,9 +1499,9 @@ mod tests {
     }
 
     #[test]
-    fn mint_keeps_odd_yuv422_chroma_consistent() {
+    fn derive_keeps_odd_yuv422_chroma_consistent() {
         let page = yuv_page(9, 10, Subsampling::Yuv422);
-        let thumb = mint(&page, 7);
+        let thumb = derive(&page, 7);
         assert_eq!((thumb.width(), thumb.height()), (6, 7));
         let Pixels::Yuv(yuv) = thumb.pixels() else {
             panic!("expected yuv pixels");

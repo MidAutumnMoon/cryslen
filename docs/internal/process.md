@@ -7,8 +7,8 @@ vocabulary.
 
 The boundary follows ownership. The parent owns the window, UI, GL,
 `App`, the want set, and the texture maps. The child owns its book's
-`Source`, `Store`, decode, mint, and archive unpack. A switch ends the
-old book by ending its process, so its queue ends with it. The child
+`Source`, `Store`, decode, derivation, and archive unpack. A switch ends
+the old book by ending its process, so its queue ends with it. The child
 decodes; the UI thread draws. A child crash becomes a book fault.
 
 ## Reading order

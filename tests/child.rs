@@ -45,7 +45,8 @@ use ipc_channel::ipc::IpcOneShotServer;
 /// decode.
 const PIXEL: [u8; 4] = [0x40, 0x80, 0xc0, 0xff];
 
-/// The page's edge. Small enough that the thumb mint is the page itself.
+/// The page's edge. Small enough that the thumb derivation is the page
+/// itself.
 const PAGE_EDGE: u32 = 2;
 
 /// RGBA bytes in the page: four channels per pixel.

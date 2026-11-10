@@ -7,7 +7,7 @@ and transport are in `docs/internal/process.md`.
 ## Direction
 
 The parent holds `BookView` and the GPU textures. The child holds one
-book's source, store, decode, and mint. The app's texture maps decide
+book's source, store, decode, and derivation. The app's texture maps decide
 what is missing; the worker serves that set and fills the store from the
 plan.
 
@@ -26,16 +26,17 @@ promotion leaves the layout unchanged.
 Content addressing gives free invalidation and shares pages across books.
 Every child opens the same tree, so switches keep its entries.
 
-The format is defined in `preview.rs`: little-endian, versioned, with the
-mint edge in the header. A changed edge is a miss that re-mints; a corrupt
-file is a miss. Writes are atomic (`<hash>.<pid>.tmp` then rename), and
-`Store::open` sweeps temps left by dead writers.
+The format is defined in `preview.rs`: little-endian, versioned, with
+the target edge in the header. A changed edge is a miss that re-derives;
+a corrupt file is a miss. Writes are atomic (`<hash>.<pid>.tmp` then
+rename), and `Store::open` sweeps temps left by dead writers.
 
 Each namespace has its own byte cap and mtime-LRU pruning
 (`THUMB_CAP_BYTES`, `VIEW_CAP_BYTES`). `load` refreshes mtime; `save`
 returns evicted hashes so the worker drops them from its ledger. Caps are
 shared across children, so a prune can evict another child's planned page;
-that page re-mints on its next want. A failed store degrades to re-minting.
+that page re-derives on its next want. A failed store degrades to
+re-deriving.
 
 ## Plan
 
@@ -47,11 +48,11 @@ the app's wants are the delivery path.
 ## Production
 
 One decode thread per book. Wants come first, grouped per page so one
-decode serves all its artifacts. A want hits the store or decodes once; a
-missing preview is minted and persisted, and the thumb mints from the view
-when available. The plan warms ahead; work beyond `head()` is preload and
-waits for `IDLE_PRELOAD` of app silence. `Motion` picks views for still
-reading and thumbs for skims.
+decode serves all its artifacts. A want hits the store or decodes once;
+a missing preview is derived and persisted, and the thumb derives from
+the view when available. The plan warms ahead; work beyond `head()` is
+preload and waits for `IDLE_PRELOAD` of app silence. `Motion` picks views
+for still reading and thumbs for skims.
 
 ## Presentation
 
@@ -73,7 +74,7 @@ before retention drops it. Uploads drain on a per-frame budget
 
 ## Limits
 
-Minting costs a full decode; decoders return the page at its encoded size.
+Deriving costs a full decode; decoders return the page at its encoded size.
 A cold page costs its decode before showing.
 
 `slow frame`, `slow upload`, and `holding for a view` log at `info`; others

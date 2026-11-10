@@ -397,27 +397,28 @@ impl Session {
             );
             if needs.view && view.is_none() {
                 let started = Instant::now();
-                let minted = preview::mint(&native, preview::VIEW_EDGE);
+                let derived = preview::derive(&native, preview::VIEW_EDGE);
                 tracing::debug!(
                     page,
                     elapsed = ?started.elapsed(),
-                    "view minted"
+                    "view derived"
                 );
-                view = Some(self.keep(page, hash, Artifact::View, minted));
+                view =
+                    Some(self.keep(page, hash, Artifact::View, derived));
             }
             if needs.thumb && thumb.is_none() {
                 let started = Instant::now();
                 // The view is the cheaper source: one area pass over the view
                 // covers the thumb.
                 let from = view.as_ref().unwrap_or(&native);
-                let minted = preview::mint(from, preview::THUMB_EDGE);
+                let derived = preview::derive(from, preview::THUMB_EDGE);
                 tracing::debug!(
                     page,
                     elapsed = ?started.elapsed(),
-                    "thumb minted"
+                    "thumb derived"
                 );
                 thumb =
-                    Some(self.keep(page, hash, Artifact::Thumb, minted));
+                    Some(self.keep(page, hash, Artifact::Thumb, derived));
             }
             // Natives bypass the store; a demand job delivers them.
             if needs.native && demand {
@@ -655,7 +656,7 @@ mod tests {
 
     use parking_lot::Mutex;
 
-    /// Page edge for the tests that check minted and native dimensions:
+    /// Page edge for the tests that check derived and native dimensions:
     /// larger than the thumb edge, smaller than the view edge, so the
     /// thumb is scaled and the view is the page itself.
     const BIG: u32 = 1400;
@@ -858,7 +859,7 @@ mod tests {
         assert_eq!(
             long_edge(&view),
             preview::VIEW_EDGE.min(BIG),
-            "the view's long edge matches the mint edge"
+            "the view's long edge matches the target edge"
         );
 
         let store = Store::at(root.path());
@@ -1050,7 +1051,7 @@ mod tests {
         let root = TempDir::new("worker-warm-store");
         let store_root = root.path();
 
-        // The first session mints and persists both artifacts.
+        // The first session derives and persists both artifacts.
         let (first, notify) = Events::new();
         let worker = Worker::spawn_at(
             Arc::clone(&source),
@@ -1072,7 +1073,7 @@ mod tests {
         assert_eq!(
             long_edge(&view),
             preview::VIEW_EDGE.min(BIG),
-            "the view's long edge matches the mint edge"
+            "the view's long edge matches the target edge"
         );
         drop(worker);
 
