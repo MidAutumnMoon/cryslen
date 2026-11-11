@@ -10,7 +10,6 @@ use image::codecs::gif::Repeat;
 
 use crate::fault::DecodeRefusal;
 use crate::fault::PageError;
-use crate::source::PageRead;
 use crate::source::Source;
 
 fn encode(
@@ -102,24 +101,24 @@ pub fn failed_page(message: &'static str) -> Arc<PageError> {
     Arc::new(ErrorUnion::new(DecodeRefusal::Corrupt(message)))
 }
 
-/// Poll a source page until its bytes arrive. Panics if the page
-/// fails instead: the caller asked for its content.
-pub fn eventually_ready(source: &Source, index: usize) -> Arc<[u8]> {
-    eventually(20, "page never settled", || match source.bytes(index) {
-        PageRead::Ready(bytes) => Some(bytes),
-        PageRead::Failed(error) => panic!("page {index} failed: {error}"),
-        PageRead::NotYet => None,
-    })
+/// Materialize the source and return one page's bytes; panics if that
+/// page fails.
+pub fn readable_page(source: &Source, index: usize) -> Arc<[u8]> {
+    source.wait_ready().expect("source materialized");
+    match source.bytes(index) {
+        Ok(bytes) => bytes,
+        Err(error) => panic!("page {index} failed: {error}"),
+    }
 }
 
-/// Poll a source page until it settles as a failure, returning the
-/// fault. Panics if it unpacks: the caller asked for the failure.
-pub fn eventually_failed(source: &Source, index: usize) -> Arc<PageError> {
-    eventually(20, "page never settled", || match source.bytes(index) {
-        PageRead::Failed(error) => Some(error),
-        PageRead::Ready(_) => panic!("page {index} unpacked"),
-        PageRead::NotYet => None,
-    })
+/// Materialize the source and return one page's failure; panics if that
+/// page reads.
+pub fn unreadable_page(source: &Source, index: usize) -> Arc<PageError> {
+    source.wait_ready().expect("source materialized");
+    match source.bytes(index) {
+        Err(error) => error,
+        Ok(_) => panic!("page {index} materialized"),
+    }
 }
 
 /// Poll `probe` until it returns `Some`, or `secs` seconds pass.

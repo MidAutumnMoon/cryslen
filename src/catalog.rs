@@ -37,10 +37,13 @@ pub fn is_archive(path: &Path) -> bool {
 
 /// The next or previous sibling book of the same kind, in natural order;
 /// none at either end.
-pub fn sibling(path: &Path, forward: bool) -> Option<PathBuf> {
+pub fn sibling(
+    path: &Path,
+    archive: bool,
+    forward: bool,
+) -> Option<PathBuf> {
     let parent = path.parent()?;
     let current = path.file_name()?;
-    let archive = is_archive(path);
     let mut siblings: Vec<(String, PathBuf)> = fs::read_dir(parent)
         .ok()?
         .filter_map(Result::ok)

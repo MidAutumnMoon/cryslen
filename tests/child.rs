@@ -212,7 +212,7 @@ fn child_serves_a_decoded_thumb() {
         "the child lists the one page that was written",
     );
     assert_eq!(info.names, ["page.png"], "the child lists the page");
-    assert!(!info.unpacking, "a directory never unpacks");
+    assert!(!info.archive, "a directory is not an archive");
 
     commands
         .send(ParentMsg::SetView {

@@ -39,4 +39,4 @@ Reduced-resolution JXL and AVIF, hardware AV1 or JXL for stills, and a pure-Rust
 
 ## Division
 
-The child owns the message loop, requests, prefetch scheduling, and the panic boundary; the source owns archive unpack. Scheduling and retention are in `cache.md`; transport is in `process.md`.
+The child owns the message loop, requests, prefetch scheduling, and the panic boundary; the source owns archive materialization. Scheduling and retention are in `cache.md`; transport is in `process.md`.

@@ -1,6 +1,6 @@
 //! Page source: a directory or archive as a natural-sorted page list.
-//! Archives unpack once on a background thread; `bytes` answers `NotYet`
-//! until a member arrives.
+//! An archive materializes once on a background thread; `wait_ready`
+//! gates `bytes`, which is total after it returns.
 
 use std::collections::HashMap;
 use std::fs;
@@ -12,12 +12,14 @@ use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 use std::time::Instant;
 
+use crossbeam_channel::Receiver;
+use crossbeam_channel::Sender;
 use eros::ErrorUnion;
 use eros::IntoUnion as _;
-use parking_lot::Mutex;
 
 use crate::browse::PageCount;
 use crate::catalog;
@@ -29,53 +31,13 @@ use crate::fault::OpenRefusal;
 use crate::fault::PageError;
 use crate::fault::PanicFault;
 
-#[derive(Debug)]
-pub enum PageRead {
-    Ready(Arc<[u8]>),
-    NotYet,
-    Failed(Arc<PageError>),
-}
-
-/// Pages one background pass fills. A member's own failure settles that
-/// page; a pass-level failure answers every unfilled page, while filled
-/// pages keep their results.
-#[derive(Debug)]
-struct Fill {
-    pages: HashMap<usize, Result<Arc<[u8]>, Arc<PageError>>>,
-    /// `None` while the pass runs, `Some(Ok(()))` when it ended whole,
-    /// `Some(Err(reason))` when it ended early.
-    pass: Option<Result<(), Arc<PageError>>>,
-}
-
-impl Fill {
-    fn empty() -> Self {
-        Self {
-            pages: HashMap::new(),
-            pass: None,
-        }
-    }
-
-    fn resolve(&self, index: usize) -> PageRead {
-        match self.pages.get(&index) {
-            Some(Ok(bytes)) => PageRead::Ready(Arc::clone(bytes)),
-            Some(Err(error)) => PageRead::Failed(Arc::clone(error)),
-            None => match &self.pass {
-                None => PageRead::NotYet,
-                // Every listed member is inserted by the pass that
-                // ended whole, so a miss is a caller bug.
-                Some(Ok(())) => {
-                    PageRead::Failed(Arc::new(ErrorUnion::new(BadIndex)))
-                }
-                Some(Err(fatal)) => PageRead::Failed(Arc::clone(fatal)),
-            },
-        }
-    }
-}
+type PageRead = Result<Arc<[u8]>, Arc<PageError>>;
+type PageSet = Vec<PageRead>;
 
 #[derive(Debug)]
 enum Backend {
     Directory(PathBuf),
-    Archive(Arc<Mutex<Fill>>),
+    Archive { page_set_rx: Receiver<PageSet> },
 }
 
 #[derive(Debug)]
@@ -83,6 +45,8 @@ pub struct Source {
     names: Vec<String>,
     count: PageCount,
     backend: Backend,
+    /// Filled once by `wait_ready`; `bytes` reads it for archives.
+    pages: OnceLock<PageSet>,
 }
 
 impl Source {
@@ -129,7 +93,7 @@ impl Source {
     }
 
     /// Listing reads the central directory, so a damaged local header fails
-    /// only that member when the fill reaches it.
+    /// only that member when materialization reaches it.
     fn open_zip(path: &Path) -> Result<Self, OpenError> {
         let zip = zip::ZipArchive::new(BufReader::new(
             File::open(path).union()?,
@@ -148,12 +112,12 @@ impl Source {
         }
         let (names, unpacked) = validated_listing(listed).union()?;
         guard_memory(unpacked, mem_available_bytes()).union()?;
-        let fill = Arc::new(Mutex::new(Fill::empty()));
+        let (page_set_tx, page_set_rx) = crossbeam_channel::bounded(1);
         let source = Self::from_names(
-            Backend::Archive(Arc::clone(&fill)),
+            Backend::Archive { page_set_rx },
             names.clone(),
         )?;
-        spawn_zip_fill(zip, names, &fill);
+        spawn_zip_materialize(zip, names, &page_set_tx);
         Ok(source)
     }
 
@@ -177,12 +141,12 @@ impl Source {
             .collect();
         let (names, unpacked) = validated_listing(listed).union()?;
         guard_memory(unpacked, mem_available_bytes()).union()?;
-        let fill = Arc::new(Mutex::new(Fill::empty()));
+        let (page_set_tx, page_set_rx) = crossbeam_channel::bounded(1);
         let source = Self::from_names(
-            Backend::Archive(Arc::clone(&fill)),
+            Backend::Archive { page_set_rx },
             names.clone(),
         )?;
-        spawn_sevenzip_fill(archive, &names, &fill);
+        spawn_sevenzip_materialize(archive, &names, &page_set_tx);
         Ok(source)
     }
 
@@ -197,6 +161,7 @@ impl Source {
             names,
             count,
             backend,
+            pages: OnceLock::new(),
         })
     }
 
@@ -215,34 +180,60 @@ impl Source {
         self.names.get(index).map(String::as_str)
     }
 
-    /// The encoded bytes of one page. An archive still unpacking answers
-    /// `NotYet` without waiting; the caller decides how to wait.
+    /// Blocks until an archive's pages are materialized; a directory is
+    /// always ready. Afterwards [`Self::bytes`] is total.
+    pub fn wait_ready(&self) -> Result<(), Arc<PageError>> {
+        if self.pages.get().is_some() {
+            return Ok(());
+        }
+        let Backend::Archive { page_set_rx } = &self.backend else {
+            return Ok(());
+        };
+        let page_set = page_set_rx.recv().map_err(|error| {
+            Arc::new(ErrorUnion::new(PanicFault {
+                origin: "unpack",
+                message: format!(
+                    "the unpack thread stopped without a page set: {error}"
+                ),
+            }))
+        })?;
+        if self.pages.set(page_set).is_err() {
+            tracing::debug!("the page set was already materialized");
+        }
+        Ok(())
+    }
+
+    /// The encoded bytes of one page. For an archive the caller must
+    /// have called [`Self::wait_ready`] first.
     pub fn bytes(&self, index: usize) -> PageRead {
         let Some(name) = self.names.get(index) else {
-            return PageRead::Failed(Arc::new(ErrorUnion::new(BadIndex)));
+            return Err(Arc::new(ErrorUnion::new(BadIndex)));
         };
         match &self.backend {
             Backend::Directory(dir) => match fs::read(dir.join(name)) {
-                Ok(bytes) => PageRead::Ready(bytes.into()),
-                Err(error) => {
-                    PageRead::Failed(Arc::new(ErrorUnion::new(error)))
-                }
+                Ok(bytes) => Ok(bytes.into()),
+                Err(error) => Err(Arc::new(ErrorUnion::new(error))),
             },
-            Backend::Archive(fill) => fill.lock().resolve(index),
+            Backend::Archive {
+                page_set_rx: _page_set_rx,
+            } => self
+                .pages
+                .get()
+                .and_then(|page_set| page_set.get(index))
+                .cloned()
+                .unwrap_or_else(|| {
+                    Err(Arc::new(ErrorUnion::new(BadIndex)))
+                }),
         }
     }
 
-    pub fn unpacking(&self) -> bool {
-        match &self.backend {
-            Backend::Directory(_) => false,
-            Backend::Archive(fill) => fill.lock().pass.is_none(),
-        }
-    }
-
-    /// Whether the source runs an unpack pass; `unpacking()` reports its
-    /// progress.
-    pub fn unpacks(&self) -> bool {
-        matches!(self.backend, Backend::Archive(_))
+    pub fn is_archive(&self) -> bool {
+        matches!(
+            &self.backend,
+            Backend::Archive {
+                page_set_rx: _page_set_rx
+            }
+        )
     }
 }
 
@@ -311,68 +302,113 @@ fn read_member(
     }
 }
 
-/// Fill a zip's pages in reading order. Zip members decode
-/// independently, so each page settles on its own result.
-fn spawn_zip_fill(
+/// Materialize a zip's pages in reading order.
+fn spawn_zip_materialize(
     mut zip: zip::ZipArchive<BufReader<File>>,
     names: Vec<String>,
-    fill: &Arc<Mutex<Fill>>,
+    tx: &Sender<PageSet>,
 ) {
-    spawn_pass(fill, move |fill| {
+    let page_count = names.len();
+    spawn_materialize(page_count, tx, move |slots| {
         for (index, name) in names.iter().enumerate() {
             let page = match zip.by_name(name) {
                 Ok(mut entry) => read_member(&mut entry).map_err(Arc::new),
                 Err(error) => Err(Arc::new(ErrorUnion::new(error))),
             };
-            fill.lock().pages.insert(index, page);
+            if let Some(slot) = slots.get_mut(index) {
+                *slot = Some(page);
+            }
         }
         Ok(())
     });
 }
 
-/// Start the unpack thread for one pass body. Dropping the handle
-/// detaches the thread, so quitting proceeds immediately. A failed spawn
-/// settles the pass with the spawn error, so every page gets a verdict.
-fn spawn_pass(
-    fill: &Arc<Mutex<Fill>>,
-    body: impl FnOnce(&Arc<Mutex<Fill>>) -> Result<(), PageError>
+/// The thread detaches when its handle drops, so quitting proceeds
+/// immediately; a failed spawn answers every page with the spawn error.
+fn spawn_materialize(
+    page_count: usize,
+    tx: &Sender<PageSet>,
+    body: impl FnOnce(&mut [Option<PageRead>]) -> Result<(), PageError>
         + Send
         + 'static,
 ) {
+    use std::panic;
+    use std::panic::AssertUnwindSafe;
     use std::thread::Builder;
 
-    let thread_fill = Arc::clone(fill);
-    let spawned = Builder::new()
-        .name("cy-unpack".into())
-        .spawn(move || settle_pass(&thread_fill, body));
+    let thread_tx = tx.clone();
+    let spawned =
+        Builder::new().name("cy-unpack".into()).spawn(move || {
+            let started = Instant::now();
+            let mut slots: Vec<Option<PageRead>> = vec![None; page_count];
+            let outcome =
+                panic::catch_unwind(AssertUnwindSafe(|| body(&mut slots)));
+            let verdict = match outcome {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(reason)) => {
+                    tracing::warn!(?reason, "unpack pass ended early");
+                    Err(Arc::new(reason))
+                }
+                Err(payload) => Err(Arc::new(ErrorUnion::new(
+                    PanicFault::from_payload("unpack", payload.as_ref()),
+                ))),
+            };
+            tracing::debug!(
+                elapsed = ?started.elapsed(),
+                ok = verdict.is_ok(),
+                "unpack pass ended"
+            );
+            if thread_tx.send(finish_pages(slots, verdict)).is_err() {
+                tracing::debug!("the page set has no reader");
+            }
+        });
     if let Err(error) = spawned {
         tracing::warn!(?error, "could not start the unpack thread");
-        fill.lock().pass = Some(Err(Arc::new(ErrorUnion::new(error))));
+        let error: Arc<PageError> = Arc::new(ErrorUnion::new(error));
+        let page_set = vec![Err(Arc::clone(&error)); page_count];
+        if tx.send(page_set).is_err() {
+            tracing::debug!("the page set has no reader");
+        }
     }
 }
 
-/// Fill a 7z's pages in storage order, the only order a solid stream
-/// permits: every member is consumed, page or not, before the next
-/// decodes.
-fn spawn_sevenzip_fill(
+/// An unfilled page takes the pass verdict, or `BadIndex` if the pass
+/// ended whole.
+fn finish_pages(
+    slots: Vec<Option<PageRead>>,
+    verdict: Result<(), Arc<PageError>>,
+) -> PageSet {
+    let fallback = verdict
+        .err()
+        .unwrap_or_else(|| Arc::new(ErrorUnion::new(BadIndex)));
+    slots
+        .into_iter()
+        .map(|slot| slot.unwrap_or_else(|| Err(Arc::clone(&fallback))))
+        .collect()
+}
+
+/// Materialize a 7z's pages in storage order, the only order a solid
+/// stream permits.
+fn spawn_sevenzip_materialize(
     mut reader: sevenz_rust2::ArchiveReader<File>,
     names: &[String],
-    fill: &Arc<Mutex<Fill>>,
+    tx: &Sender<PageSet>,
 ) {
     let by_name: HashMap<String, usize> = names
         .iter()
         .enumerate()
         .map(|(index, name)| (name.clone(), index))
         .collect();
-    spawn_pass(fill, move |fill| {
+    let page_count = names.len();
+    spawn_materialize(page_count, tx, move |slots| {
         reader
             .for_each_entries(|entry, data| {
                 match by_name.get(&entry.name) {
                     Some(&index) => {
-                        fill.lock().pages.insert(
-                            index,
-                            read_member(data).map_err(Arc::new),
-                        );
+                        if let Some(slot) = slots.get_mut(index) {
+                            *slot =
+                                Some(read_member(data).map_err(Arc::new));
+                        }
                     }
                     None => {
                         // A solid block yields its later members only
@@ -384,37 +420,6 @@ fn spawn_sevenzip_fill(
             })
             .map_err(ErrorUnion::new)
     });
-}
-
-/// Settle the pass: from here on, an unfilled page answers the pass's
-/// verdict.
-fn settle_pass(
-    fill: &Arc<Mutex<Fill>>,
-    body: impl FnOnce(&Arc<Mutex<Fill>>) -> Result<(), PageError>,
-) {
-    use std::panic;
-    use std::panic::AssertUnwindSafe;
-
-    let started = Instant::now();
-    let outcome = panic::catch_unwind(AssertUnwindSafe(|| body(fill)));
-    tracing::debug!(
-        elapsed = ?started.elapsed(),
-        ok = matches!(outcome.as_ref(), Ok(Ok(()))),
-        "unpack pass ended"
-    );
-    {
-        let mut state = fill.lock();
-        state.pass = Some(match outcome {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(reason)) => {
-                tracing::warn!(?reason, "unpack pass ended early");
-                Err(Arc::new(reason))
-            }
-            Err(payload) => Err(Arc::new(ErrorUnion::new(
-                PanicFault::from_payload("unpack", payload.as_ref()),
-            ))),
-        });
-    }
 }
 
 /// `MemAvailable` from a `/proc/meminfo` text, converted to bytes. The
@@ -468,22 +473,16 @@ mod tests {
     use crate::catalog::PageName;
     use crate::decode;
     use crate::fault::BadIndex;
-    use crate::fault::DecodeRefusal;
     use crate::fault::PanicFault;
-    use crate::testkit::eventually;
-    use crate::testkit::eventually_failed;
-    use crate::testkit::eventually_ready;
     use crate::testkit::failed_page;
+    use crate::testkit::readable_page;
     use crate::testkit::tiny_png;
+    use crate::testkit::unreadable_page;
     use crate::testkit::TempDir;
 
     use std::cmp::Ordering;
     use std::io::Error as IoError;
     use std::io::Write as _;
-
-    fn failed_reason(what: &'static str) -> PageError {
-        ErrorUnion::new(DecodeRefusal::Corrupt(what))
-    }
 
     /// LZMA-compressed 7z with two small PNGs, built by 7zz. The crate's
     /// encoder features are trimmed, so the fixture is checked in.
@@ -500,35 +499,33 @@ mod tests {
     );
 
     #[test]
-    fn a_pages_own_result_answers_before_the_pass_verdict() {
-        let mut fill = Fill::empty();
-        assert!(matches!(fill.resolve(0), PageRead::NotYet));
+    fn a_failed_pass_answers_only_unfilled_pages() {
         let good: Arc<[u8]> = Arc::from(&b"a"[..]);
         let bad = failed_page("bad page");
-        fill.pages.insert(0, Ok(Arc::clone(&good)));
-        fill.pages.insert(1, Err(Arc::clone(&bad)));
-        assert!(
-            matches!(fill.resolve(0), PageRead::Ready(bytes) if Arc::ptr_eq(&bytes, &good))
-        );
-        assert!(
-            matches!(fill.resolve(1), PageRead::Failed(error) if Arc::ptr_eq(&error, &bad))
-        );
-        assert!(matches!(fill.resolve(2), PageRead::NotYet));
-
         let fatal = failed_page("stream broke");
-        fill.pass = Some(Err(Arc::clone(&fatal)));
-        assert!(
-            matches!(fill.resolve(1), PageRead::Failed(error) if Arc::ptr_eq(&error, &bad))
+        let pages = finish_pages(
+            vec![
+                Some(Ok(Arc::clone(&good))),
+                Some(Err(Arc::clone(&bad))),
+                None,
+            ],
+            Err(Arc::clone(&fatal)),
         );
-        assert!(
-            matches!(fill.resolve(2), PageRead::Failed(error) if Arc::ptr_eq(&error, &fatal))
-        );
+        let [first, second, third] = pages.as_slice() else {
+            panic!("three page slots");
+        };
+        assert!(matches!(first, Ok(bytes) if Arc::ptr_eq(bytes, &good)));
+        assert!(matches!(second, Err(error) if Arc::ptr_eq(error, &bad)));
+        assert!(matches!(third, Err(error) if Arc::ptr_eq(error, &fatal)));
 
-        fill.pass = Some(Ok(()));
-        // A whole pass inserts every listed member, so a miss after it
-        // names the caller.
+        // A whole pass that missed a page reports `BadIndex`.
+        let whole =
+            finish_pages(vec![Some(Ok(Arc::clone(&good))), None], Ok(()));
+        let [_, missing] = whole.as_slice() else {
+            panic!("two page slots");
+        };
         assert!(
-            matches!(fill.resolve(2), PageRead::Failed(error) if error.downcast_inner_ref::<BadIndex>().is_some())
+            matches!(missing, Err(error) if error.downcast_inner_ref::<BadIndex>().is_some())
         );
     }
 
@@ -686,27 +683,21 @@ mod tests {
     }
 
     #[test]
-    fn settle_pass_outcomes() {
-        let whole = Arc::new(Mutex::new(Fill::empty()));
-        settle_pass(&whole, |_| Ok(()));
-        assert!(matches!(&whole.lock().pass, Some(Ok(()))));
-
-        let broke = Arc::new(Mutex::new(Fill::empty()));
-        settle_pass(&broke, |_| Err(failed_reason("stream broke")));
-        let settled = broke.lock();
-        let Some(Err(reason)) = &settled.pass else {
-            panic!("the broken pass must settle as an error");
+    fn a_panicking_materializer_answers_unfilled_pages() {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        spawn_materialize(2, &tx, |slots| {
+            if let Some(slot) = slots.get_mut(0) {
+                *slot = Some(Ok(Arc::from(&b"a"[..])));
+            }
+            panic!("boom");
+        });
+        let pages = rx.recv().expect("the materializer sends a page set");
+        let [first, second] = pages.as_slice() else {
+            panic!("two page slots");
         };
-        assert_eq!(
-            reason.downcast_inner_ref::<DecodeRefusal>(),
-            Some(&DecodeRefusal::Corrupt("stream broke"))
-        );
-        drop(settled);
-
-        let boom = Arc::new(Mutex::new(Fill::empty()));
-        settle_pass(&boom, |_| panic!("boom"));
-        let PageRead::Failed(error) = boom.lock().resolve(0) else {
-            panic!("a panic settles as its unfilled pages' failure");
+        assert!(first.is_ok());
+        let Err(error) = second else {
+            panic!("the unfilled page takes the panic verdict");
         };
         let fault = error
             .downcast_inner_ref::<PanicFault>()
@@ -764,34 +755,15 @@ mod tests {
     }
 
     #[test]
-    fn sevenz_read_through_fill() {
-        let source =
-            Source::open(Path::new(SEVENZ_FIXTURE)).expect("7z opens");
-        let bytes = eventually_ready(&source, 0);
-        assert!(
-            matches!(source.bytes(0), PageRead::Ready(repeat) if repeat.as_ref() == bytes.as_ref())
-        );
-        assert_eq!(bytes.get(..8), Some(&b"\x89PNG\r\n\x1a\n"[..]));
-        // the decoder is the oracle for the fixture's dims
-        let page = decode::decode(&bytes, "p1.png")
-            .expect("fixture page decodes");
-        assert_eq!((page.width(), page.height()), (40, 30));
-
-        eventually(20, "pass never ended", || {
-            (!source.unpacking()).then_some(())
-        });
-        assert!(matches!(source.bytes(1), PageRead::Ready(_)));
-    }
-
-    #[test]
-    fn sevenz_drains_non_page_members() {
+    fn sevenz_materializes_once_and_drains_non_page_members() {
         let source = Source::open(Path::new(MIXED_SEVENZ_FIXTURE))
             .expect("7z opens");
+        source.wait_ready().expect("7z materializes");
         assert_eq!(source.len().get(), 2);
         let mut pages = Vec::new();
         for index in 0..source.len().get() {
             let name = source.name(index).expect("page listed");
-            let bytes = eventually_ready(&source, index);
+            let bytes = source.bytes(index).expect("page materialized");
             let page = decode::decode(&bytes, name)
                 .expect("fixture page decodes");
             assert_eq!(page.format(), decode::Format::Png);
@@ -831,9 +803,9 @@ mod tests {
                 file: "c10.png".into(),
             }
         );
-        assert!(!source.unpacking());
+        assert!(!source.is_archive());
         assert!(
-            matches!(source.bytes(1), PageRead::Ready(read) if read.as_ref() == tiny_png(1, 1, [7, 8, 9, 255]).as_slice())
+            matches!(source.bytes(1), Ok(read) if read.as_ref() == tiny_png(1, 1, [7, 8, 9, 255]).as_slice())
         );
     }
 
@@ -882,14 +854,11 @@ mod tests {
             }
         );
         // bytes(1) is b/010.png, written with color 1.
-        let page = eventually_ready(&source, 1);
+        let page = readable_page(&source, 1);
         assert_eq!(
             page.as_ref(),
             tiny_png(2, 2, [1, 0, 0, 255]).as_slice()
         );
-        eventually(20, "pass never ended", || {
-            (!source.unpacking()).then_some(())
-        });
     }
 
     #[test]
@@ -944,15 +913,15 @@ mod tests {
 
         let source = Source::open(&zip_path)
             .expect("the central directory still opens the book");
-        let failure = eventually_failed(&source, 1);
+        let failure = unreadable_page(&source, 1);
         let read_error = failure
             .downcast_inner_ref::<IoError>()
             .expect("a corrupt member settles as an io error");
         // zip reports a payload CRC mismatch as invalid data.
         assert_eq!(read_error.kind(), ErrorKind::InvalidData);
-        eventually_failed(&source, 2);
+        unreadable_page(&source, 2);
         assert_eq!(
-            eventually_ready(&source, 0).as_ref(),
+            readable_page(&source, 0).as_ref(),
             pages[0].as_slice()
         );
     }
@@ -1006,17 +975,17 @@ mod tests {
             .expect("plain file writes");
 
         assert_eq!(
-            sibling(&middle, true),
+            sibling(&middle, false, true),
             Some(last),
             "forward follows natural order"
         );
         assert_eq!(
-            sibling(&middle, false),
+            sibling(&middle, false, false),
             Some(first.clone()),
             "backward follows natural order"
         );
         assert_eq!(
-            sibling(&first, false),
+            sibling(&first, false, false),
             None,
             "the shelf's start has no earlier book"
         );
@@ -1043,12 +1012,12 @@ mod tests {
         // The volumes directory is a sibling entry of the other kind and
         // must not answer.
         assert_eq!(
-            sibling(&before, true),
+            sibling(&before, true, true),
             Some(after),
             "archives step between archives"
         );
         assert_eq!(
-            sibling(&before, false),
+            sibling(&before, true, false),
             None,
             "the first archive has no earlier book"
         );

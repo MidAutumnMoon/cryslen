@@ -66,7 +66,7 @@ impl BookView {
                 "the book has no pages",
             )));
         };
-        let archive = catalog::is_archive(&path);
+        let archive = info.archive;
         let dir_name = if archive {
             None
         } else {
@@ -79,7 +79,7 @@ impl BookView {
             dir_name,
             names: info.names,
             count,
-            unpacking: info.unpacking,
+            unpacking: archive,
         })
     }
 
@@ -104,7 +104,7 @@ impl BookView {
     }
 
     pub fn sibling(&self, forward: bool) -> Option<PathBuf> {
-        catalog::sibling(&self.path, forward)
+        catalog::sibling(&self.path, self.archive, forward)
     }
 }
 
@@ -616,7 +616,7 @@ mod tests {
             PathBuf::from("/nonexistent-cryslen-book/book"),
             BookInfo {
                 names: vec![String::from("page.png")],
-                unpacking: false,
+                archive: false,
             },
         )
         .expect("a one-page book view")

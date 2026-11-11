@@ -57,12 +57,7 @@ use crate::protocol::PlaybackCommand;
 use crate::protocol::PlaybackEvent;
 use crate::protocol::PlaybackId;
 use crate::protocol::WireImage;
-use crate::source::PageRead;
 use crate::source::Source;
-
-/// Nap between checks while a page unpacks; the loop drains the channel
-/// after each, so a stop or request waits at most this long.
-const FILL_POLL: Duration = Duration::from_millis(15);
 
 /// Silence required before preload beyond the head starts, so a turning
 /// reader leaves the worker idle between turns.
@@ -80,8 +75,8 @@ pub enum Update {
         error: Arc<PageError>,
     },
     Playback(DecodedEvent),
-    /// Every page now reads without waiting on an unpack pass. Sent
-    /// once, on the first loop iteration that observes it.
+    /// Every page now reads without waiting on an unpack pass. An
+    /// archive sends this once, when that pass ends.
     Unpacked,
     Fatal(String),
 }
@@ -418,15 +413,11 @@ impl Session {
         let roles = job.roles;
         let requested = job.requested;
         let bytes = match source.bytes(page) {
-            PageRead::NotYet => {
-                thread::sleep(FILL_POLL);
-                return;
-            }
-            PageRead::Failed(error) => {
+            Ok(bytes) => bytes,
+            Err(error) => {
                 self.record_failure(page, error, notify);
                 return;
             }
-            PageRead::Ready(bytes) => bytes,
         };
         let serve_started = Instant::now();
         let hash = self.hash(page, &bytes);
@@ -543,18 +534,12 @@ impl Session {
     ) {
         let page = id.page;
         let bytes = match source.bytes(page) {
-            PageRead::NotYet => {
-                thread::sleep(FILL_POLL);
-                self.playback_steps
-                    .push_front(PlaybackStep::Start { id, role });
-                return;
-            }
-            PageRead::Failed(_) => {
-                tracing::debug!(?id, "playback source failed");
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::debug!(?id, %error, "playback source failed");
                 self.fail_playback(id, notify);
                 return;
             }
-            PageRead::Ready(bytes) => bytes,
         };
         let Some(name) = source.name(page) else {
             self.fail_playback(id, notify);
@@ -783,14 +768,14 @@ fn run(
     mut session: Session,
     notify: &dyn Fn(Update),
 ) {
-    // An archive pass that settled before this thread started is still
-    // announced; a directory has no pass to announce.
-    let mut unpack_pending = source.unpacks();
+    if let Err(error) = source.wait_ready() {
+        notify(Update::Fatal(error.to_string()));
+        return;
+    }
+    if source.is_archive() {
+        notify(Update::Unpacked);
+    }
     loop {
-        if unpack_pending && !source.unpacking() {
-            unpack_pending = false;
-            notify(Update::Unpacked);
-        }
         while let Ok(message) = rx.try_recv() {
             if !session.apply(message) {
                 return;
@@ -967,7 +952,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
     };
     let info = BookInfo {
         names: opened.names().to_vec(),
-        unpacking: opened.unpacking(),
+        archive: opened.is_archive(),
     };
     if child_tx.send(ChildMsg::BookInfo(info)).is_err() {
         tracing::warn!("the parent left before the book info");
@@ -1187,10 +1172,8 @@ mod tests {
     /// The worker's content hash for one page of a directory source.
     fn page_hash(source: &Source, page: usize) -> u128 {
         match source.bytes(page) {
-            PageRead::Ready(bytes) => cache::content_hash(&bytes),
-            PageRead::NotYet | PageRead::Failed(_) => {
-                panic!("page {page} did not read")
-            }
+            Ok(bytes) => cache::content_hash(&bytes),
+            Err(error) => panic!("page {page} did not read: {error}"),
         }
     }
 
@@ -1388,6 +1371,33 @@ mod tests {
                     .then_some(())
             });
         }
+    }
+
+    #[test]
+    fn an_archive_materializes_before_serving() {
+        const SEVENZ_FIXTURE: &str = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/two_pages.7z"
+        );
+        let source = Arc::new(
+            Source::open(Path::new(SEVENZ_FIXTURE)).expect("7z opens"),
+        );
+        let root = TempDir::new("worker-archive-store");
+        let (events, notify) = Updates::new();
+        let worker = Worker::spawn_at(
+            Arc::clone(&source),
+            prefetch_for(0, 2),
+            root.path(),
+            notify,
+        )
+        .expect("worker spawns");
+
+        worker.set_requests(vec![request_thumb(0)]);
+        let thumb = events
+            .ready("the archive page never served", |page, role| {
+                page == 0 && is_thumb(role)
+            });
+        assert_eq!((thumb.width(), thumb.height()), (40, 30));
     }
 
     #[test]

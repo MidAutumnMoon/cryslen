@@ -37,7 +37,7 @@ pub use crate::fault::PageFault;
 #[non_exhaustive]
 pub struct BookInfo {
     pub names: Vec<String>,
-    pub unpacking: bool,
+    pub archive: bool,
 }
 
 /// Pixel storage for one image, one shared region per plane.
