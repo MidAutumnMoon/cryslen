@@ -208,7 +208,8 @@ pub struct App {
     timers: ui::Timers,
     /// Cursor position in viewport px, same as window px.
     cursor: (f32, f32),
-    dragging: bool,
+    /// Left button held on the page for panning.
+    panning: bool,
     /// Held modifier state; winit 0.30 key events carry none, only
     /// `ModifiersChanged` does.
     modifiers: ModifiersState,
@@ -241,7 +242,7 @@ impl App {
             reading,
             timers: ui::Timers::default(),
             cursor: (0.0, 0.0),
-            dragging: false,
+            panning: false,
             modifiers: ModifiersState::empty(),
             last_viewport: Viewport::default(),
             proxy,
@@ -460,9 +461,14 @@ impl App {
             let Some(gl) = self.gl.as_mut() else {
                 return Ok(());
             };
+            let panning = self.panning;
             let mut content = egui::Rect::NOTHING;
             gl.egui.run(gl.window.winit(), |ui| {
                 content = ui::show(ui, &status, show_bar);
+                // Set after the bar so a drag over it keeps the move icon.
+                if panning {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
+                }
             });
             content_viewport(
                 size,
@@ -1038,11 +1044,8 @@ impl ApplicationHandler<WakeEvent> for App {
                 post(&proxy.lock(), WakeEvent::Repaint(info.delay));
             });
         }
-        if window.translucent() {
-            egui.egui_ctx.all_styles_mut(|style| {
-                style.visuals.panel_fill = glass_fill();
-            });
-        }
+        let panel_fill = window.translucent().then(glass_fill);
+        apply_dark_theme(&egui.egui_ctx, panel_fill);
         window.winit().request_redraw();
         self.gl = Some(Gl {
             pages,
@@ -1199,7 +1202,7 @@ impl ApplicationHandler<WakeEvent> for App {
                 button: MouseButton::Left,
                 ..
             } => {
-                self.dragging =
+                self.panning =
                     *state == ElementState::Pressed && !egui_wants_pointer;
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -1208,7 +1211,7 @@ impl ApplicationHandler<WakeEvent> for App {
                     reason = "cursor positions are physical px, where f32 keeps subpixel precision"
                 )]
                 let cursor_pos = (position.x as f32, position.y as f32);
-                if self.dragging && !egui_wants_pointer {
+                if self.panning && !egui_wants_pointer {
                     let (total, viewport) = self.geometry();
                     let pan_delta = (
                         cursor_pos.0 - self.cursor.0,
@@ -1283,6 +1286,20 @@ fn glass_fill() -> egui::Color32 {
     )
 }
 
+/// A light desktop theme would otherwise pick dark status text over the
+/// dark window.
+fn apply_dark_theme(
+    egui_ctx: &egui::Context,
+    panel_fill: Option<egui::Color32>,
+) {
+    egui_ctx.set_theme(egui::Theme::Dark);
+    if let Some(fill) = panel_fill {
+        egui_ctx.global_style_mut(|style| {
+            style.visuals.panel_fill = fill;
+        });
+    }
+}
+
 /// One wheel notch zooms ~×1.16, three notches ~×1.6.
 const WHEEL_ZOOM_SENSITIVITY: f32 = 0.15;
 
@@ -1325,6 +1342,22 @@ mod tests {
         {
             assert!((channel - want).abs() < 1e-6, "{channel} vs {want}");
         }
+    }
+
+    #[test]
+    fn egui_stays_dark_when_the_desktop_is_light() {
+        let ctx = egui::Context::default();
+        apply_dark_theme(&ctx, Some(glass_fill()));
+        ctx.run_ui(
+            egui::RawInput {
+                system_theme: Some(egui::Theme::Light),
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .drop_without_applying_deltas();
+        assert_eq!(ctx.theme(), egui::Theme::Dark);
+        assert_eq!(ctx.global_style().visuals.panel_fill, glass_fill());
     }
 
     #[test]
