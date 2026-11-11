@@ -1,4 +1,4 @@
-//! Status bar and page interaction surface.
+//! Status bar, page interaction surface, and prompt rendering.
 
 use std::fmt;
 use std::iter;
@@ -221,6 +221,94 @@ pub fn show(
         ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
     }
     response
+}
+
+const PAGE_DIM_ALPHA: u8 = 150;
+const PROMPT_MARGIN: i8 = 28;
+const PROMPT_MIN_WIDTH: f32 = 480.0;
+const PROMPT_PREFIX_SIZE: f32 = 36.0;
+const PROMPT_VALUE_SIZE: f32 = 44.0;
+const PROMPT_PREFIX_GAP: f32 = 12.0;
+
+/// Draws the prompt over `page_rect`; callers pass the page surface, so
+/// the status bar stays outside the dim.
+pub fn page_jump(
+    ctx: &egui::Context,
+    page_rect: egui::Rect,
+    digits: &str,
+    page_count: usize,
+    digits_valid: bool,
+) {
+    // The prompt frame is Foreground; keep the dim one layer below it.
+    let dim_layer = egui::LayerId::new(
+        egui::Order::Middle,
+        egui::Id::unique("page-jump-dim"),
+    );
+    ctx.layer_painter(dim_layer)
+        .with_clip_rect(page_rect)
+        .rect_filled(
+            page_rect,
+            0.0,
+            egui::Color32::from_black_alpha(PAGE_DIM_ALPHA),
+        );
+
+    egui::Area::new(egui::Id::unique("page-jump"))
+        .order(egui::Order::Foreground)
+        .interactable(false)
+        .fade_in(false)
+        .fixed_pos(page_rect.center())
+        .pivot(egui::Align2::CENTER_CENTER)
+        .show(ctx, |ui| {
+            egui::Frame::popup(ui.style())
+                .inner_margin(egui::Margin::same(PROMPT_MARGIN))
+                .show(ui, |ui| {
+                    ui.set_min_width(PROMPT_MIN_WIDTH);
+                    ui.label(page_jump_text(
+                        ui.style(),
+                        digits,
+                        page_count,
+                        digits_valid,
+                    ));
+                });
+        });
+}
+
+fn page_jump_text(
+    style: &egui::Style,
+    digits: &str,
+    page_count: usize,
+    digits_valid: bool,
+) -> LayoutJob {
+    let value_color = if digits.is_empty() {
+        style.visuals.weak_text_color()
+    } else if digits_valid {
+        style.visuals.text_color()
+    } else {
+        style.visuals.error_fg_color
+    };
+    let value_text = if digits.is_empty() {
+        format!("1-{page_count}")
+    } else {
+        digits.to_owned()
+    };
+
+    let mut prefix_format = egui::TextFormat::simple(
+        egui::FontId::monospace(PROMPT_PREFIX_SIZE),
+        style.visuals.strong_text_color(),
+    );
+    prefix_format.valign = egui::Align::Center;
+
+    let mut job = LayoutJob::default();
+    job.append(":", 0.0, prefix_format);
+    job.append(
+        &value_text,
+        PROMPT_PREFIX_GAP,
+        egui::TextFormat::simple(
+            egui::FontId::monospace(PROMPT_VALUE_SIZE),
+            value_color,
+        ),
+    );
+    job
 }
 
 /// The mode group plus a showing toast to its left. The Sides right

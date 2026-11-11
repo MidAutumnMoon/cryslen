@@ -15,6 +15,7 @@ use std::time::Instant;
 use egui_winit::winit;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
+use winit::event::KeyEvent;
 use winit::event::StartCause;
 use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
@@ -22,6 +23,7 @@ use winit::event_loop::ControlFlow;
 use winit::event_loop::EventLoopProxy;
 use winit::keyboard::KeyCode;
 use winit::keyboard::ModifiersState;
+use winit::keyboard::PhysicalKey;
 use winit::window::WindowId;
 
 use crate::animation::DecodedEvent;
@@ -195,6 +197,14 @@ impl Reading {
     }
 }
 
+/// The 1-based page a digit buffer names, if it is within the book.
+fn page_number(digits: &str, page_count: usize) -> Option<usize> {
+    digits
+        .parse::<usize>()
+        .ok()
+        .filter(|page| (1..=page_count).contains(page))
+}
+
 pub struct App {
     /// The book and its lifecycle; it outlives a dead child until a switch
     /// lands.
@@ -209,6 +219,8 @@ pub struct App {
     /// Held modifier state; winit 0.30 key events carry none, only
     /// `ModifiersChanged` does.
     modifiers: ModifiersState,
+    /// Digits typed in `:` mode; `None` while the prompt is closed.
+    jump_digits: Option<String>,
     last_viewport: Viewport,
     /// Wakes the parked loop from egui, timed waits, and book readers,
     /// which all run outside the event loop's handlers.
@@ -238,6 +250,7 @@ impl App {
             reading,
             timers: ui::Timers::default(),
             modifiers: ModifiersState::empty(),
+            jump_digits: None,
             last_viewport: Viewport::default(),
             proxy,
         }
@@ -444,13 +457,26 @@ impl App {
         // pages are placed; `paint` later draws the bar above them.
         let page_surface = {
             let show_status_bar = !self.is_fullscreen();
+            let jump_digits = self.jump_digits.as_deref();
+            let digits_valid = jump_digits.is_some_and(|digits| {
+                page_number(digits, status.page_count).is_some()
+            });
             let Some(gl) = self.gl.as_mut() else {
                 return Ok(());
             };
             let mut page_surface = None;
             gl.egui.run(gl.window.winit(), |ui| {
-                page_surface =
-                    Some(ui::show(ui, &status, show_status_bar));
+                let page_response = ui::show(ui, &status, show_status_bar);
+                if let Some(digits) = jump_digits {
+                    ui::page_jump(
+                        ui.ctx(),
+                        page_response.rect,
+                        digits,
+                        status.page_count,
+                        digits_valid,
+                    );
+                }
+                page_surface = Some(page_response);
             });
             let Some(page_surface) = page_surface else {
                 return Ok(());
@@ -469,12 +495,14 @@ impl App {
             self.last_viewport = viewport;
             self.request_redraw();
         }
-        if apply_page_input(
-            &mut self.fit,
-            &page_surface,
-            spread_size,
-            viewport,
-        ) {
+        if self.jump_digits.is_none()
+            && apply_page_input(
+                &mut self.fit,
+                &page_surface,
+                spread_size,
+                viewport,
+            )
+        {
             self.request_redraw();
         }
         let drawn = self.fit.resolve(spread_size, viewport);
@@ -889,6 +917,7 @@ impl App {
                 let index = browse::first_spread();
                 self.reading =
                     Reading::start(&self.book, self.mode, index);
+                self.jump_digits = None;
                 self.fit.refit();
                 if let Some(gl) = self.gl.as_mut() {
                     gl.pages.clear_all();
@@ -953,6 +982,92 @@ impl App {
             let change = self.book.step(BookControl::Opened(opened));
             self.apply_book_change(change);
         }
+    }
+
+    fn on_jump_key(&mut self, key: &KeyEvent) {
+        if self.modifiers.control_key()
+            || self.modifiers.alt_key()
+            || self.modifiers.super_key()
+        {
+            return;
+        }
+
+        // Digits and Backspace repeat at the compositor's rate.
+        let digit = key.text.as_deref().and_then(|text| {
+            let [digit] = text.as_bytes() else {
+                return None;
+            };
+            digit.is_ascii_digit().then(|| char::from(*digit))
+        });
+        if let Some(digit) = digit {
+            if let Some(digits) = &mut self.jump_digits {
+                digits.push(digit);
+            }
+            self.request_redraw();
+            return;
+        }
+
+        let PhysicalKey::Code(code) = key.physical_key else {
+            return;
+        };
+        if code == KeyCode::Backspace {
+            if let Some(digits) = &mut self.jump_digits {
+                digits.pop();
+            }
+            self.request_redraw();
+            return;
+        }
+        if matches!(code, KeyCode::Enter | KeyCode::NumpadEnter) {
+            if key.repeat {
+                return;
+            }
+            let page_count = self.book.view().len().get();
+            let Some(digits) = self.jump_digits.take() else {
+                return;
+            };
+            if digits.is_empty() {
+                self.request_redraw();
+                return;
+            }
+            let page = page_number(&digits, page_count);
+            if let Some(page) = page {
+                self.jump_to_page(page);
+            } else {
+                self.jump_digits = Some(digits);
+            }
+            self.request_redraw();
+            return;
+        }
+        if code == KeyCode::Escape {
+            if key.repeat {
+                return;
+            }
+            self.jump_digits = None;
+            self.request_redraw();
+        }
+    }
+
+    fn jump_to_page(&mut self, page: usize) {
+        let Some(index) = page.checked_sub(1) else {
+            return;
+        };
+        let len = self.book.view().len();
+        let target_start = browse::spread_for(index, self.mode, len).first;
+        let current_start = browse::spread_for(
+            self.reading.position.target(),
+            self.mode,
+            len,
+        )
+        .first;
+        if target_start == current_start {
+            return;
+        }
+        self.reading.position.set_target(target_start);
+        self.after_page_change(if target_start > current_start {
+            Direction::Forward
+        } else {
+            Direction::Backward
+        });
     }
 
     fn set_view(&self) {
@@ -1087,7 +1202,6 @@ impl ApplicationHandler<WakeEvent> for App {
     ) {
         use winit::event::ElementState;
         use winit::event::WindowEvent;
-        use winit::keyboard::PhysicalKey;
 
         if matches!(
             event,
@@ -1106,6 +1220,8 @@ impl ApplicationHandler<WakeEvent> for App {
                 gl.window.winit().request_redraw();
             }
         }
+        let egui_wants_keyboard =
+            gl.egui.egui_ctx.egui_wants_keyboard_input();
 
         match &event {
             WindowEvent::Resized(_) => {
@@ -1116,16 +1232,29 @@ impl ApplicationHandler<WakeEvent> for App {
                 self.modifiers = modifiers.state();
             }
             WindowEvent::KeyboardInput { event: key, .. } => {
-                let PhysicalKey::Code(code) = key.physical_key else {
-                    return;
-                };
                 match key.state {
-                    ElementState::Pressed
-                        if !gl
-                            .egui
-                            .egui_ctx
-                            .egui_wants_keyboard_input() =>
-                    {
+                    ElementState::Pressed => {
+                        if self.jump_digits.is_some() {
+                            self.on_jump_key(key);
+                            return;
+                        }
+                        if egui_wants_keyboard {
+                            return;
+                        }
+                        if !key.repeat
+                            && !self.modifiers.control_key()
+                            && !self.modifiers.alt_key()
+                            && !self.modifiers.super_key()
+                            && key.text.as_deref() == Some(":")
+                        {
+                            self.jump_digits = Some(String::new());
+                            self.request_redraw();
+                            return;
+                        }
+                        let PhysicalKey::Code(code) = key.physical_key
+                        else {
+                            return;
+                        };
                         let Some(action) =
                             Action::from_key(code, self.modifiers)
                         else {
@@ -1141,10 +1270,13 @@ impl ApplicationHandler<WakeEvent> for App {
                         self.dispatch(action, event_loop);
                     }
                     ElementState::Released => {
+                        let PhysicalKey::Code(code) = key.physical_key
+                        else {
+                            return;
+                        };
                         self.reading.held_keys.release(code);
                         self.sync_motion();
                     }
-                    ElementState::Pressed => {}
                 }
             }
             WindowEvent::Focused(false) => {
