@@ -40,10 +40,15 @@ Proper CLI handling later.
 |-|
 |Mode indicators|
 
+|![cryslen page jump popup](assets/screenshot-2026-11/page-jump-popup.avif)|
+|-|
+|The `:` page jump popup. Background is dimmed.|
+
 ## Shortcuts
 
 - `←/→` switch pages
 - `space`/`shift+space` forward/backward by reading order
+- `:` brings up a popup for typing page number to jump to (like vim)
 - `home`/`end` first/last spread
 - `n`/`m`/`c` normal, manga, comic mode (first letter of each mode)
 - `f` toggle fullscreen
