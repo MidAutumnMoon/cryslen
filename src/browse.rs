@@ -127,7 +127,10 @@ pub enum Motion {
 
 /// A page image: a thumb for skims, a fit image for settled reading, or
 /// the page's own pixels for zoom. Only the first two enter the store.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize,
+)]
+#[repr(usize)]
 pub enum Role {
     Thumb,
     Fit,
@@ -135,6 +138,17 @@ pub enum Role {
 }
 
 impl Role {
+    pub const COUNT: usize = 3;
+    /// Ascending size; array storage keyed by [`Self::index`] follows this
+    /// order.
+    pub const ALL: [Self; Self::COUNT] = [Self::Thumb, Self::Fit, Self::Full];
+
+    /// Slot index for role-keyed arrays.
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self as usize
+    }
+
     /// The role's stable name. The store keeps `thumb` and `view` for
     /// existing entries; full images bypass the store.
     #[must_use]
@@ -147,63 +161,75 @@ impl Role {
     }
 }
 
+#[expect(
+    clippy::indexing_slicing,
+    reason = "the loop bound keeps the index in range"
+)]
+const _: () = {
+    let mut index = 0;
+    while index < Role::COUNT {
+        assert!(
+            Role::ALL[index].index() == index,
+            "Role::ALL order must match Role::index"
+        );
+        index += 1;
+    }
+};
+
 /// The roles present for one page.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Roles {
-    thumb: bool,
-    fit: bool,
-    full: bool,
+    present: [bool; Role::COUNT],
 }
 
 impl Roles {
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "Role::index is bounded by Role::COUNT"
+    )]
+    fn slot(self, role: Role) -> bool {
+        self.present[role.index()]
+    }
+
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "Role::index is bounded by Role::COUNT"
+    )]
+    fn slot_mut(&mut self, role: Role) -> &mut bool {
+        &mut self.present[role.index()]
+    }
+
     pub fn set(&mut self, role: Role) {
-        match role {
-            Role::Thumb => self.thumb = true,
-            Role::Fit => self.fit = true,
-            Role::Full => self.full = true,
-        }
+        *self.slot_mut(role) = true;
     }
 
     pub fn clear(&mut self, role: Role) {
-        match role {
-            Role::Thumb => self.thumb = false,
-            Role::Fit => self.fit = false,
-            Role::Full => self.full = false,
-        }
+        *self.slot_mut(role) = false;
     }
 
     #[must_use]
     pub fn contains(self, role: Role) -> bool {
-        match role {
-            Role::Thumb => self.thumb,
-            Role::Fit => self.fit,
-            Role::Full => self.full,
-        }
+        self.slot(role)
     }
 
     #[must_use]
     pub fn any(self) -> bool {
-        self.thumb || self.fit || self.full
+        self.present.iter().any(|present| *present)
     }
 
     /// A fit or full image can fill a still seat.
     #[must_use]
     pub fn has_settled_image(self) -> bool {
-        self.fit || self.full
+        self.contains(Role::Fit) || self.contains(Role::Full)
     }
 
     /// The largest role present: full, then fit, then thumb.
     #[must_use]
     pub fn best(self) -> Option<Role> {
-        if self.full {
-            Some(Role::Full)
-        } else if self.fit {
-            Some(Role::Fit)
-        } else if self.thumb {
-            Some(Role::Thumb)
-        } else {
-            None
-        }
+        Role::ALL
+            .into_iter()
+            .rev()
+            .find(|role| self.contains(*role))
     }
 }
 

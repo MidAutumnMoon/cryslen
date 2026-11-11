@@ -1,11 +1,5 @@
-//! GL rendering: the window, its EGL context and surface, and the page
-//! quad renderer.
-//!
-//! GL is used from the main thread only and `Window` makes the context
-//! current once, so the `# Safety` docs below presuppose a current context.
-//! vsync is `DontWait`, so the app presents with `pre_present_and_swap()`.
-//! Texture-creation failure panics; recovery is deliberately not built
-//! because an `egui_glow` unwrap can panic anyway.
+//! GL rendering: window, EGL surface, and the page quad. GL runs on the
+//! main thread with the context current. Texture-creation failure panics.
 
 use core::num::NonZeroU32;
 use std::collections::HashMap;
@@ -32,6 +26,7 @@ use crate::decode::Pixels;
 use crate::decode::Plane;
 use crate::decode::Subsampling;
 use crate::decode::Transfer;
+use crate::decode::YuvImage;
 use crate::fault::TextureError;
 use crate::fault::TextureFault;
 use crate::browse::Role;
@@ -49,57 +44,60 @@ macro_rules! shader_variants {
     };
 }
 
-// Fixed -1..1 strip. The VS places it at the seat's screen rect from
-// uniforms, so pan/zoom never touch vertex data. Top-origin math lives in
-// the VS, because GL clip space is bottom-origin while winit coords are
-// top-origin.
+// The quad is a fixed -1..1 strip generated from gl_VertexID; uniforms
+// place it at the seat rect. Clip space is bottom-origin; winit coords
+// are top-origin.
 shader_variants!(
     VS_CORE,
     VS_ES,
     "#version 330 core\n",
     "#version 300 es\n",
     "
-    in vec2 pos;
-    uniform vec2 u_win;    // window size, px
-    uniform vec2 u_offset; // seat rect origin, screen px
-    uniform vec2 u_size;   // seat rect size, screen px
-    out vec2 v_px;
+    uniform vec2 u_window_size; // window size, px
+    uniform vec2 u_seat_offset; // seat rect origin, screen px
+    uniform vec2 u_seat_size;   // seat rect size, screen px
+    out vec2 v_screen_px;
     void main() {
-        vec2 px = u_offset + (pos * 0.5 + 0.5) * u_size;
-        v_px = px;
-        gl_Position = vec4(px.x / u_win.x * 2.0 - 1.0, 1.0 - px.y / u_win.y * 2.0, 0.0, 1.0);
+        vec2 corner = vec2(float(gl_VertexID & 1), float(gl_VertexID >> 1));
+        vec2 pos = corner * 2.0 - 1.0;
+        vec2 screen_px = u_seat_offset + (pos * 0.5 + 0.5) * u_seat_size;
+        v_screen_px = screen_px;
+        gl_Position = vec4(screen_px.x / u_window_size.x * 2.0 - 1.0,
+                           1.0 - screen_px.y / u_window_size.y * 2.0,
+                           0.0, 1.0);
     }"
 );
 
 // highp is required: mediump may be fp16, where the ulp at 16k image px is
 // 8.0 and wrecks the coordinate math. ES3 mandates highp support. The
-// samplers declare highp too, because ES defaults them to lowp and strict
-// hardware quantizes >8-bit samples to ~8 bits through the return path.
+// samplers declare highp too because ES defaults them to lowp.
 //
-// One shader covers both pixel layouts and both transfers. Per-draw
-// constants are folded CPU-side into `u_lmap`/`u_cmap`, `u_mat`, `u_off`,
-// and `u_norm`, leaving one matrix multiply and one subtract per
-// fragment. Output is premultiplied.
+// Per-draw constants are folded CPU-side; output is premultiplied.
 shader_variants!(
     FS_CORE,
     FS_ES,
     "#version 330 core\n",
     "#version 300 es\nprecision highp float;\nprecision highp sampler2D;\n",
     "
-    in vec2 v_px;
+    in vec2 v_screen_px;
     out vec4 color;
-    uniform vec2 u_offset;   // page rect origin, screen px
-    uniform vec2 u_lmap;     // screen px -> page fraction: 1 / (scale * page size)
-    uniform vec2 u_cmap;     // screen px -> chroma-page fraction, subsample-aware
-    uniform mat3 u_mat;      // storage samples -> gamma RGB
-    uniform vec3 u_off;      // u_mat times the quantization anchors
-    uniform float u_norm;    // depth normalize of the alpha sample; 1.0 for 8-bit storage
-    uniform int u_mode;      // 0 = RGBA, 1 = YUV
-    uniform int u_transfer;  // 0 = sRGB passthrough, 1 = PQ tone-mapped to SDR
-    uniform sampler2D u_tex0; // RGBA or luma
-    uniform sampler2D u_tex1; // Cb (1x1 midpoint for mono)
-    uniform sampler2D u_tex2; // Cr
-    uniform sampler2D u_tex3; // alpha (1x1 opaque when the page carries none)
+    uniform vec2 u_seat_offset;   // page rect origin, screen px
+    uniform vec2 u_page_uv_per_pixel;   // screen px -> page fraction: 1 / (scale * page size)
+    uniform vec2 u_chroma_uv_per_pixel; // screen px -> chroma-page fraction, subsample-aware
+    uniform mat3 u_color_matrix;  // storage samples -> gamma RGB
+    uniform vec3 u_color_offset;  // u_color_matrix times the quantization anchors
+    uniform float u_alpha_normalization; // depth normalize of the alpha sample; 1.0 for 8-bit storage
+    uniform int u_pixel_layout;   // PIXEL_LAYOUT_RGBA or PIXEL_LAYOUT_YUV
+    uniform int u_transfer_code;  // TRANSFER_SRGB or TRANSFER_PQ
+    uniform int u_dither;         // 0 = 8-bit source, 1 = deep source
+    uniform sampler2D u_rgba_or_luma;
+    uniform sampler2D u_cb;
+    uniform sampler2D u_cr;
+    uniform sampler2D u_alpha;
+    const int PIXEL_LAYOUT_RGBA = 0;
+    const int PIXEL_LAYOUT_YUV = 1;
+    const int TRANSFER_SRGB = 0;
+    const int TRANSFER_PQ = 1;
     // ST 2084 constants.
     const float PQ_M1 = 2610.0 / 16384.0;
     const float PQ_M2 = 2523.0 / 4096.0 * 128.0;
@@ -110,109 +108,168 @@ shader_variants!(
     // brighter highlights clip, the fixed HDR->SDR compromise.
     const float PQ_DIFFUSE_WHITE = 203.0;
     const float PQ_PEAK = 10000.0;
-    vec3 display(vec3 x) {
-        if (u_transfer == 0) {
-            return x;
+    const float OUTPUT_MAX = 255.0;
+    vec3 to_srgb(vec3 rgb) {
+        if (u_transfer_code == TRANSFER_SRGB) {
+            return rgb;
         }
-        vec3 p = pow(clamp(x, 0.0, 1.0), vec3(1.0 / PQ_M2));
-        vec3 lum = PQ_PEAK * pow(max(p - PQ_C1, 0.0) / (PQ_C2 - PQ_C3 * p), vec3(1.0 / PQ_M1));
-        vec3 sdr = clamp(lum / PQ_DIFFUSE_WHITE, 0.0, 1.0);
-        // Linear light to the sRGB curve: the 12.92 slope below the
-        // 0.0031308 threshold, else 1.055 * s^(1/2.4) - 0.055.
-        return mix(sdr * 12.92, 1.055 * pow(sdr, vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), sdr));
+        vec3 pq_scaled = pow(clamp(rgb, 0.0, 1.0), vec3(1.0 / PQ_M2));
+        vec3 luminance = PQ_PEAK * pow(max(pq_scaled - PQ_C1, 0.0) / (PQ_C2 - PQ_C3 * pq_scaled), vec3(1.0 / PQ_M1));
+        vec3 sdr_linear = clamp(luminance / PQ_DIFFUSE_WHITE, 0.0, 1.0);
+        // Linear light to the sRGB transfer curve.
+        return mix(sdr_linear * 12.92, 1.055 * pow(sdr_linear, vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), sdr_linear));
     }
-    float bayer4(vec2 frag) {
-        float tiles[16] = float[16](
+    float bayer4(vec2 fragment_px) {
+        float thresholds[16] = float[16](
             0.0, 8.0, 2.0, 10.0,
             12.0, 4.0, 14.0, 6.0,
             3.0, 11.0, 1.0, 9.0,
             15.0, 7.0, 13.0, 5.0
         );
-        return tiles[int(mod(frag.x, 4.0)) + 4 * int(mod(frag.y, 4.0))] / 16.0;
+        return thresholds[int(mod(fragment_px.x, 4.0)) + 4 * int(mod(fragment_px.y, 4.0))] / 16.0;
     }
     void main() {
         // Fragment centers land on texel centers at 1:1 zoom with
-        // whole-pixel origins (px = k + 0.5), so the linear maps already
-        // address texel centers with no half-texel offset.
-        vec2 rel = v_px - u_offset;
-        // Ordered dither at half an output quantum, applied to the
-        // straight color, hides the deep->8-bit contouring of gradients.
-        float dither = (bayer4(gl_FragCoord.xy) - 0.5) / 255.0;
-        if (u_mode == 0) {
-            vec4 px = texture(u_tex0, rel * u_lmap);
-            color = vec4((display(px.rgb) + dither) * px.a, px.a);
+        // whole-pixel origins.
+        vec2 page_px = v_screen_px - u_seat_offset;
+        // Dither the straight color at half an output quantum; an 8-bit
+        // source has nothing to hide.
+        float dither_offset = 0.0;
+        if (u_dither != 0) {
+            dither_offset = (bayer4(gl_FragCoord.xy) - 0.5) / OUTPUT_MAX;
+        }
+        if (u_pixel_layout == PIXEL_LAYOUT_RGBA) {
+            vec4 rgba_texel = texture(u_rgba_or_luma, page_px * u_page_uv_per_pixel);
+            color = vec4((to_srgb(rgba_texel.rgb) + dither_offset) * rgba_texel.a, rgba_texel.a);
             return;
         }
-        vec3 yuv = vec3(texture(u_tex0, rel * u_lmap).r,
-                        texture(u_tex1, rel * u_cmap).r,
-                        texture(u_tex2, rel * u_cmap).r);
-        float a = texture(u_tex3, rel * u_lmap).r * u_norm;
-        color = vec4((display(u_mat * yuv - u_off) + dither) * a, a);
+        vec3 yuv_samples = vec3(
+            texture(u_rgba_or_luma, page_px * u_page_uv_per_pixel).r,
+            texture(u_cb, page_px * u_chroma_uv_per_pixel).r,
+            texture(u_cr, page_px * u_chroma_uv_per_pixel).r);
+        float alpha = texture(u_alpha, page_px * u_page_uv_per_pixel).r * u_alpha_normalization;
+        color = vec4((to_srgb(u_color_matrix * yuv_samples - u_color_offset) + dither_offset) * alpha, alpha);
     }"
 );
 
-/// A seat rect spanning the page maps to a UV extent of 1. Page dims
-/// are whole pixels, so only float rounding can move that extent.
+/// Seat rect and page UV agree within float rounding; page dims are
+/// whole pixels.
 const SEAT_UV_TOLERANCE: f32 = 1e-3;
 
-/// Page-keyed texture cache plus the spread draw. Seat binding is the
-/// app's fact; a seat draws the largest size present.
+/// Page-keyed texture cache and spread draw; a seat draws its largest
+/// resident role.
 pub struct PageTextures {
     gl: Arc<glow::Context>,
     pipeline: Pipeline,
-    entries: HashMap<(usize, Role), TextureEntry>,
+    pages: HashMap<usize, [Option<PageTexture>; Role::COUNT]>,
     max_texture_edge: u32,
 }
 
-struct Locations {
-    win: <glow::Context as glow::HasContext>::UniformLocation,
-    offset: <glow::Context as glow::HasContext>::UniformLocation,
-    size: <glow::Context as glow::HasContext>::UniformLocation,
-    lmap: <glow::Context as glow::HasContext>::UniformLocation,
-    cmap: <glow::Context as glow::HasContext>::UniformLocation,
-    mat: <glow::Context as glow::HasContext>::UniformLocation,
-    off: <glow::Context as glow::HasContext>::UniformLocation,
-    norm: <glow::Context as glow::HasContext>::UniformLocation,
-    mode: <glow::Context as glow::HasContext>::UniformLocation,
-    transfer: <glow::Context as glow::HasContext>::UniformLocation,
+struct UniformLocations {
+    window_size: <glow::Context as glow::HasContext>::UniformLocation,
+    seat_offset: <glow::Context as glow::HasContext>::UniformLocation,
+    seat_size: <glow::Context as glow::HasContext>::UniformLocation,
+    page_uv_per_pixel: <glow::Context as glow::HasContext>::UniformLocation,
+    chroma_uv_per_pixel: <glow::Context as glow::HasContext>::UniformLocation,
+    color_matrix: <glow::Context as glow::HasContext>::UniformLocation,
+    color_offset: <glow::Context as glow::HasContext>::UniformLocation,
+    alpha_normalization: <glow::Context as glow::HasContext>::UniformLocation,
+    pixel_layout: <glow::Context as glow::HasContext>::UniformLocation,
+    transfer_code: <glow::Context as glow::HasContext>::UniformLocation,
+    dither: <glow::Context as glow::HasContext>::UniformLocation,
 }
 
-/// One cached page's GPU state, freed by [`PageTextures::retain`] and on
-/// drop.
-enum TextureEntry {
+/// One cached role's GPU state.
+struct PageTexture {
+    /// Screen px -> page fraction, before the zoom-scale divide.
+    page_uv_per_pixel: (f32, f32),
+    transfer: Transfer,
+    needs_dither: bool,
+    layout: PixelLayout,
+}
+
+enum PixelLayout {
     Rgba {
         texture: <glow::Context as glow::HasContext>::Texture,
         dims: (u32, u32),
-        /// Screen px -> page fraction, before the zoom-scale divide.
-        lmap_base: (f32, f32),
-        transfer: Transfer,
     },
-    /// Luma + Cb + Cr + alpha plane textures.
     Yuv {
         luma: <glow::Context as glow::HasContext>::Texture,
         cb: <glow::Context as glow::HasContext>::Texture,
         cr: <glow::Context as glow::HasContext>::Texture,
         alpha: <glow::Context as glow::HasContext>::Texture,
-        /// Screen px -> page fraction, before the zoom-scale divide.
-        lmap_base: (f32, f32),
         /// Screen px -> chroma-page fraction, subsample-folded.
-        cmap_base: (f32, f32),
-        conversion: Conversion,
-        /// Depth-normalize factor for the alpha sample (1.0 for 8-bit
-        /// storage).
-        norm: f32,
-        transfer: Transfer,
+        chroma_uv_per_pixel: (f32, f32),
+        color_conversion: ColorConversion,
+        /// Storage-sample normalization for the alpha plane.
+        alpha_normalization: f32,
     },
 }
 
-/// One page's storage-sample-to-RGB math, folded at upload:
-/// `rgb = matrix * samples - offset`, with `samples` in 0..1 storage
-/// units (R16 samplers already divide by 65535).
+impl PixelLayout {
+    #[expect(
+        clippy::rest_pattern_accessible_field,
+        reason = "the code depends only on the variant"
+    )]
+    fn shader_code(&self) -> i32 {
+        match self {
+            Self::Rgba { .. } => PIXEL_LAYOUT_RGBA,
+            Self::Yuv { .. } => PIXEL_LAYOUT_YUV,
+        }
+    }
+}
+
+const PIXEL_LAYOUT_RGBA: i32 = 0;
+const PIXEL_LAYOUT_YUV: i32 = 1;
+
+/// Fold storage samples to gamma RGB at upload: `matrix * samples - offset`.
+/// Samples are 0..1 storage units; R16 sampling already divides by 65535.
 #[derive(Debug, Clone, Copy)]
-struct Conversion {
+struct ColorConversion {
     /// Column-major 3x3.
     matrix: [f32; 9],
     offset: [f32; 3],
+}
+
+#[expect(
+    clippy::indexing_slicing,
+    reason = "Role::index is bounded by Role::COUNT"
+)]
+fn role_slot(
+    slots: &[Option<PageTexture>; Role::COUNT],
+    role: Role,
+) -> Option<&PageTexture> {
+    slots[role.index()].as_ref()
+}
+
+#[expect(
+    clippy::indexing_slicing,
+    reason = "Role::index is bounded by Role::COUNT"
+)]
+fn role_slot_mut(
+    slots: &mut [Option<PageTexture>; Role::COUNT],
+    role: Role,
+) -> &mut Option<PageTexture> {
+    &mut slots[role.index()]
+}
+
+/// The largest resident role; slots are in ascending [`Role::ALL`] order.
+fn best_texture(
+    slots: &[Option<PageTexture>; Role::COUNT],
+) -> Option<&PageTexture> {
+    slots.iter().rev().find_map(Option::as_ref)
+}
+
+/// Refuse a page over `MAX_TEXTURE_SIZE` before upload; an oversized
+/// upload samples black.
+fn check_texture_dims(
+    dims: (u32, u32),
+    max_edge: u32,
+) -> Result<(), TextureError> {
+    if dims.0 == 0 || dims.1 == 0 || dims.0 > max_edge || dims.1 > max_edge {
+        return Err(ErrorUnion::new(TextureFault { dims, max_edge }));
+    }
+    Ok(())
 }
 
 impl PageTextures {
@@ -240,14 +297,12 @@ impl PageTextures {
         Ok(Self {
             gl,
             pipeline,
-            entries: HashMap::new(),
+            pages: HashMap::new(),
             max_texture_edge,
         })
     }
 
     /// Upload `image` as `page`'s `role`; no-op if present, never evicts.
-    /// A page over `MAX_TEXTURE_SIZE` would upload black, so it returns
-    /// the page's error instead.
     pub fn insert(
         &mut self,
         page: usize,
@@ -257,26 +312,23 @@ impl PageTextures {
         if self.has(page, role) {
             return Ok(());
         }
-        let (width, height) = (image.width(), image.height());
-        if width == 0
-            || height == 0
-            || width > self.max_texture_edge
-            || height > self.max_texture_edge
-        {
-            return Err(ErrorUnion::new(TextureFault {
-                dims: (width, height),
-                max_edge: self.max_texture_edge,
-            }));
-        }
+        let dims = (image.width(), image.height());
+        check_texture_dims(dims, self.max_texture_edge)?;
         // SAFETY: the size check above keeps the page inside this
-        // context's texture limit, and `upload_entry` asserts its own
-        // plane byte extents.
-        let entry = unsafe { upload_entry(&self.gl, image) };
-        self.entries.insert((page, role), entry);
+        // context's texture limit, and `upload_page_texture` asserts its
+        // own plane byte extents.
+        let texture = unsafe { upload_page_texture(&self.gl, image) };
+        // SAFETY: the context is current and the entry's names are live
+        // until the cache removes it.
+        unsafe {
+            label_entry(&self.gl, page, role, &texture);
+        }
+        *role_slot_mut(self.pages.entry(page).or_default(), role) =
+            Some(texture);
         Ok(())
     }
 
-    /// Keeps the `(page, role)` key, so draws and retention stay put.
+    /// Keeps the page's role slot.
     #[expect(
         clippy::rest_pattern_accessible_field,
         reason = "the update only reads the fields that decide reuse"
@@ -288,22 +340,18 @@ impl PageTextures {
         image: &Decoded,
     ) -> Result<(), TextureError> {
         let dims = (image.width(), image.height());
-        if dims.0 == 0
-            || dims.1 == 0
-            || dims.0 > self.max_texture_edge
-            || dims.1 > self.max_texture_edge
-        {
-            return Err(ErrorUnion::new(TextureFault {
-                dims,
-                max_edge: self.max_texture_edge,
-            }));
-        }
-        if let Some(TextureEntry::Rgba {
-            texture,
-            dims: present_dims,
+        check_texture_dims(dims, self.max_texture_edge)?;
+        if let Some(PageTexture {
+            layout: PixelLayout::Rgba {
+                texture,
+                dims: present_dims,
+            },
             transfer,
             ..
-        }) = self.entries.get(&(page, role))
+        }) = self
+            .pages
+            .get(&page)
+            .and_then(|slots| role_slot(slots, role))
         {
             if *present_dims == dims && *transfer == image.transfer() {
                 if let Pixels::Rgba8(bytes) = image.pixels() {
@@ -317,48 +365,66 @@ impl PageTextures {
                 }
             }
         }
-        if let Some(entry) = self.entries.remove(&(page, role)) {
-            // SAFETY: the entry left the map, so this is its only
-            // deletion.
-            unsafe {
-                delete_entry(&self.gl, &entry);
+        let empty = if let Some(slots) = self.pages.get_mut(&page) {
+            if let Some(texture) = role_slot_mut(slots, role).take() {
+                // SAFETY: the entry left the slots, so this is its only
+                // deletion.
+                unsafe {
+                    delete_entry(&self.gl, &texture);
+                }
             }
+            slots.iter().all(Option::is_none)
+        } else {
+            false
+        };
+        if empty {
+            self.pages.remove(&page);
         }
         self.insert(page, role, image)
     }
 
     pub fn roles(&self, page: usize) -> Roles {
+        let Some(slots) = self.pages.get(&page) else {
+            return Roles::default();
+        };
         let mut roles = Roles::default();
-        for role in [Role::Thumb, Role::Fit, Role::Full] {
-            if self.entries.contains_key(&(page, role)) {
+        for (slot, role) in slots.iter().zip(Role::ALL) {
+            if slot.is_some() {
                 roles.set(role);
             }
         }
         roles
     }
 
-    pub fn has(&self, page: usize, role: Role) -> bool {
-        self.entries.contains_key(&(page, role))
+    fn has(&self, page: usize, role: Role) -> bool {
+        self.pages
+            .get(&page)
+            .is_some_and(|slots| role_slot(slots, role).is_some())
     }
 
     pub fn has_any(&self, page: usize) -> bool {
-        self.roles(page).any()
+        self.pages.get(&page).is_some_and(|slots| {
+            slots.iter().any(Option::is_some)
+        })
     }
 
-    /// Drop every entry `keep` rejects, at every role, freeing its
-    /// textures.
+    /// Drop every texture whose page and role `keep` rejects.
     pub fn retain(&mut self, keep: impl Fn(usize, Role) -> bool) {
         let gl = &self.gl;
-        self.entries.retain(|&(page, role), entry| {
-            if keep(page, role) {
-                return true;
+        self.pages.retain(|&page, slots| {
+            for (slot, role) in slots.iter_mut().zip(Role::ALL) {
+                if slot.is_none() || keep(page, role) {
+                    continue;
+                }
+                if let Some(texture) = slot.take() {
+                    // SAFETY: the texture leaves the slots in this same
+                    // step, so this is its only deletion.
+                    unsafe {
+                        delete_entry(gl, &texture);
+                    }
+                }
             }
-            // SAFETY: the entry leaves the map in this same step, so this
-            // is its only deletion.
-            unsafe {
-                delete_entry(gl, entry);
-            }
-            false
+            slots.iter().any(Option::is_some)
         });
     }
 
@@ -366,26 +432,22 @@ impl PageTextures {
         self.retain(|_, _| false);
     }
 
-    /// Draw the shown spread, clipped to `viewport`; each seat draws
-    /// its page's largest resident texture. Does not clear the framebuffer.
-    #[expect(
-        clippy::rest_pattern_accessible_field,
-        reason = "the match only reads `lmap_base`; the texture fields are unrelated"
-    )]
+    /// Draw the shown spread, clipped to `viewport`; each seat draws its
+    /// largest resident role. Does not clear the framebuffer.
     pub fn draw(
         &self,
-        size: (u32, u32),
+        window_size: (u32, u32),
         viewport: Viewport,
-        layout: &SpreadLayout,
+        spread_layout: &SpreadLayout,
         seat_pages: [Option<usize>; 2],
         placement: &Placement,
     ) {
-        if size.0 == 0 || size.1 == 0 {
+        if window_size.0 == 0 || window_size.1 == 0 {
             return;
         }
         // SAFETY: the pipeline is Self's field, live until Drop.
         unsafe {
-            begin_frame(&self.gl, &self.pipeline, size);
+            begin_frame(&self.gl, &self.pipeline, window_size);
         }
         // GL scissor is bottom-origin and the viewport hugs the window's
         // top-left, so only the height converts.
@@ -404,42 +466,38 @@ impl PageTextures {
         unsafe {
             self.gl.scissor(
                 0,
-                gl_int(size.1.saturating_sub(height)),
+                gl_int(window_size.1.saturating_sub(height)),
                 gl_int(width),
                 gl_int(height),
             );
         }
-        for (rect, page) in layout.rects.iter().zip(seat_pages.iter()) {
+        for (rect, page) in spread_layout.rects.iter().zip(seat_pages.iter()) {
             let Some(rect) = rect else { continue };
             let Some(page) = page else { continue };
-            let Some(entry) = self
-                .roles(*page)
-                .best()
-                .and_then(|role| self.entries.get(&(*page, role)))
+            let Some(texture) = self.pages.get(page).and_then(best_texture)
             else {
                 continue;
             };
-            let lmap_base = match entry {
-                TextureEntry::Rgba { lmap_base, .. }
-                | TextureEntry::Yuv { lmap_base, .. } => *lmap_base,
-            };
+            let page_uv_per_pixel = texture.page_uv_per_pixel;
             // A seat rect is in page pixels; a texture's UV spans the page.
-            let uv_extent =
-                (rect.size.0 * lmap_base.0, rect.size.1 * lmap_base.1);
+            let uv_extent = (
+                rect.size.0 * page_uv_per_pixel.0,
+                rect.size.1 * page_uv_per_pixel.1,
+            );
             let aligned = (uv_extent.0 - 1.0).abs() <= SEAT_UV_TOLERANCE
                 && (uv_extent.1 - 1.0).abs() <= SEAT_UV_TOLERANCE;
             if !aligned {
                 tracing::debug!(
                     page = *page,
                     rect = ?rect.size,
-                    ?lmap_base,
+                    ?page_uv_per_pixel,
                     "seat layout disagrees with the texture's page dims"
                 );
             }
             debug_assert!(
                 aligned,
                 "seat rect and texture page dims disagree for page \
-                 {page}: rect {:?}, lmap {lmap_base:?}",
+                 {page}: rect {:?}, page uv {page_uv_per_pixel:?}",
                 rect.size
             );
             // Whole-pixel rect origin: at 1:1 zoom a fractional origin
@@ -461,12 +519,12 @@ impl PageTextures {
             if screen_size.0 <= 0.0 || screen_size.1 <= 0.0 {
                 continue;
             }
-            // SAFETY: &self pins the entry, so its texture names outlive the call.
+            // SAFETY: &self pins the texture, so its GL names outlive the call.
             unsafe {
                 draw_page(
                     &self.gl,
                     &self.pipeline,
-                    entry,
+                    texture,
                     screen_origin,
                     screen_size,
                     placement.scale,
@@ -516,19 +574,16 @@ unsafe fn compile_shader(
     Ok(shader)
 }
 
-/// The linked program and its fixed companions. The names are owned by
-/// [`PageTextures`] and deleted by its Drop.
+/// The linked program, cached uniform locations, and the empty VAO a
+/// core profile requires.
 struct Pipeline {
     program: <glow::Context as HasContext>::Program,
-    locations: Locations,
+    uniform_locations: UniformLocations,
     vao: <glow::Context as glow::HasContext>::VertexArray,
-    vbo: <glow::Context as HasContext>::Buffer,
 }
 
-/// Create the linked program with its cached uniform locations, the
-/// vertex buffer, and the VAO wiring. Both shaders are deleted once the
-/// link succeeds. Objects left behind by a failed step leak into the
-/// process-fatal error path (module policy).
+/// Create the linked program and empty VAO. Objects from a failed step
+/// leak into the process-fatal exit.
 ///
 /// # Safety
 ///
@@ -540,9 +595,6 @@ unsafe fn create_pipeline(
 ) -> eros::Result<Pipeline> {
     let program = gl.create_program().map_err(|error| {
         eros::error!("GL program object creation failed: {error}")
-    })?;
-    let vbo = gl.create_buffer().map_err(|error| {
-        eros::error!("GL buffer object creation failed: {error}")
     })?;
     let vao = gl.create_vertex_array().map_err(|error| {
         eros::error!("GL vertex array object creation failed: {error}")
@@ -562,25 +614,8 @@ unsafe fn create_pipeline(
     gl.delete_shader(vertex_shader);
     gl.delete_shader(fragment_shader);
 
-    gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
-    gl.buffer_data_u8_slice(
-        glow::ARRAY_BUFFER,
-        bytemuck::cast_slice(&[
-            -1.0_f32, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0,
-        ]),
-        glow::STATIC_DRAW,
-    );
-
+    // A core profile still requires a VAO.
     gl.bind_vertex_array(Some(vao));
-    #[expect(
-        clippy::expect_used,
-        reason = "declared and used in the in-tree shader sources, so a miss is an in-tree regression"
-    )]
-    let loc = gl
-        .get_attrib_location(program, "pos")
-        .expect("pos attribute in page shader");
-    gl.enable_vertex_attrib_array(loc);
-    gl.vertex_attrib_pointer_f32(loc, 2, glow::FLOAT, false, 8, 0);
 
     // Sampler units are fixed. Draw rebinds textures only. A silently
     // skipped sampler uniform would point every unit at 0, so a missing
@@ -595,31 +630,34 @@ unsafe fn create_pipeline(
             .expect("uniform location in page shader")
     };
     for (unit, name) in [
-        (0_i32, "u_tex0"),
-        (1, "u_tex1"),
-        (2, "u_tex2"),
-        (3, "u_tex3"),
+        (0_i32, "u_rgba_or_luma"),
+        (1, "u_cb"),
+        (2, "u_cr"),
+        (3, "u_alpha"),
     ] {
         gl.uniform_1_i32(Some(&location(name)), unit);
     }
-    let locations = Locations {
-        win: location("u_win"),
-        offset: location("u_offset"),
-        size: location("u_size"),
-        lmap: location("u_lmap"),
-        cmap: location("u_cmap"),
-        mat: location("u_mat"),
-        off: location("u_off"),
-        norm: location("u_norm"),
-        mode: location("u_mode"),
-        transfer: location("u_transfer"),
+    let uniform_locations = UniformLocations {
+        window_size: location("u_window_size"),
+        seat_offset: location("u_seat_offset"),
+        seat_size: location("u_seat_size"),
+        page_uv_per_pixel: location("u_page_uv_per_pixel"),
+        chroma_uv_per_pixel: location("u_chroma_uv_per_pixel"),
+        color_matrix: location("u_color_matrix"),
+        color_offset: location("u_color_offset"),
+        alpha_normalization: location("u_alpha_normalization"),
+        pixel_layout: location("u_pixel_layout"),
+        transfer_code: location("u_transfer_code"),
+        dither: location("u_dither"),
     };
+
+    label(gl, glow::PROGRAM, program.0.get(), "page program");
+    label(gl, glow::VERTEX_ARRAY, vao.0.get(), "page quad");
 
     Ok(Pipeline {
         program,
-        locations,
+        uniform_locations,
         vao,
-        vbo,
     })
 }
 
@@ -633,9 +671,9 @@ unsafe fn create_pipeline(
 unsafe fn begin_frame(
     gl: &glow::Context,
     pipeline: &Pipeline,
-    size: (u32, u32),
+    window_size: (u32, u32),
 ) {
-    gl.viewport(0, 0, gl_int(size.0), gl_int(size.1));
+    gl.viewport(0, 0, gl_int(window_size.0), gl_int(window_size.1));
     gl.enable(glow::BLEND);
     gl.blend_func_separate(
         glow::ONE,
@@ -645,107 +683,95 @@ unsafe fn begin_frame(
     );
     gl.use_program(Some(pipeline.program));
     gl.bind_vertex_array(Some(pipeline.vao));
-    let win = geometry::px_f32(size);
-    gl.uniform_2_f32(Some(&pipeline.locations.win), win.0, win.1);
+    let window_px = geometry::px_f32(window_size);
+    gl.uniform_2_f32(
+        Some(&pipeline.uniform_locations.window_size),
+        window_px.0,
+        window_px.1,
+    );
 }
 
-#[derive(Debug, Clone, Copy)]
-#[repr(i32)]
-enum ShaderMode {
-    Rgba = 0,
-    Yuv = 1,
-}
-
-/// Draw one seat's quad. The shader's `u_mode` branch guards the
-/// mode-specific uniforms, so each variant sets only its own.
+/// Draw one seat's quad. `u_pixel_layout` guards the layout-specific
+/// uniforms.
 ///
 /// # Safety
 ///
-/// The context must be current. `pipeline`'s names and `entry`'s texture
-/// names are live for the duration of the call.
+/// The context must be current. `pipeline`'s names and `page_texture`'s
+/// texture names are live for the duration of the call.
 #[expect(
     clippy::rest_pattern_accessible_field,
-    reason = "the draw only reads the fields each representation draws with"
+    reason = "the draw ignores the RGBA texture dims"
 )]
 unsafe fn draw_page(
     gl: &glow::Context,
     pipeline: &Pipeline,
-    entry: &TextureEntry,
+    page_texture: &PageTexture,
     screen_origin: (f32, f32),
     screen_size: (f32, f32),
     scale: f32,
 ) {
-    let locations = &pipeline.locations;
+    let locations = &pipeline.uniform_locations;
     gl.use_program(Some(pipeline.program));
     gl.uniform_2_f32(
-        Some(&locations.offset),
+        Some(&locations.seat_offset),
         screen_origin.0,
         screen_origin.1,
     );
-    gl.uniform_2_f32(Some(&locations.size), screen_size.0, screen_size.1);
+    gl.uniform_2_f32(
+        Some(&locations.seat_size),
+        screen_size.0,
+        screen_size.1,
+    );
+    gl.uniform_1_i32(
+        Some(&locations.pixel_layout),
+        page_texture.layout.shader_code(),
+    );
+    gl.uniform_1_i32(
+        Some(&locations.transfer_code),
+        transfer_code(page_texture.transfer),
+    );
+    gl.uniform_1_i32(
+        Some(&locations.dither),
+        i32::from(page_texture.needs_dither),
+    );
+    gl.uniform_2_f32(
+        Some(&locations.page_uv_per_pixel),
+        page_texture.page_uv_per_pixel.0 / scale,
+        page_texture.page_uv_per_pixel.1 / scale,
+    );
     gl.active_texture(glow::TEXTURE0);
-    match entry {
-        TextureEntry::Rgba {
-            texture,
-            lmap_base,
-            transfer,
-            ..
-        } => {
-            gl.uniform_1_i32(
-                Some(&locations.mode),
-                ShaderMode::Rgba as i32,
-            );
-            gl.uniform_1_i32(
-                Some(&locations.transfer),
-                transfer_id(*transfer),
-            );
-            gl.uniform_2_f32(
-                Some(&locations.lmap),
-                lmap_base.0 / scale,
-                lmap_base.1 / scale,
-            );
+    match &page_texture.layout {
+        PixelLayout::Rgba { texture, .. } => {
             gl.bind_texture(glow::TEXTURE_2D, Some(*texture));
         }
-        TextureEntry::Yuv {
+        PixelLayout::Yuv {
             luma,
             cb,
             cr,
             alpha,
-            lmap_base,
-            cmap_base,
-            conversion,
-            norm,
-            transfer,
+            chroma_uv_per_pixel,
+            color_conversion,
+            alpha_normalization,
         } => {
-            gl.uniform_1_i32(
-                Some(&locations.mode),
-                ShaderMode::Yuv as i32,
-            );
-            gl.uniform_1_i32(
-                Some(&locations.transfer),
-                transfer_id(*transfer),
-            );
             gl.uniform_2_f32(
-                Some(&locations.lmap),
-                lmap_base.0 / scale,
-                lmap_base.1 / scale,
+                Some(&locations.chroma_uv_per_pixel),
+                chroma_uv_per_pixel.0 / scale,
+                chroma_uv_per_pixel.1 / scale,
             );
-            gl.uniform_2_f32(
-                Some(&locations.cmap),
-                cmap_base.0 / scale,
-                cmap_base.1 / scale,
+            gl.uniform_1_f32(
+                Some(&locations.alpha_normalization),
+                *alpha_normalization,
             );
-            gl.uniform_1_f32(Some(&locations.norm), *norm);
             gl.uniform_matrix_3_f32_slice(
-                Some(&locations.mat),
+                Some(&locations.color_matrix),
                 false,
-                &conversion.matrix,
+                &color_conversion.matrix,
             );
             gl.uniform_3_f32(
-                Some(&locations.off),
-                conversion.offset[0],
-                conversion.offset[1],
-                conversion.offset[2],
+                Some(&locations.color_offset),
+                color_conversion.offset[0],
+                color_conversion.offset[1],
+                color_conversion.offset[2],
             );
             gl.bind_texture(glow::TEXTURE_2D, Some(*luma));
             gl.active_texture(glow::TEXTURE1);
@@ -765,7 +791,6 @@ unsafe fn draw_page(
 unsafe fn delete_pipeline(gl: &glow::Context, pipeline: &Pipeline) {
     gl.delete_program(pipeline.program);
     gl.delete_vertex_array(pipeline.vao);
-    gl.delete_buffer(pipeline.vbo);
 }
 
 /// # Safety
@@ -773,12 +798,12 @@ unsafe fn delete_pipeline(gl: &glow::Context, pipeline: &Pipeline) {
 /// The context must be current. The names are live and deleted at most once.
 #[expect(
     clippy::rest_pattern_accessible_field,
-    reason = "deletion touches the texture names only, so the folded draw state stays unnamed"
+    reason = "deletion touches the texture names only"
 )]
-unsafe fn delete_entry(gl: &glow::Context, entry: &TextureEntry) {
-    match entry {
-        TextureEntry::Rgba { texture, .. } => gl.delete_texture(*texture),
-        TextureEntry::Yuv {
+unsafe fn delete_entry(gl: &glow::Context, page_texture: &PageTexture) {
+    match &page_texture.layout {
+        PixelLayout::Rgba { texture, .. } => gl.delete_texture(*texture),
+        PixelLayout::Yuv {
             luma,
             cb,
             cr,
@@ -801,31 +826,107 @@ fn gl_int(value: u32) -> i32 {
     value as i32
 }
 
-#[derive(Clone, Copy)]
-enum Mag {
-    Sharp,
-    Smooth,
+/// Name one object when the driver exposes `KHR_debug`.
+///
+/// # Safety
+///
+/// The context must be current and `name` must be live.
+unsafe fn label(gl: &glow::Context, identifier: u32, name: u32, text: &str) {
+    if gl.supports_debug() {
+        gl.object_label(identifier, name, Some(text));
+    }
 }
 
-impl Mag {
-    fn gl(self) -> u32 {
-        match self {
-            Self::Sharp => glow::NEAREST,
-            Self::Smooth => glow::LINEAR,
+/// # Safety
+///
+/// The context must be current and the textures' names must be live.
+#[expect(
+    clippy::rest_pattern_accessible_field,
+    reason = "the labels read the texture names only"
+)]
+unsafe fn label_entry(
+    gl: &glow::Context,
+    page: usize,
+    role: Role,
+    page_texture: &PageTexture,
+) {
+    if !gl.supports_debug() {
+        return;
+    }
+    let role = role.name();
+    match &page_texture.layout {
+        PixelLayout::Rgba { texture, .. } => label(
+            gl,
+            glow::TEXTURE,
+            texture.0.get(),
+            &format!("page {page} {role} rgba"),
+        ),
+        PixelLayout::Yuv {
+            luma,
+            cb,
+            cr,
+            alpha,
+            ..
+        } => {
+            label(
+                gl,
+                glow::TEXTURE,
+                luma.0.get(),
+                &format!("page {page} {role} luma"),
+            );
+            label(
+                gl,
+                glow::TEXTURE,
+                cb.0.get(),
+                &format!("page {page} {role} cb"),
+            );
+            label(
+                gl,
+                glow::TEXTURE,
+                cr.0.get(),
+                &format!("page {page} {role} cr"),
+            );
+            label(
+                gl,
+                glow::TEXTURE,
+                alpha.0.get(),
+                &format!("page {page} {role} alpha"),
+            );
         }
     }
 }
 
-fn magnification(decoded: &Decoded) -> Mag {
-    if (decoded.width(), decoded.height()) == decoded.page_dims() {
-        Mag::Sharp
-    } else {
-        Mag::Smooth
+#[derive(Clone, Copy)]
+enum MagnificationFilter {
+    Nearest,
+    Linear,
+}
+
+impl MagnificationFilter {
+    fn gl_filter(self) -> u32 {
+        match self {
+            Self::Nearest => glow::NEAREST,
+            Self::Linear => glow::LINEAR,
+        }
     }
 }
 
-/// Texture with viewer defaults. CLAMP keeps edge texels from bleeding.
-/// `filterable` false (GLES R16) means NEAREST and no mips.
+fn magnification_filter(decoded: &Decoded) -> MagnificationFilter {
+    if (decoded.width(), decoded.height()) == decoded.page_dims() {
+        MagnificationFilter::Nearest
+    } else {
+        MagnificationFilter::Linear
+    }
+}
+
+/// Dither hides precision loss from a PQ or >8-bit source; 8-bit sRGB
+/// has none.
+fn needs_dither(transfer: Transfer, plane_depth: Option<u8>) -> bool {
+    transfer == Transfer::Pq
+        || plane_depth.is_some_and(|depth| depth > BYTE_DEPTH)
+}
+
+/// `filterable` false (GLES R16) forces NEAREST and no mips.
 ///
 /// # Safety
 ///
@@ -833,7 +934,7 @@ fn magnification(decoded: &Decoded) -> Mag {
 unsafe fn new_texture(
     gl: &glow::Context,
     filterable: bool,
-    mag: Mag,
+    magnification_filter: MagnificationFilter,
 ) -> <glow::Context as HasContext>::Texture {
     #[expect(
         clippy::expect_used,
@@ -851,21 +952,23 @@ unsafe fn new_texture(
         glow::TEXTURE_WRAP_T,
         gl_int(glow::CLAMP_TO_EDGE),
     );
-    let (min, mag) = if filterable {
-        // A fit view of a 50MP page minifies ~8x, where LINEAR-only shimmers.
-        (glow::LINEAR_MIPMAP_LINEAR, mag.gl())
+    let (min_filter, mag_filter) = if filterable {
+        (
+            glow::LINEAR_MIPMAP_LINEAR,
+            magnification_filter.gl_filter(),
+        )
     } else {
         (glow::NEAREST, glow::NEAREST)
     };
     gl.tex_parameter_i32(
         glow::TEXTURE_2D,
         glow::TEXTURE_MIN_FILTER,
-        gl_int(min),
+        gl_int(min_filter),
     );
     gl.tex_parameter_i32(
         glow::TEXTURE_2D,
         glow::TEXTURE_MAG_FILTER,
-        gl_int(mag),
+        gl_int(mag_filter),
     );
     texture
 }
@@ -878,9 +981,9 @@ unsafe fn upload_rgba(
     gl: &glow::Context,
     data: &[u8],
     dims: (u32, u32),
-    mag: Mag,
+    magnification_filter: MagnificationFilter,
 ) -> <glow::Context as HasContext>::Texture {
-    let texture = new_texture(gl, true, mag);
+    let texture = new_texture(gl, true, magnification_filter);
     gl.bind_texture(glow::TEXTURE_2D, Some(texture));
     gl.tex_image_2d(
         glow::TEXTURE_2D,
@@ -939,14 +1042,14 @@ unsafe fn upload_plane(
     dims: (u32, u32),
     wide: bool,
     filterable: bool,
-    mag: Mag,
+    magnification_filter: MagnificationFilter,
 ) -> <glow::Context as HasContext>::Texture {
     let (internal, ty) = if wide {
         (glow::R16, glow::UNSIGNED_SHORT)
     } else {
         (glow::R8, glow::UNSIGNED_BYTE)
     };
-    let texture = new_texture(gl, filterable, mag);
+    let texture = new_texture(gl, filterable, magnification_filter);
     gl.bind_texture(glow::TEXTURE_2D, Some(texture));
     // Odd row widths: GL's default 4-byte unpack alignment would desync
     // every row after the first.
@@ -976,8 +1079,12 @@ unsafe fn upload_plane(
     clippy::similar_names,
     reason = "Cb and Cr are the YUV plane names the two textures hold"
 )]
-unsafe fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> TextureEntry {
-    let mag = magnification(decoded);
+unsafe fn upload_page_texture(
+    gl: &glow::Context,
+    decoded: &Decoded,
+) -> PageTexture {
+    let magnification_filter = magnification_filter(decoded);
+    let page_uv_per_pixel = page_uv_per_pixel(decoded.page_dims());
     let (width, height) = (decoded.width(), decoded.height());
     match &decoded.pixels() {
         Pixels::Rgba8(rgba_bytes) => {
@@ -986,11 +1093,19 @@ unsafe fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> TextureEntry {
                 width as usize * height as usize * 4,
                 "rgba byte length"
             );
-            TextureEntry::Rgba {
-                texture: upload_rgba(gl, rgba_bytes, (width, height), mag),
-                dims: (width, height),
-                lmap_base: page_lmap(decoded),
+            PageTexture {
+                page_uv_per_pixel,
                 transfer: decoded.transfer(),
+                needs_dither: needs_dither(decoded.transfer(), None),
+                layout: PixelLayout::Rgba {
+                    texture: upload_rgba(
+                        gl,
+                        rgba_bytes,
+                        (width, height),
+                        magnification_filter,
+                    ),
+                    dims: (width, height),
+                },
             }
         }
         Pixels::Yuv(yuv) => {
@@ -1019,13 +1134,14 @@ unsafe fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> TextureEntry {
                 (luma_w, luma_h),
                 wide,
                 filterable,
-                mag,
+                magnification_filter,
             );
             let (cb_texture, cr_texture) =
                 if yuv.subsampling == Subsampling::Mono {
                     // 1x1 chroma at the neutral code, which the folded
                     // quantization anchor cancels exactly.
-                    let neutral = stub_plane(depth, 1_u32 << (depth - 1));
+                    let neutral =
+                        constant_plane(depth, 1_u32 << (depth - 1));
                     let neutral_bytes = plane_bytes(&neutral);
                     (
                         upload_plane(
@@ -1034,7 +1150,7 @@ unsafe fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> TextureEntry {
                             (1, 1),
                             wide,
                             filterable,
-                            Mag::Smooth,
+                            MagnificationFilter::Linear,
                         ),
                         upload_plane(
                             gl,
@@ -1042,7 +1158,7 @@ unsafe fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> TextureEntry {
                             (1, 1),
                             wide,
                             filterable,
-                            Mag::Smooth,
+                            MagnificationFilter::Linear,
                         ),
                     )
                 } else {
@@ -1065,7 +1181,7 @@ unsafe fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> TextureEntry {
                             (chroma_w, chroma_h),
                             wide,
                             filterable,
-                            Mag::Smooth,
+                            MagnificationFilter::Linear,
                         ),
                         upload_plane(
                             gl,
@@ -1073,21 +1189,23 @@ unsafe fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> TextureEntry {
                             (chroma_w, chroma_h),
                             wide,
                             filterable,
-                            Mag::Smooth,
+                            MagnificationFilter::Linear,
                         ),
                     )
                 };
             let alpha_texture = yuv.alpha.as_ref().map_or_else(
-                // 1x1 opaque: the max code, which `u_norm` maps to 1.0.
+                // 1x1 opaque: the max code, which the alpha normalization
+                // maps to 1.0.
                 || {
-                    let opaque = stub_plane(depth, (1_u32 << depth) - 1);
+                    let opaque =
+                        constant_plane(depth, (1_u32 << depth) - 1);
                     upload_plane(
                         gl,
                         plane_bytes(&opaque),
                         (1, 1),
                         wide,
                         filterable,
-                        Mag::Smooth,
+                        MagnificationFilter::Linear,
                     )
                 },
                 |alpha| {
@@ -1102,53 +1220,53 @@ unsafe fn upload_entry(gl: &glow::Context, decoded: &Decoded) -> TextureEntry {
                         (width, height),
                         wide,
                         filterable,
-                        Mag::Smooth,
+                        MagnificationFilter::Linear,
                     )
                 },
             );
-            TextureEntry::Yuv {
-                luma: luma_texture,
-                cb: cb_texture,
-                cr: cr_texture,
-                alpha: alpha_texture,
-                lmap_base: page_lmap(decoded),
-                cmap_base: page_cmap(decoded, yuv.subsampling),
-                conversion: page_conversion(decoded),
-                norm: depth_norm(depth, wide),
+            PageTexture {
+                page_uv_per_pixel,
                 transfer: decoded.transfer(),
+                needs_dither: needs_dither(
+                    decoded.transfer(),
+                    Some(depth),
+                ),
+                layout: PixelLayout::Yuv {
+                    luma: luma_texture,
+                    cb: cb_texture,
+                    cr: cr_texture,
+                    alpha: alpha_texture,
+                    chroma_uv_per_pixel: chroma_uv_per_pixel(
+                        decoded.page_dims(),
+                        yuv.subsampling,
+                    ),
+                    color_conversion: page_color_conversion(yuv, wide),
+                    alpha_normalization: depth_normalization(depth, wide),
+                },
             }
         }
     }
 }
 
-/// The maps an entry must carry: the page's dims, never the texture's.
-/// A preview covers the whole page at lower resolution, so its UV spans
-/// the page while the seat rect is laid out in page pixels.
-fn page_lmap(decoded: &Decoded) -> (f32, f32) {
-    lmap_base(decoded.page_dims())
+/// Page fractions per screen pixel before zoom. Use the page's dims; a
+/// preview covers the whole page at lower resolution.
+fn page_uv_per_pixel(page_dims: (u32, u32)) -> (f32, f32) {
+    let page_px = geometry::px_f32(page_dims);
+    (1.0 / page_px.0, 1.0 / page_px.1)
 }
 
-fn page_cmap(decoded: &Decoded, subsampling: Subsampling) -> (f32, f32) {
-    cmap_base(decoded.page_dims(), subsampling)
-}
-
-/// Page fractions per screen px, before the zoom-scale divide. `size` is
-/// the page's dims: a texture may be a smaller rendering, but its UV
-/// still spans the whole page.
-fn lmap_base(size: (u32, u32)) -> (f32, f32) {
-    let img = geometry::px_f32(size);
-    (1.0 / img.0, 1.0 / img.1)
-}
-
-fn cmap_base(size: (u32, u32), subsampling: Subsampling) -> (f32, f32) {
-    let (_, (chroma_w, chroma_h)) = plane_dims(size, subsampling);
-    let chroma = geometry::px_f32((chroma_w, chroma_h));
+fn chroma_uv_per_pixel(
+    page_dims: (u32, u32),
+    subsampling: Subsampling,
+) -> (f32, f32) {
+    let (_, (chroma_w, chroma_h)) = plane_dims(page_dims, subsampling);
+    let chroma_px = geometry::px_f32((chroma_w, chroma_h));
     let ratio = subsampling.chroma_ratio();
-    (ratio.0 / chroma.0, ratio.1 / chroma.1)
+    (ratio.0 / chroma_px.0, ratio.1 / chroma_px.1)
 }
 
-fn stub_plane(depth: u8, code: u32) -> Plane {
-    if depth > 8 {
+fn constant_plane(depth: u8, code: u32) -> Plane {
+    if depth > BYTE_DEPTH {
         #[expect(
             clippy::cast_possible_truncation,
             reason = "callers pass a depth clamped to 16, so the code fits u16"
@@ -1165,21 +1283,24 @@ fn stub_plane(depth: u8, code: u32) -> Plane {
     }
 }
 
-fn transfer_id(transfer: Transfer) -> i32 {
+const TRANSFER_SRGB: i32 = 0;
+const TRANSFER_PQ: i32 = 1;
+
+fn transfer_code(transfer: Transfer) -> i32 {
     match transfer {
-        Transfer::Srgb => 0,
-        Transfer::Pq => 1,
+        Transfer::Srgb => TRANSFER_SRGB,
+        Transfer::Pq => TRANSFER_PQ,
     }
 }
 
-/// Normalizes R16 sampler output for U16-stored planes: sampling divides by
+/// Normalize R16 output for U16-stored planes: sampling divides by
 /// [`R16_STORAGE_MAX`] but only `depth` bits are significant. 1.0 for 8-bit
 /// storage.
 #[expect(
     clippy::cast_precision_loss,
     reason = "the depth mask 2^depth - 1 is at most 65535, exact in f32"
 )]
-fn depth_norm(depth: u8, wide: bool) -> f32 {
+fn depth_normalization(depth: u8, wide: bool) -> f32 {
     if !wide {
         return 1.0;
     }
@@ -1189,14 +1310,17 @@ fn depth_norm(depth: u8, wide: bool) -> f32 {
 }
 
 const R16_STORAGE_MAX: f32 = 65535.0;
+const R8_STORAGE_MAX: f32 = 255.0;
+
+/// 8-bit storage; wider planes use `R16` and need depth normalization.
+const BYTE_DEPTH: u8 = 8;
 
 const MIN_PLANE_DEPTH: u8 = 1;
 const MAX_PLANE_DEPTH: u8 = 16;
 
-/// One page's storage-code quantization: anchor codes, sample-to-RGB
-/// scales, and capacity. Limited range scales the BT studio swing by
-/// 2^(depth-8).
-struct Quantization {
+/// YUV storage-code quantization: anchor codes, sample-to-RGB scales,
+/// and capacity. Limited range scales the BT studio swing by 2^(depth-8).
+struct CodeQuantization {
     luma_black: f32,
     chroma_neutral: f32,
     luma_scale: f32,
@@ -1208,11 +1332,19 @@ struct Quantization {
     clippy::cast_precision_loss,
     reason = "codes and scales stay below 65536, exact in f32"
 )]
-fn quantization(depth: u8, full_range: bool) -> Quantization {
+fn code_quantization(
+    depth: u8,
+    full_range: bool,
+    wide: bool,
+) -> CodeQuantization {
     let max_code = (1_u32 << depth) - 1;
-    let storage_max = if depth > 8 { R16_STORAGE_MAX } else { 255.0 };
+    let storage_max = if wide {
+        R16_STORAGE_MAX
+    } else {
+        R8_STORAGE_MAX
+    };
     if full_range {
-        Quantization {
+        CodeQuantization {
             luma_black: 0.0,
             chroma_neutral: (1_u32 << (depth - 1)) as f32,
             luma_scale: 1.0,
@@ -1221,7 +1353,7 @@ fn quantization(depth: u8, full_range: bool) -> Quantization {
         }
     } else {
         let swing = u32::from(depth.saturating_sub(8));
-        Quantization {
+        CodeQuantization {
             luma_black: (16 << swing) as f32,
             chroma_neutral: (128 << swing) as f32,
             luma_scale: max_code as f32 / (219 << swing) as f32,
@@ -1231,33 +1363,26 @@ fn quantization(depth: u8, full_range: bool) -> Quantization {
     }
 }
 
-/// Fold the sample-to-RGB math at upload: the stored matrix maps
-/// storage-normalized samples through depth normalization, quantization,
-/// and the KR/KB matrix (or the GBR permutation); the offset is that
-/// matrix times the anchor codes.
-fn page_conversion(decoded: &Decoded) -> Conversion {
-    let Pixels::Yuv(yuv) = &decoded.pixels() else {
-        return Conversion {
-            matrix: IDENTITY3,
-            offset: [0.0; 3],
-        };
-    };
+/// Fold storage samples to gamma RGB: depth normalization, quantization,
+/// and the KR/KB matrix (or GBR permutation). The offset is the matrix
+/// times the anchor codes.
+fn page_color_conversion(yuv: &YuvImage, wide: bool) -> ColorConversion {
     let depth = yuv.depth.clamp(MIN_PLANE_DEPTH, MAX_PLANE_DEPTH);
-    let quantization = quantization(depth, yuv.full_range);
-    let norm = depth_norm(depth, depth > 8);
-    let (base, luma_scale, chroma_scale, luma_black, chroma_neutral) =
+    let quantization = code_quantization(depth, yuv.full_range, wide);
+    let normalization = depth_normalization(depth, wide);
+    let (base_matrix, luma_scale, chroma_scale, luma_black, chroma_neutral) =
         if yuv.matrix == Matrix::Identity {
             // H.273 identity planes are GBR in the (Y, Cb, Cr) slots,
             // quantized as luma on all three axes: permute into RGB and
             // anchor every axis at luma black. Mono identity repeats the
             // luma plane to RGB.
-            let base = if yuv.subsampling == Subsampling::Mono {
+            let base_matrix = if yuv.subsampling == Subsampling::Mono {
                 [1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
             } else {
                 [0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0]
             };
             (
-                base,
+                base_matrix,
                 quantization.luma_scale,
                 quantization.luma_scale,
                 quantization.luma_black,
@@ -1265,14 +1390,14 @@ fn page_conversion(decoded: &Decoded) -> Conversion {
             )
         } else {
             (
-                full_range_yuv_matrix(yuv.matrix),
+                yuv_to_rgb_matrix(yuv.matrix),
                 quantization.luma_scale,
                 quantization.chroma_scale,
                 quantization.luma_black,
                 quantization.chroma_neutral,
             )
         };
-    let mut matrix = base;
+    let mut matrix = base_matrix;
     for (column, matrix_column) in
         matrix.as_chunks_mut::<3>().0.iter_mut().enumerate()
     {
@@ -1280,7 +1405,7 @@ fn page_conversion(decoded: &Decoded) -> Conversion {
             luma_scale
         } else {
             chroma_scale
-        } * norm;
+        } * normalization;
         for cell in matrix_column {
             *cell *= scale;
         }
@@ -1298,17 +1423,17 @@ fn page_conversion(decoded: &Decoded) -> Conversion {
             *slot = cell.mul_add(anchor, *slot);
         }
     }
-    Conversion { matrix, offset }
+    ColorConversion { matrix, offset }
 }
 
-/// Full-range YUV→RGB from the exact KR/KB of each standard, stored
-/// column-major. KG = 1 - KR - KB. Identity pages never reach here;
-/// `page_conversion` routes them through the GBR permutation.
+/// Full-range YUV→RGB from the exact KR/KB of each standard.
+/// KG = 1 - KR - KB. Identity pages never reach here;
+/// `page_color_conversion` routes them through the GBR permutation.
 #[expect(
     clippy::similar_names,
     reason = "the green coefficients are the Cb and Cr terms of the BT matrix derivation"
 )]
-fn full_range_yuv_matrix(matrix: Matrix) -> [f32; 9] {
+fn yuv_to_rgb_matrix(matrix: Matrix) -> [f32; 9] {
     let (k_red, k_blue) = match matrix {
         Matrix::Bt601 => BT601_KR_KB,
         Matrix::Bt709 => BT709_KR_KB,
@@ -1335,8 +1460,6 @@ const BT601_KR_KB: (f32, f32) = (0.299, 0.114);
 const BT709_KR_KB: (f32, f32) = (0.2126, 0.0722);
 const BT2020_KR_KB: (f32, f32) = (0.2627, 0.0593);
 
-const IDENTITY3: [f32; 9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
-
 /// Window + EGL context + surface. vsync is `DontWait`, so the app must call
 /// `pre_present_and_swap()` to present.
 pub struct Window {
@@ -1344,9 +1467,8 @@ pub struct Window {
     gl: Arc<glow::Context>,
     surface: Surface<WindowSurface>,
     context: PossiblyCurrentContext,
-    /// True when the alpha-demanding EGL query matched. The fallback
-    /// config may still carry alpha bits, but the opaque hint and clear
-    /// make that invisible.
+    /// Alpha config matched. The fallback may still carry alpha bits; the
+    /// opaque hint and clear hide them.
     translucent: bool,
     /// Size the surface was last resized to. Creation counts as the
     /// first resize.
@@ -1384,9 +1506,8 @@ impl Window {
         let raw_display = event_loop.display_handle()?.as_raw();
         let gl_display =
             Display::new(raw_display, DisplayApiPreference::Egl)?;
-        // Prefer a config with alpha so the background can show the
-        // desktop through it. A machine with none runs fully opaque,
-        // a mode, not an error.
+        // Prefer a config with alpha so the desktop shows through; a machine
+        // without one runs opaque.
         let translucent_template =
             ConfigTemplateBuilder::new().with_alpha_size(8).build();
         let (gl_config, translucent) = if let Some(config) =
@@ -1414,9 +1535,8 @@ impl Window {
                 height: INITIAL_WINDOW_HEIGHT,
             })
             .with_title("cryslen")
-            // Without the transparent hint winit marks the whole surface
-            // opaque, so compositors may skip blending and background
-            // effects behind it even though the buffer has alpha.
+            // Without this hint winit marks the surface opaque even though the
+            // buffer has alpha.
             .with_transparent(translucent);
 
         let window =
@@ -1449,12 +1569,11 @@ impl Window {
         let surface = gl_display
             .create_window_surface(&gl_config, &surface_attrs)?;
         let context = not_current.make_current(&surface)?;
-        // Non-blocking present plus pre_present_and_swap's
-        // window.pre_present_notify() gives Wayland frame-callback pacing
-        // without a blocking eglSwapBuffers owning the event loop.
+        // Non-blocking present; `pre_present_and_swap` requests a Wayland
+        // frame callback.
         surface.set_swap_interval(&context, SwapInterval::DontWait)?;
 
-        let gl = Arc::new(glow::Context::from_loader_function(|symbol| {
+        let gl = glow::Context::from_loader_function(|symbol| {
             #[expect(
                 clippy::expect_used,
                 reason = "symbol names are static ASCII GL entry points, NUL-free by construction"
@@ -1462,7 +1581,33 @@ impl Window {
             let symbol = CString::new(symbol)
                 .expect("GL proc name without interior NUL");
             gl_display.get_proc_address(&symbol)
-        }));
+        });
+        #[cfg(debug_assertions)]
+        let mut gl = gl;
+        #[cfg(debug_assertions)]
+        if gl.supports_debug() {
+            // SAFETY: the context is current, and the callback only logs.
+            unsafe {
+                gl.debug_message_callback(|source, kind, id, severity, message| {
+                    if severity == glow::DEBUG_SEVERITY_NOTIFICATION {
+                        return;
+                    }
+                    tracing::debug!(
+                        source,
+                        kind,
+                        id,
+                        severity,
+                        message = message,
+                        "GL debug message"
+                    );
+                });
+            }
+            // SAFETY: the context is current and supports debug output.
+            unsafe {
+                gl.enable(glow::DEBUG_OUTPUT);
+            }
+        }
+        let gl = Arc::new(gl);
         Ok(Self {
             winit: window,
             gl,
@@ -1517,6 +1662,7 @@ const INITIAL_WINDOW_HEIGHT: f64 = 750.0;
 #[cfg(test)]
 #[expect(
     clippy::expect_used,
+    clippy::panic,
     reason = "a panic in test code is inconsequential"
 )]
 mod tests {
@@ -1525,10 +1671,9 @@ mod tests {
     use crate::decode::Transfer;
     use crate::decode::YuvImage;
 
-    // The GL draw path itself is out of reach headlessly. These tests pin
-    // the CPU-side values it consumes.
+    // GL needs a context; these tests pin the CPU-side values it consumes.
 
-    /// Row `row`, column `col` of the math matrix (storage is column-major).
+    /// Matrix element at (`row`, `col`); storage is column-major.
     #[expect(
         clippy::indexing_slicing,
         reason = "row and col are literal 0..3 coordinates into the fixed 3x3 matrix under test"
@@ -1582,8 +1727,18 @@ mod tests {
         .expect("yuv page")
     }
 
+    fn yuv_image(decoded: &Decoded) -> &YuvImage {
+        let Pixels::Yuv(yuv) = decoded.pixels() else {
+            panic!("test page must be YUV");
+        };
+        yuv
+    }
+
     /// The folded conversion through one row: `matrix * samples - offset`.
-    fn convert(conversion: &Conversion, samples: [f32; 3]) -> [f32; 3] {
+    fn convert(
+        conversion: &ColorConversion,
+        samples: [f32; 3],
+    ) -> [f32; 3] {
         let mut out = [0.0_f32; 3];
         for (row, slot) in out.iter_mut().enumerate() {
             #[expect(
@@ -1603,7 +1758,7 @@ mod tests {
 
     /// Code values of one depth's quantization (black, white, neutral) in
     /// code units, and the largest code the storage layout holds.
-    fn quantization_codes(
+    fn code_quantization_codes(
         depth: u8,
         full_range: bool,
     ) -> (f32, f32, f32, f32) {
@@ -1623,7 +1778,7 @@ mod tests {
     }
 
     #[test]
-    fn conversion_anchors_black_and_white_at_every_depth() {
+    fn color_conversion_anchors_black_and_white_at_every_depth() {
         for depth in [8_u8, 10, 12, 16] {
             for full_range in [true, false] {
                 let decoded = yuv_page(
@@ -1632,9 +1787,12 @@ mod tests {
                     full_range,
                     Matrix::Bt601,
                 );
-                let conversion = page_conversion(&decoded);
+                let conversion = page_color_conversion(
+                    yuv_image(&decoded),
+                    depth > BYTE_DEPTH,
+                );
                 let (black, white, neutral, storage_max) =
-                    quantization_codes(depth, full_range);
+                    code_quantization_codes(depth, full_range);
                 for (code, expected) in [(black, 0.0), (white, 1.0)] {
                     // Chroma at its neutral code contributes nothing.
                     let rgb = convert(
@@ -1658,12 +1816,15 @@ mod tests {
 
     #[test]
     fn identity_pages_permute_gbr() {
-        let color = page_conversion(&yuv_page(
-            8,
-            Subsampling::Yuv444,
-            true,
-            Matrix::Identity,
-        ));
+        let color = page_color_conversion(
+            yuv_image(&yuv_page(
+                8,
+                Subsampling::Yuv444,
+                true,
+                Matrix::Identity,
+            )),
+            false,
+        );
         // Column j is plane j's contribution: Y->G, U->B, V->R.
         for (col, row) in [(0, 1), (1, 2), (2, 0)] {
             for probe in 0..3 {
@@ -1678,12 +1839,15 @@ mod tests {
         // Full range anchors everything at black zero.
         assert_eq!(color.offset, [0.0; 3]);
 
-        let mono = page_conversion(&yuv_page(
-            10,
-            Subsampling::Mono,
+        let mono = page_color_conversion(
+            yuv_image(&yuv_page(
+                10,
+                Subsampling::Mono,
+                true,
+                Matrix::Identity,
+            )),
             true,
-            Matrix::Identity,
-        ));
+        );
         for row in 0..3 {
             assert!(
                 (element(&mono.matrix, row, 1)).abs() < 1e-6,
@@ -1708,30 +1872,16 @@ mod tests {
     }
 
     #[test]
-    fn transfer_ids() {
-        assert_eq!(transfer_id(Transfer::Srgb), 0);
-        assert_eq!(transfer_id(Transfer::Pq), 1);
+    fn dither_only_for_deep_or_pq_sources() {
+        assert!(!needs_dither(Transfer::Srgb, Some(8)));
+        assert!(needs_dither(Transfer::Srgb, Some(10)));
+        assert!(needs_dither(Transfer::Pq, Some(8)));
+        assert!(!needs_dither(Transfer::Srgb, None));
+        assert!(needs_dither(Transfer::Pq, None));
     }
 
     #[test]
-    fn preview_maps_span_the_page_not_the_texture() {
-        // A 100x100 preview standing for a 1000x2000 page. Keying the
-        // map by the preview's dims would squeeze the page into the first
-        // fraction of the seat and clamp the rest.
-        let page = Decoded::rgba(
-            100,
-            100,
-            Format::Png,
-            Transfer::Srgb,
-            vec![0_u8; 100 * 100 * 4].into_boxed_slice(),
-        )
-        .expect("valid page")
-        .with_page_dims((1000, 2000));
-        assert_eq!(page_lmap(&page), (1.0_f32 / 1000.0, 1.0_f32 / 2000.0));
-    }
-
-    #[test]
-    fn magnification_keys_on_page_resolution() {
+    fn magnification_filter_uses_page_resolution() {
         let page = Decoded::rgba(
             100,
             100,
@@ -1740,9 +1890,15 @@ mod tests {
             vec![0_u8; 100 * 100 * 4].into_boxed_slice(),
         )
         .expect("valid page");
-        assert!(matches!(magnification(&page), Mag::Sharp));
+        assert!(matches!(
+            magnification_filter(&page),
+            MagnificationFilter::Nearest
+        ));
         let preview = page.with_page_dims((1000, 2000));
-        assert!(matches!(magnification(&preview), Mag::Smooth));
+        assert!(matches!(
+            magnification_filter(&preview),
+            MagnificationFilter::Linear
+        ));
     }
 }
 

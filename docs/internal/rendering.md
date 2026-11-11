@@ -1,6 +1,6 @@
 # Rendering: Wayland, GL, egui
 
-One hand-wired stack: winit owns the window and events, glutin binds EGL, glow calls GL, egui-winit feeds events, and egui_glow paints egui. That wiring keeps page textures outside egui's paint list and the repaint policy local. The GUI crates are built without default features and with Wayland only, keeping the dependency tree Wayland-only. Role policy and retention are in `docs/internal/cache.md`.
+winit owns the window and events, glutin binds EGL, glow calls GL, egui-winit feeds events, and egui_glow paints egui. Page textures stay outside egui's paint list. The GUI crates are Wayland-only. Role policy and retention are in `docs/internal/cache.md`.
 
 ## Frame loop
 
@@ -12,21 +12,24 @@ One hand-wired stack: winit owns the window and events, glutin binds EGL, glow c
 ## GL rules
 
 - Clip space is bottom-origin; flip in the vertex shader and keep the rest top-origin.
+- The page quad is generated from `gl_VertexID`; no vertex buffer or attribute is bound. The empty VAO is the only binding a core profile requires.
+- Each texture owns wrap and filter state; sampler objects would leak page filtering onto egui's texture units.
 - The frame prologue sets the viewport and premultiplied blend for page quads; egui paints after and sets its own state.
 - Snap quad origins to whole pixels; nearest sampling at 1:1 draws uneven rows at a fractional origin.
-- Minify with mipmaps and trilinear filtering; magnify a downscaled representation linearly so it does not paint its pixel grid, and the page's own pixels with nearest so zoom stays crisp. Chroma reconstructs bilinearly.
+- Minify with mipmaps and trilinear filtering. Magnify a preview linearly and page-resolution pixels nearest, so zoom stays crisp. Chroma reconstructs bilinearly.
+- Dither only when the source has more precision than the 8-bit output: PQ or a plane deeper than 8 bits. An 8-bit sRGB source is not perturbed.
 - Set the unpack alignment to 1 for single-channel planes.
-- On GLES, a 16-bit single-channel texture samples black under linear filtering; bind it as nearest and skip mips for a wide plane.
+- On GLES, a 16-bit single-channel texture samples black under linear filtering; use nearest filtering and skip mips for a wide plane.
 - ES fragment shaders need `highp`; mediump can be fp16.
 - Refuse a page over the maximum texture size before upload; an oversized upload samples black.
 - Delete GL objects while the context lives; the owner drops the egui renderer before the window.
 
 ## Quads and YUV
 
-A fixed -1..1 strip is placed by the vertex shader from uniforms, so pan, zoom, and rect changes update uniforms only. One program handles RGBA and YUV, sRGB and PQ. Per-draw constants are folded on the CPU: range anchors, depth normalization, the KR/KB matrix, the mono chroma stub, and alpha normalization. Chroma samples bilinearly at centered positions; declared co-sited metadata carries a half-texel bias, invisible in practice. Render tests pin black and white at every depth and the preview page-to-texture mapping.
+One program handles RGBA and YUV, sRGB and PQ; per-draw constants are folded on the CPU. Chroma samples bilinearly.
 
-A seat rect is in page pixels and a texture's UV spans the page; every draw checks that the two agree, since a stale rect clamps one edge into a band. The app derives layout and placement from the spread the frame treats as on screen, so the rects and their textures always describe the same spread.
+A seat rect is in page pixels and a texture's UV spans the page; each draw compares them and logs a mismatch at debug (`debug_assert!` in debug builds).
 
-## Uploads
+## Page textures
 
-An upload costs one texture per plane plus mipmaps. Decoded images queue in the app and drain under a per-frame budget; a non-empty queue re-arms. Inserting keeps a present entry, adds a new texture, and refuses an oversize page as a texture fault; retention applies the frame's role bounds and owns removal. A seat draws full, then fit, then thumb; a book switch clears all. A retained page is a texture hit.
+The cache maps each page to one slot per role, in `Role::ALL` order; a seat draws the largest resident slot.
