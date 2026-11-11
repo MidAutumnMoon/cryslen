@@ -12,6 +12,7 @@ use eros::ErrorUnion;
 use glutin::context::PossiblyCurrentContext;
 use glutin::surface::Surface;
 use glutin::surface::WindowSurface;
+use indoc::indoc;
 
 use winit::dpi::PhysicalSize;
 use winit::event_loop::ActiveEventLoop;
@@ -38,9 +39,9 @@ use crate::geometry::Viewport;
 // The quad is a fixed -1..1 strip generated from gl_VertexID; uniforms
 // place it at the seat rect. Clip space is bottom-origin; winit coords
 // are top-origin.
-const VS: &str = concat!(
-    "#version 330 core\n",
-    "
+const VERTEX_SHADER_SOURCE: &str = indoc! {"
+    #version 330 core
+
     uniform vec2 u_window_size; // window size, px
     uniform vec2 u_seat_offset; // seat rect origin, screen px
     uniform vec2 u_seat_size;   // seat rect size, screen px
@@ -54,13 +55,13 @@ const VS: &str = concat!(
         gl_Position = vec4(screen_px.x / u_window_size.x * 2.0 - 1.0,
                            1.0 - screen_px.y / u_window_size.y * 2.0,
                            0.0, 1.0);
-    }"
-);
+    }
+"};
 
 // Per-draw constants are folded CPU-side; output is premultiplied.
-const FS: &str = concat!(
-    "#version 330 core\n",
-    "
+const FRAGMENT_SHADER_SOURCE: &str = indoc! {"
+    #version 330 core
+
     in vec2 v_seat_px;
     layout(location = 0) out vec4 color;
     uniform vec2 u_page_uv_per_pixel;   // screen px -> page fraction: 1 / (scale * page size)
@@ -131,8 +132,8 @@ const FS: &str = concat!(
             texture(u_cr, seat_px * u_chroma_uv_per_pixel).r);
         float alpha = texture(u_alpha, seat_px * u_page_uv_per_pixel).r * u_alpha_normalization;
         color = vec4((to_srgb(u_color_matrix * yuv_samples - u_color_offset) + dither_offset) * alpha, alpha);
-    }"
-);
+    }
+"};
 
 /// Seat rect and page UV agree within float rounding; page dims are
 /// whole pixels.
@@ -263,7 +264,13 @@ impl PageTextures {
         // SAFETY: the returned names land in Self, whose Drop deletes
         // them. The error path below leaks them into the process-fatal
         // exit.
-        let pipeline = unsafe { create_pipeline(&gl, VS, FS) }?;
+        let pipeline = unsafe {
+            create_pipeline(
+                &gl,
+                VERTEX_SHADER_SOURCE,
+                FRAGMENT_SHADER_SOURCE,
+            )
+        }?;
         #[expect(
             clippy::map_err_ignore,
             reason = "the dropped conversion error says only that the value is out of range, which the message states"
@@ -575,8 +582,8 @@ struct Pipeline {
 /// The context must be current. The returned names are live until deleted.
 unsafe fn create_pipeline(
     gl: &glow::Context,
-    vs: &str,
-    fs: &str,
+    vertex_source: &str,
+    fragment_source: &str,
 ) -> eros::Result<Pipeline> {
     let program = gl.create_program().map_err(|error| {
         eros::error!("GL program object creation failed: {error}")
@@ -585,9 +592,11 @@ unsafe fn create_pipeline(
         eros::error!("GL vertex array object creation failed: {error}")
     })?;
 
-    let vertex_shader = compile_shader(gl, glow::VERTEX_SHADER, vs)?;
+    let vertex_shader =
+        compile_shader(gl, glow::VERTEX_SHADER, vertex_source)?;
     gl.attach_shader(program, vertex_shader);
-    let fragment_shader = compile_shader(gl, glow::FRAGMENT_SHADER, fs)?;
+    let fragment_shader =
+        compile_shader(gl, glow::FRAGMENT_SHADER, fragment_source)?;
     gl.attach_shader(program, fragment_shader);
     gl.link_program(program);
     if !gl.get_program_link_status(program) {

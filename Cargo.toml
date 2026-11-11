@@ -30,6 +30,7 @@ eros = { version = "0.8", default-features = false, features = ["context", "back
 fast_image_resize = "6"
 gif = "0.14"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "tiff"] }
+indoc = "2"
 parking_lot = "0.13"
 zip = { version = "9", default-features = false, features = ["deflate"] }
 sevenz-rust2 = { version = "0.24", default-features = false, features = ["bzip2"] }
