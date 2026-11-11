@@ -20,8 +20,7 @@ use winit::window::Window as WinitWindow;
 
 use crate::browse::Role;
 use crate::browse::Roles;
-use crate::decode::plane_bytes;
-use crate::decode::plane_dims;
+use crate::decode;
 use crate::decode::Decoded;
 use crate::decode::Matrix;
 use crate::decode::Pixels;
@@ -1120,7 +1119,7 @@ unsafe fn upload_page_texture(
         }
         Pixels::Yuv(yuv) => {
             let ((luma_w, luma_h), (chroma_w, chroma_h)) =
-                plane_dims((width, height), yuv.subsampling);
+                decode::plane_dims((width, height), yuv.subsampling);
             let wide = matches!(yuv.luma, Plane::U16(_));
             // GL_R16 is not filterable in GLES. LINEAR makes the texture
             // incomplete (samples black).
@@ -1137,7 +1136,7 @@ unsafe fn upload_page_texture(
                 );
             };
             expect(&yuv.luma, luma_w as usize * luma_h as usize, "luma");
-            let luma_bytes = plane_bytes(&yuv.luma);
+            let luma_bytes = decode::plane_bytes(&yuv.luma);
             let luma_texture = upload_plane(
                 gl,
                 luma_bytes,
@@ -1152,7 +1151,7 @@ unsafe fn upload_page_texture(
                 // 1x1 chroma at the neutral code, which the folded
                 // quantization anchor cancels exactly.
                 let neutral = constant_plane(depth, 1_u32 << (depth - 1));
-                let neutral_bytes = plane_bytes(&neutral);
+                let neutral_bytes = decode::plane_bytes(&neutral);
                 (
                     upload_plane(
                         gl,
@@ -1182,8 +1181,8 @@ unsafe fn upload_page_texture(
                     chroma_w as usize * chroma_h as usize,
                     "cr",
                 );
-                let cb_bytes = plane_bytes(&yuv.cb);
-                let cr_bytes = plane_bytes(&yuv.cr);
+                let cb_bytes = decode::plane_bytes(&yuv.cb);
+                let cr_bytes = decode::plane_bytes(&yuv.cr);
                 (
                     upload_plane(
                         gl,
@@ -1211,7 +1210,7 @@ unsafe fn upload_page_texture(
                         constant_plane(depth, (1_u32 << depth) - 1);
                     upload_plane(
                         gl,
-                        plane_bytes(&opaque),
+                        decode::plane_bytes(&opaque),
                         (1, 1),
                         wide,
                         filterable,
@@ -1226,7 +1225,7 @@ unsafe fn upload_page_texture(
                     );
                     upload_plane(
                         gl,
-                        plane_bytes(alpha),
+                        decode::plane_bytes(alpha),
                         (width, height),
                         wide,
                         filterable,
@@ -1269,7 +1268,8 @@ fn chroma_uv_per_pixel(
     page_dims: (u32, u32),
     subsampling: Subsampling,
 ) -> (f32, f32) {
-    let (_, (chroma_w, chroma_h)) = plane_dims(page_dims, subsampling);
+    let (_, (chroma_w, chroma_h)) =
+        decode::plane_dims(page_dims, subsampling);
     let chroma_px = geometry::px_f32((chroma_w, chroma_h));
     let ratio = subsampling.chroma_ratio();
     (ratio.0 / chroma_px.0, ratio.1 / chroma_px.1)
@@ -1709,7 +1709,7 @@ mod tests {
     ) -> Decoded {
         let size = (4_u32, 4);
         let ((luma_w, luma_h), (chroma_w, chroma_h)) =
-            plane_dims(size, subsampling);
+            decode::plane_dims(size, subsampling);
         let plane = |samples: usize| {
             if depth > 8 {
                 Plane::U16(vec![0_u16; samples].into_boxed_slice())

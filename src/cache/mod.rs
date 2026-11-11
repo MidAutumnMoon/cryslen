@@ -42,7 +42,7 @@ use fast_image_resize::Resizer;
 use xxhash_rust::xxh3::xxh3_128;
 
 use crate::browse::Role;
-use crate::decode::plane_dims;
+use crate::decode;
 use crate::decode::Decoded;
 use crate::decode::Format;
 use crate::decode::Matrix;
@@ -176,9 +176,9 @@ fn resample_page(
         }
         Pixels::Yuv(yuv) => {
             let ((luma_w, luma_h), (chroma_w, chroma_h)) =
-                plane_dims(dims, yuv.subsampling);
+                decode::plane_dims(dims, yuv.subsampling);
             let (_, (target_w, target_h)) =
-                plane_dims(target, yuv.subsampling);
+                decode::plane_dims(target, yuv.subsampling);
             let planes = YuvImage {
                 depth: yuv.depth,
                 subsampling: yuv.subsampling,
@@ -961,7 +961,7 @@ fn read_yuv(
     };
     let matrix = matrix_from_tag(reader.u8()?)?;
     let ((luma_w, luma_h), (chroma_w, chroma_h)) =
-        plane_dims(image, subsampling);
+        decode::plane_dims(image, subsampling);
     let luma = read_plane(reader, sample_count((luma_w, luma_h))?)?;
     let chroma = if subsampling == Subsampling::Mono {
         0
@@ -1091,7 +1091,7 @@ mod tests {
         with_alpha: bool,
     ) -> Decoded {
         let ((_, _), (chroma_w, chroma_h)) =
-            plane_dims((width, height), subsampling);
+            decode::plane_dims((width, height), subsampling);
         let plane = |samples: usize| {
             if depth > 8 {
                 Plane::U16(
@@ -1150,7 +1150,7 @@ mod tests {
         values: [u16; 4],
     ) -> Decoded {
         let ((_, _), (chroma_w, chroma_h)) =
-            plane_dims((width, height), subsampling);
+            decode::plane_dims((width, height), subsampling);
         let plane = |samples: usize, value: u16| {
             Plane::U16(vec![value; samples].into_boxed_slice())
         };

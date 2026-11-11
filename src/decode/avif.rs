@@ -35,8 +35,6 @@ use crate::fault::AvifFault;
 use crate::fault::DecodeError;
 use crate::fault::DecodeRefusal;
 
-use super::plane_dims;
-use super::transform_plane;
 use super::Decoded;
 use super::DisplayTransform;
 use super::Format;
@@ -123,9 +121,9 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
     }
 
     // Mono skips the chroma copy below, so its 1x1 stub dims from
-    // `plane_dims` are unused.
+    // `super::plane_dims` are unused.
     let (_, (chroma_width, chroma_height)) =
-        plane_dims((width, height), subsampling);
+        super::plane_dims((width, height), subsampling);
     // SAFETY: the guard still owns the frame, so the luma plane is live.
     // `copy_plane` rejects null planes and short strides.
     let luma_plane = unsafe {
@@ -181,19 +179,20 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
     // The display transform applies to every plane alike; chroma
     // dimensions rotate coherently with the luma grid.
     let (luma_plane, _) =
-        transform_plane(luma_plane, (width, height), transform);
-    let (cb_plane, _) = transform_plane(
+        super::transform_plane(luma_plane, (width, height), transform);
+    let (cb_plane, _) = super::transform_plane(
         cb_plane,
         (chroma_width, chroma_height),
         transform,
     );
-    let (cr_plane, _) = transform_plane(
+    let (cr_plane, _) = super::transform_plane(
         cr_plane,
         (chroma_width, chroma_height),
         transform,
     );
-    let alpha_plane = alpha_plane
-        .map(|alpha| transform_plane(alpha, (width, height), transform).0);
+    let alpha_plane = alpha_plane.map(|alpha| {
+        super::transform_plane(alpha, (width, height), transform).0
+    });
     let (width, height) = if transform.swaps_dims() {
         (height, width)
     } else {
