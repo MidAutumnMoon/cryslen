@@ -35,6 +35,9 @@ use crate::browse::Motion;
 use crate::browse::Request;
 use crate::browse::Role;
 use crate::browse::Roles;
+use crate::cache;
+use crate::cache::prefetch::Prefetch;
+use crate::cache::Store;
 use crate::decode;
 use crate::decode::Animation;
 use crate::decode::Decoded;
@@ -46,9 +49,6 @@ use crate::fault::PageError;
 use crate::fault::PageFault;
 use crate::fault::PanicFault;
 use crate::fault::SpawnError;
-use crate::cache;
-use crate::cache::prefetch::Prefetch;
-use crate::cache::Store;
 use crate::protocol::BookInfo;
 use crate::protocol::ChildMsg;
 use crate::protocol::Hello;
@@ -471,8 +471,7 @@ impl Session {
                     elapsed = ?started.elapsed(),
                     "fit derived"
                 );
-                view =
-                    Some(self.persist(page, hash, Role::Fit, derived));
+                view = Some(self.persist(page, hash, Role::Fit, derived));
             }
             if roles.contains(Role::Thumb) && thumb.is_none() {
                 let started = Instant::now();
@@ -594,8 +593,10 @@ impl Session {
                 self.fail_playback(id, notify);
             }
             Err(payload) => {
-                let fault =
-                    PanicFault::from_payload("animation", payload.as_ref());
+                let fault = PanicFault::from_payload(
+                    "animation",
+                    payload.as_ref(),
+                );
                 tracing::warn!(
                     ?id,
                     ?role,
@@ -652,8 +653,10 @@ impl Session {
                 self.fail_playback(id, notify);
             }
             Err(payload) => {
-                let fault =
-                    PanicFault::from_payload("animation", payload.as_ref());
+                let fault = PanicFault::from_payload(
+                    "animation",
+                    payload.as_ref(),
+                );
                 tracing::warn!(
                     ?id,
                     ?role,
@@ -884,9 +887,7 @@ fn into_message(update: Update) -> ChildMsg {
             page,
             fault: PageFault::from(error),
         },
-        Update::Playback(event) => {
-            ChildMsg::Playback(wire_event(event))
-        }
+        Update::Playback(event) => ChildMsg::Playback(wire_event(event)),
         Update::Unpacked => ChildMsg::Unpacked,
         Update::Fatal(summary) => ChildMsg::Fatal(summary),
     }
@@ -1016,8 +1017,11 @@ pub fn main(args: &[OsString]) -> ExitCode {
                             return;
                         };
                     };
-                    match Worker::spawn(Arc::clone(&source), prefetch, notify)
-                    {
+                    match Worker::spawn(
+                        Arc::clone(&source),
+                        prefetch,
+                        notify,
+                    ) {
                         Ok(spawned) => worker = Some(spawned),
                         Err(error) => {
                             tracing::error!(
@@ -1114,17 +1118,17 @@ fn write(child_tx: &IpcSender<ChildMsg>, queue: &Receiver<Update>) {
 )]
 mod tests {
     use super::*;
-    use crate::fault::DecodeRefusal;
     use crate::browse::Direction;
+    use crate::browse::PageCount;
+    use crate::browse::ReadingMode;
+    use crate::browse::Spread;
     use crate::cache::Store;
+    use crate::fault::DecodeRefusal;
     use crate::testkit::eventually;
-    use image::codecs::gif::Repeat;
     use crate::testkit::tiny_animated_gif;
     use crate::testkit::tiny_png;
     use crate::testkit::TempDir;
-    use crate::browse::PageCount;
-    use crate::browse::Spread;
-    use crate::browse::ReadingMode;
+    use image::codecs::gif::Repeat;
 
     use parking_lot::Mutex;
 
@@ -1404,10 +1408,10 @@ mod tests {
             .ready("the target never delivered a thumb", |page, role| {
                 page == 0 && is_thumb(role)
             });
-        let view = events
-            .ready("the target never delivered a fit image", |page, role| {
-                page == 0 && is_fit(role)
-            });
+        let view = events.ready(
+            "the target never delivered a fit image",
+            |page, role| page == 0 && is_fit(role),
+        );
         assert_eq!(long_edge(&thumb), cache::THUMB_EDGE);
         assert_eq!(
             long_edge(&view),
@@ -1523,12 +1527,16 @@ mod tests {
         .expect("worker spawns");
 
         let store = Store::at(root.path());
-        eventually(20, "the prefetch never produced the head fit image", || {
-            store
-                .load(page_hash(&source, 0), Role::Fit)
-                .is_some()
-                .then_some(())
-        });
+        eventually(
+            20,
+            "the prefetch never produced the head fit image",
+            || {
+                store
+                    .load(page_hash(&source, 0), Role::Fit)
+                    .is_some()
+                    .then_some(())
+            },
+        );
         events.drain();
         assert_eq!(
             events.delivered(0, |_| true),
@@ -1551,9 +1559,10 @@ mod tests {
         .expect("worker spawns");
 
         worker.set_requests(vec![request_fit(0)]);
-        events.ready("the target never delivered a fit image", |page, role| {
-            page == 0 && is_fit(role)
-        });
+        events.ready(
+            "the target never delivered a fit image",
+            |page, role| page == 0 && is_fit(role),
+        );
         // An unchanged set is the app still waiting for its own upload.
         worker.set_requests(vec![request_fit(0)]);
         thread::sleep(Duration::from_millis(50));
@@ -1585,12 +1594,10 @@ mod tests {
         .expect("worker spawns");
 
         worker.set_requests(vec![request_full(0)]);
-        let image = events.ready(
-            "the full target was never honoured",
-            |page, role| {
+        let image = events
+            .ready("the full target was never honoured", |page, role| {
                 page == 0 && role == Role::Full
-            },
-        );
+            });
         assert_eq!(
             (image.width(), image.height()),
             (BIG, BIG),
@@ -1600,11 +1607,8 @@ mod tests {
 
     #[test]
     fn animation_frames_stream_in_order() {
-        let colors = [
-            [255, 0, 0, 255],
-            [0, 255, 0, 255],
-            [0, 0, 255, 255],
-        ];
+        let colors =
+            [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]];
         let dir = TempDir::new("worker-animation");
         dir.write(
             "p000.gif",
@@ -1639,11 +1643,8 @@ mod tests {
 
     #[test]
     fn a_finite_animation_finishes_after_its_last_pass() {
-        let colors = [
-            [255, 0, 0, 255],
-            [0, 255, 0, 255],
-            [0, 0, 255, 255],
-        ];
+        let colors =
+            [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]];
         let dir = TempDir::new("worker-animation-finite");
         dir.write(
             "p000.gif",
@@ -1687,14 +1688,14 @@ mod tests {
         )
         .expect("worker spawns");
         worker.set_requests(vec![request_thumb(0), request_fit(0)]);
-        let thumb = first
-            .ready("the first session never delivered a thumb", |page, role| {
-                page == 0 && is_thumb(role)
-            });
-        let view = first
-            .ready("the first session never delivered a fit image", |page, role| {
-                page == 0 && is_fit(role)
-            });
+        let thumb = first.ready(
+            "the first session never delivered a thumb",
+            |page, role| page == 0 && is_thumb(role),
+        );
+        let view = first.ready(
+            "the first session never delivered a fit image",
+            |page, role| page == 0 && is_fit(role),
+        );
         assert_eq!(long_edge(&thumb), cache::THUMB_EDGE);
         assert_eq!(
             long_edge(&view),
@@ -1740,10 +1741,10 @@ mod tests {
             "the second session never delivered a thumb",
             |page, role| page == 0 && is_thumb(role),
         );
-        let warm_view = second
-            .ready("the second session never delivered a fit image", |page, role| {
-                page == 0 && is_fit(role)
-            });
+        let warm_view = second.ready(
+            "the second session never delivered a fit image",
+            |page, role| page == 0 && is_fit(role),
+        );
         assert_eq!(
             (warm_thumb.width(), warm_thumb.height()),
             (7, 7),
@@ -1762,4 +1763,3 @@ mod tests {
         assert_eq!((kept.width(), kept.height()), (7, 7));
     }
 }
-

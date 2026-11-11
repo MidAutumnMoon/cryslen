@@ -22,8 +22,11 @@ use ipc_channel::ipc::IpcSender;
 use ipc_channel::TryRecvError as IpcTryRecvError;
 
 use crate::animation::DecodedEvent;
+use crate::browse::PageCount;
+use crate::browse::Role;
 use crate::catalog;
 use crate::catalog::PageName;
+use crate::decode::Decoded;
 use crate::fault::BookFault;
 use crate::fault::PageFault;
 use crate::protocol::BookInfo;
@@ -32,9 +35,6 @@ use crate::protocol::Hello;
 use crate::protocol::ParentMsg;
 use crate::protocol::PlaybackEvent;
 use crate::protocol::WireImage;
-use crate::browse::PageCount;
-use crate::browse::Role;
-use crate::decode::Decoded;
 
 /// A child that has not answered by now is wedged; the parent reports a
 /// fault.
@@ -594,12 +594,8 @@ fn decoded_event(event: PlaybackEvent<WireImage>) -> DecodedEvent {
                 }
             }
         }
-        PlaybackEvent::Finished { id } => {
-            DecodedEvent::Finished { id }
-        }
-        PlaybackEvent::Failed { id } => {
-            DecodedEvent::Failed { id }
-        }
+        PlaybackEvent::Finished { id } => DecodedEvent::Finished { id },
+        PlaybackEvent::Failed { id } => DecodedEvent::Failed { id },
     }
 }
 

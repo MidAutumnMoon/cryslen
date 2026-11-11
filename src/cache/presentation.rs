@@ -5,18 +5,18 @@ use std::collections::BTreeMap;
 
 use crate::browse;
 use crate::browse::Direction;
-use crate::browse::ReadingMode;
 use crate::browse::Motion;
 use crate::browse::PageCount;
 use crate::browse::PageInfo;
+use crate::browse::ReadingMode;
 
 use crate::browse::Request;
 use crate::browse::Role;
 use crate::browse::Roles;
 use crate::browse::ShownSpread;
 use crate::browse::Spread;
-use crate::fault::PageFault;
 use crate::cache::FIT_EDGE;
+use crate::fault::PageFault;
 
 pub struct FrameInput<'frame> {
     pub target: Spread,
@@ -256,11 +256,7 @@ fn request_roles(
     requests
 }
 
-fn push_request(
-    requests: &mut Vec<Request>,
-    page: usize,
-    role: Role,
-) {
+fn push_request(requests: &mut Vec<Request>, page: usize, role: Role) {
     let request = Request { page, role };
     if !requests.contains(&request) {
         requests.push(request);
@@ -301,10 +297,7 @@ fn choose_presented(
         return Some(target);
     }
     let (low, high) = shown.map_or((0, usize::MAX), |shown| {
-        (
-            shown.first.min(target.first),
-            shown.first.max(target.first),
-        )
+        (shown.first.min(target.first), shown.first.max(target.first))
     });
     let mut best: Option<Spread> = None;
     for &page in cached.keys() {
@@ -553,8 +546,7 @@ mod tests {
         assert!(!position.commit_shown(ReadingMode::Normal));
         assert_eq!(position.target(), 5);
 
-        position
-            .record_shown(ReadingMode::Normal, Some(Spread::lone(4)));
+        position.record_shown(ReadingMode::Normal, Some(Spread::lone(4)));
         assert!(position.commit_shown(ReadingMode::Normal));
         assert_eq!(position.target(), 4);
         assert!(!position.commit_shown(ReadingMode::Normal));
@@ -612,7 +604,11 @@ mod tests {
             BTreeMap::from([(10, PageFault::new("unreadable"))]);
         let roles = |page: usize| {
             let mut page_roles = Roles::default();
-            page_roles.set(if page == 6 { Role::Thumb } else { Role::Fit });
+            page_roles.set(if page == 6 {
+                Role::Thumb
+            } else {
+                Role::Fit
+            });
             page_roles
         };
         let frame_at = |page: usize, motion: Motion| {

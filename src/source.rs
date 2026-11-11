@@ -19,6 +19,7 @@ use eros::ErrorUnion;
 use eros::IntoUnion as _;
 use parking_lot::Mutex;
 
+use crate::browse::PageCount;
 use crate::catalog;
 use crate::catalog::ArchiveKind;
 use crate::decode::format_from_name;
@@ -27,7 +28,6 @@ use crate::fault::OpenError;
 use crate::fault::OpenRefusal;
 use crate::fault::PageError;
 use crate::fault::PanicFault;
-use crate::browse::PageCount;
 
 #[derive(Debug)]
 pub enum PageRead {

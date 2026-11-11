@@ -21,16 +21,16 @@ use crate::fault::DecodeRefusal;
 pub use crate::animation::PlaybackCommand;
 pub use crate::animation::PlaybackEvent;
 pub use crate::animation::PlaybackId;
+pub use crate::browse::Direction;
+pub use crate::browse::Motion;
+pub use crate::browse::ReadingMode;
+pub use crate::browse::Request;
+pub use crate::browse::Role;
 pub use crate::decode::Format;
 pub use crate::decode::Matrix;
 pub use crate::decode::Subsampling;
 pub use crate::decode::Transfer;
 pub use crate::fault::PageFault;
-pub use crate::browse::Direction;
-pub use crate::browse::ReadingMode;
-pub use crate::browse::Motion;
-pub use crate::browse::Request;
-pub use crate::browse::Role;
 
 /// What a freshly opened child knows about its book.
 #[derive(Debug, Clone, Deserialize, Serialize)]

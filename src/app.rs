@@ -329,7 +329,8 @@ impl App {
             |page| self.roles(page),
             |on_screen| {
                 let total =
-                    geometry::layout(self.seat_dims_for(on_screen)).total();
+                    geometry::layout(self.seat_dims_for(on_screen))
+                        .total();
                 self.fit.scale_for(total, self.last_viewport)
             },
         );
@@ -337,9 +338,7 @@ impl App {
         let changed = shown != self.reading.position.shown();
         if changed {
             let seats = shown.map(|spread| {
-                spread
-                    .seats(self.mode)
-                    .map(|seat| self.role_name(seat))
+                spread.seats(self.mode).map(|seat| self.role_name(seat))
             });
             let took = self
                 .reading
@@ -356,9 +355,7 @@ impl App {
             self.fit.commit();
         }
         // Record every frame so a mode switch retags an unchanged spread.
-        self.reading
-            .position
-            .record_shown(self.mode, shown);
+        self.reading.position.record_shown(self.mode, shown);
         let on_screen = frame.on_screen();
         // The layout must describe the spread the frame shows; a stale
         // layout clamps one edge.
@@ -375,9 +372,7 @@ impl App {
                 "placement"
             );
         }
-        if self.reading.motion == Motion::Still
-            && shown != Some(target)
-        {
+        if self.reading.motion == Motion::Still && shown != Some(target) {
             let since = *self.reading.hold_since.get_or_insert(now);
             let waited = now.saturating_duration_since(since);
             if !self.reading.hold_logged
@@ -422,13 +417,13 @@ impl App {
         let spread_status = ui::summarize_spread(on_screen, |page| {
             let info = facts
                 .get(&page)
-                .filter(|_| {
-                    pages.is_some_and(|pages| pages.has_any(page))
-                })
+                .filter(|_| pages.is_some_and(|pages| pages.has_any(page)))
                 .copied();
             (info, faults.get(&page))
         });
-        if let Some(delay) = self.timers.tick_wait(now, spread_status.waiting) {
+        if let Some(delay) =
+            self.timers.tick_wait(now, spread_status.waiting)
+        {
             post(&self.proxy, WakeEvent::Repaint(delay));
         }
         if let Some(delay) = self.timers.tick_toast(now) {
@@ -543,15 +538,15 @@ impl App {
             if uploaded > 0 && over_budget {
                 break;
             }
-            let Some(delivery) = self.reading.deliveries.pop_front() else {
+            let Some(delivery) = self.reading.deliveries.pop_front()
+            else {
                 break;
             };
             let dims = delivery.image.page_dims();
             let format = delivery.image.format();
             match self.reading.facts.entry(delivery.page) {
                 Entry::Vacant(entry) => {
-                    entry
-                        .insert(PageInfo { dims, format });
+                    entry.insert(PageInfo { dims, format });
                 }
                 Entry::Occupied(entry) => debug_assert_eq!(
                     (entry.get().dims, entry.get().format),
@@ -560,8 +555,11 @@ impl App {
                 ),
             }
             let upload_started = Instant::now();
-            let refused =
-                gl.pages.insert(delivery.page, delivery.role, &delivery.image);
+            let refused = gl.pages.insert(
+                delivery.page,
+                delivery.role,
+                &delivery.image,
+            );
             let elapsed = upload_started.elapsed();
             tracing::debug!(
                 page = delivery.page,
@@ -609,11 +607,12 @@ impl App {
         for (&page, state) in &self.reading.playback {
             let keep = match state {
                 PagePlayback::Refused => true,
-                PagePlayback::Playing(player) => {
-                    targets.iter().flatten().any(|&(want_page, want_role)| {
+                PagePlayback::Playing(player) => targets
+                    .iter()
+                    .flatten()
+                    .any(|&(want_page, want_role)| {
                         want_page == page && want_role == player.role()
-                    })
-                }
+                    }),
             };
             if !keep {
                 stop.push(page);
@@ -635,16 +634,19 @@ impl App {
             generation: self.reading.next_generation,
         };
         self.reading.next_generation = id.generation.wrapping_add(1);
-        self.send(ParentMsg::Playback(PlaybackCommand::Start { id, role }));
-        self.reading.playback.insert(
-            page,
-            PagePlayback::Playing(Player::new(id, role)),
-        );
+        self.send(ParentMsg::Playback(PlaybackCommand::Start {
+            id,
+            role,
+        }));
+        self.reading
+            .playback
+            .insert(page, PagePlayback::Playing(Player::new(id, role)));
         tracing::debug!(?id, ?role, "playback player start");
     }
 
     fn stop_playback(&mut self, page: usize) {
-        let Some(PagePlayback::Playing(player)) = self.reading.playback.get(&page)
+        let Some(PagePlayback::Playing(player)) =
+            self.reading.playback.get(&page)
         else {
             return;
         };
@@ -795,7 +797,8 @@ impl App {
 
     fn geometry(&self) -> ((f32, f32), Viewport) {
         (
-            geometry::layout(self.seat_dims_for(self.last_shown_spread())).total(),
+            geometry::layout(self.seat_dims_for(self.last_shown_spread()))
+                .total(),
             self.last_viewport,
         )
     }
@@ -817,8 +820,7 @@ impl App {
                     // The new pairing is a different coordinate system;
                     // commit the shown spread before switching.
                     let from = self.reading.position.target();
-                    if self.reading.position.commit_shown(self.mode)
-                    {
+                    if self.reading.position.commit_shown(self.mode) {
                         tracing::debug!(
                             from,
                             to = self.reading.position.target(),

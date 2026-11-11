@@ -485,9 +485,9 @@ struct Frames {
 
 impl Frames {
     fn new(bytes: Arc<[u8]>, format: Format) -> Result<Self, DecodeError> {
+        use ::image::codecs::gif::GifDecoder;
         use ::image::AnimationDecoder as _;
         use ::image::ImageDecoder as _;
-        use ::image::codecs::gif::GifDecoder;
 
         if format != Format::Gif {
             return Err(ErrorUnion::new(DecodeRefusal::Unsupported(
@@ -516,9 +516,15 @@ impl Frames {
         let (width, height) = buffer.dimensions();
         let rgba = buffer.into_raw().into_boxed_slice();
         Some(
-            Decoded::rgba(width, height, self.format, Transfer::Srgb, rgba)
-                .map(|image| Frame { image, delay })
-                .union(),
+            Decoded::rgba(
+                width,
+                height,
+                self.format,
+                Transfer::Srgb,
+                rgba,
+            )
+            .map(|image| Frame { image, delay })
+            .union(),
         )
     }
 }
@@ -1003,13 +1009,9 @@ mod tests {
 
     #[test]
     fn animated_gif_streams_composited_frames() {
-        let colors = [
-            [255, 0, 0, 255],
-            [0, 255, 0, 255],
-            [0, 0, 255, 255],
-        ];
-        let bytes =
-            tiny_animated_gif(4, 3, &colors, 50, Repeat::Infinite);
+        let colors =
+            [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]];
+        let bytes = tiny_animated_gif(4, 3, &colors, 50, Repeat::Infinite);
         let mut animation = open_animation(arc(bytes), "a.gif")
             .expect("animated gif decodes")
             .expect("gif has a frame stream");
@@ -1059,11 +1061,8 @@ mod tests {
 
     #[test]
     fn animation_rewinds() {
-        let colors = [
-            [255, 0, 0, 255],
-            [0, 255, 0, 255],
-            [0, 0, 255, 255],
-        ];
+        let colors =
+            [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]];
         let bytes = tiny_animated_gif(2, 2, &colors, 20, Repeat::Infinite);
         let mut animation = open_animation(arc(bytes), "a.gif")
             .expect("gif decodes")

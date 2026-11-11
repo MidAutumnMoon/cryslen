@@ -7,13 +7,13 @@ use std::time::Instant;
 
 use egui::text::LayoutJob;
 
+use crate::browse::PageInfo;
+use crate::browse::ReadingMode;
+use crate::browse::Spread;
 use crate::catalog::PageName;
 use crate::decode::Format;
 use crate::fault::BookFault;
 use crate::fault::PageFault;
-use crate::browse::PageInfo;
-use crate::browse::Spread;
-use crate::browse::ReadingMode;
 
 pub struct StatusLine<'fault> {
     pub page_count: usize,

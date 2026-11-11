@@ -2,8 +2,8 @@
 
 use crate::browse;
 use crate::browse::Direction;
-use crate::browse::ReadingMode;
 use crate::browse::PageCount;
+use crate::browse::ReadingMode;
 use crate::browse::Spread;
 
 pub const AHEAD_PAGES: usize = 512;
@@ -108,7 +108,11 @@ mod tests {
     }
 
     fn starts(prefetch: &Prefetch) -> Vec<usize> {
-        prefetch.spreads().iter().map(|spread| spread.first).collect()
+        prefetch
+            .spreads()
+            .iter()
+            .map(|spread| spread.first)
+            .collect()
     }
 
     #[test]
@@ -139,7 +143,8 @@ mod tests {
     #[test]
     fn the_ends_do_not_wrap() {
         let long_book = pages(1200);
-        let opening = browse::spread_for(0, ReadingMode::Normal, long_book);
+        let opening =
+            browse::spread_for(0, ReadingMode::Normal, long_book);
         let before = Prefetch::build(
             opening,
             Direction::Backward,
@@ -153,7 +158,8 @@ mod tests {
             .iter()
             .all(|spread| spread.first <= BEHIND_PAGES));
 
-        let closing = browse::spread_for(1199, ReadingMode::Normal, long_book);
+        let closing =
+            browse::spread_for(1199, ReadingMode::Normal, long_book);
         let after = Prefetch::build(
             closing,
             Direction::Forward,
@@ -170,8 +176,12 @@ mod tests {
         let single = pages(1);
         let only = browse::spread_for(0, ReadingMode::Manga, single);
         for direction in [Direction::Forward, Direction::Backward] {
-            let alone =
-                Prefetch::build(only, direction, ReadingMode::Manga, single);
+            let alone = Prefetch::build(
+                only,
+                direction,
+                ReadingMode::Manga,
+                single,
+            );
             assert_eq!(alone.spreads(), &[only]);
             assert_eq!(alone.head(), &[only]);
         }
@@ -187,15 +197,21 @@ mod tests {
             ReadingMode::Normal,
             book,
         );
-        assert_eq!(prefetch.spreads().len(), 1 + AHEAD_PAGES + BEHIND_PAGES);
+        assert_eq!(
+            prefetch.spreads().len(),
+            1 + AHEAD_PAGES + BEHIND_PAGES
+        );
         assert_eq!(prefetch.spreads().first(), Some(&origin));
         assert_eq!(prefetch.head().len(), HEAD_SPREADS);
         assert!(prefetch.spreads().iter().all(|spread| {
             (600 - BEHIND_PAGES..=600 + AHEAD_PAGES)
                 .contains(&spread.first)
         }));
-        let unique: BTreeSet<usize> =
-            prefetch.spreads().iter().map(|spread| spread.first).collect();
+        let unique: BTreeSet<usize> = prefetch
+            .spreads()
+            .iter()
+            .map(|spread| spread.first)
+            .collect();
         assert_eq!(unique.len(), prefetch.spreads().len());
     }
 }

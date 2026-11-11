@@ -127,9 +127,7 @@ pub enum Motion {
 
 /// A page image: a thumb for skims, a fit image for settled reading, or
 /// the page's own pixels for zoom. Only the first two enter the store.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[repr(usize)]
 pub enum Role {
     Thumb,
@@ -141,7 +139,8 @@ impl Role {
     pub const COUNT: usize = 3;
     /// Ascending size; array storage keyed by [`Self::index`] follows this
     /// order.
-    pub const ALL: [Self; Self::COUNT] = [Self::Thumb, Self::Fit, Self::Full];
+    pub const ALL: [Self; Self::COUNT] =
+        [Self::Thumb, Self::Fit, Self::Full];
 
     /// Slot index for role-keyed arrays.
     #[must_use]
@@ -294,7 +293,11 @@ impl ReadingPosition {
         self.target = target;
     }
 
-    pub fn record_shown(&mut self, mode: ReadingMode, shown: Option<Spread>) {
+    pub fn record_shown(
+        &mut self,
+        mode: ReadingMode,
+        shown: Option<Spread>,
+    ) {
         self.shown = shown.map(|spread| ShownSpread { mode, spread });
     }
 
@@ -311,7 +314,11 @@ impl ReadingPosition {
 }
 /// Spread containing `index` under `mode`, clamped to the book. An
 /// odd tail shows one page (`second: None`).
-pub fn spread_for(index: usize, mode: ReadingMode, len: PageCount) -> Spread {
+pub fn spread_for(
+    index: usize,
+    mode: ReadingMode,
+    len: PageCount,
+) -> Spread {
     let len = len.get();
     let index = index.min(len - 1);
     if !mode.pairs() {
@@ -410,7 +417,6 @@ pub fn last_spread(mode: ReadingMode, len: PageCount) -> usize {
     spread_start(spread_count(len.get()) - 1)
 }
 
-
 #[cfg(test)]
 #[expect(
     clippy::expect_used,
@@ -472,7 +478,9 @@ mod tests {
         for len in [1_usize, 2, 3, 6, 9, 10] {
             for &mode in &ReadingMode::ALL {
                 for page in 0..=len {
-                    for &direction in &[Direction::Backward, Direction::Forward] {
+                    for &direction in
+                        &[Direction::Backward, Direction::Forward]
+                    {
                         let stepped =
                             advance(page, direction, mode, pages(len));
                         assert_eq!(
@@ -512,28 +520,48 @@ mod tests {
     #[test]
     fn mode_switch_relands_only_on_pairing_change() {
         assert_eq!(
-            switch_mode(ReadingMode::Normal, ReadingMode::Manga, 2, pages(10)),
+            switch_mode(
+                ReadingMode::Normal,
+                ReadingMode::Manga,
+                2,
+                pages(10)
+            ),
             ModeSwitch {
                 index: 1,
                 pairing_changed: true
             }
         );
         assert_eq!(
-            switch_mode(ReadingMode::Normal, ReadingMode::Comic, 0, pages(10)),
+            switch_mode(
+                ReadingMode::Normal,
+                ReadingMode::Comic,
+                0,
+                pages(10)
+            ),
             ModeSwitch {
                 index: 0,
                 pairing_changed: true
             }
         );
         assert_eq!(
-            switch_mode(ReadingMode::Manga, ReadingMode::Comic, 5, pages(10)),
+            switch_mode(
+                ReadingMode::Manga,
+                ReadingMode::Comic,
+                5,
+                pages(10)
+            ),
             ModeSwitch {
                 index: 5,
                 pairing_changed: false
             }
         );
         assert_eq!(
-            switch_mode(ReadingMode::Manga, ReadingMode::Manga, 5, pages(10)),
+            switch_mode(
+                ReadingMode::Manga,
+                ReadingMode::Manga,
+                5,
+                pages(10)
+            ),
             ModeSwitch {
                 index: 5,
                 pairing_changed: false

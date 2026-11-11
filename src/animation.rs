@@ -31,10 +31,7 @@ pub struct PlaybackId {
 #[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 pub enum PlaybackCommand {
     /// Open the page's stream and fix its role.
-    Start {
-        id: PlaybackId,
-        role: Role,
-    },
+    Start { id: PlaybackId, role: Role },
     /// Produce the next frame. A pass boundary is invisible to the parent.
     Next { id: PlaybackId },
     /// Drop the session. The child answers nothing.
@@ -233,7 +230,13 @@ mod tests {
     use crate::decode::Transfer;
 
     fn player(generation: u32) -> Player {
-        Player::new(PlaybackId { page: 0, generation }, Role::Fit)
+        Player::new(
+            PlaybackId {
+                page: 0,
+                generation,
+            },
+            Role::Fit,
+        )
     }
 
     fn frame(shade: u8) -> Decoded {
@@ -264,10 +267,9 @@ mod tests {
         assert!(player.take_next());
 
         let start = Instant::now();
-        assert!(player.on_frame(
-            Duration::from_millis(50),
-            Box::new(frame(1))
-        ));
+        assert!(
+            player.on_frame(Duration::from_millis(50), Box::new(frame(1)))
+        );
         assert_eq!(
             shown_delay(&player.tick(start)),
             Some(Duration::from_millis(50))
@@ -278,10 +280,9 @@ mod tests {
             player.tick(start + Duration::from_millis(20)),
             Due::Wait(_)
         ));
-        assert!(player.on_frame(
-            Duration::from_millis(50),
-            Box::new(frame(2))
-        ));
+        assert!(
+            player.on_frame(Duration::from_millis(50), Box::new(frame(2)))
+        );
         assert_eq!(
             shown_delay(&player.tick(start + Duration::from_millis(50))),
             Some(Duration::from_millis(50))
@@ -310,20 +311,15 @@ mod tests {
     #[test]
     fn frames_need_a_request() {
         let mut player = player(1);
-        assert!(!player.on_frame(
-            Duration::from_millis(20),
-            Box::new(frame(1))
-        ));
+        assert!(!player
+            .on_frame(Duration::from_millis(20), Box::new(frame(1))));
         assert!(!player.on_finished());
         assert!(player.take_next());
-        assert!(player.on_frame(
-            Duration::from_millis(20),
-            Box::new(frame(1))
-        ));
-        assert!(!player.on_frame(
-            Duration::from_millis(20),
-            Box::new(frame(1))
-        ));
+        assert!(
+            player.on_frame(Duration::from_millis(20), Box::new(frame(1)))
+        );
+        assert!(!player
+            .on_frame(Duration::from_millis(20), Box::new(frame(1))));
         assert!(!player.on_finished());
     }
 
@@ -332,10 +328,9 @@ mod tests {
         let mut player = player(1);
         let start = Instant::now();
         assert!(player.take_next());
-        assert!(player.on_frame(
-            Duration::from_millis(50),
-            Box::new(frame(1))
-        ));
+        assert!(
+            player.on_frame(Duration::from_millis(50), Box::new(frame(1)))
+        );
         assert!(player.take_next());
         assert!(player.on_finished());
 

@@ -1233,9 +1233,11 @@ mod tests {
 
         // A dead writer leaves its temp unlocked.
         let stale_pid = 4242;
-        let stale_thumb = root.join("thumb").join(temp_name(hash, stale_pid));
+        let stale_thumb =
+            root.join("thumb").join(temp_name(hash, stale_pid));
         fs::write(&stale_thumb, b"partial").expect("thumb temp");
-        let stale_view = root.join("view").join(temp_name(hash, stale_pid));
+        let stale_view =
+            root.join("view").join(temp_name(hash, stale_pid));
         fs::write(&stale_view, b"partial").expect("view temp");
 
         // A live writer's temp stays while it holds the lock.
@@ -1285,8 +1287,7 @@ mod tests {
         assert!(!store.save(hash, Role::Full, &page).persisted);
         assert!(store.load(hash, Role::Full).is_none());
 
-        let loaded =
-            store.load(hash, Role::Thumb).expect("cached thumb");
+        let loaded = store.load(hash, Role::Thumb).expect("cached thumb");
         assert_eq!((loaded.width(), loaded.height()), (3, 2));
         assert_eq!(loaded.page_dims(), (9, 6));
         assert_eq!(loaded.format(), Format::Png);
@@ -1303,8 +1304,7 @@ mod tests {
         let hash = content_hash(b"page-b");
         assert!(store.save(hash, Role::Fit, &page).persisted);
 
-        let loaded =
-            store.load(hash, Role::Fit).expect("cached view");
+        let loaded = store.load(hash, Role::Fit).expect("cached view");
         assert_eq!((loaded.width(), loaded.height()), (5, 3));
         assert_eq!(loaded.page_dims(), (15, 9));
         assert_eq!(loaded.format(), Format::Avif);
@@ -1327,8 +1327,7 @@ mod tests {
         let hash = content_hash(b"page-e");
         assert!(store.save(hash, Role::Thumb, &page).persisted);
 
-        let loaded =
-            store.load(hash, Role::Thumb).expect("cached thumb");
+        let loaded = store.load(hash, Role::Thumb).expect("cached thumb");
         let Pixels::Yuv(yuv) = loaded.pixels() else {
             panic!("expected yuv pixels");
         };
@@ -1465,10 +1464,9 @@ mod tests {
             bytes.into_boxed_slice(),
         )
         .expect("rgba page");
-        for (kind, edge, row_count) in [
-            (Role::Thumb, THUMB_EDGE, 5_u32),
-            (Role::Fit, FIT_EDGE, 64),
-        ] {
+        for (kind, edge, row_count) in
+            [(Role::Thumb, THUMB_EDGE, 5_u32), (Role::Fit, FIT_EDGE, 64)]
+        {
             let derived = derive(&page, kind);
             let row_width = count(derived.width(), 1);
             assert_eq!(
@@ -1534,10 +1532,9 @@ mod tests {
             Subsampling::Yuv420,
             [400, 600, 300, 1023],
         );
-        for (kind, edge, row_count) in [
-            (Role::Thumb, THUMB_EDGE, 5_u32),
-            (Role::Fit, FIT_EDGE, 64),
-        ] {
+        for (kind, edge, row_count) in
+            [(Role::Thumb, THUMB_EDGE, 5_u32), (Role::Fit, FIT_EDGE, 64)]
+        {
             let derived = derive(&page, kind);
             assert_eq!(
                 (derived.width(), derived.height()),
@@ -1598,8 +1595,8 @@ mod tests {
         let dir = TempDir::new("preview-prune");
         let root = dir.path().join("cache");
         let page = rgba_page(4, 4);
-        let size = u64::try_from(encode(&page, Role::Thumb).len())
-            .expect("size");
+        let size =
+            u64::try_from(encode(&page, Role::Thumb).len()).expect("size");
         let mut store = Store::with_caps(&root, size + 1, FIT_CAP_BYTES);
 
         let first = content_hash(b"first");

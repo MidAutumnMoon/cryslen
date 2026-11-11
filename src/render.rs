@@ -18,6 +18,8 @@ use winit::event_loop::ActiveEventLoop;
 use winit::raw_window_handle::HasWindowHandle as _;
 use winit::window::Window as WinitWindow;
 
+use crate::browse::Role;
+use crate::browse::Roles;
 use crate::decode::plane_bytes;
 use crate::decode::plane_dims;
 use crate::decode::Decoded;
@@ -29,8 +31,6 @@ use crate::decode::Transfer;
 use crate::decode::YuvImage;
 use crate::fault::TextureError;
 use crate::fault::TextureFault;
-use crate::browse::Role;
-use crate::browse::Roles;
 use crate::geometry;
 use crate::geometry::Placement;
 use crate::geometry::SpreadLayout;
@@ -169,11 +169,14 @@ struct UniformLocations {
     window_size: <glow::Context as glow::HasContext>::UniformLocation,
     seat_offset: <glow::Context as glow::HasContext>::UniformLocation,
     seat_size: <glow::Context as glow::HasContext>::UniformLocation,
-    page_uv_per_pixel: <glow::Context as glow::HasContext>::UniformLocation,
-    chroma_uv_per_pixel: <glow::Context as glow::HasContext>::UniformLocation,
+    page_uv_per_pixel:
+        <glow::Context as glow::HasContext>::UniformLocation,
+    chroma_uv_per_pixel:
+        <glow::Context as glow::HasContext>::UniformLocation,
     color_matrix: <glow::Context as glow::HasContext>::UniformLocation,
     color_offset: <glow::Context as glow::HasContext>::UniformLocation,
-    alpha_normalization: <glow::Context as glow::HasContext>::UniformLocation,
+    alpha_normalization:
+        <glow::Context as glow::HasContext>::UniformLocation,
     pixel_layout: <glow::Context as glow::HasContext>::UniformLocation,
     transfer_code: <glow::Context as glow::HasContext>::UniformLocation,
     dither: <glow::Context as glow::HasContext>::UniformLocation,
@@ -266,7 +269,8 @@ fn check_texture_dims(
     dims: (u32, u32),
     max_edge: u32,
 ) -> Result<(), TextureError> {
-    if dims.0 == 0 || dims.1 == 0 || dims.0 > max_edge || dims.1 > max_edge {
+    if dims.0 == 0 || dims.1 == 0 || dims.0 > max_edge || dims.1 > max_edge
+    {
         return Err(ErrorUnion::new(TextureFault { dims, max_edge }));
     }
     Ok(())
@@ -342,10 +346,11 @@ impl PageTextures {
         let dims = (image.width(), image.height());
         check_texture_dims(dims, self.max_texture_edge)?;
         if let Some(PageTexture {
-            layout: PixelLayout::Rgba {
-                texture,
-                dims: present_dims,
-            },
+            layout:
+                PixelLayout::Rgba {
+                    texture,
+                    dims: present_dims,
+                },
             transfer,
             ..
         }) = self
@@ -403,9 +408,9 @@ impl PageTextures {
     }
 
     pub fn has_any(&self, page: usize) -> bool {
-        self.pages.get(&page).is_some_and(|slots| {
-            slots.iter().any(Option::is_some)
-        })
+        self.pages
+            .get(&page)
+            .is_some_and(|slots| slots.iter().any(Option::is_some))
     }
 
     /// Drop every texture whose page and role `keep` rejects.
@@ -471,10 +476,13 @@ impl PageTextures {
                 gl_int(height),
             );
         }
-        for (rect, page) in spread_layout.rects.iter().zip(seat_pages.iter()) {
+        for (rect, page) in
+            spread_layout.rects.iter().zip(seat_pages.iter())
+        {
             let Some(rect) = rect else { continue };
             let Some(page) = page else { continue };
-            let Some(texture) = self.pages.get(page).and_then(best_texture)
+            let Some(texture) =
+                self.pages.get(page).and_then(best_texture)
             else {
                 continue;
             };
@@ -831,7 +839,12 @@ fn gl_int(value: u32) -> i32 {
 /// # Safety
 ///
 /// The context must be current and `name` must be live.
-unsafe fn label(gl: &glow::Context, identifier: u32, name: u32, text: &str) {
+unsafe fn label(
+    gl: &glow::Context,
+    identifier: u32,
+    name: u32,
+    text: &str,
+) {
     if gl.supports_debug() {
         gl.object_label(identifier, name, Some(text));
     }
@@ -953,10 +966,7 @@ unsafe fn new_texture(
         gl_int(glow::CLAMP_TO_EDGE),
     );
     let (min_filter, mag_filter) = if filterable {
-        (
-            glow::LINEAR_MIPMAP_LINEAR,
-            magnification_filter.gl_filter(),
-        )
+        (glow::LINEAR_MIPMAP_LINEAR, magnification_filter.gl_filter())
     } else {
         (glow::NEAREST, glow::NEAREST)
     };
@@ -1136,63 +1146,63 @@ unsafe fn upload_page_texture(
                 filterable,
                 magnification_filter,
             );
-            let (cb_texture, cr_texture) =
-                if yuv.subsampling == Subsampling::Mono {
-                    // 1x1 chroma at the neutral code, which the folded
-                    // quantization anchor cancels exactly.
-                    let neutral =
-                        constant_plane(depth, 1_u32 << (depth - 1));
-                    let neutral_bytes = plane_bytes(&neutral);
-                    (
-                        upload_plane(
-                            gl,
-                            neutral_bytes,
-                            (1, 1),
-                            wide,
-                            filterable,
-                            MagnificationFilter::Linear,
-                        ),
-                        upload_plane(
-                            gl,
-                            neutral_bytes,
-                            (1, 1),
-                            wide,
-                            filterable,
-                            MagnificationFilter::Linear,
-                        ),
-                    )
-                } else {
-                    expect(
-                        &yuv.cb,
-                        chroma_w as usize * chroma_h as usize,
-                        "cb",
-                    );
-                    expect(
-                        &yuv.cr,
-                        chroma_w as usize * chroma_h as usize,
-                        "cr",
-                    );
-                    let cb_bytes = plane_bytes(&yuv.cb);
-                    let cr_bytes = plane_bytes(&yuv.cr);
-                    (
-                        upload_plane(
-                            gl,
-                            cb_bytes,
-                            (chroma_w, chroma_h),
-                            wide,
-                            filterable,
-                            MagnificationFilter::Linear,
-                        ),
-                        upload_plane(
-                            gl,
-                            cr_bytes,
-                            (chroma_w, chroma_h),
-                            wide,
-                            filterable,
-                            MagnificationFilter::Linear,
-                        ),
-                    )
-                };
+            let (cb_texture, cr_texture) = if yuv.subsampling
+                == Subsampling::Mono
+            {
+                // 1x1 chroma at the neutral code, which the folded
+                // quantization anchor cancels exactly.
+                let neutral = constant_plane(depth, 1_u32 << (depth - 1));
+                let neutral_bytes = plane_bytes(&neutral);
+                (
+                    upload_plane(
+                        gl,
+                        neutral_bytes,
+                        (1, 1),
+                        wide,
+                        filterable,
+                        MagnificationFilter::Linear,
+                    ),
+                    upload_plane(
+                        gl,
+                        neutral_bytes,
+                        (1, 1),
+                        wide,
+                        filterable,
+                        MagnificationFilter::Linear,
+                    ),
+                )
+            } else {
+                expect(
+                    &yuv.cb,
+                    chroma_w as usize * chroma_h as usize,
+                    "cb",
+                );
+                expect(
+                    &yuv.cr,
+                    chroma_w as usize * chroma_h as usize,
+                    "cr",
+                );
+                let cb_bytes = plane_bytes(&yuv.cb);
+                let cr_bytes = plane_bytes(&yuv.cr);
+                (
+                    upload_plane(
+                        gl,
+                        cb_bytes,
+                        (chroma_w, chroma_h),
+                        wide,
+                        filterable,
+                        MagnificationFilter::Linear,
+                    ),
+                    upload_plane(
+                        gl,
+                        cr_bytes,
+                        (chroma_w, chroma_h),
+                        wide,
+                        filterable,
+                        MagnificationFilter::Linear,
+                    ),
+                )
+            };
             let alpha_texture = yuv.alpha.as_ref().map_or_else(
                 // 1x1 opaque: the max code, which the alpha normalization
                 // maps to 1.0.
@@ -1370,33 +1380,38 @@ fn page_color_conversion(yuv: &YuvImage, wide: bool) -> ColorConversion {
     let depth = yuv.depth.clamp(MIN_PLANE_DEPTH, MAX_PLANE_DEPTH);
     let quantization = code_quantization(depth, yuv.full_range, wide);
     let normalization = depth_normalization(depth, wide);
-    let (base_matrix, luma_scale, chroma_scale, luma_black, chroma_neutral) =
-        if yuv.matrix == Matrix::Identity {
-            // H.273 identity planes are GBR in the (Y, Cb, Cr) slots,
-            // quantized as luma on all three axes: permute into RGB and
-            // anchor every axis at luma black. Mono identity repeats the
-            // luma plane to RGB.
-            let base_matrix = if yuv.subsampling == Subsampling::Mono {
-                [1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-            } else {
-                [0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0]
-            };
-            (
-                base_matrix,
-                quantization.luma_scale,
-                quantization.luma_scale,
-                quantization.luma_black,
-                quantization.luma_black,
-            )
+    let (
+        base_matrix,
+        luma_scale,
+        chroma_scale,
+        luma_black,
+        chroma_neutral,
+    ) = if yuv.matrix == Matrix::Identity {
+        // H.273 identity planes are GBR in the (Y, Cb, Cr) slots,
+        // quantized as luma on all three axes: permute into RGB and
+        // anchor every axis at luma black. Mono identity repeats the
+        // luma plane to RGB.
+        let base_matrix = if yuv.subsampling == Subsampling::Mono {
+            [1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
         } else {
-            (
-                yuv_to_rgb_matrix(yuv.matrix),
-                quantization.luma_scale,
-                quantization.chroma_scale,
-                quantization.luma_black,
-                quantization.chroma_neutral,
-            )
+            [0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0]
         };
+        (
+            base_matrix,
+            quantization.luma_scale,
+            quantization.luma_scale,
+            quantization.luma_black,
+            quantization.luma_black,
+        )
+    } else {
+        (
+            yuv_to_rgb_matrix(yuv.matrix),
+            quantization.luma_scale,
+            quantization.chroma_scale,
+            quantization.luma_black,
+            quantization.chroma_neutral,
+        )
+    };
     let mut matrix = base_matrix;
     for (column, matrix_column) in
         matrix.as_chunks_mut::<3>().0.iter_mut().enumerate()
@@ -1588,19 +1603,21 @@ impl Window {
         if gl.supports_debug() {
             // SAFETY: the context is current, and the callback only logs.
             unsafe {
-                gl.debug_message_callback(|source, kind, id, severity, message| {
-                    if severity == glow::DEBUG_SEVERITY_NOTIFICATION {
-                        return;
-                    }
-                    tracing::debug!(
-                        source,
-                        kind,
-                        id,
-                        severity,
-                        message = message,
-                        "GL debug message"
-                    );
-                });
+                gl.debug_message_callback(
+                    |source, kind, id, severity, message| {
+                        if severity == glow::DEBUG_SEVERITY_NOTIFICATION {
+                            return;
+                        }
+                        tracing::debug!(
+                            source,
+                            kind,
+                            id,
+                            severity,
+                            message = message,
+                            "GL debug message"
+                        );
+                    },
+                );
             }
             // SAFETY: the context is current and supports debug output.
             unsafe {
@@ -1901,4 +1918,3 @@ mod tests {
         ));
     }
 }
-

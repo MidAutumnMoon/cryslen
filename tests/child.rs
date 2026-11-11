@@ -30,7 +30,6 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
-use cryslen::protocol::Role;
 use cryslen::protocol::ChildMsg;
 use cryslen::protocol::Direction;
 use cryslen::protocol::Format;
@@ -38,6 +37,7 @@ use cryslen::protocol::Hello;
 use cryslen::protocol::ParentMsg;
 use cryslen::protocol::ReadingMode;
 use cryslen::protocol::Request;
+use cryslen::protocol::Role;
 use cryslen::protocol::WirePixels;
 use ipc_channel::ipc::IpcOneShotServer;
 
