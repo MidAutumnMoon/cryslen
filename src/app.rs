@@ -23,7 +23,6 @@ use winit::event_loop::ControlFlow;
 use winit::event_loop::EventLoopProxy;
 use winit::keyboard::KeyCode;
 use winit::keyboard::ModifiersState;
-use winit::keyboard::PhysicalKey;
 use winit::window::WindowId;
 
 use crate::animation::DecodedEvent;
@@ -985,6 +984,8 @@ impl App {
     }
 
     fn on_jump_key(&mut self, key: &KeyEvent) {
+        use winit::keyboard::PhysicalKey;
+
         if self.modifiers.control_key()
             || self.modifiers.alt_key()
             || self.modifiers.super_key()
@@ -1202,6 +1203,7 @@ impl ApplicationHandler<WakeEvent> for App {
     ) {
         use winit::event::ElementState;
         use winit::event::WindowEvent;
+        use winit::keyboard::PhysicalKey;
 
         if matches!(
             event,

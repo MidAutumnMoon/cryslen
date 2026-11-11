@@ -6,6 +6,13 @@ use std::time::Duration;
 use std::time::Instant;
 
 use egui::text::LayoutJob;
+use egui::Color32;
+use egui::Context;
+use egui::Rect;
+use egui::Response;
+use egui::Style;
+use egui::TextFormat;
+use egui::Ui;
 
 use crate::browse::PageInfo;
 use crate::browse::ReadingMode;
@@ -189,36 +196,39 @@ pub struct PageStatus {
 }
 
 pub fn show(
-    ui: &mut egui::Ui,
+    ui: &mut Ui,
     status: &StatusLine<'_>,
     show_status_bar: bool,
-) -> egui::Response {
+) -> Response {
+    use egui::CursorIcon;
+    use egui::Label;
+    use egui::Panel;
+    use egui::Sense;
+    use egui::Sides;
+
     if show_status_bar {
-        egui::Panel::bottom("status").show(ui, |ui| {
+        Panel::bottom("status").show(ui, |ui| {
             // Sides measures the right end from what it renders, so the
             // facts truncate at the group's true edge. Without
             // `shrink_left()` the group parks beside the facts.
-            egui::Sides::new().shrink_left().show(
+            Sides::new().shrink_left().show(
                 ui,
                 |ui| {
                     let job = line(ui.style(), status);
-                    ui.add(egui::Label::new(job).truncate());
+                    ui.add(Label::new(job).truncate());
                 },
                 |ui| right_end(ui, status),
             );
         });
     }
     let content = ui.available_rect_before_wrap();
-    let response = ui.interact(
-        content,
-        ui.scope_id().with("page"),
-        egui::Sense::DRAG,
-    );
+    let response =
+        ui.interact(content, ui.scope_id().with("page"), Sense::DRAG);
     // Set after the bar so a drag over it keeps the move icon.
     if response.is_pointer_button_down_on()
         && ui.ctx().input(|i| i.pointer.primary_down())
     {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
+        ui.ctx().set_cursor_icon(CursorIcon::Move);
     }
     response
 }
@@ -233,34 +243,40 @@ const PROMPT_PREFIX_GAP: f32 = 12.0;
 /// Draws the prompt over `page_rect`; callers pass the page surface, so
 /// the status bar stays outside the dim.
 pub fn page_jump(
-    ctx: &egui::Context,
-    page_rect: egui::Rect,
+    ctx: &Context,
+    page_rect: Rect,
     digits: &str,
     page_count: usize,
     digits_valid: bool,
 ) {
+    use egui::Align2;
+    use egui::Area;
+    use egui::Frame;
+    use egui::Id;
+    use egui::LayerId;
+    use egui::Margin;
+    use egui::Order;
+
     // The prompt frame is Foreground; keep the dim one layer below it.
-    let dim_layer = egui::LayerId::new(
-        egui::Order::Middle,
-        egui::Id::unique("page-jump-dim"),
-    );
+    let dim_layer =
+        LayerId::new(Order::Middle, Id::unique("page-jump-dim"));
     ctx.layer_painter(dim_layer)
         .with_clip_rect(page_rect)
         .rect_filled(
             page_rect,
             0.0,
-            egui::Color32::from_black_alpha(PAGE_DIM_ALPHA),
+            Color32::from_black_alpha(PAGE_DIM_ALPHA),
         );
 
-    egui::Area::new(egui::Id::unique("page-jump"))
-        .order(egui::Order::Foreground)
+    Area::new(Id::unique("page-jump"))
+        .order(Order::Foreground)
         .interactable(false)
         .fade_in(false)
         .fixed_pos(page_rect.center())
-        .pivot(egui::Align2::CENTER_CENTER)
+        .pivot(Align2::CENTER_CENTER)
         .show(ctx, |ui| {
-            egui::Frame::popup(ui.style())
-                .inner_margin(egui::Margin::same(PROMPT_MARGIN))
+            Frame::popup(ui.style())
+                .inner_margin(Margin::same(PROMPT_MARGIN))
                 .show(ui, |ui| {
                     ui.set_min_width(PROMPT_MIN_WIDTH);
                     ui.label(page_jump_text(
@@ -274,11 +290,14 @@ pub fn page_jump(
 }
 
 fn page_jump_text(
-    style: &egui::Style,
+    style: &Style,
     digits: &str,
     page_count: usize,
     digits_valid: bool,
 ) -> LayoutJob {
+    use egui::Align;
+    use egui::FontId;
+
     let value_color = if digits.is_empty() {
         style.visuals.weak_text_color()
     } else if digits_valid {
@@ -286,25 +305,22 @@ fn page_jump_text(
     } else {
         style.visuals.error_fg_color
     };
-    let value_text = if digits.is_empty() {
-        format!("1-{page_count}")
-    } else {
-        digits.to_owned()
-    };
+    let placeholder = digits.is_empty().then(|| format!("1-{page_count}"));
+    let value_text = placeholder.as_deref().unwrap_or(digits);
 
-    let mut prefix_format = egui::TextFormat::simple(
-        egui::FontId::monospace(PROMPT_PREFIX_SIZE),
+    let mut prefix_format = TextFormat::simple(
+        FontId::monospace(PROMPT_PREFIX_SIZE),
         style.visuals.strong_text_color(),
     );
-    prefix_format.valign = egui::Align::Center;
+    prefix_format.valign = Align::Center;
 
     let mut job = LayoutJob::default();
     job.append(":", 0.0, prefix_format);
     job.append(
-        &value_text,
+        value_text,
         PROMPT_PREFIX_GAP,
-        egui::TextFormat::simple(
-            egui::FontId::monospace(PROMPT_VALUE_SIZE),
+        TextFormat::simple(
+            FontId::monospace(PROMPT_VALUE_SIZE),
             value_color,
         ),
     );
@@ -314,9 +330,11 @@ fn page_jump_text(
 /// The mode group plus a showing toast to its left. The Sides right
 /// side lays out right-to-left, so the display order iterates in
 /// reverse.
-fn right_end(ui: &mut egui::Ui, status: &StatusLine<'_>) {
+fn right_end(ui: &mut Ui, status: &StatusLine<'_>) {
+    use egui::RichText;
+
     for (mode_index, &mode) in ReadingMode::ALL.iter().enumerate().rev() {
-        let text = egui::RichText::new(group_label(mode)).monospace();
+        let text = RichText::new(group_label(mode)).monospace();
         let text = if mode == status.mode {
             text.color(mode_color(mode)).strong()
         } else {
@@ -324,11 +342,11 @@ fn right_end(ui: &mut egui::Ui, status: &StatusLine<'_>) {
         };
         ui.label(text);
         if mode_index > 0 {
-            ui.label(egui::RichText::new("·").weak().monospace());
+            ui.label(RichText::new("·").weak().monospace());
         }
     }
     if status.toast {
-        ui.label(egui::RichText::new(status.mode.effect()).monospace());
+        ui.label(RichText::new(status.mode.effect()).monospace());
     }
 }
 
@@ -336,36 +354,31 @@ fn group_label(mode: ReadingMode) -> String {
     format!("{} ({})", mode.label(), mode.shortcut())
 }
 
-fn mode_color(mode: ReadingMode) -> egui::Color32 {
+fn mode_color(mode: ReadingMode) -> Color32 {
     match mode {
-        ReadingMode::Normal => egui::Color32::from_rgb(0x87, 0xb3, 0x7d),
-        ReadingMode::Manga => egui::Color32::from_rgb(0xd2, 0x7b, 0x7b),
-        ReadingMode::Comic => egui::Color32::from_rgb(0x7b, 0x9f, 0xd2),
+        ReadingMode::Normal => Color32::from_rgb(0x87, 0xb3, 0x7d),
+        ReadingMode::Manga => Color32::from_rgb(0xd2, 0x7b, 0x7b),
+        ReadingMode::Comic => Color32::from_rgb(0x7b, 0x9f, 0xd2),
     }
 }
 
 /// Muted hue for the spread range, quieter than the mode colors so the
 /// group keeps the bar's strongest accent.
-const HEAD_COLOR: egui::Color32 =
-    egui::Color32::from_rgb(0xc2, 0x9e, 0x6f);
+const HEAD_COLOR: Color32 = Color32::from_rgb(0xc2, 0x9e, 0x6f);
 
-const NAME_COLOR: egui::Color32 =
-    egui::Color32::from_rgb(0xa2, 0x92, 0xc5);
+const NAME_COLOR: Color32 = Color32::from_rgb(0xa2, 0x92, 0xc5);
 
 /// The left-side facts as one job of colored sections, separate so they
 /// are directly testable. One job, one label: the whole line keeps
 /// eliding together on narrow screens.
-fn line(style: &egui::Style, status: &StatusLine<'_>) -> LayoutJob {
-    let font = egui::TextStyle::Monospace.resolve(style);
+fn line(style: &Style, status: &StatusLine<'_>) -> LayoutJob {
+    use egui::TextStyle;
+
+    let font = TextStyle::Monospace.resolve(style);
     let plain = style.visuals.text_color();
-    let section =
-        |job: &mut LayoutJob, text: &str, color: egui::Color32| {
-            job.append(
-                text,
-                0.0,
-                egui::TextFormat::simple(font.clone(), color),
-            );
-        };
+    let section = |job: &mut LayoutJob, text: &str, color: Color32| {
+        job.append(text, 0.0, TextFormat::simple(font.clone(), color));
+    };
     let mut job = LayoutJob::default();
 
     let head = status.spread.second.map_or_else(
@@ -408,6 +421,10 @@ fn line(style: &egui::Style, status: &StatusLine<'_>) -> LayoutJob {
     reason = "a panic in test code is inconsequential"
 )]
 mod tests {
+    use egui::Pos2;
+    use egui::RawInput;
+    use egui::Shape;
+
     use super::*;
 
     #[test]
@@ -515,7 +532,7 @@ mod tests {
 
     struct TextItem {
         text: String,
-        rect: egui::Rect,
+        rect: Rect,
         elided: bool,
     }
 
@@ -523,9 +540,9 @@ mod tests {
         clippy::wildcard_enum_match_arm,
         reason = "egui's non-text shape variants carry no text items"
     )]
-    fn walk(shape: &egui::Shape, out: &mut Vec<TextItem>) {
+    fn walk(shape: &Shape, out: &mut Vec<TextItem>) {
         match shape {
-            egui::Shape::Text(text_shape) => out.push(TextItem {
+            Shape::Text(text_shape) => out.push(TextItem {
                 text: text_shape
                     .galley
                     .rows
@@ -538,7 +555,7 @@ mod tests {
                     .translate(text_shape.pos.to_vec2()),
                 elided: text_shape.galley.elided,
             }),
-            egui::Shape::Vec(shapes) => {
+            Shape::Vec(shapes) => {
                 for child_shape in shapes {
                     walk(child_shape, out);
                 }
@@ -552,13 +569,13 @@ mod tests {
     fn render(
         width: f32,
         status: &StatusLine<'_>,
-    ) -> (Vec<TextItem>, egui::Rect) {
+    ) -> (Vec<TextItem>, Rect) {
         use std::mem;
 
-        let ctx = egui::Context::default();
-        let input = || egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
+        let ctx = Context::default();
+        let input = || RawInput {
+            screen_rect: Some(Rect::from_min_size(
+                Pos2::ZERO,
                 egui::vec2(width, SCREEN_HEIGHT),
             )),
             ..Default::default()
@@ -567,7 +584,7 @@ mod tests {
             show(ui, status, true);
         })
         .drop_without_applying_deltas();
-        let mut content = egui::Rect::NOTHING;
+        let mut content = Rect::NOTHING;
         let mut out = ctx.run_ui(input(), |ui| {
             content = show(ui, status, true).rect;
         });
