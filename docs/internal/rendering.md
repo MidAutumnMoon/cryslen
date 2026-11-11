@@ -11,6 +11,7 @@ winit owns the window and events, glutin binds EGL, glow calls GL, egui-winit fe
 
 ## GL rules
 
+- The context floor is desktop OpenGL 3.3 core; the EGL config query requires `EGL_OPENGL_BIT`.
 - Clip space is bottom-origin; flip in the vertex shader and keep the rest top-origin.
 - The page quad is generated from `gl_VertexID`; no vertex buffer or attribute is bound. The empty VAO is the only binding a core profile requires.
 - Each texture owns wrap and filter state; sampler objects would leak page filtering onto egui's texture units.
@@ -19,8 +20,7 @@ winit owns the window and events, glutin binds EGL, glow calls GL, egui-winit fe
 - Minify with mipmaps and trilinear filtering. Magnify a preview linearly and page-resolution pixels nearest, so zoom stays crisp. Chroma reconstructs bilinearly.
 - Dither only when the source has more precision than the 8-bit output: PQ or a plane deeper than 8 bits. An 8-bit sRGB source is not perturbed.
 - Set the unpack alignment to 1 for single-channel planes.
-- On GLES, a 16-bit single-channel texture samples black under linear filtering; use nearest filtering and skip mips for a wide plane.
-- ES fragment shaders need `highp`; mediump can be fp16.
+- `R16` planes are texture-filterable, so they minify and mipmap like `R8`.
 - Refuse a page over the maximum texture size before upload; an oversized upload samples black.
 - Delete GL objects while the context lives; the owner drops the egui renderer before the window.
 

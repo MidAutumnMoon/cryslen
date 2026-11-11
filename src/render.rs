@@ -35,22 +35,11 @@ use crate::geometry::Placement;
 use crate::geometry::SpreadLayout;
 use crate::geometry::Viewport;
 
-/// Both dialect variants of one shader source, so the pair cannot drift.
-macro_rules! shader_variants {
-    ($core:ident, $es:ident, $core_preamble:literal, $es_preamble:literal, $body:literal) => {
-        const $core: &str = concat!($core_preamble, $body);
-        const $es: &str = concat!($es_preamble, $body);
-    };
-}
-
 // The quad is a fixed -1..1 strip generated from gl_VertexID; uniforms
 // place it at the seat rect. Clip space is bottom-origin; winit coords
 // are top-origin.
-shader_variants!(
-    VS_CORE,
-    VS_ES,
+const VS: &str = concat!(
     "#version 330 core\n",
-    "#version 300 es\n",
     "
     uniform vec2 u_window_size; // window size, px
     uniform vec2 u_seat_offset; // seat rect origin, screen px
@@ -67,16 +56,9 @@ shader_variants!(
     }"
 );
 
-// highp is required: mediump may be fp16, where the ulp at 16k image px is
-// 8.0 and wrecks the coordinate math. ES3 mandates highp support. The
-// samplers declare highp too because ES defaults them to lowp.
-//
 // Per-draw constants are folded CPU-side; output is premultiplied.
-shader_variants!(
-    FS_CORE,
-    FS_ES,
+const FS: &str = concat!(
     "#version 330 core\n",
-    "#version 300 es\nprecision highp float;\nprecision highp sampler2D;\n",
     "
     in vec2 v_screen_px;
     out vec4 color;
@@ -277,15 +259,10 @@ fn check_texture_dims(
 
 impl PageTextures {
     pub fn new(gl: Arc<glow::Context>) -> eros::Result<Self> {
-        let (vs, fs) = if gl.version().is_embedded {
-            (VS_ES, FS_ES)
-        } else {
-            (VS_CORE, FS_CORE)
-        };
         // SAFETY: the returned names land in Self, whose Drop deletes
         // them. The error path below leaks them into the process-fatal
         // exit.
-        let pipeline = unsafe { create_pipeline(&gl, vs, fs) }?;
+        let pipeline = unsafe { create_pipeline(&gl, VS, FS) }?;
         #[expect(
             clippy::map_err_ignore,
             reason = "the dropped conversion error says only that the value is out of range, which the message states"
@@ -938,14 +915,14 @@ fn needs_dither(transfer: Transfer, plane_depth: Option<u8>) -> bool {
         || plane_depth.is_some_and(|depth| depth > BYTE_DEPTH)
 }
 
-/// `filterable` false (GLES R16) forces NEAREST and no mips.
+/// Create a texture with mipmapped minification and the requested
+/// magnification filter.
 ///
 /// # Safety
 ///
 /// The context must be current. The returned name is live until deleted.
 unsafe fn new_texture(
     gl: &glow::Context,
-    filterable: bool,
     magnification_filter: MagnificationFilter,
 ) -> <glow::Context as HasContext>::Texture {
     #[expect(
@@ -964,11 +941,8 @@ unsafe fn new_texture(
         glow::TEXTURE_WRAP_T,
         gl_int(glow::CLAMP_TO_EDGE),
     );
-    let (min_filter, mag_filter) = if filterable {
-        (glow::LINEAR_MIPMAP_LINEAR, magnification_filter.gl_filter())
-    } else {
-        (glow::NEAREST, glow::NEAREST)
-    };
+    let min_filter = glow::LINEAR_MIPMAP_LINEAR;
+    let mag_filter = magnification_filter.gl_filter();
     gl.tex_parameter_i32(
         glow::TEXTURE_2D,
         glow::TEXTURE_MIN_FILTER,
@@ -992,7 +966,7 @@ unsafe fn upload_rgba(
     dims: (u32, u32),
     magnification_filter: MagnificationFilter,
 ) -> <glow::Context as HasContext>::Texture {
-    let texture = new_texture(gl, true, magnification_filter);
+    let texture = new_texture(gl, magnification_filter);
     gl.bind_texture(glow::TEXTURE_2D, Some(texture));
     gl.tex_image_2d(
         glow::TEXTURE_2D,
@@ -1050,7 +1024,6 @@ unsafe fn upload_plane(
     data: &[u8],
     dims: (u32, u32),
     wide: bool,
-    filterable: bool,
     magnification_filter: MagnificationFilter,
 ) -> <glow::Context as HasContext>::Texture {
     let (internal, ty) = if wide {
@@ -1058,7 +1031,7 @@ unsafe fn upload_plane(
     } else {
         (glow::R8, glow::UNSIGNED_BYTE)
     };
-    let texture = new_texture(gl, filterable, magnification_filter);
+    let texture = new_texture(gl, magnification_filter);
     gl.bind_texture(glow::TEXTURE_2D, Some(texture));
     // Odd row widths: GL's default 4-byte unpack alignment would desync
     // every row after the first.
@@ -1074,9 +1047,7 @@ unsafe fn upload_plane(
         ty,
         glow::PixelUnpackData::Slice(Some(data)),
     );
-    if filterable {
-        gl.generate_mipmap(glow::TEXTURE_2D);
-    }
+    gl.generate_mipmap(glow::TEXTURE_2D);
     texture
 }
 
@@ -1121,9 +1092,6 @@ unsafe fn upload_page_texture(
             let ((luma_w, luma_h), (chroma_w, chroma_h)) =
                 decode::plane_dims((width, height), yuv.subsampling);
             let wide = matches!(yuv.luma, Plane::U16(_));
-            // GL_R16 is not filterable in GLES. LINEAR makes the texture
-            // incomplete (samples black).
-            let filterable = !(gl.version().is_embedded && wide);
             let depth = yuv.depth.clamp(MIN_PLANE_DEPTH, MAX_PLANE_DEPTH);
             let expect = |plane: &Plane,
                           want_samples: usize,
@@ -1142,7 +1110,6 @@ unsafe fn upload_page_texture(
                 luma_bytes,
                 (luma_w, luma_h),
                 wide,
-                filterable,
                 magnification_filter,
             );
             let (cb_texture, cr_texture) = if yuv.subsampling
@@ -1158,7 +1125,6 @@ unsafe fn upload_page_texture(
                         neutral_bytes,
                         (1, 1),
                         wide,
-                        filterable,
                         MagnificationFilter::Linear,
                     ),
                     upload_plane(
@@ -1166,7 +1132,6 @@ unsafe fn upload_page_texture(
                         neutral_bytes,
                         (1, 1),
                         wide,
-                        filterable,
                         MagnificationFilter::Linear,
                     ),
                 )
@@ -1189,7 +1154,6 @@ unsafe fn upload_page_texture(
                         cb_bytes,
                         (chroma_w, chroma_h),
                         wide,
-                        filterable,
                         MagnificationFilter::Linear,
                     ),
                     upload_plane(
@@ -1197,7 +1161,6 @@ unsafe fn upload_page_texture(
                         cr_bytes,
                         (chroma_w, chroma_h),
                         wide,
-                        filterable,
                         MagnificationFilter::Linear,
                     ),
                 )
@@ -1213,7 +1176,6 @@ unsafe fn upload_page_texture(
                         decode::plane_bytes(&opaque),
                         (1, 1),
                         wide,
-                        filterable,
                         MagnificationFilter::Linear,
                     )
                 },
@@ -1228,7 +1190,6 @@ unsafe fn upload_page_texture(
                         decode::plane_bytes(alpha),
                         (width, height),
                         wide,
-                        filterable,
                         MagnificationFilter::Linear,
                     )
                 },
@@ -1491,17 +1452,20 @@ pub struct Window {
 }
 
 impl Window {
-    /// Prefer desktop GL, fall back to GLES.
+    /// Create the window and its desktop OpenGL 3.3 core context.
     ///
     /// # Safety
     ///
     /// The event loop must outlive the returned window. The platform
     /// display behind its raw handle backs every GL object created here.
     pub unsafe fn new(event_loop: &ActiveEventLoop) -> eros::Result<Self> {
+        use glutin::config::Api as ConfigApi;
         use glutin::config::ConfigTemplateBuilder;
         use glutin::context::ContextApi;
         use glutin::context::ContextAttributesBuilder;
+        use glutin::context::GlProfile;
         use glutin::context::NotCurrentGlContext as _;
+        use glutin::context::Version;
         use glutin::display::Display;
         use glutin::display::DisplayApiPreference;
         use glutin::display::GlDisplay as _;
@@ -1523,8 +1487,10 @@ impl Window {
             Display::new(raw_display, DisplayApiPreference::Egl)?;
         // Prefer a config with alpha so the desktop shows through; a machine
         // without one runs opaque.
-        let translucent_template =
-            ConfigTemplateBuilder::new().with_alpha_size(8).build();
+        let translucent_template = ConfigTemplateBuilder::new()
+            .with_api(ConfigApi::OPENGL)
+            .with_alpha_size(8)
+            .build();
         let (gl_config, translucent) = if let Some(config) =
             gl_display.find_configs(translucent_template)?.next()
         {
@@ -1533,12 +1499,17 @@ impl Window {
             // The second pass drops the alpha demand. The default
             // template also demands alpha, which would repeat the
             // same empty query.
-            let plain =
-                ConfigTemplateBuilder::new().with_alpha_size(0).build();
-            let config =
-                gl_display.find_configs(plain)?.next().ok_or_else(
-                    || eros::error!("no GL config matched the template"),
-                )?;
+            let plain = ConfigTemplateBuilder::new()
+                .with_api(ConfigApi::OPENGL)
+                .with_alpha_size(0)
+                .build();
+            let config = gl_display.find_configs(plain)?.next().ok_or_else(
+                || {
+                    eros::error!(
+                        "no desktop OpenGL 3.3 core config on this EGL display"
+                    )
+                },
+            )?;
             (config, false)
         };
 
@@ -1557,19 +1528,12 @@ impl Window {
         let window =
             glutin_winit::finalize_window(event_loop, attrs, &gl_config)?;
         let raw_window = window.window_handle()?.as_raw();
-        let ctx_attrs =
-            ContextAttributesBuilder::new().build(Some(raw_window));
-        let fallback = ContextAttributesBuilder::new()
-            .with_context_api(ContextApi::Gles(None))
+        let ctx_attrs = ContextAttributesBuilder::new()
+            .with_context_api(ContextApi::OpenGl(Some(Version::new(3, 3))))
+            .with_profile(GlProfile::Core)
             .build(Some(raw_window));
-        let not_current = match gl_display.create_context(&gl_config, &ctx_attrs) {
-            Ok(context) => context,
-            Err(desktop) => gl_display
-                .create_context(&gl_config, &fallback)
-                .map_err(|gles| {
-                    eros::error!("GL context creation failed. desktop: {desktop}. GLES: {gles}")
-                })?,
-        };
+        let not_current =
+            gl_display.create_context(&gl_config, &ctx_attrs)?;
 
         let (width, height): (u32, u32) = window.inner_size().into();
         let surface_attrs =
