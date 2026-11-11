@@ -206,10 +206,6 @@ pub struct App {
     fit: geometry::Fit,
     reading: Reading,
     timers: ui::Timers,
-    /// Cursor position in viewport px, same as window px.
-    cursor: (f32, f32),
-    /// Left button held on the page for panning.
-    panning: bool,
     /// Held modifier state; winit 0.30 key events carry none, only
     /// `ModifiersChanged` does.
     modifiers: ModifiersState,
@@ -241,8 +237,6 @@ impl App {
             fit: geometry::Fit::default(),
             reading,
             timers: ui::Timers::default(),
-            cursor: (0.0, 0.0),
-            panning: false,
             modifiers: ModifiersState::empty(),
             last_viewport: Viewport::default(),
             proxy,
@@ -277,14 +271,6 @@ impl App {
             return "empty";
         };
         self.roles(page).best().map_or("none", Role::name)
-    }
-
-    fn target_spread(&self) -> Spread {
-        browse::spread_for(
-            self.reading.position.target(),
-            self.mode,
-            self.book.view().len(),
-        )
     }
 
     fn is_fullscreen(&self) -> bool {
@@ -456,31 +442,39 @@ impl App {
 
         // `EguiGlow::run` only records shapes, so egui lays out before
         // pages are placed; `paint` later draws the bar above them.
-        let viewport = {
-            let show_bar = !self.is_fullscreen();
+        let page_surface = {
+            let show_status_bar = !self.is_fullscreen();
             let Some(gl) = self.gl.as_mut() else {
                 return Ok(());
             };
-            let panning = self.panning;
-            let mut content = egui::Rect::NOTHING;
+            let mut page_surface = None;
             gl.egui.run(gl.window.winit(), |ui| {
-                content = ui::show(ui, &status, show_bar);
-                // Set after the bar so a drag over it keeps the move icon.
-                if panning {
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
-                }
+                page_surface =
+                    Some(ui::show(ui, &status, show_status_bar));
             });
-            content_viewport(
-                size,
-                content,
-                gl.egui.egui_ctx.pixels_per_point(),
-            )
+            let Some(page_surface) = page_surface else {
+                return Ok(());
+            };
+            page_surface
         };
-        // The bar's height changes without a winit resize; the status
-        // line used the old scale, so redraw once.
+        let viewport = content_viewport(
+            size,
+            page_surface.rect,
+            page_surface.ctx.pixels_per_point(),
+        );
+        // The bar can change height without a resize; the status scale
+        // needs a repaint.
         if viewport != self.last_viewport {
             self.fit.refit();
             self.last_viewport = viewport;
+            self.request_redraw();
+        }
+        if apply_page_input(
+            &mut self.fit,
+            &page_surface,
+            spread_size,
+            viewport,
+        ) {
             self.request_redraw();
         }
         let drawn = self.fit.resolve(spread_size, viewport);
@@ -730,13 +724,6 @@ impl App {
         deadline
     }
 
-    fn last_shown_spread(&self) -> Spread {
-        self.reading
-            .position
-            .shown()
-            .unwrap_or_else(|| self.target_spread())
-    }
-
     fn seat_dims_for(&self, spread: Spread) -> [Option<(u32, u32)>; 2] {
         spread.seats(self.mode).map(|seat| {
             let page = seat?;
@@ -791,14 +778,6 @@ impl App {
         if let Some(gl) = self.gl.as_ref() {
             gl.window.winit().request_redraw();
         }
-    }
-
-    fn geometry(&self) -> ((f32, f32), Viewport) {
-        (
-            geometry::layout(self.seat_dims_for(self.last_shown_spread()))
-                .total(),
-            self.last_viewport,
-        )
     }
 
     fn dispatch(&mut self, action: Action, event_loop: &ActiveEventLoop) {
@@ -1107,8 +1086,6 @@ impl ApplicationHandler<WakeEvent> for App {
         event: WindowEvent,
     ) {
         use winit::event::ElementState;
-        use winit::event::MouseButton;
-        use winit::event::MouseScrollDelta;
         use winit::event::WindowEvent;
         use winit::keyboard::PhysicalKey;
 
@@ -1120,21 +1097,15 @@ impl ApplicationHandler<WakeEvent> for App {
         }
         let Some(gl) = self.gl.as_mut() else { return };
 
-        let egui_wants_pointer =
-            if matches!(event, WindowEvent::RedrawRequested) {
-                // egui-winit answers RedrawRequested with `repaint: true`;
-                // honoring that answer would re-request the redraw and
-                // self-sustain the loop at compositor refresh while idle.
-                gl.egui.egui_ctx.egui_wants_pointer_input()
-            } else {
-                let response =
-                    gl.egui.on_window_event(gl.window.winit(), &event);
-                let wants = gl.egui.egui_ctx.egui_wants_pointer_input();
-                if response.repaint {
-                    gl.window.winit().request_redraw();
-                }
-                wants
-            };
+        // egui-winit reports repaint on RedrawRequested; honoring it would
+        // self-sustain the loop at compositor refresh.
+        if !matches!(event, WindowEvent::RedrawRequested) {
+            let response =
+                gl.egui.on_window_event(gl.window.winit(), &event);
+            if response.repaint {
+                gl.window.winit().request_redraw();
+            }
+        }
 
         match &event {
             WindowEvent::Resized(_) => {
@@ -1179,48 +1150,6 @@ impl ApplicationHandler<WakeEvent> for App {
             WindowEvent::Focused(false) => {
                 self.reading.held_keys.clear();
                 self.sync_motion();
-            }
-            WindowEvent::MouseWheel { delta, .. }
-                if !egui_wants_pointer =>
-            {
-                let wheel_delta_y = match delta {
-                    MouseScrollDelta::LineDelta(_, lines) => *lines,
-                    MouseScrollDelta::PixelDelta(pixels) => wheel_lines(
-                        pixels.y,
-                        gl.window.winit().scale_factor(),
-                    ),
-                };
-                let (total, viewport) = self.geometry();
-                // Scroll up (positive dy) zooms in.
-                let zoom_factor =
-                    (wheel_delta_y * WHEEL_ZOOM_SENSITIVITY).exp();
-                self.fit.zoom(zoom_factor, self.cursor, total, viewport);
-                self.request_redraw();
-            }
-            WindowEvent::MouseInput {
-                state,
-                button: MouseButton::Left,
-                ..
-            } => {
-                self.panning =
-                    *state == ElementState::Pressed && !egui_wants_pointer;
-            }
-            WindowEvent::CursorMoved { position, .. } => {
-                #[expect(
-                    clippy::cast_possible_truncation,
-                    reason = "cursor positions are physical px, where f32 keeps subpixel precision"
-                )]
-                let cursor_pos = (position.x as f32, position.y as f32);
-                if self.panning && !egui_wants_pointer {
-                    let (total, viewport) = self.geometry();
-                    let pan_delta = (
-                        cursor_pos.0 - self.cursor.0,
-                        cursor_pos.1 - self.cursor.1,
-                    );
-                    self.fit.pan(pan_delta, total, viewport);
-                    self.request_redraw();
-                }
-                self.cursor = cursor_pos;
             }
             WindowEvent::RedrawRequested => {
                 if let Err(error) = self.frame() {
@@ -1269,6 +1198,78 @@ fn content_viewport(
     Viewport::above_bottom_bar(win, bar_top)
 }
 
+fn raw_zoom_factor(
+    page_surface: &egui::Response,
+    points_per_line: f32,
+) -> f32 {
+    let viewport_height = page_surface.ctx.viewport_rect().height();
+    page_surface.ctx.input(|i| {
+        let mut wheel_lines = 0.0;
+        let mut pinch_factor = 1.0;
+        // egui smooths wheel deltas over frames; page zoom follows each
+        // raw event.
+        for event in &i.raw.events {
+            if let egui::Event::MouseWheel {
+                unit,
+                delta,
+                phase: _phase,
+                source: _source,
+                modifiers: _modifiers,
+            } = event
+            {
+                let scroll_points = match unit {
+                    egui::MouseWheelUnit::Point => delta.y,
+                    egui::MouseWheelUnit::Line => {
+                        delta.y * points_per_line
+                    }
+                    egui::MouseWheelUnit::Page => {
+                        delta.y * viewport_height
+                    }
+                };
+                wheel_lines += scroll_points / points_per_line;
+            }
+            if let egui::Event::Zoom(zoom_factor) = event {
+                pinch_factor *= zoom_factor;
+            }
+        }
+        pinch_factor * (wheel_lines * WHEEL_ZOOM_PER_LINE).exp()
+    })
+}
+
+fn apply_page_input(
+    fit: &mut geometry::Fit,
+    page_surface: &egui::Response,
+    spread_size: (f32, f32),
+    viewport: Viewport,
+) -> bool {
+    let pixels_per_point = page_surface.ctx.pixels_per_point();
+    if page_surface.dragged_by(egui::PointerButton::Primary) {
+        let delta = page_surface.drag_delta() * pixels_per_point;
+        if delta.length_sq() > 0.0 {
+            fit.pan((delta.x, delta.y), spread_size, viewport);
+        }
+    }
+    if !page_surface.hovered() {
+        return false;
+    }
+    let points_per_line = page_surface
+        .ctx
+        .options(|options| options.input_options.line_scroll_speed);
+    if points_per_line <= 0.0 {
+        return false;
+    }
+    let zoom_factor = raw_zoom_factor(page_surface, points_per_line);
+    if (zoom_factor - 1.0).abs() <= f32::EPSILON {
+        return false;
+    }
+    let Some(hover_pos) = page_surface.hover_pos() else {
+        return false;
+    };
+    let anchor = (hover_pos - page_surface.rect.min) * pixels_per_point;
+    fit.zoom(zoom_factor, (anchor.x, anchor.y), spread_size, viewport);
+    true
+}
+
 /// The glass in egui's premultiplied u8 color, converted from [`clear_color`].
 #[expect(
     clippy::cast_possible_truncation,
@@ -1300,22 +1301,7 @@ fn apply_dark_theme(
     }
 }
 
-/// One wheel notch zooms ~×1.16, three notches ~×1.6.
-const WHEEL_ZOOM_SENSITIVITY: f32 = 0.15;
-
-/// Assumed wheel resolution for pixel-mode wheels, in logical px of
-/// scroll per line.
-const PIXELS_PER_WHEEL_LINE: f32 = 40.0;
-
-/// Pixel-mode wheel motion as zoom lines, divided by scale factor so
-/// zoom speed stays constant across output scaling.
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "wheel lines feed an exponential zoom sensitivity, so one f64-to-f32 rounding is immaterial"
-)]
-fn wheel_lines(dy: f64, scale_factor: f64) -> f32 {
-    (dy / (f64::from(PIXELS_PER_WHEEL_LINE) * scale_factor)) as f32
-}
+const WHEEL_ZOOM_PER_LINE: f32 = 0.2;
 
 #[cfg(test)]
 mod tests {

@@ -1,4 +1,4 @@
-//! Status overlay: one egui bottom panel, data in / text out.
+//! Status bar and page interaction surface.
 
 use std::fmt;
 use std::iter;
@@ -188,31 +188,39 @@ pub struct PageStatus {
     pub claimed: Option<Format>,
 }
 
-/// Render the status bar into `ui` and return the content rect: what
-/// the chrome leaves, the only legal page viewport. A hidden
-/// bar (`fullscreen`) leaves the whole window as content.
 pub fn show(
     ui: &mut egui::Ui,
     status: &StatusLine<'_>,
-    show_bar: bool,
-) -> egui::Rect {
-    if !show_bar {
-        return ui.available_rect_before_wrap();
+    show_status_bar: bool,
+) -> egui::Response {
+    if show_status_bar {
+        egui::Panel::bottom("status").show(ui, |ui| {
+            // Sides measures the right end from what it renders, so the
+            // facts truncate at the group's true edge. Without
+            // `shrink_left()` the group parks beside the facts.
+            egui::Sides::new().shrink_left().show(
+                ui,
+                |ui| {
+                    let job = line(ui.style(), status);
+                    ui.add(egui::Label::new(job).truncate());
+                },
+                |ui| right_end(ui, status),
+            );
+        });
     }
-    egui::Panel::bottom("status").show(ui, |ui| {
-        // Sides measures the right end from what it renders, so the
-        // facts truncate at the group's true edge. Without
-        // `shrink_left()` the group parks beside the facts.
-        egui::Sides::new().shrink_left().show(
-            ui,
-            |ui| {
-                let job = line(ui.style(), status);
-                ui.add(egui::Label::new(job).truncate());
-            },
-            |ui| right_end(ui, status),
-        );
-    });
-    ui.available_rect_before_wrap()
+    let content = ui.available_rect_before_wrap();
+    let response = ui.interact(
+        content,
+        ui.scope_id().with("page"),
+        egui::Sense::DRAG,
+    );
+    // Set after the bar so a drag over it keeps the move icon.
+    if response.is_pointer_button_down_on()
+        && ui.ctx().input(|i| i.pointer.primary_down())
+    {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Move);
+    }
+    response
 }
 
 /// The mode group plus a showing toast to its left. The Sides right
@@ -472,8 +480,9 @@ mod tests {
         })
         .drop_without_applying_deltas();
         let mut content = egui::Rect::NOTHING;
-        let mut out =
-            ctx.run_ui(input(), |ui| content = show(ui, status, true));
+        let mut out = ctx.run_ui(input(), |ui| {
+            content = show(ui, status, true).rect;
+        });
         let shapes = mem::take(&mut out.shapes);
         out.drop_without_applying_deltas();
         let mut items = Vec::new();
