@@ -138,7 +138,6 @@ struct Reading {
     /// Page faults, sticky per page so a blip cannot erase them.
     faults: BTreeMap<usize, PageFault>,
     deliveries: VecDeque<Delivery>,
-    upload_fault_page: Option<usize>,
     motion: Motion,
     held_keys: HeldKeys,
     last_turn: Option<Instant>,
@@ -169,7 +168,6 @@ impl Reading {
             facts: BTreeMap::new(),
             faults: BTreeMap::new(),
             deliveries: VecDeque::new(),
-            upload_fault_page: None,
             motion: Motion::Still,
             held_keys: HeldKeys::default(),
             last_turn: None,
@@ -438,10 +436,6 @@ impl App {
                 .name(page)
                 .and_then(decode::format_from_name),
         });
-        let upload_fault = self
-            .reading
-            .upload_fault_page
-            .and_then(|failed| self.reading.faults.get(&failed));
         let status = StatusLine {
             page_count: self.book.view().len().get(),
             spread: on_screen,
@@ -456,7 +450,6 @@ impl App {
             fault: ui::fault_to_show(
                 spread_status.fault,
                 self.book.fault(),
-                upload_fault,
             ),
         };
 
@@ -583,7 +576,6 @@ impl App {
                 self.reading
                     .faults
                     .insert(delivery.page, PageFault::from(error.widen()));
-                self.reading.upload_fault_page = Some(delivery.page);
             }
             uploaded += 1;
             bytes = bytes.saturating_add(cost);

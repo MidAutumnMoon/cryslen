@@ -46,16 +46,14 @@ impl fmt::Display for StatusFault<'_> {
 }
 
 /// The one fault the line shows: the page's own failure first, then the
-/// book's, then a texture the GPU refused. Each layer's cell keeps its
-/// own retention; this is only the ordering.
+/// book's. Each layer's cell keeps its own retention; this is only the
+/// ordering.
 pub fn fault_to_show<'fault>(
     page: Option<&'fault PageFault>,
     book: Option<&'fault BookFault>,
-    upload: Option<&'fault PageFault>,
 ) -> Option<StatusFault<'fault>> {
     page.map(StatusFault::Page)
         .or_else(|| book.map(StatusFault::Book))
-        .or_else(|| upload.map(StatusFault::Page))
 }
 
 /// Status-line timers, pure in the clock the caller passes.
@@ -373,25 +371,20 @@ mod tests {
     }
 
     #[test]
-    fn the_line_blames_the_page_before_the_book_before_the_upload() {
+    fn the_line_blames_the_page_before_the_book() {
         let page_fault = PageFault::new("page");
-        let upload_fault = PageFault::new("upload");
         let book_fault = BookFault::Timeout;
-        assert!(fault_to_show(None, None, None).is_none());
+        assert!(fault_to_show(None, None).is_none());
         assert!(matches!(
-            fault_to_show(None, Some(&book_fault), Some(&upload_fault)),
+            fault_to_show(None, Some(&book_fault)),
             Some(StatusFault::Book(_))
         ));
         assert!(matches!(
-            fault_to_show(None, None, Some(&upload_fault)),
+            fault_to_show(Some(&page_fault), None),
             Some(StatusFault::Page(_))
         ));
         assert!(matches!(
-            fault_to_show(
-                Some(&page_fault),
-                Some(&book_fault),
-                Some(&upload_fault)
-            ),
+            fault_to_show(Some(&page_fault), Some(&book_fault)),
             Some(StatusFault::Page(_))
         ));
     }
