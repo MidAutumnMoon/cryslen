@@ -44,12 +44,13 @@ const VS: &str = concat!(
     uniform vec2 u_window_size; // window size, px
     uniform vec2 u_seat_offset; // seat rect origin, screen px
     uniform vec2 u_seat_size;   // seat rect size, screen px
-    out vec2 v_screen_px;
+    out vec2 v_seat_px;
     void main() {
         vec2 corner = vec2(float(gl_VertexID & 1), float(gl_VertexID >> 1));
         vec2 pos = corner * 2.0 - 1.0;
-        vec2 screen_px = u_seat_offset + (pos * 0.5 + 0.5) * u_seat_size;
-        v_screen_px = screen_px;
+        vec2 seat_px = (pos * 0.5 + 0.5) * u_seat_size;
+        v_seat_px = seat_px;
+        vec2 screen_px = u_seat_offset + seat_px;
         gl_Position = vec4(screen_px.x / u_window_size.x * 2.0 - 1.0,
                            1.0 - screen_px.y / u_window_size.y * 2.0,
                            0.0, 1.0);
@@ -60,9 +61,8 @@ const VS: &str = concat!(
 const FS: &str = concat!(
     "#version 330 core\n",
     "
-    in vec2 v_screen_px;
-    out vec4 color;
-    uniform vec2 u_seat_offset;   // page rect origin, screen px
+    in vec2 v_seat_px;
+    layout(location = 0) out vec4 color;
     uniform vec2 u_page_uv_per_pixel;   // screen px -> page fraction: 1 / (scale * page size)
     uniform vec2 u_chroma_uv_per_pixel; // screen px -> chroma-page fraction, subsample-aware
     uniform mat3 u_color_matrix;  // storage samples -> gamma RGB
@@ -107,12 +107,13 @@ const FS: &str = concat!(
             3.0, 11.0, 1.0, 9.0,
             15.0, 7.0, 13.0, 5.0
         );
-        return thresholds[int(mod(fragment_px.x, 4.0)) + 4 * int(mod(fragment_px.y, 4.0))] / 16.0;
+        ivec2 cell = ivec2(fragment_px) & 3;
+        return thresholds[cell.x + 4 * cell.y] / 16.0;
     }
     void main() {
         // Fragment centers land on texel centers at 1:1 zoom with
         // whole-pixel origins.
-        vec2 page_px = v_screen_px - u_seat_offset;
+        vec2 seat_px = v_seat_px;
         // Dither the straight color at half an output quantum; an 8-bit
         // source has nothing to hide.
         float dither_offset = 0.0;
@@ -120,15 +121,15 @@ const FS: &str = concat!(
             dither_offset = (bayer4(gl_FragCoord.xy) - 0.5) / OUTPUT_MAX;
         }
         if (u_pixel_layout == PIXEL_LAYOUT_RGBA) {
-            vec4 rgba_texel = texture(u_rgba_or_luma, page_px * u_page_uv_per_pixel);
+            vec4 rgba_texel = texture(u_rgba_or_luma, seat_px * u_page_uv_per_pixel);
             color = vec4((to_srgb(rgba_texel.rgb) + dither_offset) * rgba_texel.a, rgba_texel.a);
             return;
         }
         vec3 yuv_samples = vec3(
-            texture(u_rgba_or_luma, page_px * u_page_uv_per_pixel).r,
-            texture(u_cb, page_px * u_chroma_uv_per_pixel).r,
-            texture(u_cr, page_px * u_chroma_uv_per_pixel).r);
-        float alpha = texture(u_alpha, page_px * u_page_uv_per_pixel).r * u_alpha_normalization;
+            texture(u_rgba_or_luma, seat_px * u_page_uv_per_pixel).r,
+            texture(u_cb, seat_px * u_chroma_uv_per_pixel).r,
+            texture(u_cr, seat_px * u_chroma_uv_per_pixel).r);
+        float alpha = texture(u_alpha, seat_px * u_page_uv_per_pixel).r * u_alpha_normalization;
         color = vec4((to_srgb(u_color_matrix * yuv_samples - u_color_offset) + dither_offset) * alpha, alpha);
     }"
 );
