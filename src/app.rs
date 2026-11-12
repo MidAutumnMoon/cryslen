@@ -12,7 +12,13 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
+use egui::Color32;
+use egui::Context;
+use egui::Rect;
+use egui::Response;
+use egui_glow::EguiGlow;
 use egui_winit::winit;
+use eros::ErrorUnion;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::KeyEvent;
@@ -52,9 +58,10 @@ use crate::cache::presentation;
 use crate::cache::presentation::FrameInput;
 use crate::catalog;
 use crate::decode;
-use crate::fault;
+use crate::fault::OpenRefusal;
 use crate::fault::PageFault;
 use crate::geometry;
+use crate::geometry::Fit;
 use crate::geometry::FitMode;
 use crate::geometry::Viewport;
 use crate::protocol::ParentMsg;
@@ -63,6 +70,7 @@ use crate::render::Window;
 use crate::ui;
 use crate::ui::PageStatus;
 use crate::ui::StatusLine;
+use crate::ui::Timers;
 
 pub enum WakeEvent {
     /// Arms a wake; `new_events` requests the redraw at the deadline.
@@ -84,7 +92,7 @@ pub fn post(proxy: &EventLoopProxy<WakeEvent>, event: WakeEvent) {
 
 struct Gl {
     pages: PageTextures,
-    egui: egui_glow::EguiGlow,
+    egui: EguiGlow,
     // Must drop last: owns the GL context used by the fields above.
     window: Window,
 }
@@ -209,12 +217,12 @@ pub struct App {
     /// lands.
     book: Book,
     gl: Option<Gl>,
-    fatal_error: Option<eros::ErrorUnion>,
+    fatal_error: Option<ErrorUnion>,
     mode: ReadingMode,
     /// The fit mode survives a book switch; its placement does not.
-    fit: geometry::Fit,
+    fit: Fit,
     reading: Reading,
-    timers: ui::Timers,
+    timers: Timers,
     /// Held modifier state; winit 0.30 key events carry none, only
     /// `ModifiersChanged` does.
     modifiers: ModifiersState,
@@ -245,9 +253,9 @@ impl App {
             gl: None,
             fatal_error: None,
             mode,
-            fit: geometry::Fit::default(),
+            fit: Fit::default(),
             reading,
-            timers: ui::Timers::default(),
+            timers: Timers::default(),
             modifiers: ModifiersState::empty(),
             jump_digits: None,
             last_viewport: Viewport::default(),
@@ -255,16 +263,12 @@ impl App {
         }
     }
 
-    fn fail(
-        &mut self,
-        error: eros::ErrorUnion,
-        event_loop: &ActiveEventLoop,
-    ) {
+    fn fail(&mut self, error: ErrorUnion, event_loop: &ActiveEventLoop) {
         self.fatal_error = Some(error);
         event_loop.exit();
     }
 
-    pub fn take_fatal_error(&mut self) -> Option<eros::ErrorUnion> {
+    pub fn take_fatal_error(&mut self) -> Option<ErrorUnion> {
         self.fatal_error.take()
     }
 
@@ -1100,6 +1104,8 @@ impl App {
 )]
 impl ApplicationHandler<WakeEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        use egui_system_font_provider::SystemFontProvider;
+
         // SAFETY: `exiting` sets `self.gl = None`, dropping the window and
         // its GL objects while the event loop's display is still alive.
         let window = match unsafe { Window::new(event_loop) } {
@@ -1119,18 +1125,12 @@ impl ApplicationHandler<WakeEvent> for App {
         };
         // `EguiGlow::new` panics if its painter cannot initialize; accepted
         // upstream risk.
-        let egui = egui_glow::EguiGlow::new(
-            event_loop,
-            Arc::clone(&gl),
-            None,
-            None,
-            true,
-        );
+        let egui =
+            EguiGlow::new(event_loop, Arc::clone(&gl), None, None, true);
         // System fonts cover filename characters the built-in fonts cannot
         // render.
-        egui.egui_ctx.add_font_provider(Arc::new(
-            egui_system_font_provider::SystemFontProvider::new(),
-        ));
+        egui.egui_ctx
+            .add_font_provider(Arc::new(SystemFontProvider::new()));
         {
             use parking_lot::Mutex;
 
@@ -1322,7 +1322,7 @@ fn clear_color(translucent: bool) -> [f32; 4] {
 /// window area above the status bar, in physical px.
 fn content_viewport(
     window: PhysicalSize<u32>,
-    content: egui::Rect,
+    content: Rect,
     pixels_per_point: f32,
 ) -> Viewport {
     let win = geometry::px_f32((window.width, window.height));
@@ -1332,10 +1332,10 @@ fn content_viewport(
     Viewport::above_bottom_bar(win, bar_top)
 }
 
-fn raw_zoom_factor(
-    page_surface: &egui::Response,
-    points_per_line: f32,
-) -> f32 {
+fn raw_zoom_factor(page_surface: &Response, points_per_line: f32) -> f32 {
+    use egui::Event;
+    use egui::MouseWheelUnit;
+
     let viewport_height = page_surface.ctx.viewport_rect().height();
     page_surface.ctx.input(|i| {
         let mut wheel_lines = 0.0;
@@ -1343,7 +1343,7 @@ fn raw_zoom_factor(
         // egui smooths wheel deltas over frames; page zoom follows each
         // raw event.
         for event in &i.raw.events {
-            if let egui::Event::MouseWheel {
+            if let Event::MouseWheel {
                 unit,
                 delta,
                 phase: _phase,
@@ -1352,17 +1352,13 @@ fn raw_zoom_factor(
             } = event
             {
                 let scroll_points = match unit {
-                    egui::MouseWheelUnit::Point => delta.y,
-                    egui::MouseWheelUnit::Line => {
-                        delta.y * points_per_line
-                    }
-                    egui::MouseWheelUnit::Page => {
-                        delta.y * viewport_height
-                    }
+                    MouseWheelUnit::Point => delta.y,
+                    MouseWheelUnit::Line => delta.y * points_per_line,
+                    MouseWheelUnit::Page => delta.y * viewport_height,
                 };
                 wheel_lines += scroll_points / points_per_line;
             }
-            if let egui::Event::Zoom(zoom_factor) = event {
+            if let Event::Zoom(zoom_factor) = event {
                 pinch_factor *= zoom_factor;
             }
         }
@@ -1371,13 +1367,15 @@ fn raw_zoom_factor(
 }
 
 fn apply_page_input(
-    fit: &mut geometry::Fit,
-    page_surface: &egui::Response,
+    fit: &mut Fit,
+    page_surface: &Response,
     spread_size: (f32, f32),
     viewport: Viewport,
 ) -> bool {
+    use egui::PointerButton;
+
     let pixels_per_point = page_surface.ctx.pixels_per_point();
-    if page_surface.dragged_by(egui::PointerButton::Primary) {
+    if page_surface.dragged_by(PointerButton::Primary) {
         let delta = page_surface.drag_delta() * pixels_per_point;
         if delta.length_sq() > 0.0 {
             fit.pan((delta.x, delta.y), spread_size, viewport);
@@ -1410,10 +1408,10 @@ fn apply_page_input(
     clippy::cast_sign_loss,
     reason = "the clear color's channels lie in 0..=1, so the rounded scaled value is a valid u8"
 )]
-fn glass_fill() -> egui::Color32 {
+fn glass_fill() -> Color32 {
     let [red, green, blue, alpha] = clear_color(true);
     let channel = |value: f32| value.mul_add(255.0, 0.5) as u8;
-    egui::Color32::from_rgba_premultiplied(
+    Color32::from_rgba_premultiplied(
         channel(red),
         channel(green),
         channel(blue),
@@ -1423,11 +1421,10 @@ fn glass_fill() -> egui::Color32 {
 
 /// A light desktop theme would otherwise pick dark status text over the
 /// dark window.
-fn apply_dark_theme(
-    egui_ctx: &egui::Context,
-    panel_fill: Option<egui::Color32>,
-) {
-    egui_ctx.set_theme(egui::Theme::Dark);
+fn apply_dark_theme(egui_ctx: &Context, panel_fill: Option<Color32>) {
+    use egui::Theme;
+
+    egui_ctx.set_theme(Theme::Dark);
     if let Some(fill) = panel_fill {
         egui_ctx.global_style_mut(|style| {
             style.visuals.panel_fill = fill;
@@ -1440,6 +1437,9 @@ const WHEEL_ZOOM_PER_LINE: f32 = 0.2;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use egui::Pos2;
+    use egui::RawInput;
+    use egui::Theme;
 
     #[test]
     fn a_tap_stays_still_and_a_repeat_skims_until_release() {
@@ -1466,26 +1466,24 @@ mod tests {
 
     #[test]
     fn egui_stays_dark_when_the_desktop_is_light() {
-        let ctx = egui::Context::default();
+        let ctx = Context::default();
         apply_dark_theme(&ctx, Some(glass_fill()));
         ctx.run_ui(
-            egui::RawInput {
-                system_theme: Some(egui::Theme::Light),
+            RawInput {
+                system_theme: Some(Theme::Light),
                 ..Default::default()
             },
             |_| {},
         )
         .drop_without_applying_deltas();
-        assert_eq!(ctx.theme(), egui::Theme::Dark);
+        assert_eq!(ctx.theme(), Theme::Dark);
         assert_eq!(ctx.global_style().visuals.panel_fill, glass_fill());
     }
 
     #[test]
     fn content_viewport_subtracts_the_bar_in_physical_px() {
-        let content = egui::Rect::from_min_max(
-            egui::Pos2::ZERO,
-            egui::pos2(1280.0, 772.0),
-        );
+        let content =
+            Rect::from_min_max(Pos2::ZERO, egui::pos2(1280.0, 772.0));
         let integer =
             content_viewport(PhysicalSize::new(1280, 800), content, 1.0);
         assert_eq!(integer.size(), (1280.0, 772.0));
@@ -1770,7 +1768,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
     }
 }
 
-fn classify(path: &Path) -> Result<Argument, fault::OpenRefusal> {
+fn classify(path: &Path) -> Result<Argument, OpenRefusal> {
     let Some(name) = path.file_name() else {
         return Ok(Argument::Book(path.to_path_buf()));
     };
@@ -1779,7 +1777,7 @@ fn classify(path: &Path) -> Result<Argument, fault::OpenRefusal> {
     }
     let name = name.to_string_lossy().into_owned();
     if decode::format_from_name(&name).is_none() {
-        return Err(fault::OpenRefusal::Unsupported(path.to_path_buf()));
+        return Err(OpenRefusal::Unsupported(path.to_path_buf()));
     }
     // Path::parent() yields Some("") for bare relative names ("pic.jpg").
     let dir = path
@@ -1854,7 +1852,7 @@ mod argv_tests {
             ),
             (
                 dir.path().join("notes.txt"),
-                Err(fault::OpenRefusal::Unsupported(
+                Err(OpenRefusal::Unsupported(
                     dir.path().join("notes.txt"),
                 )),
             ),

@@ -199,7 +199,7 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
         (width, height)
     };
 
-    super::Decoded::yuv(
+    Decoded::yuv(
         width,
         height,
         Format::Avif,

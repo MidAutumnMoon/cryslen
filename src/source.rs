@@ -24,7 +24,7 @@ use eros::IntoUnion as _;
 use crate::browse::PageCount;
 use crate::catalog;
 use crate::catalog::ArchiveKind;
-use crate::decode::format_from_name;
+use crate::decode;
 use crate::fault::BadIndex;
 use crate::fault::OpenError;
 use crate::fault::OpenRefusal;
@@ -86,7 +86,7 @@ impl Source {
                     .is_ok_and(|file_type| file_type.is_file())
             })
             .filter_map(|entry| entry.file_name().into_string().ok())
-            .filter(|name| format_from_name(name).is_some())
+            .filter(|name| decode::format_from_name(name).is_some())
             .collect();
         sort_page_names(&mut names);
         Self::from_names(Backend::Directory(dir.to_path_buf()), names)
@@ -106,7 +106,7 @@ impl Source {
                 continue;
             }
             let name = entry.name().union()?.into_owned();
-            if format_from_name(&name).is_some() {
+            if decode::format_from_name(&name).is_some() {
                 listed.push((name, entry.size()));
             }
         }
@@ -135,7 +135,7 @@ impl Source {
             .iter()
             .filter(|entry| {
                 !entry.is_directory()
-                    && format_from_name(&entry.name).is_some()
+                    && decode::format_from_name(&entry.name).is_some()
             })
             .map(|entry| (entry.name.clone(), entry.size()))
             .collect();
@@ -467,17 +467,14 @@ fn guard_memory(
 )]
 mod tests {
     use super::*;
-    use crate::catalog::compare_names;
-    use crate::catalog::page_name;
-    use crate::catalog::sibling;
+
+    use crate::catalog;
     use crate::catalog::PageName;
     use crate::decode;
+    use crate::decode::Format;
     use crate::fault::BadIndex;
     use crate::fault::PanicFault;
-    use crate::testkit::failed_page;
-    use crate::testkit::readable_page;
-    use crate::testkit::tiny_png;
-    use crate::testkit::unreadable_page;
+    use crate::testkit;
     use crate::testkit::TempDir;
 
     use std::cmp::Ordering;
@@ -501,8 +498,8 @@ mod tests {
     #[test]
     fn a_failed_pass_answers_only_unfilled_pages() {
         let good: Arc<[u8]> = Arc::from(&b"a"[..]);
-        let bad = failed_page("bad page");
-        let fatal = failed_page("stream broke");
+        let bad = testkit::failed_page("bad page");
+        let fatal = testkit::failed_page("stream broke");
         let pages = finish_pages(
             vec![
                 Some(Ok(Arc::clone(&good))),
@@ -544,38 +541,50 @@ mod tests {
         sort_page_names(&mut padded);
         assert_eq!(padded, ["page09.png", "page10.png"]);
         // Equal values keep a deterministic order: fewer zeros first.
-        assert_eq!(compare_names("10.png", "010.png"), Ordering::Less);
-        assert_eq!(compare_names("010.png", "10.png"), Ordering::Greater);
-        assert_eq!(compare_names("10.png", "10.png"), Ordering::Equal);
+        assert_eq!(
+            catalog::compare_names("10.png", "010.png"),
+            Ordering::Less
+        );
+        assert_eq!(
+            catalog::compare_names("010.png", "10.png"),
+            Ordering::Greater
+        );
+        assert_eq!(
+            catalog::compare_names("10.png", "10.png"),
+            Ordering::Equal
+        );
         // Non-digits compare byte-wise; case and spaces stay significant.
         assert_eq!(
-            compare_names("Page2.png", "page3.png"),
+            catalog::compare_names("Page2.png", "page3.png"),
             Ordering::Less
         );
         assert_eq!(
-            compare_names("page 2.png", "page2.png"),
+            catalog::compare_names("page 2.png", "page2.png"),
             Ordering::Less
         );
-        assert_eq!(compare_names("page.png", "page2.png"), Ordering::Less);
-        assert_eq!(compare_names("b", "a"), Ordering::Greater);
-        assert_eq!(compare_names("", ""), Ordering::Equal);
-        assert_eq!(compare_names("", "a"), Ordering::Less);
+        assert_eq!(
+            catalog::compare_names("page.png", "page2.png"),
+            Ordering::Less
+        );
+        assert_eq!(catalog::compare_names("b", "a"), Ordering::Greater);
+        assert_eq!(catalog::compare_names("", ""), Ordering::Equal);
+        assert_eq!(catalog::compare_names("", "a"), Ordering::Less);
     }
 
     #[test]
     fn natural_order_handles_non_ascii_prefixes() {
         assert_eq!(
-            compare_names("漫画-2.jpg", "漫画-10.jpg"),
+            catalog::compare_names("漫画-2.jpg", "漫画-10.jpg"),
             Ordering::Less
         );
         assert_eq!(
-            compare_names("第1話.cbz", "第10話.cbz"),
+            catalog::compare_names("第1話.cbz", "第10話.cbz"),
             Ordering::Less
         );
         // Code-point order for non-ASCII text.
-        assert_eq!(compare_names("阿", "白"), Ordering::Greater);
+        assert_eq!(catalog::compare_names("阿", "白"), Ordering::Greater);
         assert_eq!(
-            compare_names("06-漫画.jpg", "漫画-06.jpg"),
+            catalog::compare_names("06-漫画.jpg", "漫画-06.jpg"),
             Ordering::Less
         );
     }
@@ -610,10 +619,10 @@ mod tests {
         ];
         for &left in &names {
             for &right in &names {
-                let forward = compare_names(left, right);
+                let forward = catalog::compare_names(left, right);
                 assert_eq!(
                     forward,
-                    compare_names(right, left).reverse(),
+                    catalog::compare_names(right, left).reverse(),
                     "{left:?} vs {right:?}"
                 );
                 assert_eq!(
@@ -625,15 +634,19 @@ mod tests {
         }
         for &left in &names {
             for &middle in &names {
-                if compare_names(left, middle) == Ordering::Greater {
+                if catalog::compare_names(left, middle)
+                    == Ordering::Greater
+                {
                     continue;
                 }
                 for &right in &names {
-                    if compare_names(middle, right) == Ordering::Greater {
+                    if catalog::compare_names(middle, right)
+                        == Ordering::Greater
+                    {
                         continue;
                     }
                     assert_ne!(
-                        compare_names(left, right),
+                        catalog::compare_names(left, right),
                         Ordering::Greater,
                         "{left:?} <= {middle:?} <= {right:?}"
                     );
@@ -746,7 +759,7 @@ mod tests {
             Source::open(Path::new(SEVENZ_FIXTURE)).expect("7z opens");
         assert_eq!(source.names, ["p1.png", "p2.png"]);
         assert_eq!(
-            page_name(&source.names, true, None, 0),
+            catalog::page_name(&source.names, true, None, 0),
             PageName {
                 parent_dir: None,
                 file: "p1.png".into()
@@ -766,7 +779,7 @@ mod tests {
             let bytes = source.bytes(index).expect("page materialized");
             let page = decode::decode(&bytes, name)
                 .expect("fixture page decodes");
-            assert_eq!(page.format(), decode::Format::Png);
+            assert_eq!(page.format(), Format::Png);
             pages.push(bytes);
         }
         let [first, second] = pages.as_slice() else {
@@ -778,10 +791,10 @@ mod tests {
     #[test]
     fn dir_listing_and_read() {
         let dir = TempDir::new("pagedir");
-        dir.write("c10.png", &tiny_png(1, 1, [0, 0, 0, 255]));
-        dir.write("c2.png", &tiny_png(1, 1, [7, 8, 9, 255]));
-        dir.write("c1.png", &tiny_png(1, 1, [0, 0, 0, 255]));
-        dir.write("cover.PNG", &tiny_png(1, 1, [0, 0, 0, 255]));
+        dir.write("c10.png", &testkit::tiny_png(1, 1, [0, 0, 0, 255]));
+        dir.write("c2.png", &testkit::tiny_png(1, 1, [7, 8, 9, 255]));
+        dir.write("c1.png", &testkit::tiny_png(1, 1, [0, 0, 0, 255]));
+        dir.write("cover.PNG", &testkit::tiny_png(1, 1, [0, 0, 0, 255]));
         dir.write("notes.txt", b"not a page");
         let source = Source::open(dir.path()).expect("dir opens");
         assert_eq!(
@@ -797,15 +810,16 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         assert_eq!(
-            page_name(&source.names, false, Some(&dir_name), 2),
+            catalog::page_name(&source.names, false, Some(&dir_name), 2),
             PageName {
                 parent_dir: Some(dir_name),
                 file: "c10.png".into(),
             }
         );
         assert!(!source.is_archive());
+        let expected = testkit::tiny_png(1, 1, [7, 8, 9, 255]);
         assert!(
-            matches!(source.bytes(1), Ok(read) if read.as_ref() == tiny_png(1, 1, [7, 8, 9, 255]).as_slice())
+            matches!(source.bytes(1), Ok(read) if read.as_ref() == expected.as_slice())
         );
     }
 
@@ -827,8 +841,12 @@ mod tests {
                 ("b/deep/005.png", 4),
             ] {
                 zip.start_file(name, options).unwrap();
-                zip.write_all(&tiny_png(2, 2, [color, 0, 0, 255]))
-                    .unwrap();
+                zip.write_all(&testkit::tiny_png(
+                    2,
+                    2,
+                    [color, 0, 0, 255],
+                ))
+                .unwrap();
             }
             zip.start_file("b/info.txt", options).unwrap();
             zip.write_all(b"skip me").unwrap();
@@ -840,24 +858,24 @@ mod tests {
             ["b/002.png", "b/010.png", "b/020.png", "b/deep/005.png"]
         );
         assert_eq!(
-            page_name(&source.names, true, None, 1),
+            catalog::page_name(&source.names, true, None, 1),
             PageName {
                 parent_dir: Some("b".into()),
                 file: "010.png".into()
             }
         );
         assert_eq!(
-            page_name(&source.names, true, None, 3),
+            catalog::page_name(&source.names, true, None, 3),
             PageName {
                 parent_dir: Some("deep".into()),
                 file: "005.png".into()
             }
         );
         // bytes(1) is b/010.png, written with color 1.
-        let page = readable_page(&source, 1);
+        let page = testkit::readable_page(&source, 1);
         assert_eq!(
             page.as_ref(),
-            tiny_png(2, 2, [1, 0, 0, 255]).as_slice()
+            testkit::tiny_png(2, 2, [1, 0, 0, 255]).as_slice()
         );
     }
 
@@ -868,9 +886,9 @@ mod tests {
         let dir = TempDir::new("pagezipbad");
         let zip_path = dir.path().join("book.cbz");
         let pages = [
-            tiny_png(2, 2, [1, 0, 0, 255]),
-            tiny_png(2, 2, [2, 0, 0, 255]),
-            tiny_png(2, 2, [3, 0, 0, 255]),
+            testkit::tiny_png(2, 2, [1, 0, 0, 255]),
+            testkit::tiny_png(2, 2, [2, 0, 0, 255]),
+            testkit::tiny_png(2, 2, [3, 0, 0, 255]),
         ];
         {
             let file = File::create(&zip_path).unwrap();
@@ -913,15 +931,15 @@ mod tests {
 
         let source = Source::open(&zip_path)
             .expect("the central directory still opens the book");
-        let failure = unreadable_page(&source, 1);
+        let failure = testkit::unreadable_page(&source, 1);
         let read_error = failure
             .downcast_inner_ref::<IoError>()
             .expect("a corrupt member settles as an io error");
         // zip reports a payload CRC mismatch as invalid data.
         assert_eq!(read_error.kind(), ErrorKind::InvalidData);
-        unreadable_page(&source, 2);
+        testkit::unreadable_page(&source, 2);
         assert_eq!(
-            readable_page(&source, 0).as_ref(),
+            testkit::readable_page(&source, 0).as_ref(),
             pages[0].as_slice()
         );
     }
@@ -963,8 +981,11 @@ mod tests {
         let volume = |name: &str| {
             let dir = parent.path().join(name);
             fs::create_dir_all(&dir).expect("volume dir creates");
-            fs::write(dir.join("p.png"), tiny_png(1, 1, [0, 0, 0, 255]))
-                .expect("volume page writes");
+            fs::write(
+                dir.join("p.png"),
+                testkit::tiny_png(1, 1, [0, 0, 0, 255]),
+            )
+            .expect("volume page writes");
             dir
         };
         // Natural order puts "v1" < "v2" < "v10" by digit value.
@@ -975,17 +996,17 @@ mod tests {
             .expect("plain file writes");
 
         assert_eq!(
-            sibling(&middle, false, true),
+            catalog::sibling(&middle, false, true),
             Some(last),
             "forward follows natural order"
         );
         assert_eq!(
-            sibling(&middle, false, false),
+            catalog::sibling(&middle, false, false),
             Some(first.clone()),
             "backward follows natural order"
         );
         assert_eq!(
-            sibling(&first, false, false),
+            catalog::sibling(&first, false, false),
             None,
             "the shelf's start has no earlier book"
         );
@@ -1000,7 +1021,7 @@ mod tests {
             let mut zip = zip::ZipWriter::new(file);
             zip.start_file("p.png", SimpleFileOptions::default())
                 .expect("entry starts");
-            zip.write_all(&tiny_png(1, 1, [0, 0, 0, 255]))
+            zip.write_all(&testkit::tiny_png(1, 1, [0, 0, 0, 255]))
                 .expect("entry writes");
             zip.finish().expect("zip finishes");
             path
@@ -1012,12 +1033,12 @@ mod tests {
         // The volumes directory is a sibling entry of the other kind and
         // must not answer.
         assert_eq!(
-            sibling(&before, true, true),
+            catalog::sibling(&before, true, true),
             Some(after),
             "archives step between archives"
         );
         assert_eq!(
-            sibling(&before, true, false),
+            catalog::sibling(&before, true, false),
             None,
             "the first archive has no earlier book"
         );

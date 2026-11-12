@@ -679,8 +679,8 @@ fn ftyp_brands(bytes: &[u8]) -> Option<&[u8]> {
 )]
 mod tests {
     use super::*;
-    use crate::testkit::tiny_animated_gif;
-    use crate::testkit::tiny_gif;
+
+    use crate::testkit;
     use ::image::codecs::gif::Repeat;
 
     /// The refusal a decode returned, for tests that assert on the
@@ -1011,7 +1011,13 @@ mod tests {
     fn animated_gif_streams_composited_frames() {
         let colors =
             [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]];
-        let bytes = tiny_animated_gif(4, 3, &colors, 50, Repeat::Infinite);
+        let bytes = testkit::tiny_animated_gif(
+            4,
+            3,
+            &colors,
+            50,
+            Repeat::Infinite,
+        );
         let mut animation = open_animation(arc(bytes), "a.gif")
             .expect("animated gif decodes")
             .expect("gif has a frame stream");
@@ -1036,7 +1042,7 @@ mod tests {
     fn gif_loop_metadata_keeps_absent_distinct_from_infinite() {
         // No NETSCAPE extension: the decoder's zero default means one
         // play, not forever.
-        let still = tiny_gif(2, 2, [10, 20, 30]);
+        let still = testkit::tiny_gif(2, 2, [10, 20, 30]);
         let mut once = open_animation(arc(still), "a.gif")
             .expect("still gif decodes")
             .expect("gif has a frame stream");
@@ -1046,7 +1052,7 @@ mod tests {
 
         // The field counts repetitions after the first, so 2 means 3
         // total passes.
-        let finite = tiny_animated_gif(
+        let finite = testkit::tiny_animated_gif(
             2,
             2,
             &[[1, 2, 3, 255], [4, 5, 6, 255]],
@@ -1063,7 +1069,13 @@ mod tests {
     fn animation_rewinds() {
         let colors =
             [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]];
-        let bytes = tiny_animated_gif(2, 2, &colors, 20, Repeat::Infinite);
+        let bytes = testkit::tiny_animated_gif(
+            2,
+            2,
+            &colors,
+            20,
+            Repeat::Infinite,
+        );
         let mut animation = open_animation(arc(bytes), "a.gif")
             .expect("gif decodes")
             .expect("gif has a frame stream");

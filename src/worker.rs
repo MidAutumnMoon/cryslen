@@ -24,13 +24,12 @@ use crossbeam_channel::Receiver;
 use eros::ErrorUnion;
 use ipc_channel::ipc;
 use ipc_channel::ipc::IpcSender;
-use rustix::process::getppid;
-use rustix::process::set_parent_process_death_signal;
+use rustix::process;
 use rustix::process::Pid;
 use rustix::process::Signal;
 
 use crate::animation::DecodedEvent;
-use crate::browse::spread_for;
+use crate::browse;
 use crate::browse::Motion;
 use crate::browse::Request;
 use crate::browse::Role;
@@ -896,13 +895,14 @@ pub fn main(args: &[OsString]) -> ExitCode {
     };
     // The kernel kills this process with SIGKILL once the parent dies, so a
     // parent crash ends the decode.
-    if let Err(error) = set_parent_process_death_signal(Some(Signal::KILL))
+    if let Err(error) =
+        process::set_parent_process_death_signal(Some(Signal::KILL))
     {
         tracing::error!(?error, "could not arm the parent-death signal");
         return ExitCode::FAILURE;
     }
     // The parent may have died before the signal was armed; exit.
-    if getppid() == Some(Pid::INIT) {
+    if process::getppid() == Some(Pid::INIT) {
         tracing::warn!("the parent already exited");
         return ExitCode::FAILURE;
     }
@@ -986,7 +986,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
                 direction,
             } => {
                 let prefetch = Prefetch::build(
-                    spread_for(page, mode, len),
+                    browse::spread_for(page, mode, len),
                     direction,
                     mode,
                     len,
@@ -1103,17 +1103,18 @@ fn write(child_tx: &IpcSender<ChildMsg>, queue: &Receiver<Update>) {
 )]
 mod tests {
     use super::*;
+
     use crate::browse::Direction;
     use crate::browse::PageCount;
     use crate::browse::ReadingMode;
     use crate::browse::Spread;
     use crate::cache::Store;
+    use crate::decode::Pixels;
     use crate::fault::DecodeRefusal;
-    use crate::testkit::eventually;
-    use crate::testkit::tiny_animated_gif;
-    use crate::testkit::tiny_png;
+    use crate::testkit;
     use crate::testkit::TempDir;
     use image::codecs::gif::Repeat;
+    use image::ImageError;
 
     use parking_lot::Mutex;
 
@@ -1161,7 +1162,7 @@ mod tests {
             let tint = u8::try_from(page >> 8).expect("tint fits");
             dir.write(
                 &format!("p{page:04}.png"),
-                &tiny_png(size, size, [shade, tint, 90, 255]),
+                &testkit::tiny_png(size, size, [shade, tint, 90, 255]),
             );
         }
         let source =
@@ -1182,7 +1183,7 @@ mod tests {
     }
 
     fn first_pixel(image: &Decoded) -> [u8; 4] {
-        let decode::Pixels::Rgba8(bytes) = image.pixels() else {
+        let Pixels::Rgba8(bytes) = image.pixels() else {
             panic!("a gif frame decodes to rgba");
         };
         let mut pixel = [0; 4];
@@ -1257,7 +1258,7 @@ mod tests {
             what: &str,
             want: impl Fn(usize, Role) -> bool,
         ) -> Decoded {
-            eventually(20, what, || {
+            testkit::eventually(20, what, || {
                 self.drain();
                 let seen = self.seen.lock();
                 seen.iter().find_map(|event| match event {
@@ -1276,7 +1277,7 @@ mod tests {
         }
 
         fn failure(&self, page: usize) -> Arc<PageError> {
-            eventually(20, "page never failed", || {
+            testkit::eventually(20, "page never failed", || {
                 self.drain();
                 let seen = self.seen.lock();
                 seen.iter().find_map(|event| match event {
@@ -1333,7 +1334,7 @@ mod tests {
             page: usize,
             offset: usize,
         ) -> (Duration, Decoded) {
-            eventually(20, "no animation frame", || {
+            testkit::eventually(20, "no animation frame", || {
                 self.drain();
                 let seen = self.seen.lock();
                 seen.iter()
@@ -1356,7 +1357,7 @@ mod tests {
         }
 
         fn finished(&self, page: usize) {
-            eventually(20, "no animation finish", || {
+            testkit::eventually(20, "no animation finish", || {
                 self.drain();
                 let seen = self.seen.lock();
                 seen.iter()
@@ -1455,17 +1456,21 @@ mod tests {
         let store = Store::at(root.path());
         // The head is pages 0, 1 and 2; wait until it is fully produced.
         for page in [0, 1, 2] {
-            eventually(20, "the head never reached the store", || {
-                store
-                    .load(page_hash(&source, page), Role::Thumb)
-                    .is_some()
-                    .then_some(())
-            });
+            testkit::eventually(
+                20,
+                "the head never reached the store",
+                || {
+                    store
+                        .load(page_hash(&source, page), Role::Thumb)
+                        .is_some()
+                        .then_some(())
+                },
+            );
         }
         let head_done = Instant::now();
         // Page 3 is beyond the head: it must not start until the app has
         // been silent for the preload window.
-        eventually(20, "the tail never preloaded", || {
+        testkit::eventually(20, "the tail never preloaded", || {
             store
                 .load(page_hash(&source, 3), Role::Thumb)
                 .is_some()
@@ -1486,7 +1491,7 @@ mod tests {
         for page in 1..5_u8 {
             dir.write(
                 &format!("p{page:03}.png"),
-                &tiny_png(BIG, BIG, [page, 20, 30, 255]),
+                &testkit::tiny_png(BIG, BIG, [page, 20, 30, 255]),
             );
         }
         let source =
@@ -1503,19 +1508,23 @@ mod tests {
 
         let error = events.failure(0);
         assert!(
-            error.downcast_inner_ref::<image::ImageError>().is_some()
+            error.downcast_inner_ref::<ImageError>().is_some()
                 || error.downcast_inner_ref::<DecodeRefusal>().is_some(),
             "page 0 failed as {error}, expected a decode fault"
         );
         // The failure leaves the rest of the prefetch running: pages behind it
         // still reach the store.
         let store = Store::at(root.path());
-        eventually(20, "the failure stalled the prefetch", || {
-            store
-                .load(page_hash(&source, 4), Role::Thumb)
-                .is_some()
-                .then_some(())
-        });
+        testkit::eventually(
+            20,
+            "the failure stalled the prefetch",
+            || {
+                store
+                    .load(page_hash(&source, 4), Role::Thumb)
+                    .is_some()
+                    .then_some(())
+            },
+        );
         assert_eq!(
             events.failures(0),
             1,
@@ -1537,7 +1546,7 @@ mod tests {
         .expect("worker spawns");
 
         let store = Store::at(root.path());
-        eventually(
+        testkit::eventually(
             20,
             "the prefetch never produced the head fit image",
             || {
@@ -1585,9 +1594,11 @@ mod tests {
         // must fetch it again.
         worker.set_requests(Vec::new());
         worker.set_requests(vec![request_fit(0)]);
-        eventually(20, "the re-added fit image was never served", || {
-            (events.delivered(0, is_fit) >= 2).then_some(())
-        });
+        testkit::eventually(
+            20,
+            "the re-added fit image was never served",
+            || (events.delivered(0, is_fit) >= 2).then_some(()),
+        );
     }
 
     #[test]
@@ -1622,7 +1633,13 @@ mod tests {
         let dir = TempDir::new("worker-animation");
         dir.write(
             "p000.gif",
-            &tiny_animated_gif(8, 8, &colors, 50, Repeat::Infinite),
+            &testkit::tiny_animated_gif(
+                8,
+                8,
+                &colors,
+                50,
+                Repeat::Infinite,
+            ),
         );
         let source =
             Arc::new(Source::open(dir.path()).expect("temp source opens"));
@@ -1658,7 +1675,13 @@ mod tests {
         let dir = TempDir::new("worker-animation-finite");
         dir.write(
             "p000.gif",
-            &tiny_animated_gif(8, 8, &colors, 50, Repeat::Finite(0)),
+            &testkit::tiny_animated_gif(
+                8,
+                8,
+                &colors,
+                50,
+                Repeat::Finite(0),
+            ),
         );
         let source =
             Arc::new(Source::open(dir.path()).expect("temp source opens"));
@@ -1729,7 +1752,7 @@ mod tests {
         // page could produce, so the second session's events say where
         // the pixels came from.
         let sentinel = decode::decode(
-            &tiny_png(7, 7, [1, 2, 3, 255]),
+            &testkit::tiny_png(7, 7, [1, 2, 3, 255]),
             "sentinel.png",
         )
         .expect("sentinel decodes");

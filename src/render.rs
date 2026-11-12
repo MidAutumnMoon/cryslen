@@ -6,7 +6,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use egui_glow::glow;
-use egui_glow::glow::HasContext;
+use egui_glow::glow::Context;
+use egui_glow::glow::HasContext as _;
+use egui_glow::glow::PixelUnpackData;
+use egui_glow::glow::Program;
+use egui_glow::glow::Shader;
+use egui_glow::glow::Texture;
+use egui_glow::glow::UniformLocation;
+use egui_glow::glow::VertexArray;
 use egui_winit::winit;
 use eros::ErrorUnion;
 use glutin::context::PossiblyCurrentContext;
@@ -142,27 +149,24 @@ const SEAT_UV_TOLERANCE: f32 = 1e-3;
 /// Page-keyed texture cache and spread draw; a seat draws its largest
 /// resident role.
 pub struct PageTextures {
-    gl: Arc<glow::Context>,
+    gl: Arc<Context>,
     pipeline: Pipeline,
     pages: HashMap<usize, [Option<PageTexture>; Role::COUNT]>,
     max_texture_edge: u32,
 }
 
 struct UniformLocations {
-    window_size: <glow::Context as glow::HasContext>::UniformLocation,
-    seat_offset: <glow::Context as glow::HasContext>::UniformLocation,
-    seat_size: <glow::Context as glow::HasContext>::UniformLocation,
-    page_uv_per_pixel:
-        <glow::Context as glow::HasContext>::UniformLocation,
-    chroma_uv_per_pixel:
-        <glow::Context as glow::HasContext>::UniformLocation,
-    color_matrix: <glow::Context as glow::HasContext>::UniformLocation,
-    color_offset: <glow::Context as glow::HasContext>::UniformLocation,
-    alpha_normalization:
-        <glow::Context as glow::HasContext>::UniformLocation,
-    pixel_layout: <glow::Context as glow::HasContext>::UniformLocation,
-    transfer_code: <glow::Context as glow::HasContext>::UniformLocation,
-    dither: <glow::Context as glow::HasContext>::UniformLocation,
+    window_size: UniformLocation,
+    seat_offset: UniformLocation,
+    seat_size: UniformLocation,
+    page_uv_per_pixel: UniformLocation,
+    chroma_uv_per_pixel: UniformLocation,
+    color_matrix: UniformLocation,
+    color_offset: UniformLocation,
+    alpha_normalization: UniformLocation,
+    pixel_layout: UniformLocation,
+    transfer_code: UniformLocation,
+    dither: UniformLocation,
 }
 
 /// One cached role's GPU state.
@@ -176,14 +180,14 @@ struct PageTexture {
 
 enum PixelLayout {
     Rgba {
-        texture: <glow::Context as glow::HasContext>::Texture,
+        texture: Texture,
         dims: (u32, u32),
     },
     Yuv {
-        luma: <glow::Context as glow::HasContext>::Texture,
-        cb: <glow::Context as glow::HasContext>::Texture,
-        cr: <glow::Context as glow::HasContext>::Texture,
-        alpha: <glow::Context as glow::HasContext>::Texture,
+        luma: Texture,
+        cb: Texture,
+        cr: Texture,
+        alpha: Texture,
         /// Screen px -> chroma-page fraction, subsample-folded.
         chroma_uv_per_pixel: (f32, f32),
         color_conversion: ColorConversion,
@@ -260,7 +264,7 @@ fn check_texture_dims(
 }
 
 impl PageTextures {
-    pub fn new(gl: Arc<glow::Context>) -> eros::Result<Self> {
+    pub fn new(gl: Arc<Context>) -> eros::Result<Self> {
         // SAFETY: the returned names land in Self, whose Drop deletes
         // them. The error path below leaks them into the process-fatal
         // exit.
@@ -548,10 +552,10 @@ impl Drop for PageTextures {
 ///
 /// The context must be current. The caller must delete the returned name.
 unsafe fn compile_shader(
-    gl: &glow::Context,
+    gl: &Context,
     kind: u32,
     src: &str,
-) -> eros::Result<<glow::Context as HasContext>::Shader> {
+) -> eros::Result<Shader> {
     let shader = gl.create_shader(kind).map_err(|error| {
         eros::error!("GL shader object creation failed: {error}")
     })?;
@@ -569,9 +573,9 @@ unsafe fn compile_shader(
 /// The linked program, cached uniform locations, and the empty VAO a
 /// core profile requires.
 struct Pipeline {
-    program: <glow::Context as HasContext>::Program,
+    program: Program,
     uniform_locations: UniformLocations,
-    vao: <glow::Context as glow::HasContext>::VertexArray,
+    vao: VertexArray,
 }
 
 /// Create the linked program and empty VAO. Objects from a failed step
@@ -581,7 +585,7 @@ struct Pipeline {
 ///
 /// The context must be current. The returned names are live until deleted.
 unsafe fn create_pipeline(
-    gl: &glow::Context,
+    gl: &Context,
     vertex_source: &str,
     fragment_source: &str,
 ) -> eros::Result<Pipeline> {
@@ -663,7 +667,7 @@ unsafe fn create_pipeline(
 ///
 /// The context must be current. `pipeline`'s names are live.
 unsafe fn begin_frame(
-    gl: &glow::Context,
+    gl: &Context,
     pipeline: &Pipeline,
     window_size: (u32, u32),
 ) {
@@ -697,7 +701,7 @@ unsafe fn begin_frame(
     reason = "the draw ignores the RGBA texture dims"
 )]
 unsafe fn draw_page(
-    gl: &glow::Context,
+    gl: &Context,
     pipeline: &Pipeline,
     page_texture: &PageTexture,
     screen_origin: (f32, f32),
@@ -782,7 +786,7 @@ unsafe fn draw_page(
 /// # Safety
 ///
 /// The context must be current. Each name is live and deleted at most once.
-unsafe fn delete_pipeline(gl: &glow::Context, pipeline: &Pipeline) {
+unsafe fn delete_pipeline(gl: &Context, pipeline: &Pipeline) {
     gl.delete_program(pipeline.program);
     gl.delete_vertex_array(pipeline.vao);
 }
@@ -794,7 +798,7 @@ unsafe fn delete_pipeline(gl: &glow::Context, pipeline: &Pipeline) {
     clippy::rest_pattern_accessible_field,
     reason = "deletion touches the texture names only"
 )]
-unsafe fn delete_entry(gl: &glow::Context, page_texture: &PageTexture) {
+unsafe fn delete_entry(gl: &Context, page_texture: &PageTexture) {
     match &page_texture.layout {
         PixelLayout::Rgba { texture, .. } => gl.delete_texture(*texture),
         PixelLayout::Yuv {
@@ -825,12 +829,7 @@ fn gl_int(value: u32) -> i32 {
 /// # Safety
 ///
 /// The context must be current and `name` must be live.
-unsafe fn label(
-    gl: &glow::Context,
-    identifier: u32,
-    name: u32,
-    text: &str,
-) {
+unsafe fn label(gl: &Context, identifier: u32, name: u32, text: &str) {
     if gl.supports_debug() {
         gl.object_label(identifier, name, Some(text));
     }
@@ -844,7 +843,7 @@ unsafe fn label(
     reason = "the labels read the texture names only"
 )]
 unsafe fn label_entry(
-    gl: &glow::Context,
+    gl: &Context,
     page: usize,
     role: Role,
     page_texture: &PageTexture,
@@ -932,9 +931,9 @@ fn needs_dither(transfer: Transfer, plane_depth: Option<u8>) -> bool {
 ///
 /// The context must be current. The returned name is live until deleted.
 unsafe fn new_texture(
-    gl: &glow::Context,
+    gl: &Context,
     magnification_filter: MagnificationFilter,
-) -> <glow::Context as HasContext>::Texture {
+) -> Texture {
     #[expect(
         clippy::expect_used,
         reason = "texture-creation failure panics by policy"
@@ -971,11 +970,11 @@ unsafe fn new_texture(
 /// The context must be current. `data` holds exactly `dims.0 * dims.1 * 4`
 /// bytes and each dim is within `MAX_TEXTURE_SIZE`.
 unsafe fn upload_rgba(
-    gl: &glow::Context,
+    gl: &Context,
     data: &[u8],
     dims: (u32, u32),
     magnification_filter: MagnificationFilter,
-) -> <glow::Context as HasContext>::Texture {
+) -> Texture {
     let texture = new_texture(gl, magnification_filter);
     gl.bind_texture(glow::TEXTURE_2D, Some(texture));
     gl.tex_image_2d(
@@ -987,7 +986,7 @@ unsafe fn upload_rgba(
         0,
         glow::RGBA,
         glow::UNSIGNED_BYTE,
-        glow::PixelUnpackData::Slice(Some(data)),
+        PixelUnpackData::Slice(Some(data)),
     );
     gl.generate_mipmap(glow::TEXTURE_2D);
     texture
@@ -998,8 +997,8 @@ unsafe fn upload_rgba(
 /// The context must be current, `texture` is live, and `data` holds
 /// exactly `dims.0 * dims.1 * 4` bytes.
 unsafe fn update_rgba(
-    gl: &glow::Context,
-    texture: <glow::Context as HasContext>::Texture,
+    gl: &Context,
+    texture: Texture,
     data: &[u8],
     dims: (u32, u32),
 ) {
@@ -1019,7 +1018,7 @@ unsafe fn update_rgba(
         gl_int(dims.1),
         glow::RGBA,
         glow::UNSIGNED_BYTE,
-        glow::PixelUnpackData::Slice(Some(data)),
+        PixelUnpackData::Slice(Some(data)),
     );
     gl.generate_mipmap(glow::TEXTURE_2D);
 }
@@ -1030,12 +1029,12 @@ unsafe fn update_rgba(
 /// `dims`, two bytes each when `wide`, and each dim is within
 /// `MAX_TEXTURE_SIZE`.
 unsafe fn upload_plane(
-    gl: &glow::Context,
+    gl: &Context,
     data: &[u8],
     dims: (u32, u32),
     wide: bool,
     magnification_filter: MagnificationFilter,
-) -> <glow::Context as HasContext>::Texture {
+) -> Texture {
     let (internal, ty) = if wide {
         (glow::R16, glow::UNSIGNED_SHORT)
     } else {
@@ -1055,7 +1054,7 @@ unsafe fn upload_plane(
         0,
         glow::RED,
         ty,
-        glow::PixelUnpackData::Slice(Some(data)),
+        PixelUnpackData::Slice(Some(data)),
     );
     gl.generate_mipmap(glow::TEXTURE_2D);
     texture
@@ -1070,7 +1069,7 @@ unsafe fn upload_plane(
     reason = "Cb and Cr are the YUV plane names the two textures hold"
 )]
 unsafe fn upload_page_texture(
-    gl: &glow::Context,
+    gl: &Context,
     decoded: &Decoded,
 ) -> PageTexture {
     let magnification_filter = magnification_filter(decoded);
@@ -1450,7 +1449,7 @@ const BT2020_KR_KB: (f32, f32) = (0.2627, 0.0593);
 /// `pre_present_and_swap()` to present.
 pub struct Window {
     winit: WinitWindow,
-    gl: Arc<glow::Context>,
+    gl: Arc<Context>,
     surface: Surface<WindowSurface>,
     context: PossiblyCurrentContext,
     /// Alpha config matched. The fallback may still carry alpha bits; the
@@ -1562,7 +1561,7 @@ impl Window {
         // frame callback.
         surface.set_swap_interval(&context, SwapInterval::DontWait)?;
 
-        let gl = glow::Context::from_loader_function(|symbol| {
+        let gl = Context::from_loader_function(|symbol| {
             #[expect(
                 clippy::expect_used,
                 reason = "symbol names are static ASCII GL entry points, NUL-free by construction"
@@ -1609,7 +1608,7 @@ impl Window {
         })
     }
 
-    pub fn glow(&self) -> Arc<glow::Context> {
+    pub fn glow(&self) -> Arc<Context> {
         Arc::clone(&self.gl)
     }
 

@@ -14,7 +14,6 @@
 
 use std::env;
 use std::fs;
-use std::io::Cursor;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process;
@@ -121,14 +120,16 @@ impl Drop for ChildGuard {
 /// A solid `PAGE_EDGE`-square RGBA page the test can recognize after the
 /// round trip.
 fn write_page(dir: &Path) {
-    let page = image::RgbaImage::from_pixel(
-        PAGE_EDGE,
-        PAGE_EDGE,
-        image::Rgba(PIXEL),
-    );
+    use image::DynamicImage;
+    use image::ImageFormat;
+    use image::Rgba;
+    use image::RgbaImage;
+    use std::io::Cursor;
+
+    let page = RgbaImage::from_pixel(PAGE_EDGE, PAGE_EDGE, Rgba(PIXEL));
     let mut encoded = Cursor::new(Vec::<u8>::new());
-    image::DynamicImage::ImageRgba8(page)
-        .write_to(&mut encoded, image::ImageFormat::Png)
+    DynamicImage::ImageRgba8(page)
+        .write_to(&mut encoded, ImageFormat::Png)
         .expect("encode the test page");
     fs::write(dir.join("page.png"), encoded.into_inner())
         .expect("write the test page");

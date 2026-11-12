@@ -7,15 +7,20 @@ use std::sync::Arc;
 
 use eros::ErrorUnion;
 use image::codecs::gif::Repeat;
+use image::Delay;
+use image::DynamicImage;
+use image::Frame;
+use image::ImageFormat;
+use image::Rgb;
+use image::RgbImage;
+use image::Rgba;
+use image::RgbaImage;
 
 use crate::fault::DecodeRefusal;
 use crate::fault::PageError;
 use crate::source::Source;
 
-fn encode(
-    img: &image::DynamicImage,
-    format: image::ImageFormat,
-) -> Vec<u8> {
+fn encode(img: &DynamicImage, format: ImageFormat) -> Vec<u8> {
     use std::io::Cursor;
 
     let mut buf = Vec::new();
@@ -25,28 +30,18 @@ fn encode(
 }
 
 pub fn tiny_png(width: u32, height: u32, rgba: [u8; 4]) -> Vec<u8> {
-    let img =
-        image::RgbaImage::from_pixel(width, height, image::Rgba(rgba));
-    encode(
-        &image::DynamicImage::ImageRgba8(img),
-        image::ImageFormat::Png,
-    )
+    let img = RgbaImage::from_pixel(width, height, Rgba(rgba));
+    encode(&DynamicImage::ImageRgba8(img), ImageFormat::Png)
 }
 
 pub fn tiny_jpeg(width: u32, height: u32, rgb: [u8; 3]) -> Vec<u8> {
-    let img = image::RgbImage::from_pixel(width, height, image::Rgb(rgb));
-    encode(
-        &image::DynamicImage::ImageRgb8(img),
-        image::ImageFormat::Jpeg,
-    )
+    let img = RgbImage::from_pixel(width, height, Rgb(rgb));
+    encode(&DynamicImage::ImageRgb8(img), ImageFormat::Jpeg)
 }
 
 pub fn tiny_gif(width: u32, height: u32, rgb: [u8; 3]) -> Vec<u8> {
-    let img = image::RgbImage::from_pixel(width, height, image::Rgb(rgb));
-    encode(
-        &image::DynamicImage::ImageRgb8(img),
-        image::ImageFormat::Gif,
-    )
+    let img = RgbImage::from_pixel(width, height, Rgb(rgb));
+    encode(&DynamicImage::ImageRgb8(img), ImageFormat::Gif)
 }
 
 /// A GIF whose frames are solid colors, all with the same delay.
@@ -64,16 +59,12 @@ pub fn tiny_animated_gif(
         let mut encoder = GifEncoder::new(&mut bytes);
         encoder.set_repeat(repeat).expect("repeat is accepted");
         for &color in colors {
-            let image = image::RgbaImage::from_pixel(
-                width,
-                height,
-                image::Rgba(color),
-            );
-            let frame = image::Frame::from_parts(
+            let image = RgbaImage::from_pixel(width, height, Rgba(color));
+            let frame = Frame::from_parts(
                 image,
                 0,
                 0,
-                image::Delay::from_numer_denom_ms(delay_ms, 1),
+                Delay::from_numer_denom_ms(delay_ms, 1),
             );
             encoder.encode_frame(frame).expect("frame encodes");
         }
@@ -82,19 +73,13 @@ pub fn tiny_animated_gif(
 }
 
 pub fn tiny_bmp(width: u32, height: u32, rgb: [u8; 3]) -> Vec<u8> {
-    let img = image::RgbImage::from_pixel(width, height, image::Rgb(rgb));
-    encode(
-        &image::DynamicImage::ImageRgb8(img),
-        image::ImageFormat::Bmp,
-    )
+    let img = RgbImage::from_pixel(width, height, Rgb(rgb));
+    encode(&DynamicImage::ImageRgb8(img), ImageFormat::Bmp)
 }
 
 pub fn tiny_tiff(width: u32, height: u32, rgb: [u8; 3]) -> Vec<u8> {
-    let img = image::RgbImage::from_pixel(width, height, image::Rgb(rgb));
-    encode(
-        &image::DynamicImage::ImageRgb8(img),
-        image::ImageFormat::Tiff,
-    )
+    let img = RgbImage::from_pixel(width, height, Rgb(rgb));
+    encode(&DynamicImage::ImageRgb8(img), ImageFormat::Tiff)
 }
 
 pub fn failed_page(message: &'static str) -> Arc<PageError> {
