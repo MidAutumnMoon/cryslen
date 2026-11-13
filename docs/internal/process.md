@@ -9,7 +9,7 @@ The boundary follows ownership. The parent owns the window, UI, GL, the app stat
 - Open: spawn, then handshake. The handshake must start on the event-loop thread, because the child's parent-death signal follows the thread that forked it.
 - Archive: list pages immediately, materialize in one background pass, then serve. Per-page failures stay page-local; a failed pass answers the rest. A directory is ready immediately.
 - Switch: kill the old child, open the new one off the event loop, and adopt its view when it lands. The book owns the lifecycle; the app keeps the last frame on screen meanwhile.
-- Child: one message loop and one writer, so messages reach the parent in the order they were queued.
+- Child: foreground loop serving requests and playback directly to the parent IPC channel, paired with a `cy-prefetch` thread that warms the store.
 - Only one update type reaches the UI thread; wire messages stop at the reader thread.
 - A page fault is text; a book fault is the process.
 - The store, prefetch, and retention are in `docs/internal/cache.md`.

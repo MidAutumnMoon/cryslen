@@ -250,10 +250,6 @@ mod tests {
         .expect("test frame constructs")
     }
 
-    #[expect(
-        clippy::rest_pattern_accessible_field,
-        reason = "the test reads only the clock's delay"
-    )]
     fn shown_delay(due: &Due) -> Option<Duration> {
         match due {
             Due::Show { delay, .. } => Some(*delay),

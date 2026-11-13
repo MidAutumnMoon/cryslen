@@ -24,7 +24,6 @@ mod worker;
 
 /// Run the mode the command line names: `cy --worker <ipc-server-name>
 /// <path>` serves one book, and anything else is the windowed parent.
-#[must_use]
 pub fn run(args: &[OsString]) -> ExitCode {
     let worker_mode = args
         .get(1)

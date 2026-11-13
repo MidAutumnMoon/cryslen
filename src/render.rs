@@ -197,10 +197,6 @@ enum PixelLayout {
 }
 
 impl PixelLayout {
-    #[expect(
-        clippy::rest_pattern_accessible_field,
-        reason = "the code depends only on the variant"
-    )]
     fn shader_code(&self) -> i32 {
         match self {
             Self::Rgba { .. } => PIXEL_LAYOUT_RGBA,
@@ -321,10 +317,6 @@ impl PageTextures {
     }
 
     /// Keeps the page's role slot.
-    #[expect(
-        clippy::rest_pattern_accessible_field,
-        reason = "the update only reads the fields that decide reuse"
-    )]
     pub fn update(
         &mut self,
         page: usize,
@@ -696,10 +688,6 @@ unsafe fn begin_frame(
 ///
 /// The context must be current. `pipeline`'s names and `page_texture`'s
 /// texture names are live for the duration of the call.
-#[expect(
-    clippy::rest_pattern_accessible_field,
-    reason = "the draw ignores the RGBA texture dims"
-)]
 unsafe fn draw_page(
     gl: &Context,
     pipeline: &Pipeline,
@@ -794,10 +782,6 @@ unsafe fn delete_pipeline(gl: &Context, pipeline: &Pipeline) {
 /// # Safety
 ///
 /// The context must be current. The names are live and deleted at most once.
-#[expect(
-    clippy::rest_pattern_accessible_field,
-    reason = "deletion touches the texture names only"
-)]
 unsafe fn delete_entry(gl: &Context, page_texture: &PageTexture) {
     match &page_texture.layout {
         PixelLayout::Rgba { texture, .. } => gl.delete_texture(*texture),
@@ -838,10 +822,6 @@ unsafe fn label(gl: &Context, identifier: u32, name: u32, text: &str) {
 /// # Safety
 ///
 /// The context must be current and the textures' names must be live.
-#[expect(
-    clippy::rest_pattern_accessible_field,
-    reason = "the labels read the texture names only"
-)]
 unsafe fn label_entry(
     gl: &Context,
     page: usize,

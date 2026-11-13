@@ -214,9 +214,7 @@ impl Source {
                 Ok(bytes) => Ok(bytes.into()),
                 Err(error) => Err(Arc::new(ErrorUnion::new(error))),
             },
-            Backend::Archive {
-                page_set_rx: _page_set_rx,
-            } => self
+            Backend::Archive { .. } => self
                 .pages
                 .get()
                 .and_then(|page_set| page_set.get(index))
@@ -228,12 +226,7 @@ impl Source {
     }
 
     pub fn is_archive(&self) -> bool {
-        matches!(
-            &self.backend,
-            Backend::Archive {
-                page_set_rx: _page_set_rx
-            }
-        )
+        matches!(&self.backend, Backend::Archive { .. })
     }
 }
 
@@ -682,10 +675,6 @@ mod tests {
         let available = 4 * 1024 * 1024 * 1024;
         guard_memory(available - MEM_RESERVE_BYTES, Some(available))
             .unwrap();
-        #[expect(
-            clippy::rest_pattern_accessible_field,
-            reason = "naming the ignored field as `_` would trip unneeded_field_pattern"
-        )]
         let Err(OpenRefusal::TooBig { unpacked, .. }) = guard_memory(
             available - MEM_RESERVE_BYTES + 1,
             Some(available),
@@ -728,10 +717,6 @@ mod tests {
             validated_listing(listed).expect("liar names still list");
         assert_eq!(names, ["a.png", "b.png"]);
         assert_eq!(unpacked, u64::MAX);
-        #[expect(
-            clippy::rest_pattern_accessible_field,
-            reason = "naming the ignored field as `_` would trip unneeded_field_pattern"
-        )]
         let Err(OpenRefusal::TooBig { unpacked, .. }) =
             guard_memory(unpacked, Some(4 * 1024 * 1024 * 1024))
         else {

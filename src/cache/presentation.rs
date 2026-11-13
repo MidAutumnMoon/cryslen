@@ -237,9 +237,6 @@ fn request_roles(
                 if !resident.has_settled_image() {
                     push_request(&mut requests, page, Role::Fit);
                 }
-                if !resident.contains(Role::Thumb) {
-                    push_request(&mut requests, page, Role::Thumb);
-                }
                 if on_screen.contains(page)
                     && upscaled(page)
                     && !resident.contains(Role::Full)
@@ -248,7 +245,7 @@ fn request_roles(
                 }
                 continue;
             }
-            if !resident.contains(Role::Thumb) {
+            if !resident.any() {
                 push_request(&mut requests, page, Role::Thumb);
             }
         }
@@ -655,6 +652,89 @@ mod tests {
             frame_at(12, Motion::Skimming).playback_targets(),
             [None, None],
             "skimming never plays"
+        );
+    }
+
+    #[test]
+    fn still_frames_never_request_thumbs() {
+        let len = PageCount::new(10).expect("the test book is not empty");
+        assert_eq!(
+            cold_requests(Spread::lone(0), ReadingMode::Normal),
+            vec![Request::new(0, Role::Fit)]
+        );
+
+        let entry = PageInfo {
+            dims: (4000, 6000),
+            format: Format::Png,
+        };
+        let facts = BTreeMap::from([(2, entry)]);
+        let faults = BTreeMap::new();
+        let frame = build_frame(
+            &FrameInput {
+                target: Spread::lone(2),
+                shown: Some(ShownSpread {
+                    mode: ReadingMode::Normal,
+                    spread: Spread::lone(2),
+                }),
+                mode: ReadingMode::Normal,
+                motion: Motion::Still,
+                direction: Direction::Forward,
+                len,
+                facts: &facts,
+                faults: &faults,
+                measurable: true,
+            },
+            |page| {
+                let mut roles = Roles::default();
+                if page == 2 {
+                    roles.set(Role::Thumb);
+                }
+                roles
+            },
+            |_| 1.0,
+        );
+        assert_eq!(
+            frame.into_requests(),
+            vec![Request::new(2, Role::Fit), Request::new(2, Role::Full)]
+        );
+    }
+
+    #[test]
+    fn skim_skips_thumb_when_any_role_is_resident() {
+        let len = PageCount::new(10).expect("the test book is not empty");
+        let entry = PageInfo {
+            dims: (800, 600),
+            format: Format::Png,
+        };
+        let facts = BTreeMap::from([(4, entry)]);
+        let faults = BTreeMap::new();
+        let frame = build_frame(
+            &FrameInput {
+                target: Spread::lone(6),
+                shown: Some(ShownSpread {
+                    mode: ReadingMode::Normal,
+                    spread: Spread::lone(4),
+                }),
+                mode: ReadingMode::Normal,
+                motion: Motion::Skimming,
+                direction: Direction::Forward,
+                len,
+                facts: &facts,
+                faults: &faults,
+                measurable: true,
+            },
+            |page| {
+                let mut roles = Roles::default();
+                if page == 4 {
+                    roles.set(Role::Fit);
+                }
+                roles
+            },
+            |_| 1.0,
+        );
+        assert_eq!(
+            frame.into_requests(),
+            vec![Request::new(5, Role::Thumb)]
         );
     }
 }

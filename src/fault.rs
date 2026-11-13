@@ -155,8 +155,6 @@ pub type DecodeError =
 
 pub type TextureError = ErrorUnion<(TextureFault,)>;
 
-pub type SpawnError = ErrorUnion<(io::Error,)>;
-
 /// A page's failure as text; the error types stay in the child.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PageFault {

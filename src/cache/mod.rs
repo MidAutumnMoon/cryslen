@@ -28,6 +28,8 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 use std::time::SystemTime;
 
@@ -318,7 +320,7 @@ struct Namespace {
     dir: PathBuf,
     cap: u64,
     /// Bytes written since the last scan or prune.
-    total: u64,
+    total: AtomicU64,
 }
 
 impl Store {
@@ -370,12 +372,12 @@ impl Store {
     /// Store `page` under `hash`, replacing the same key. Crossing the
     /// namespace's cap prunes it; the result names the removed entries.
     pub fn save(
-        &mut self,
+        &self,
         hash: u128,
         role: Role,
         page: &Decoded,
     ) -> SaveResult {
-        let Some(namespace) = self.namespace_mut(role) else {
+        let Some(namespace) = self.namespace(role) else {
             return SaveResult::default();
         };
         let path = namespace.path(hash);
@@ -386,8 +388,8 @@ impl Store {
         if write_atomic(&temp, &path, &encoded).is_err() {
             return SaveResult::default();
         }
-        namespace.total = namespace.total.saturating_add(size);
-        let over = namespace.total > namespace.cap;
+        let prev = namespace.total.fetch_add(size, Ordering::Relaxed);
+        let over = prev.saturating_add(size) > namespace.cap;
         tracing::debug!(
             ?role,
             bytes = size,
@@ -417,16 +419,9 @@ impl Store {
             Role::Full => None,
         }
     }
-
-    fn namespace_mut(&mut self, role: Role) -> Option<&mut Namespace> {
-        let state = self.state.as_mut()?;
-        match role {
-            Role::Thumb => Some(&mut state.thumb),
-            Role::Fit => Some(&mut state.view),
-            Role::Full => None,
-        }
-    }
 }
+
+static NEXT_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 impl Namespace {
     fn new(dir: PathBuf, cap: u64) -> Self {
@@ -435,20 +430,27 @@ impl Namespace {
             .iter()
             .map(|entry| entry.size)
             .fold(0_u64, u64::saturating_add);
-        Self { dir, cap, total }
+        Self {
+            dir,
+            cap,
+            total: AtomicU64::new(total),
+        }
     }
 
     fn path(&self, hash: u128) -> PathBuf {
         self.dir.join(format!("{hash:032x}"))
     }
 
-    /// The per-writer temp name: several processes save into one
-    /// namespace, so the pid keeps their in-progress files apart.
+    /// The per-write temp name: concurrent processes or worker threads
+    /// save into one namespace, so pid plus sequence keeps each
+    /// in-progress file distinct.
     fn temp_path(&self, hash: u128) -> PathBuf {
-        self.dir.join(format!("{hash:032x}.{}.tmp", process::id()))
+        let sequence = NEXT_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        self.dir
+            .join(format!("{hash:032x}.{}-{sequence}.tmp", process::id()))
     }
 
-    fn prune(&mut self) -> Vec<u128> {
+    fn prune(&self) -> Vec<u128> {
         let entries = entries(&self.dir);
         let mut total = entries
             .iter()
@@ -479,7 +481,7 @@ impl Namespace {
             cap = self.cap,
             "preview prune"
         );
-        self.total = total;
+        self.total.store(total, Ordering::Relaxed);
         evicted
     }
 }
@@ -588,21 +590,26 @@ fn clean_temps(dir: &Path) {
     }
 }
 
-/// Whether `name` is a writer's temp: `<hash:032x>.<pid>.tmp`.
+/// Whether `name` is a writer's temp: `<hash:032x>.<pid>[-<sequence>].tmp`.
 fn is_temp_name(name: &OsStr) -> bool {
     let Some(name) = name.to_str() else {
         return false;
     };
-    let Some((hash, rest)) = name.split_once('.') else {
+    let Some(stem) = name.strip_suffix(".tmp") else {
         return false;
     };
-    let Some((pid, suffix)) = rest.split_once('.') else {
+    let Some((hash, writer)) = stem.split_once('.') else {
         return false;
     };
-    suffix == "tmp"
-        && is_hash_name(OsStr::new(hash))
-        && !pid.is_empty()
-        && pid.bytes().all(|byte| byte.is_ascii_digit())
+    let valid_writer = match writer.split_once('-') {
+        Some((pid, sequence)) => is_digits(pid) && is_digits(sequence),
+        None => is_digits(writer),
+    };
+    is_hash_name(OsStr::new(hash)) && valid_writer
+}
+
+fn is_digits(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 /// Create the store's directories, refusing a root that is not a plain
@@ -644,17 +651,16 @@ fn write_atomic(
     final_path: &Path,
     bytes: &[u8],
 ) -> io::Result<()> {
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(temp)?;
     let guard = DropGuard::new(temp, |path| {
         if let Err(error) = fs::remove_file(path) {
             tracing::debug!(%error, "leftover preview temp file");
         }
     });
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(*guard)?;
     // Hold until the rename: clean_temps treats a free lock as a dead
     // writer.
     file.lock()?;
@@ -1051,6 +1057,7 @@ fn sample_count(dims: (u32, u32)) -> Option<usize> {
     reason = "a panic in test code is inconsequential"
 )]
 mod tests {
+    use std::thread;
     use std::time::Duration;
 
     use super::*;
@@ -1195,26 +1202,33 @@ mod tests {
             .expect("set mtime");
     }
 
-    fn temp_name(hash: u128, pid: u32) -> String {
-        format!("{hash:032x}.{pid}.tmp")
-    }
-
     #[test]
-    fn temp_names_carry_the_writer_pid() {
-        let dir = TempDir::new("preview-temp-pid");
+    fn concurrent_saves_do_not_collide() {
+        const WRITER_COUNT: usize = 2;
+        const SAVES_PER_WRITER: usize = 20;
+
+        let dir = TempDir::new("preview-concurrent-save");
+        let page = rgba_page(8, 8);
+        let hash = content_hash(b"same-entry");
         let store = Store::at(dir.path());
-        let thumb = store.namespace(Role::Thumb).expect("thumb");
-        let hash = content_hash(b"temp-pid");
-        let expected = dir
-            .path()
-            .join("thumb")
-            .join(temp_name(hash, process::id()));
-        let path = thumb.temp_path(hash);
-        assert_eq!(path, expected);
-        assert!(
-            path.file_name().is_some_and(is_temp_name),
-            "the cleaner must recognize its own writer temp"
-        );
+
+        thread::scope(|scope| {
+            let store = &store;
+            let page = &page;
+            for _ in 0..WRITER_COUNT {
+                scope.spawn(move || {
+                    for _ in 0..SAVES_PER_WRITER {
+                        assert!(
+                            store.save(hash, Role::Fit, page).persisted
+                        );
+                    }
+                });
+            }
+        });
+
+        let loaded =
+            Store::at(dir.path()).load(hash, Role::Fit).expect("kept");
+        assert_eq!((loaded.width(), loaded.height()), (8, 8));
     }
 
     #[test]
@@ -1223,22 +1237,21 @@ mod tests {
         let root = dir.path().join("cache");
         let page = rgba_page(2, 2);
         let hash = content_hash(b"page-kept");
-        let mut store = Store::at(&root);
+        let store = Store::at(&root);
         assert!(store.save(hash, Role::Thumb, &page).persisted);
-        drop(store);
 
         // A dead writer leaves its temp unlocked.
-        let stale_pid = 4242;
         let stale_thumb =
-            root.join("thumb").join(temp_name(hash, stale_pid));
+            store.namespace(Role::Thumb).expect("thumb").temp_path(hash);
         fs::write(&stale_thumb, b"partial").expect("thumb temp");
         let stale_view =
-            root.join("view").join(temp_name(hash, stale_pid));
+            store.namespace(Role::Fit).expect("view").temp_path(hash);
         fs::write(&stale_view, b"partial").expect("view temp");
 
         // A live writer's temp stays while it holds the lock.
-        let live_pid = 4243;
-        let live_temp = root.join("thumb").join(temp_name(hash, live_pid));
+        let live_temp =
+            store.namespace(Role::Thumb).expect("thumb").temp_path(hash);
+        drop(store);
         let locked_temp = File::options()
             .write(true)
             .create_new(true)
@@ -1276,7 +1289,7 @@ mod tests {
     fn rgba_roundtrip_preserves_the_page() {
         let dir = TempDir::new("preview-rgba");
         let page = rgba_page(3, 2).with_page_dims((9, 6));
-        let mut store = Store::at(dir.path());
+        let store = Store::at(dir.path());
         assert!(store.state.is_some());
         let hash = content_hash(b"page-a");
         assert!(store.save(hash, Role::Thumb, &page).persisted);
@@ -1296,7 +1309,7 @@ mod tests {
         let dir = TempDir::new("preview-yuv");
         let page =
             yuv_page(5, 3, Subsampling::Yuv420).with_page_dims((15, 9));
-        let mut store = Store::at(dir.path());
+        let store = Store::at(dir.path());
         let hash = content_hash(b"page-b");
         assert!(store.save(hash, Role::Fit, &page).persisted);
 
@@ -1319,7 +1332,7 @@ mod tests {
     fn yuv_u8_planes_and_alpha_roundtrip() {
         let dir = TempDir::new("preview-yuv8");
         let page = yuv_page_with(6, 4, Subsampling::Yuv444, 8, true);
-        let mut store = Store::at(dir.path());
+        let store = Store::at(dir.path());
         let hash = content_hash(b"page-e");
         assert!(store.save(hash, Role::Thumb, &page).persisted);
 
@@ -1336,7 +1349,7 @@ mod tests {
     fn corrupt_entries_are_rejected() {
         let dir = TempDir::new("preview-corrupt");
         let page = rgba_page(2, 2);
-        let mut store = Store::at(dir.path());
+        let store = Store::at(dir.path());
         let hash = content_hash(b"page-c");
         assert!(store.save(hash, Role::Thumb, &page).persisted);
         let path = dir.path().join("thumb").join(format!("{hash:032x}"));
@@ -1391,15 +1404,14 @@ mod tests {
     fn disabled_store_is_a_no_op() {
         let dir = TempDir::new("preview-disabled");
         dir.write("not-a-directory", b"x");
-        let mut store = Store::at(&dir.path().join("not-a-directory"));
+        let store = Store::at(&dir.path().join("not-a-directory"));
         assert!(store.state.is_none());
         let page = rgba_page(2, 2);
         let hash = content_hash(b"page-d");
         assert!(!store.save(hash, Role::Thumb, &page).persisted);
         assert!(store.load(hash, Role::Thumb).is_none());
 
-        let mut nested =
-            Store::at(&dir.path().join("not-a-directory/file"));
+        let nested = Store::at(&dir.path().join("not-a-directory/file"));
         assert!(nested.state.is_none());
         assert!(!nested.save(hash, Role::Fit, &page).persisted);
     }
@@ -1593,7 +1605,7 @@ mod tests {
         let page = rgba_page(4, 4);
         let size =
             u64::try_from(encode(&page, Role::Thumb).len()).expect("size");
-        let mut store = Store::with_caps(&root, size + 1, FIT_CAP_BYTES);
+        let store = Store::with_caps(&root, size + 1, FIT_CAP_BYTES);
 
         let first = content_hash(b"first");
         let second = content_hash(b"second");

@@ -55,7 +55,7 @@ The serving issues in `performance-plan.md` (§2 and §3) look like worker sched
 
 ## Part 2: Redesign Plan (Balanced for Simplicity)
 
-### 1. Simplify the Serving Model (`cache/presentation.rs`, `worker.rs`)
+### 1. [Done] Simplify the Serving Model (`cache/presentation.rs`, `worker.rs`)
 
 Instead of adding a complex multi-role scheduler, remove the work that shouldn't happen and make each work item a single `(page, Role)`:
 

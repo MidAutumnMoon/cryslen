@@ -190,8 +190,6 @@ impl Reading {
         (reading, cold)
     }
 
-    /// Start a book: build its reading state, then send the view before the
-    /// cold requests so the child has a prefetch to serve.
     fn start(book: &Book, mode: ReadingMode, index: usize) -> Self {
         let (reading, cold) = Self::new(book.view(), mode, index);
         book.send(ParentMsg::SetView {
@@ -1098,10 +1096,6 @@ impl App {
     }
 }
 
-#[expect(
-    clippy::rest_pattern_accessible_field,
-    reason = "the ignored fields are unused; naming them would trip unneeded_field_pattern"
-)]
 impl ApplicationHandler<WakeEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         use egui_system_font_provider::SystemFontProvider;
@@ -1343,14 +1337,7 @@ fn raw_zoom_factor(page_surface: &Response, points_per_line: f32) -> f32 {
         // egui smooths wheel deltas over frames; page zoom follows each
         // raw event.
         for event in &i.raw.events {
-            if let Event::MouseWheel {
-                unit,
-                delta,
-                phase: _phase,
-                source: _source,
-                modifiers: _modifiers,
-            } = event
-            {
+            if let Event::MouseWheel { unit, delta, .. } = event {
                 let scroll_points = match unit {
                     MouseWheelUnit::Point => delta.y,
                     MouseWheelUnit::Line => delta.y * points_per_line,

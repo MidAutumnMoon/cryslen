@@ -1,7 +1,7 @@
-//! Decode worker: the per-book child process. It owns the book's source,
-//! decode loop, and preview store; the parent starts it as `cy --worker`
-//! and talks to it over [`protocol`]. Nothing decoded survives here.
+//! Per-book decode worker (`cy --worker`): serves requests and
+//! playback in the foreground while `cy-prefetch` warms the store.
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
@@ -11,26 +11,25 @@ use std::panic;
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::process::ExitCode;
-use std::sync::mpsc;
-use std::sync::mpsc::RecvTimeoutError;
 use std::sync::Arc;
 use std::thread;
-use std::thread::Builder;
-use std::thread::JoinHandle;
 use std::time::Duration;
 use std::time::Instant;
 
-use crossbeam_channel::Receiver;
 use eros::ErrorUnion;
 use ipc_channel::ipc;
+use ipc_channel::ipc::IpcReceiver;
 use ipc_channel::ipc::IpcSender;
+use ipc_channel::TryRecvError as IpcTryRecvError;
+use parking_lot::Condvar;
+use parking_lot::Mutex;
 use rustix::process;
 use rustix::process::Pid;
 use rustix::process::Signal;
 
-use crate::animation::DecodedEvent;
 use crate::browse;
 use crate::browse::Motion;
+use crate::browse::PageCount;
 use crate::browse::Request;
 use crate::browse::Role;
 use crate::browse::Roles;
@@ -47,7 +46,6 @@ use crate::fault::DecodeError;
 use crate::fault::PageError;
 use crate::fault::PageFault;
 use crate::fault::PanicFault;
-use crate::fault::SpawnError;
 use crate::protocol::BookInfo;
 use crate::protocol::ChildMsg;
 use crate::protocol::Hello;
@@ -58,40 +56,77 @@ use crate::protocol::PlaybackId;
 use crate::protocol::WireImage;
 use crate::source::Source;
 
-/// Silence required before preload beyond the head starts, so a turning
-/// reader leaves the worker idle between turns.
+/// Quiet window before prefetch preloads pages beyond the head.
 const IDLE_PRELOAD: Duration = Duration::from_millis(300);
 
-/// One message from the decode thread.
-pub enum Update {
+enum ChildEvent<'image> {
     Ready {
         page: usize,
         role: Role,
-        image: Box<Decoded>,
+        image: &'image Decoded,
     },
     Failed {
         page: usize,
-        error: Arc<PageError>,
+        error: &'image Arc<PageError>,
     },
-    Playback(DecodedEvent),
-    /// Every page now reads without waiting on an unpack pass. An
-    /// archive sends this once, when that pass ends.
+    Playback(PlaybackEvent<&'image Decoded>),
     Unpacked,
-    Fatal(String),
+    Fatal(&'image str),
 }
 
-enum WorkerCommand {
-    SetPrefetch(Prefetch),
-    Motion(Motion),
-    /// Replace the set of roles the app is missing. The app sends
-    /// it on change; a request leaving the set is how it says it got the
-    /// role.
-    Requests(Vec<Request>),
-    Playback(PlaybackCommand),
-    Stop,
+enum CommandPoll {
+    Message(ParentMsg),
+    Empty,
+    Disconnected,
 }
 
-/// A playback step from the parent, in arrival order.
+trait CommandReceiver {
+    fn try_recv(&self) -> CommandPoll;
+    fn recv(&self) -> Option<ParentMsg>;
+}
+
+impl CommandReceiver for IpcReceiver<ParentMsg> {
+    fn try_recv(&self) -> CommandPoll {
+        match Self::try_recv(self) {
+            Ok(message) => CommandPoll::Message(message),
+            Err(IpcTryRecvError::Empty) => CommandPoll::Empty,
+            Err(IpcTryRecvError::IpcError(_)) => CommandPoll::Disconnected,
+        }
+    }
+
+    fn recv(&self) -> Option<ParentMsg> {
+        Self::recv(self).ok()
+    }
+}
+
+trait EventSink {
+    fn emit(&self, event: ChildEvent<'_>) -> bool;
+}
+
+impl EventSink for IpcSender<ChildMsg> {
+    fn emit(&self, event: ChildEvent<'_>) -> bool {
+        let message = match event {
+            ChildEvent::Ready { page, role, image } => ChildMsg::Ready {
+                page,
+                role,
+                image: WireImage::from_decoded(image),
+            },
+            ChildEvent::Failed { page, error } => ChildMsg::Failed {
+                page,
+                fault: PageFault::from(Arc::clone(error)),
+            },
+            ChildEvent::Playback(event) => ChildMsg::Playback(
+                event.map_image(WireImage::from_decoded),
+            ),
+            ChildEvent::Unpacked => ChildMsg::Unpacked,
+            ChildEvent::Fatal(summary) => {
+                ChildMsg::Fatal(summary.to_owned())
+            }
+        };
+        self.send(message).is_ok()
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum PlaybackStep {
     Start { id: PlaybackId, role: Role },
@@ -99,10 +134,6 @@ enum PlaybackStep {
 }
 
 impl PlaybackStep {
-    #[expect(
-        clippy::rest_pattern_accessible_field,
-        reason = "the id is all the caller needs from either step"
-    )]
     fn id(self) -> PlaybackId {
         match self {
             Self::Start { id, .. } | Self::Next { id } => id,
@@ -110,8 +141,6 @@ impl PlaybackStep {
     }
 }
 
-/// The child's playback cursor for one playing page; the session owns
-/// the loop policy.
 struct PlaybackSession {
     id: PlaybackId,
     role: Role,
@@ -120,7 +149,6 @@ struct PlaybackSession {
 }
 
 impl PlaybackSession {
-    /// `None` once every allowed pass has been played.
     fn advance(&mut self) -> Result<Option<Frame>, DecodeError> {
         let mut rewound = false;
         loop {
@@ -147,121 +175,174 @@ impl PlaybackSession {
     }
 }
 
-/// A page and the roles to produce. A `requested` job is delivered; a
-/// `preload` job is speculative.
 #[derive(Clone, Copy, Debug)]
-struct Job {
+struct PrefetchStep {
     page: usize,
-    roles: Roles,
-    requested: bool,
+    role: Role,
     preload: bool,
 }
 
-struct Session {
-    prefetch: Prefetch,
-    motion: Motion,
-    store: Store,
-    /// Content hash of each page's bytes, computed once per session.
-    hashes: HashMap<usize, u128>,
-    /// Roles this session put in the store or loaded, by content hash.
-    /// Evictions clear the entry, and a failed save still counts so a
-    /// refusing store cannot make the worker spin.
-    stored: HashMap<u128, Roles>,
-    /// A page's first failure is its verdict for the session.
-    failed: HashMap<usize, Arc<PageError>>,
-    /// What the app is missing, in its priority order.
-    requests: Vec<Request>,
-    requests_at: Instant,
-    /// Requests already handed over since they last entered the set.
-    served: HashSet<Request>,
-    playing_pages: HashMap<usize, PlaybackSession>,
-    playback_steps: VecDeque<PlaybackStep>,
-    preload_allowed: bool,
+#[derive(Clone, Copy)]
+enum ServeKind {
+    Request { requested_at: Instant },
+    Prefetch { preload: bool },
 }
 
-impl Session {
-    fn new(prefetch: Prefetch, store: Store) -> Self {
-        Self {
-            prefetch,
-            motion: Motion::Still,
-            store,
-            hashes: HashMap::new(),
-            stored: HashMap::new(),
-            failed: HashMap::new(),
-            requests: Vec::new(),
-            requests_at: Instant::now(),
-            served: HashSet::new(),
-            playing_pages: HashMap::new(),
-            playback_steps: VecDeque::new(),
-            preload_allowed: false,
+impl ServeKind {
+    const fn lane(self) -> &'static str {
+        match self {
+            Self::Request { .. } => "request",
+            Self::Prefetch { .. } => "prefetch",
         }
     }
 
-    /// Apply one message. `false` means the loop must stop.
-    fn apply(&mut self, message: WorkerCommand) -> bool {
-        // Playback is not a page turn: it must not reset the quiet window
-        // that lets the prefetch tail run.
-        if !matches!(
-            message,
-            WorkerCommand::Stop | WorkerCommand::Playback(_)
-        ) {
+    const fn is_request(self) -> bool {
+        matches!(self, Self::Request { .. })
+    }
+
+    fn report(
+        self,
+        page: usize,
+        role: Role,
+        hit: bool,
+        elapsed: Duration,
+    ) {
+        match self {
+            Self::Request { requested_at } => tracing::debug!(
+                page,
+                ?role,
+                hit,
+                waited = ?requested_at.elapsed(),
+                ?elapsed,
+                "target served"
+            ),
+            Self::Prefetch { preload } => tracing::debug!(
+                page,
+                ?role,
+                preload,
+                hit,
+                ?elapsed,
+                "prefetch served"
+            ),
+        }
+    }
+}
+
+struct BookState {
+    page_count: PageCount,
+    prefetch: Option<Prefetch>,
+    motion: Motion,
+    /// Content hash of each page's bytes, computed once per session.
+    hashes: HashMap<usize, u128>,
+    /// Roles known to reside in the store, by content hash. Evictions
+    /// clear entries, and failed saves stay marked so a refusing store
+    /// cannot make prefetch spin.
+    stored: HashMap<u128, Roles>,
+    /// A page's first failure is its verdict for the session.
+    failed: HashMap<usize, Arc<PageError>>,
+    /// The request foreground is currently decoding, so prefetch skips it
+    /// even if a new `SetRequests` drops it mid-decode.
+    active_request: Option<Request>,
+    requests: Vec<Request>,
+    /// Requests already handed over since they last entered the set.
+    served: HashSet<Request>,
+    preload_allowed: bool,
+    activity_sequence: u64,
+    stopped: bool,
+}
+
+impl BookState {
+    fn new(page_count: PageCount) -> Self {
+        Self {
+            page_count,
+            prefetch: None,
+            motion: Motion::Still,
+            hashes: HashMap::new(),
+            stored: HashMap::new(),
+            failed: HashMap::new(),
+            active_request: None,
+            requests: Vec::new(),
+            served: HashSet::new(),
+            preload_allowed: false,
+            activity_sequence: 0,
+            stopped: false,
+        }
+    }
+
+    fn apply(
+        &mut self,
+        message: ParentMsg,
+        playback: &mut PlaybackRunner,
+    ) -> bool {
+        // Ignore playback so animation frames keep the preload quiet window.
+        if !matches!(message, ParentMsg::Playback(_)) {
             self.preload_allowed = false;
+            self.activity_sequence =
+                self.activity_sequence.wrapping_add(1);
         }
         match message {
-            WorkerCommand::SetPrefetch(prefetch) => {
+            ParentMsg::SetView {
+                page,
+                mode,
+                direction,
+            } => {
+                let prefetch = Prefetch::build(
+                    browse::spread_for(page, mode, self.page_count),
+                    direction,
+                    mode,
+                    self.page_count,
+                );
                 tracing::debug!(
                     origin = ?prefetch.spreads().first(),
                     motion = ?self.motion,
                     "prefetch set"
                 );
-                self.prefetch = prefetch;
+                self.prefetch = Some(prefetch);
+                true
             }
-            WorkerCommand::Motion(motion) => {
+            ParentMsg::SetMotion(motion) => {
                 tracing::debug!(?motion, "motion");
                 self.motion = motion;
+                true
             }
-            WorkerCommand::Requests(requests) => {
+            ParentMsg::SetRequests(requests) => {
                 tracing::debug!(count = requests.len(), "requests");
                 self.served.retain(|request| requests.contains(request));
                 self.requests = requests;
-                self.requests_at = Instant::now();
+                true
             }
-            WorkerCommand::Playback(command) => {
-                self.apply_playback(command);
-            }
-            WorkerCommand::Stop => return false,
-        }
-        true
-    }
-
-    fn apply_playback(&mut self, command: PlaybackCommand) {
-        match command {
-            PlaybackCommand::Start { id, role } => {
-                // A restart replaces everything still queued for the page.
-                self.playback_steps
-                    .retain(|step| step.id().page != id.page);
-                self.playback_steps
-                    .push_back(PlaybackStep::Start { id, role });
-            }
-            PlaybackCommand::Next { id } => {
-                self.playback_steps.push_back(PlaybackStep::Next { id });
-            }
-            PlaybackCommand::Stop { id } => {
-                if self
-                    .playing_pages
-                    .get(&id.page)
-                    .is_some_and(|session| session.id == id)
-                {
-                    self.playing_pages.remove(&id.page);
-                }
-                self.playback_steps.retain(|step| step.id() != id);
+            ParentMsg::Playback(command) => {
+                playback.apply(command);
+                false
             }
         }
     }
 
-    fn next_prefetch_job(&self) -> Option<Job> {
-        let head = self.prefetch.head();
-        for spread in self.prefetch.spreads() {
+    fn take_request(&mut self) -> Option<Request> {
+        let request = *self.requests.iter().find(|request| {
+            !self.served.contains(request)
+                && !self.failed.contains_key(&request.page)
+        })?;
+        self.active_request = Some(request);
+        Some(request)
+    }
+
+    fn wants_unserved(&self, page: usize, role: Role) -> bool {
+        let request = Request::new(page, role);
+        self.requests.contains(&request) && !self.served.contains(&request)
+    }
+
+    fn is_claimed(&self, page: usize, role: Role) -> bool {
+        let request = Request::new(page, role);
+        self.active_request == Some(request)
+            || (self.requests.contains(&request)
+                && !self.served.contains(&request))
+    }
+
+    fn next_prefetch_job(&self) -> Option<(PrefetchStep, Motion)> {
+        let prefetch = self.prefetch.as_ref()?;
+        let head = prefetch.head();
+        for spread in prefetch.spreads() {
             let in_head = head.contains(spread);
             for page in
                 [Some(spread.first), spread.second].into_iter().flatten()
@@ -275,79 +356,244 @@ impl Session {
                     .and_then(|hash| self.stored.get(hash))
                     .copied()
                     .unwrap_or_default();
-                let mut roles = Roles::default();
-                if !stored.contains(Role::Thumb) {
-                    roles.set(Role::Thumb);
-                }
                 if in_head
                     && self.motion == Motion::Still
                     && !stored.contains(Role::Fit)
+                    && !self.is_claimed(page, Role::Fit)
                 {
-                    roles.set(Role::Fit);
+                    return Some((
+                        PrefetchStep {
+                            page,
+                            role: Role::Fit,
+                            preload: false,
+                        },
+                        self.motion,
+                    ));
                 }
-                if roles.any() {
-                    return Some(Job {
-                        page,
-                        roles,
-                        requested: false,
-                        preload: !in_head,
-                    });
+                // Let a pending fit decode finish before warming thumb so
+                // thumb can derive from the saved fit without re-decoding.
+                let fit_pending = !stored.contains(Role::Fit)
+                    && self.is_claimed(page, Role::Fit);
+                if !stored.contains(Role::Thumb)
+                    && !fit_pending
+                    && !self.is_claimed(page, Role::Thumb)
+                {
+                    return Some((
+                        PrefetchStep {
+                            page,
+                            role: Role::Thumb,
+                            preload: !in_head,
+                        },
+                        self.motion,
+                    ));
                 }
             }
         }
         None
     }
 
-    /// The first requested page with an unserved role, with the page's whole
-    /// group so one decode serves it.
-    fn next_request(&self) -> Option<Job> {
-        let mut found: Option<Job> = None;
-        for request in &self.requests {
-            if self.served.contains(request)
-                || self.failed.contains_key(&request.page)
-            {
-                continue;
-            }
-            match found.as_mut() {
-                Some(job) if job.page == request.page => {
-                    job.roles.set(request.role);
+    fn mark_stored(&mut self, hash: u128, role: Role) {
+        self.stored.entry(hash).or_default().set(role);
+    }
+}
+
+struct RequestGuard<'shared, Sink> {
+    shared: &'shared Shared<Sink>,
+}
+
+impl<Sink> Drop for RequestGuard<'_, Sink> {
+    fn drop(&mut self) {
+        self.shared.finish_request();
+    }
+}
+
+struct Shared<Sink> {
+    store: Store,
+    state: Mutex<BookState>,
+    wake: Condvar,
+    sink: Mutex<Sink>,
+}
+
+impl<Sink> Shared<Sink> {
+    fn finish_request(&self) {
+        let mut state = self.state.lock();
+        state.active_request = None;
+        drop(state);
+        self.wake.notify_one();
+    }
+}
+
+impl<Sink> Shared<Sink>
+where
+    Sink: EventSink,
+{
+    fn new(page_count: PageCount, store: Store, sink: Sink) -> Self {
+        Self {
+            store,
+            state: Mutex::new(BookState::new(page_count)),
+            wake: Condvar::new(),
+            sink: Mutex::new(sink),
+        }
+    }
+
+    fn stop(&self) {
+        let mut state = self.state.lock();
+        state.stopped = true;
+        drop(state);
+        self.wake.notify_all();
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.state.lock().stopped
+    }
+
+    fn apply_message(
+        &self,
+        message: ParentMsg,
+        playback: &mut PlaybackRunner,
+        requested_at: &mut Instant,
+    ) {
+        if matches!(message, ParentMsg::SetRequests(_)) {
+            *requested_at = Instant::now();
+        }
+        let wake_prefetch = self.state.lock().apply(message, playback);
+        if wake_prefetch {
+            self.wake.notify_one();
+        }
+    }
+
+    fn apply_messages(
+        &self,
+        rx: &impl CommandReceiver,
+        playback: &mut PlaybackRunner,
+        requested_at: &mut Instant,
+    ) -> bool {
+        loop {
+            match rx.try_recv() {
+                CommandPoll::Message(message) => {
+                    self.apply_message(message, playback, requested_at);
                 }
-                Some(_) => break,
-                None => {
-                    let mut roles = Roles::default();
-                    roles.set(request.role);
-                    found = Some(Job {
-                        page: request.page,
-                        roles,
-                        requested: true,
-                        preload: false,
-                    });
-                }
+                CommandPoll::Empty => return true,
+                CommandPoll::Disconnected => return false,
             }
         }
-        found
     }
 
-    fn request_wait(&self) -> Duration {
-        self.requests_at.elapsed()
+    fn next_request(&self) -> Option<(Request, RequestGuard<'_, Sink>)> {
+        let request = self.state.lock().take_request()?;
+        Some((request, RequestGuard { shared: self }))
     }
 
-    fn hash(&mut self, page: usize, bytes: &[u8]) -> u128 {
-        *self
-            .hashes
-            .entry(page)
-            .or_insert_with(|| cache::content_hash(bytes))
+    #[expect(
+        clippy::significant_drop_tightening,
+        reason = "condvar wait loop holds the mutex guard across iterations"
+    )]
+    fn next_prefetch(&self) -> Option<PrefetchStep> {
+        let mut preload_wait: Option<(Instant, Instant, u64)> = None;
+        let (step, motion) = {
+            let mut state = self.state.lock();
+            loop {
+                if state.stopped {
+                    return None;
+                }
+                let Some((step, motion)) = state.next_prefetch_job()
+                else {
+                    preload_wait = None;
+                    self.wake.wait(&mut state);
+                    continue;
+                };
+                if !step.preload || state.preload_allowed {
+                    break (step, motion);
+                }
+                let sequence = state.activity_sequence;
+                let (started, deadline) = match preload_wait {
+                    Some((started, deadline, wait_sequence))
+                        if wait_sequence == sequence =>
+                    {
+                        (started, deadline)
+                    }
+                    _ => {
+                        let started = Instant::now();
+                        let deadline = started + IDLE_PRELOAD;
+                        preload_wait = Some((started, deadline, sequence));
+                        (started, deadline)
+                    }
+                };
+                let timed_out =
+                    self.wake.wait_until(&mut state, deadline).timed_out();
+                if timed_out
+                    && !state.stopped
+                    && state.activity_sequence == sequence
+                {
+                    state.preload_allowed = true;
+                    tracing::debug!(
+                        waited = ?started.elapsed(),
+                        "preload started"
+                    );
+                }
+            }
+        };
+        tracing::debug!(
+            page = step.page,
+            role = ?step.role,
+            ?motion,
+            preload = step.preload,
+            "prefetch job"
+        );
+        Some(step)
     }
 
-    /// Hand one role to the app and mark it served for the current set.
-    fn publish(
-        &mut self,
+    fn hash_of(&self, page: usize) -> Option<u128> {
+        self.state.lock().hashes.get(&page).copied()
+    }
+
+    fn insert_hash(&self, page: usize, bytes: &[u8]) -> u128 {
+        let hash = cache::content_hash(bytes);
+        *self.state.lock().hashes.entry(page).or_insert(hash)
+    }
+
+    fn load_cached(&self, hash: u128, role: Role) -> Option<Decoded> {
+        let image = self.store.load(hash, role)?;
+        self.state.lock().mark_stored(hash, role);
+        Some(image)
+    }
+
+    fn persist(
+        &self,
         page: usize,
+        hash: u128,
         role: Role,
-        image: Decoded,
-        notify: &dyn Fn(Update),
+        image: &Decoded,
     ) {
-        self.served.insert(Request { page, role });
+        let saved = self.store.save(hash, role, image);
+        if !saved.persisted {
+            tracing::debug!(page, ?role, "preview not persisted");
+        }
+        let mut state = self.state.lock();
+        for (evicted_role, evicted_hash) in saved.evicted {
+            if let Some(roles) = state.stored.get_mut(&evicted_hash) {
+                roles.clear(evicted_role);
+            }
+        }
+        state.mark_stored(hash, role);
+    }
+
+    fn wants_unserved(&self, page: usize, role: Role) -> bool {
+        self.state.lock().wants_unserved(page, role)
+    }
+
+    fn emit(&self, event: ChildEvent<'_>) {
+        let sent = self.sink.lock().emit(event);
+        if !sent {
+            let mut state = self.state.lock();
+            state.stopped = true;
+            drop(state);
+            self.wake.notify_all();
+        }
+    }
+
+    fn publish(&self, page: usize, role: Role, image: &Decoded) {
+        self.state.lock().served.insert(Request::new(page, role));
         tracing::debug!(
             page,
             ?role,
@@ -355,193 +601,309 @@ impl Session {
             height = image.height(),
             "publish"
         );
-        notify(Update::Ready {
+        self.emit(ChildEvent::Ready { page, role, image });
+    }
+
+    fn record_failure(&self, page: usize, error: &Arc<PageError>) {
+        let is_new = match self.state.lock().failed.entry(page) {
+            Entry::Vacant(entry) => {
+                entry.insert(Arc::clone(error));
+                true
+            }
+            Entry::Occupied(_) => false,
+        };
+        if is_new {
+            self.emit(ChildEvent::Failed { page, error });
+        }
+    }
+
+    fn read_source(
+        &self,
+        source: &Source,
+        page: usize,
+    ) -> Option<Arc<[u8]>> {
+        match source.bytes(page) {
+            Ok(bytes) => Some(bytes),
+            Err(error) => {
+                self.record_failure(page, &error);
+                None
+            }
+        }
+    }
+
+    fn decode(
+        &self,
+        source: &Source,
+        page: usize,
+        bytes: &[u8],
+        lane: &str,
+    ) -> Option<Decoded> {
+        let started = Instant::now();
+        match decode_page(source, page, bytes) {
+            Ok(native) => {
+                tracing::debug!(
+                    page,
+                    lane,
+                    elapsed = ?started.elapsed(),
+                    "decoded"
+                );
+                Some(native)
+            }
+            Err(error) => {
+                self.record_failure(page, &error);
+                None
+            }
+        }
+    }
+}
+
+fn derive_thumb_from_fit<Sink>(
+    shared: &Shared<Sink>,
+    last_fit: &mut Option<(u128, Decoded)>,
+    page: usize,
+    hash: u128,
+    lane: &str,
+) -> Option<Decoded>
+where
+    Sink: EventSink,
+{
+    if let Some((fit_hash, fit)) = last_fit {
+        if *fit_hash == hash {
+            return Some(derive_timed(page, Role::Thumb, fit, lane));
+        }
+    }
+    let fit = shared.load_cached(hash, Role::Fit)?;
+    let thumb = derive_timed(page, Role::Thumb, &fit, lane);
+    *last_fit = Some((hash, fit));
+    Some(thumb)
+}
+
+fn serve_cached<Sink>(
+    shared: &Shared<Sink>,
+    last_fit: &mut Option<(u128, Decoded)>,
+    page: usize,
+    role: Role,
+    hash: u128,
+    kind: ServeKind,
+    serve_started: Instant,
+) -> bool
+where
+    Sink: EventSink,
+{
+    if let Some(image) = shared.load_cached(hash, role) {
+        if kind.is_request() {
+            shared.publish(page, role, &image);
+        }
+        kind.report(page, role, true, serve_started.elapsed());
+        if role == Role::Fit {
+            *last_fit = Some((hash, image));
+        }
+        return true;
+    }
+    if role == Role::Thumb {
+        if let Some(thumb) = derive_thumb_from_fit(
+            shared,
+            last_fit,
+            page,
+            hash,
+            kind.lane(),
+        ) {
+            if kind.is_request() {
+                shared.publish(page, Role::Thumb, &thumb);
+            }
+            kind.report(page, Role::Thumb, false, serve_started.elapsed());
+            shared.persist(page, hash, Role::Thumb, &thumb);
+            return true;
+        }
+    }
+    false
+}
+
+fn produce_preview<Sink>(
+    source: &Source,
+    shared: &Shared<Sink>,
+    last_fit: &mut Option<(u128, Decoded)>,
+    page: usize,
+    role: Role,
+    kind: ServeKind,
+) where
+    Sink: EventSink,
+{
+    let serve_started = Instant::now();
+    let known_hash = shared.hash_of(page);
+    if let Some(hash) = known_hash {
+        if serve_cached(
+            shared,
+            last_fit,
             page,
             role,
-            image: Box::new(image),
-        });
-    }
-
-    fn mark_stored(&mut self, hash: u128, role: Role) {
-        self.stored.entry(hash).or_default().set(role);
-    }
-
-    /// Save one role; the evictions it reports leave the ledger.
-    fn persist(
-        &mut self,
-        page: usize,
-        hash: u128,
-        role: Role,
-        image: Decoded,
-    ) -> Decoded {
-        let saved = self.store.save(hash, role, &image);
-        if !saved.persisted {
-            tracing::debug!(page, ?role, "preview save missed the store");
-        }
-        for (evicted_role, evicted_hash) in saved.evicted {
-            if let Some(roles) = self.stored.get_mut(&evicted_hash) {
-                roles.clear(evicted_role);
-            }
-        }
-        self.mark_stored(hash, role);
-        image
-    }
-
-    /// Record a page's verdict and tell the app once.
-    fn record_failure(
-        &mut self,
-        page: usize,
-        error: Arc<PageError>,
-        notify: &dyn Fn(Update),
-    ) {
-        if self.failed.insert(page, Arc::clone(&error)).is_some() {
+            hash,
+            kind,
+            serve_started,
+        ) {
             return;
         }
-        notify(Update::Failed { page, error });
     }
 
-    /// Load what the store answers, decode once for the rest, and save every
-    /// preview; a requested job also publishes.
-    fn serve(
-        &mut self,
-        source: &Source,
-        job: Job,
-        notify: &dyn Fn(Update),
-    ) {
-        let page = job.page;
-        let roles = job.roles;
-        let requested = job.requested;
-        let bytes = match source.bytes(page) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                self.record_failure(page, error, notify);
-                return;
-            }
-        };
-        let serve_started = Instant::now();
-        let hash = self.hash(page, &bytes);
-        let mut thumb = roles
-            .contains(Role::Thumb)
-            .then(|| self.store.load(hash, Role::Thumb))
-            .flatten();
-        let mut view = roles
-            .contains(Role::Fit)
-            .then(|| self.store.load(hash, Role::Fit))
-            .flatten();
-        let thumb_hit = thumb.is_some();
-        let view_hit = view.is_some();
-        if thumb.is_some() {
-            self.mark_stored(hash, Role::Thumb);
+    let Some(bytes) = shared.read_source(source, page) else {
+        return;
+    };
+    let hash =
+        known_hash.unwrap_or_else(|| shared.insert_hash(page, &bytes));
+    if known_hash.is_none()
+        && serve_cached(
+            shared,
+            last_fit,
+            page,
+            role,
+            hash,
+            kind,
+            serve_started,
+        )
+    {
+        return;
+    }
+
+    let Some(native) = shared.decode(source, page, &bytes, kind.lane())
+    else {
+        return;
+    };
+    let derived = derive_timed(page, role, &native, kind.lane());
+    if kind.is_request() {
+        shared.publish(page, role, &derived);
+        kind.report(page, role, false, serve_started.elapsed());
+        if role == Role::Fit && shared.wants_unserved(page, Role::Full) {
+            shared.publish(page, Role::Full, &native);
+            kind.report(page, Role::Full, false, serve_started.elapsed());
         }
-        if view.is_some() {
-            self.mark_stored(hash, Role::Fit);
-        }
-        if roles.contains(Role::Full)
-            || (roles.contains(Role::Fit) && view.is_none())
-            || (roles.contains(Role::Thumb) && thumb.is_none())
-        {
-            let decode_started = Instant::now();
-            let native = match decode_page(source, page, &bytes) {
-                Ok(native) => native,
-                Err(error) => {
-                    self.record_failure(page, error, notify);
-                    return;
-                }
-            };
-            tracing::debug!(
-                page,
-                elapsed = ?decode_started.elapsed(),
-                "decoded"
-            );
-            if roles.contains(Role::Fit) && view.is_none() {
-                let started = Instant::now();
-                let derived = cache::derive(&native, Role::Fit);
-                tracing::debug!(
-                    page,
-                    elapsed = ?started.elapsed(),
-                    "fit derived"
-                );
-                view = Some(self.persist(page, hash, Role::Fit, derived));
-            }
-            if roles.contains(Role::Thumb) && thumb.is_none() {
-                let started = Instant::now();
-                let from = view.as_ref().unwrap_or(&native);
-                let derived = cache::derive(from, Role::Thumb);
-                tracing::debug!(
-                    page,
-                    elapsed = ?started.elapsed(),
-                    "thumb derived"
-                );
-                thumb =
-                    Some(self.persist(page, hash, Role::Thumb, derived));
-            }
-            // Natives bypass the store; a requested job delivers them.
-            if roles.contains(Role::Full) && requested {
-                self.publish(page, Role::Full, native, notify);
-            }
-        }
-        if requested {
-            tracing::debug!(
-                page,
-                thumb = roles.contains(Role::Thumb),
-                view = roles.contains(Role::Fit),
-                native = roles.contains(Role::Full),
-                thumb_hit,
-                view_hit,
-                waited = ?self.requests_at.elapsed(),
-                elapsed = ?serve_started.elapsed(),
-                "target served"
-            );
-            // The fit image goes first: a still frame waits on it, and the
-            // app's upload budget would otherwise defer it behind the
-            // thumb by a frame.
-            if roles.contains(Role::Fit) {
-                if let Some(view) = view {
-                    self.publish(page, Role::Fit, view, notify);
-                }
-            }
-            if roles.contains(Role::Thumb) {
-                if let Some(thumb) = thumb {
-                    self.publish(page, Role::Thumb, thumb, notify);
-                }
-            }
+    } else {
+        kind.report(page, role, false, serve_started.elapsed());
+    }
+    shared.persist(page, hash, role, &derived);
+    if role == Role::Fit {
+        *last_fit = Some((hash, derived));
+    }
+}
+
+fn serve_full<Sink>(
+    source: &Source,
+    shared: &Shared<Sink>,
+    page: usize,
+    requested_at: Instant,
+) where
+    Sink: EventSink,
+{
+    let serve_started = Instant::now();
+    let kind = ServeKind::Request { requested_at };
+    let Some(bytes) = shared.read_source(source, page) else {
+        return;
+    };
+    let Some(native) = shared.decode(source, page, &bytes, kind.lane())
+    else {
+        return;
+    };
+    shared.publish(page, Role::Full, &native);
+    kind.report(page, Role::Full, false, serve_started.elapsed());
+}
+
+fn serve_request<Sink>(
+    source: &Source,
+    shared: &Shared<Sink>,
+    last_fit: &mut Option<(u128, Decoded)>,
+    request: Request,
+    requested_at: Instant,
+) where
+    Sink: EventSink,
+{
+    if request.role == Role::Full {
+        serve_full(source, shared, request.page, requested_at);
+        return;
+    }
+    produce_preview(
+        source,
+        shared,
+        last_fit,
+        request.page,
+        request.role,
+        ServeKind::Request { requested_at },
+    );
+}
+
+struct PlaybackRunner {
+    playing_pages: HashMap<usize, PlaybackSession>,
+    steps: VecDeque<PlaybackStep>,
+}
+
+impl PlaybackRunner {
+    fn new() -> Self {
+        Self {
+            playing_pages: HashMap::new(),
+            steps: VecDeque::new(),
         }
     }
 
-    fn serve_playback(
+    fn apply(&mut self, command: PlaybackCommand) {
+        match command {
+            PlaybackCommand::Start { id, role } => {
+                self.steps.retain(|step| step.id().page != id.page);
+                self.steps.push_back(PlaybackStep::Start { id, role });
+            }
+            PlaybackCommand::Next { id } => {
+                self.steps.push_back(PlaybackStep::Next { id });
+            }
+            PlaybackCommand::Stop { id } => {
+                if self
+                    .playing_pages
+                    .get(&id.page)
+                    .is_some_and(|session| session.id == id)
+                {
+                    self.playing_pages.remove(&id.page);
+                }
+                self.steps.retain(|step| step.id() != id);
+            }
+        }
+    }
+
+    fn pop_front(&mut self) -> Option<PlaybackStep> {
+        self.steps.pop_front()
+    }
+
+    fn serve<Sink>(
         &mut self,
         source: &Source,
         step: PlaybackStep,
-        notify: &dyn Fn(Update),
-    ) {
+        shared: &Shared<Sink>,
+    ) where
+        Sink: EventSink,
+    {
         match step {
             PlaybackStep::Start { id, role } => {
-                self.start_playback(source, id, role, notify);
+                self.start_playback(source, id, role, shared);
             }
-            PlaybackStep::Next { id } => self.next_playback(id, notify),
+            PlaybackStep::Next { id } => self.next_playback(id, shared),
         }
     }
 
-    /// A successful start emits nothing; the first `Next` produces the
-    /// first frame. A start that cannot open the stream answers `Failed`.
-    fn start_playback(
+    fn start_playback<Sink>(
         &mut self,
         source: &Source,
         id: PlaybackId,
         role: Role,
-        notify: &dyn Fn(Update),
-    ) {
+        shared: &Shared<Sink>,
+    ) where
+        Sink: EventSink,
+    {
         let page = id.page;
         let bytes = match source.bytes(page) {
             Ok(bytes) => bytes,
             Err(error) => {
                 tracing::debug!(?id, %error, "playback source failed");
-                self.fail_playback(id, notify);
+                self.fail_playback(id, shared);
                 return;
             }
         };
         let Some(name) = source.name(page) else {
-            self.fail_playback(id, notify);
+            self.fail_playback(id, shared);
             return;
         };
 
@@ -565,7 +927,7 @@ impl Session {
             }
             Ok(Ok(None)) => {
                 tracing::debug!(?id, ?role, "no playback path");
-                self.fail_playback(id, notify);
+                self.fail_playback(id, shared);
             }
             Ok(Err(error)) => {
                 tracing::warn!(
@@ -574,7 +936,7 @@ impl Session {
                     %error,
                     "playback open failed"
                 );
-                self.fail_playback(id, notify);
+                self.fail_playback(id, shared);
             }
             Err(payload) => {
                 let fault = PanicFault::from_payload(
@@ -587,12 +949,18 @@ impl Session {
                     fault = %fault,
                     "playback open panicked"
                 );
-                self.fail_playback(id, notify);
+                self.fail_playback(id, shared);
             }
         }
     }
 
-    fn next_playback(&mut self, id: PlaybackId, notify: &dyn Fn(Update)) {
+    fn next_playback<Sink>(
+        &mut self,
+        id: PlaybackId,
+        shared: &Shared<Sink>,
+    ) where
+        Sink: EventSink,
+    {
         let page = id.page;
         let Some(session) = self.playing_pages.get_mut(&page) else {
             tracing::debug!(?id, "playback frame without a session");
@@ -616,16 +984,18 @@ impl Session {
                     height = image.height(),
                     "playback frame"
                 );
-                notify(Update::Playback(DecodedEvent::Frame {
+                shared.emit(ChildEvent::Playback(PlaybackEvent::Frame {
                     id,
                     delay: frame.delay,
-                    image: Box::new(image),
+                    image: &image,
                 }));
             }
             Ok(Ok(None)) => {
                 tracing::debug!(?id, ?role, "playback finished");
                 self.playing_pages.remove(&page);
-                notify(Update::Playback(DecodedEvent::Finished { id }));
+                shared.emit(ChildEvent::Playback(
+                    PlaybackEvent::Finished { id },
+                ));
             }
             Ok(Err(error)) => {
                 tracing::warn!(
@@ -634,7 +1004,7 @@ impl Session {
                     %error,
                     "playback frame failed"
                 );
-                self.fail_playback(id, notify);
+                self.fail_playback(id, shared);
             }
             Err(payload) => {
                 let fault = PanicFault::from_payload(
@@ -647,12 +1017,18 @@ impl Session {
                     fault = %fault,
                     "playback frame panicked"
                 );
-                self.fail_playback(id, notify);
+                self.fail_playback(id, shared);
             }
         }
     }
 
-    fn fail_playback(&mut self, id: PlaybackId, notify: &dyn Fn(Update)) {
+    fn fail_playback<Sink>(
+        &mut self,
+        id: PlaybackId,
+        shared: &Shared<Sink>,
+    ) where
+        Sink: EventSink,
+    {
         if self
             .playing_pages
             .get(&id.page)
@@ -660,180 +1036,119 @@ impl Session {
         {
             self.playing_pages.remove(&id.page);
         }
-        self.playback_steps.retain(|step| step.id() != id);
-        notify(Update::Playback(DecodedEvent::Failed { id }));
+        self.steps.retain(|step| step.id() != id);
+        shared.emit(ChildEvent::Playback(PlaybackEvent::Failed { id }));
     }
 }
 
-/// Handle to the decode thread. Every control is a send; the last
-/// prefetch wins, and a newer prefetch overtakes the old one's tail.
-pub struct Worker {
-    tx: mpsc::Sender<WorkerCommand>,
-    handle: Option<JoinHandle<()>>,
+fn derive_timed(
+    page: usize,
+    role: Role,
+    source: &Decoded,
+    lane: &str,
+) -> Decoded {
+    let started = Instant::now();
+    let derived = cache::derive(source, role);
+    tracing::debug!(
+        page,
+        ?role,
+        lane,
+        elapsed = ?started.elapsed(),
+        "derived"
+    );
+    derived
 }
 
-impl Worker {
-    /// Spawn the worker for `source` with `initial` as its prefetch. `notify`
-    /// fires from the worker thread with each role or failure.
-    pub fn spawn(
-        source: Arc<Source>,
-        initial: Prefetch,
-        notify: impl Fn(Update) + Send + Sync + 'static,
-    ) -> Result<Self, SpawnError> {
-        Self::launch(source, initial, Store::open(), notify)
-    }
-
-    /// Spawn against an explicit store root for tests.
-    #[cfg(test)]
-    fn spawn_at(
-        source: Arc<Source>,
-        initial: Prefetch,
-        root: &Path,
-        notify: impl Fn(Update) + Send + Sync + 'static,
-    ) -> Result<Self, SpawnError> {
-        Self::launch(source, initial, Store::at(root), notify)
-    }
-
-    fn launch(
-        source: Arc<Source>,
-        initial: Prefetch,
-        store: Store,
-        notify: impl Fn(Update) + Send + Sync + 'static,
-    ) -> Result<Self, SpawnError> {
-        let (tx, rx) = mpsc::channel::<WorkerCommand>();
-        let handle =
-            Builder::new().name("cy-decode".into()).spawn(move || {
-                run(&source, &rx, Session::new(initial, store), &notify);
-            })?;
-        Ok(Self {
-            tx,
-            handle: Some(handle),
-        })
-    }
-
-    /// A failed send means the thread already exited, so the message has
-    /// no reader left.
-    fn tell(&self, message: WorkerCommand) {
-        let Ok(()) = self.tx.send(message) else {
-            return;
-        };
-    }
-
-    /// Replace the prefetch; the in-flight decode still finishes.
-    pub fn set_prefetch(&self, prefetch: Prefetch) {
-        self.tell(WorkerCommand::SetPrefetch(prefetch));
-    }
-
-    pub fn set_motion(&self, motion: Motion) {
-        self.tell(WorkerCommand::Motion(motion));
-    }
-
-    /// Serve these requests in order, ahead of the prefetch; the app sends only
-    /// changes, and a request that leaves and returns is served again.
-    pub fn set_requests(&self, requests: Vec<Request>) {
-        self.tell(WorkerCommand::Requests(requests));
-    }
-
-    pub fn playback(&self, command: PlaybackCommand) {
-        self.tell(WorkerCommand::Playback(command));
-    }
-
-    /// Stop the worker without joining it, so the caller returns while an
-    /// in-flight decode finishes. The thread owns its state.
-    pub fn detach(&mut self) {
-        self.tell(WorkerCommand::Stop);
-        self.handle = None;
+fn prefetch_loop<Sink>(source: &Source, shared: &Shared<Sink>)
+where
+    Sink: EventSink,
+{
+    let mut last_fit = None;
+    while let Some(step) = shared.next_prefetch() {
+        produce_preview(
+            source,
+            shared,
+            &mut last_fit,
+            step.page,
+            step.role,
+            ServeKind::Prefetch {
+                preload: step.preload,
+            },
+        );
     }
 }
 
-impl Drop for Worker {
-    fn drop(&mut self) {
-        // Stop wakes a parked loop so the join returns.
-        self.tell(WorkerCommand::Stop);
-        if let Some(handle) = self.handle.take() {
-            // A panicked thread leaves nothing to act on at teardown, so
-            // debug builds surface the breach.
-            let joined = handle.join();
-            debug_assert!(joined.is_ok(), "worker thread panicked");
-        }
-    }
-}
-
-/// Worker loop: drain the channel before every pick, so Stop and a newer
-/// prefetch answer between decodes, and one in-flight decode completes.
-fn run(
+fn run<Sink>(
     source: &Source,
-    rx: &mpsc::Receiver<WorkerCommand>,
-    mut session: Session,
-    notify: &dyn Fn(Update),
-) {
+    rx: &impl CommandReceiver,
+    page_count: PageCount,
+    store: Store,
+    sink: Sink,
+) -> bool
+where
+    Sink: EventSink + Send,
+{
     if let Err(error) = source.wait_ready() {
-        notify(Update::Fatal(error.to_string()));
-        return;
+        let _sent = sink.emit(ChildEvent::Fatal(&error.to_string()));
+        return false;
     }
-    if source.is_archive() {
-        notify(Update::Unpacked);
+    if source.is_archive() && !sink.emit(ChildEvent::Unpacked) {
+        return true;
     }
-    loop {
-        while let Ok(message) = rx.try_recv() {
-            if !session.apply(message) {
-                return;
+
+    let shared = Shared::new(page_count, store, sink);
+    let mut requested_at = Instant::now();
+    let mut last_fit = None;
+    let mut playback = PlaybackRunner::new();
+
+    thread::scope(|scope| {
+        let spawned = thread::Builder::new()
+            .name("cy-prefetch".into())
+            .spawn_scoped(scope, || prefetch_loop(source, &shared));
+        if let Err(error) = spawned {
+            tracing::warn!(?error, "prefetch thread disabled");
+        }
+
+        loop {
+            if !shared.apply_messages(rx, &mut playback, &mut requested_at)
+                || shared.is_stopped()
+            {
+                break;
             }
-        }
-        if let Some(job) = session.next_request() {
-            tracing::debug!(
-                page = job.page,
-                roles = ?job.roles,
-                waited = ?session.request_wait(),
-                "request"
-            );
-            session.serve(source, job, notify);
-            continue;
-        }
-        if let Some(step) = session.playback_steps.pop_front() {
-            session.serve_playback(source, step, notify);
-            continue;
-        }
-        if let Some(job) = session.next_prefetch_job() {
-            tracing::debug!(
-                page = job.page,
-                thumb = job.roles.contains(Role::Thumb),
-                fit = job.roles.contains(Role::Fit),
-                motion = ?session.motion,
-                preload = job.preload,
-                "job"
-            );
-            if !job.preload || session.preload_allowed {
-                session.serve(source, job, notify);
+            if let Some((request, _guard)) = shared.next_request() {
+                tracing::debug!(
+                    page = request.page,
+                    role = ?request.role,
+                    waited = ?requested_at.elapsed(),
+                    "request"
+                );
+                serve_request(
+                    source,
+                    &shared,
+                    &mut last_fit,
+                    request,
+                    requested_at,
+                );
                 continue;
             }
-            // Preload yields to the app. Let the app speak first: a turning
-            // reader gets its own pages ahead of speculative work.
-            match rx.recv_timeout(IDLE_PRELOAD) {
-                Ok(message) => {
-                    if !session.apply(message) {
-                        return;
-                    }
-                }
-                Err(RecvTimeoutError::Timeout) => {
-                    session.preload_allowed = true;
-                    session.serve(source, job, notify);
-                }
-                Err(RecvTimeoutError::Disconnected) => return,
+            if let Some(step) = playback.pop_front() {
+                playback.serve(source, step, &shared);
+                continue;
             }
-        } else {
-            let Ok(message) = rx.recv() else {
-                return;
+            let Some(message) = rx.recv() else {
+                break;
             };
-            if !session.apply(message) {
-                return;
-            }
+            shared.apply_message(
+                message,
+                &mut playback,
+                &mut requested_at,
+            );
         }
-    }
+        shared.stop();
+    });
+    true
 }
 
-/// Decode one page behind the panic boundary, so a panicking decoder
-/// cannot kill the only worker thread.
 fn decode_page(
     source: &Source,
     page: usize,
@@ -853,37 +1168,6 @@ fn decode_page(
             PanicFault::from_payload("decoder", payload.as_ref()),
         ))),
     }
-}
-
-/// Messages a producer may queue for the writer. Small because the
-/// parent consumes at frame pace; this bounds updates awaiting
-/// conversion, while the request set bounds images in flight.
-const WRITER_QUEUE_DEPTH: usize = 2;
-
-fn into_message(update: Update) -> ChildMsg {
-    match update {
-        Update::Ready { page, role, image } => ChildMsg::Ready {
-            page,
-            role,
-            image: WireImage::from_decoded(&image),
-        },
-        Update::Failed { page, error } => ChildMsg::Failed {
-            page,
-            fault: PageFault::from(error),
-        },
-        Update::Playback(event) => ChildMsg::Playback(wire_event(event)),
-        Update::Unpacked => ChildMsg::Unpacked,
-        Update::Fatal(summary) => ChildMsg::Fatal(summary),
-    }
-}
-
-fn wire_event(event: DecodedEvent) -> PlaybackEvent<WireImage> {
-    event.map_image(|image| WireImage::from_decoded(&image))
-}
-
-/// Whether this message ends the writer's run.
-fn last(update: &Update) -> bool {
-    matches!(update, Update::Fatal(_))
 }
 
 pub fn main(args: &[OsString]) -> ExitCode {
@@ -959,116 +1243,11 @@ pub fn main(args: &[OsString]) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // One thread owns the child's only `IpcSender`, so messages reach the
-    // parent in the order they were queued.
-    let (to_parent_tx, to_parent_rx) =
-        crossbeam_channel::bounded::<Update>(WRITER_QUEUE_DEPTH);
-    let writer = match thread::Builder::new()
-        .name("cy-writer".into())
-        .spawn(move || write(&child_tx, &to_parent_rx))
-    {
-        Ok(writer) => writer,
-        Err(error) => {
-            tracing::error!(?error, "could not start the writer thread");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let len = opened.len();
-    let source = Arc::new(opened);
-    let mut worker: Option<Worker> = None;
-    let mut worker_failed = false;
-    while let Ok(message) = parent_rx.recv() {
-        match message {
-            ParentMsg::SetView {
-                page,
-                mode,
-                direction,
-            } => {
-                let prefetch = Prefetch::build(
-                    browse::spread_for(page, mode, len),
-                    direction,
-                    mode,
-                    len,
-                );
-                if let Some(running) = worker.as_ref() {
-                    running.set_prefetch(prefetch);
-                } else {
-                    let queue = to_parent_tx.clone();
-                    let notify = move |event| {
-                        // A disconnected queue only means the writer
-                        // already left, so the update has no reader.
-                        let Ok(()) = queue.send(event) else {
-                            return;
-                        };
-                    };
-                    match Worker::spawn(
-                        Arc::clone(&source),
-                        prefetch,
-                        notify,
-                    ) {
-                        Ok(spawned) => worker = Some(spawned),
-                        Err(error) => {
-                            tracing::error!(
-                                ?error,
-                                "could not start the decode worker"
-                            );
-                            if to_parent_tx
-                                .send(Update::Fatal(error.to_string()))
-                                .is_err()
-                            {
-                                tracing::debug!(
-                                    "the writer already exited"
-                                );
-                            }
-                            worker_failed = true;
-                            break;
-                        }
-                    }
-                }
-            }
-            ParentMsg::SetMotion(motion) => {
-                if let Some(running) = worker.as_ref() {
-                    running.set_motion(motion);
-                }
-            }
-            ParentMsg::SetRequests(requests) => {
-                // The parent always sends its first view before any
-                // request, so a request without a worker has no prefetch to
-                // serve.
-                if let Some(running) = worker.as_ref() {
-                    running.set_requests(requests);
-                } else {
-                    tracing::debug!(
-                        "requests arrived before the first view"
-                    );
-                }
-            }
-            ParentMsg::Playback(command) => {
-                if let Some(running) = worker.as_ref() {
-                    running.playback(command);
-                } else {
-                    tracing::debug!(
-                        ?command,
-                        "playback arrived before the first view"
-                    );
-                }
-            }
-        }
+    if run(&opened, &parent_rx, opened.len(), Store::open(), child_tx) {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
     }
-    if let Some(mut running) = worker {
-        // The parent is switching or quitting; waiting out an in-flight
-        // decode would only delay the exit.
-        running.detach();
-    }
-    if worker_failed {
-        // The writer delivers the verdict before the process goes away.
-        if writer.join().is_err() {
-            tracing::warn!("the writer thread panicked");
-        }
-        return ExitCode::FAILURE;
-    }
-    ExitCode::SUCCESS
 }
 
 fn parse(args: &[OsString]) -> Option<(&OsStr, &Path)> {
@@ -1081,20 +1260,6 @@ fn parse(args: &[OsString]) -> Option<(&OsStr, &Path)> {
     Some((server.as_os_str(), Path::new(path)))
 }
 
-/// Serialize updates onto the parent channel until a fatal verdict
-/// ends the run.
-fn write(child_tx: &IpcSender<ChildMsg>, queue: &Receiver<Update>) {
-    while let Ok(update) = queue.recv() {
-        let last = last(&update);
-        let Ok(()) = child_tx.send(into_message(update)) else {
-            return;
-        };
-        if last {
-            return;
-        }
-    }
-}
-
 #[cfg(test)]
 #[expect(
     clippy::expect_used,
@@ -1102,38 +1267,165 @@ fn write(child_tx: &IpcSender<ChildMsg>, queue: &Receiver<Update>) {
     reason = "a panic in test code is inconsequential"
 )]
 mod tests {
-    use super::*;
+    use std::fs;
+    use std::sync::mpsc;
 
+    use image::codecs::gif::Repeat;
+    use image::ImageError;
+
+    use super::*;
+    use crate::animation::DecodedEvent;
     use crate::browse::Direction;
-    use crate::browse::PageCount;
     use crate::browse::ReadingMode;
-    use crate::browse::Spread;
     use crate::cache::Store;
     use crate::decode::Pixels;
     use crate::fault::DecodeRefusal;
     use crate::testkit;
     use crate::testkit::TempDir;
-    use image::codecs::gif::Repeat;
-    use image::ImageError;
-
-    use parking_lot::Mutex;
 
     /// Page edge for the tests that check derived and full dimensions:
     /// larger than the thumb edge, smaller than the fit edge, so the
     /// thumb is scaled and the fit image is the page itself.
     const BIG: u32 = 1400;
 
-    fn prefetch_for(origin: usize, count: usize) -> Prefetch {
-        Prefetch::build(
-            Spread::lone(origin),
-            Direction::Forward,
-            ReadingMode::Normal,
-            PageCount::new(count).expect("test book is non-empty"),
-        )
+    enum Update {
+        Ready {
+            page: usize,
+            role: Role,
+            image: Box<Decoded>,
+        },
+        Failed {
+            page: usize,
+            error: Arc<PageError>,
+        },
+        Playback(DecodedEvent),
+        Other,
+    }
+
+    impl CommandReceiver for mpsc::Receiver<ParentMsg> {
+        fn try_recv(&self) -> CommandPoll {
+            match Self::try_recv(self) {
+                Ok(message) => CommandPoll::Message(message),
+                Err(mpsc::TryRecvError::Empty) => CommandPoll::Empty,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    CommandPoll::Disconnected
+                }
+            }
+        }
+
+        fn recv(&self) -> Option<ParentMsg> {
+            Self::recv(self).ok()
+        }
+    }
+
+    struct TestSink(Option<mpsc::Sender<Update>>);
+
+    impl TestSink {
+        const fn discard() -> Self {
+            Self(None)
+        }
+    }
+
+    impl EventSink for TestSink {
+        fn emit(&self, event: ChildEvent<'_>) -> bool {
+            let Some(tx) = &self.0 else {
+                return true;
+            };
+            let update = match event {
+                ChildEvent::Ready { page, role, image } => Update::Ready {
+                    page,
+                    role,
+                    image: Box::new(image.clone()),
+                },
+                ChildEvent::Failed { page, error } => Update::Failed {
+                    page,
+                    error: Arc::clone(error),
+                },
+                ChildEvent::Playback(playback) => Update::Playback(
+                    playback.map_image(|image| Box::new(image.clone())),
+                ),
+                ChildEvent::Unpacked | ChildEvent::Fatal(_) => {
+                    Update::Other
+                }
+            };
+            // A dropped receiver means the test already ended; keep the
+            // worker alive until commands close.
+            let Ok(()) = tx.send(update) else {
+                return true;
+            };
+            true
+        }
+    }
+
+    struct TestWorker {
+        tx: Option<mpsc::Sender<ParentMsg>>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    impl TestWorker {
+        fn spawn_at(
+            source: Arc<Source>,
+            initial_view: Option<usize>,
+            store_root: &Path,
+            sink: TestSink,
+        ) -> Self {
+            let (tx, rx) = mpsc::channel();
+            let store = Store::at(store_root);
+            let handle = thread::Builder::new()
+                .name("test-worker".into())
+                .spawn(move || {
+                    run(&source, &rx, source.len(), store, sink);
+                })
+                .expect("test worker thread spawns");
+            let worker = Self {
+                tx: Some(tx),
+                handle: Some(handle),
+            };
+            if let Some(page) = initial_view {
+                worker.set_view(page);
+            }
+            worker
+        }
+
+        fn send(&self, message: ParentMsg) {
+            let Some(tx) = &self.tx else {
+                return;
+            };
+            let Ok(()) = tx.send(message) else {
+                return;
+            };
+        }
+
+        fn set_view(&self, page: usize) {
+            self.send(ParentMsg::SetView {
+                page,
+                mode: ReadingMode::Normal,
+                direction: Direction::Forward,
+            });
+        }
+
+        fn set_requests(&self, requests: Vec<Request>) {
+            self.send(ParentMsg::SetRequests(requests));
+        }
+
+        fn playback(&self, command: PlaybackCommand) {
+            self.send(ParentMsg::Playback(command));
+        }
+    }
+
+    impl Drop for TestWorker {
+        fn drop(&mut self) {
+            drop(self.tx.take());
+            if let Some(handle) = self.handle.take() {
+                if handle.join().is_err() {
+                    tracing::warn!("test worker panicked");
+                }
+            }
+        }
     }
 
     fn start_playback(
-        worker: &Worker,
+        worker: &TestWorker,
         page: usize,
         role: Role,
         generation: u32,
@@ -1144,7 +1436,7 @@ mod tests {
         });
     }
 
-    fn next_frame(worker: &Worker, page: usize, generation: u32) {
+    fn next_frame(worker: &TestWorker, page: usize, generation: u32) {
         worker.playback(PlaybackCommand::Next {
             id: PlaybackId { page, generation },
         });
@@ -1227,24 +1519,14 @@ mod tests {
         seen: Mutex<Vec<Update>>,
     }
 
-    #[expect(
-        clippy::rest_pattern_accessible_field,
-        reason = "the ignored fields are unused; naming them would trip unneeded_field_pattern"
-    )]
     impl Updates {
-        fn new() -> (Self, impl Fn(Update) + Send + Sync + 'static) {
+        fn new() -> (Self, TestSink) {
             let (tx, rx) = mpsc::channel();
             let events = Self {
                 rx,
                 seen: Mutex::new(Vec::new()),
             };
-            (events, move |event| {
-                // A dead receiver means the test is over; the worker
-                // carries on.
-                let Ok(()) = tx.send(event) else {
-                    return;
-                };
-            })
+            (events, TestSink(Some(tx)))
         }
 
         fn drain(&self) {
@@ -1270,8 +1552,7 @@ mod tests {
                     Update::Ready { .. }
                     | Update::Failed { .. }
                     | Update::Playback(_)
-                    | Update::Unpacked
-                    | Update::Fatal(_) => None,
+                    | Update::Other => None,
                 })
             })
         }
@@ -1288,8 +1569,7 @@ mod tests {
                     Update::Ready { .. }
                     | Update::Failed { .. }
                     | Update::Playback(_)
-                    | Update::Unpacked
-                    | Update::Fatal(_) => None,
+                    | Update::Other => None,
                 })
             })
         }
@@ -1321,8 +1601,7 @@ mod tests {
                     Update::Ready { .. }
                     | Update::Failed { .. }
                     | Update::Playback(_)
-                    | Update::Unpacked
-                    | Update::Fatal(_) => None,
+                    | Update::Other => None,
                 })
                 .count()
         }
@@ -1349,8 +1628,7 @@ mod tests {
                         Update::Ready { .. }
                         | Update::Failed { .. }
                         | Update::Playback(_)
-                        | Update::Unpacked
-                        | Update::Fatal(_) => None,
+                        | Update::Other => None,
                     })
                     .nth(offset)
             })
@@ -1384,14 +1662,13 @@ mod tests {
             Source::open(Path::new(SEVENZ_FIXTURE)).expect("7z opens"),
         );
         let root = TempDir::new("worker-archive-store");
-        let (events, notify) = Updates::new();
-        let worker = Worker::spawn_at(
+        let (events, sink) = Updates::new();
+        let worker = TestWorker::spawn_at(
             Arc::clone(&source),
-            prefetch_for(0, 2),
+            Some(0),
             root.path(),
-            notify,
-        )
-        .expect("worker spawns");
+            sink,
+        );
 
         worker.set_requests(vec![request_thumb(0)]);
         let thumb = events
@@ -1405,14 +1682,13 @@ mod tests {
     fn a_target_is_served_and_persisted() {
         let (_dir, source) = page_dir("worker-target", 1, BIG);
         let root = TempDir::new("worker-target-store");
-        let (events, notify) = Updates::new();
-        let worker = Worker::spawn_at(
+        let (events, sink) = Updates::new();
+        let worker = TestWorker::spawn_at(
             Arc::clone(&source),
-            prefetch_for(0, 1),
+            Some(0),
             root.path(),
-            notify,
-        )
-        .expect("worker spawns");
+            sink,
+        );
 
         worker.set_requests(vec![request_fit(0), request_thumb(0)]);
         let thumb = events
@@ -1446,13 +1722,12 @@ mod tests {
     fn the_tail_waits_for_a_quiet_app() {
         let (_dir, source) = page_dir("worker-gate", 6, 8);
         let root = TempDir::new("worker-gate-store");
-        let _worker = Worker::spawn_at(
+        let _worker = TestWorker::spawn_at(
             Arc::clone(&source),
-            prefetch_for(0, 6),
+            Some(0),
             root.path(),
-            |_| {},
-        )
-        .expect("worker spawns");
+            TestSink::discard(),
+        );
         let store = Store::at(root.path());
         // The head is pages 0, 1 and 2; wait until it is fully produced.
         for page in [0, 1, 2] {
@@ -1497,14 +1772,13 @@ mod tests {
         let source =
             Arc::new(Source::open(dir.path()).expect("temp source opens"));
         let root = TempDir::new("worker-fail-store");
-        let (events, notify) = Updates::new();
-        let _worker = Worker::spawn_at(
+        let (events, sink) = Updates::new();
+        let _worker = TestWorker::spawn_at(
             Arc::clone(&source),
-            prefetch_for(0, 5),
+            Some(0),
             root.path(),
-            notify,
-        )
-        .expect("worker spawns");
+            sink,
+        );
 
         let error = events.failure(0);
         assert!(
@@ -1536,14 +1810,13 @@ mod tests {
     fn the_prefetch_warms_the_store_without_delivering() {
         let (_dir, source) = page_dir("worker-prefetch", 1, BIG);
         let root = TempDir::new("worker-prefetch-store");
-        let (events, notify) = Updates::new();
-        let _worker = Worker::spawn_at(
+        let (events, sink) = Updates::new();
+        let _worker = TestWorker::spawn_at(
             Arc::clone(&source),
-            prefetch_for(0, 1),
+            Some(0),
             root.path(),
-            notify,
-        )
-        .expect("worker spawns");
+            sink,
+        );
 
         let store = Store::at(root.path());
         testkit::eventually(
@@ -1568,14 +1841,13 @@ mod tests {
     fn a_fit_leaving_the_request_set_is_served_again() {
         let (_dir, source) = page_dir("worker-recover", 1, BIG);
         let root = TempDir::new("worker-recover-store");
-        let (events, notify) = Updates::new();
-        let worker = Worker::spawn_at(
+        let (events, sink) = Updates::new();
+        let worker = TestWorker::spawn_at(
             Arc::clone(&source),
-            prefetch_for(0, 1),
+            Some(0),
             root.path(),
-            notify,
-        )
-        .expect("worker spawns");
+            sink,
+        );
 
         worker.set_requests(vec![request_fit(0)]);
         events.ready(
@@ -1605,14 +1877,13 @@ mod tests {
     fn a_full_target_carries_the_page_pixels() {
         let (_dir, source) = page_dir("worker-full", 1, BIG);
         let root = TempDir::new("worker-full-store");
-        let (events, notify) = Updates::new();
-        let worker = Worker::spawn_at(
+        let (events, sink) = Updates::new();
+        let worker = TestWorker::spawn_at(
             Arc::clone(&source),
-            prefetch_for(0, 1),
+            Some(0),
             root.path(),
-            notify,
-        )
-        .expect("worker spawns");
+            sink,
+        );
 
         worker.set_requests(vec![request_full(0)]);
         let image = events
@@ -1644,14 +1915,13 @@ mod tests {
         let source =
             Arc::new(Source::open(dir.path()).expect("temp source opens"));
         let root = TempDir::new("worker-animation-store");
-        let (events, notify) = Updates::new();
-        let worker = Worker::spawn_at(
+        let (events, sink) = Updates::new();
+        let worker = TestWorker::spawn_at(
             Arc::clone(&source),
-            prefetch_for(0, 1),
+            Some(0),
             root.path(),
-            notify,
-        )
-        .expect("worker spawns");
+            sink,
+        );
 
         start_playback(&worker, 0, Role::Fit, 9);
         for (offset, color) in colors.into_iter().enumerate() {
@@ -1686,14 +1956,13 @@ mod tests {
         let source =
             Arc::new(Source::open(dir.path()).expect("temp source opens"));
         let root = TempDir::new("worker-animation-finite-store");
-        let (events, notify) = Updates::new();
-        let worker = Worker::spawn_at(
+        let (events, sink) = Updates::new();
+        let worker = TestWorker::spawn_at(
             Arc::clone(&source),
-            prefetch_for(0, 1),
+            Some(0),
             root.path(),
-            notify,
-        )
-        .expect("worker spawns");
+            sink,
+        );
 
         start_playback(&worker, 0, Role::Fit, 3);
         for (offset, color) in colors.into_iter().enumerate() {
@@ -1712,14 +1981,13 @@ mod tests {
         let store_root = root.path();
 
         // The first session derives and persists both roles.
-        let (first, notify) = Updates::new();
-        let worker = Worker::spawn_at(
+        let (first, sink) = Updates::new();
+        let worker = TestWorker::spawn_at(
             Arc::clone(&source),
-            prefetch_for(0, 1),
+            Some(0),
             store_root,
-            notify,
-        )
-        .expect("worker spawns");
+            sink,
+        );
         worker.set_requests(vec![request_thumb(0), request_fit(0)]);
         let thumb = first.ready(
             "the first session never delivered a thumb",
@@ -1738,7 +2006,7 @@ mod tests {
         drop(worker);
 
         let hash = page_hash(&source, 0);
-        let mut store = Store::at(store_root);
+        let store = Store::at(store_root);
         assert!(
             store.load(hash, Role::Thumb).is_some(),
             "the thumb was not persisted"
@@ -1761,14 +2029,13 @@ mod tests {
         drop(store);
 
         // A second worker on the same root loads the cached roles.
-        let (second, notify_second) = Updates::new();
-        let warm = Worker::spawn_at(
+        let (second, sink_second) = Updates::new();
+        let warm = TestWorker::spawn_at(
             Arc::clone(&source),
-            prefetch_for(0, 1),
+            Some(0),
             store_root,
-            notify_second,
-        )
-        .expect("worker spawns");
+            sink_second,
+        );
         warm.set_requests(vec![request_thumb(0), request_fit(0)]);
         let warm_thumb = second.ready(
             "the second session never delivered a thumb",
@@ -1794,5 +2061,143 @@ mod tests {
             .load(hash, Role::Fit)
             .expect("the sentinel fit stays");
         assert_eq!((kept.width(), kept.height()), (7, 7));
+    }
+
+    #[test]
+    fn store_hit_with_known_hash_skips_source_read() {
+        const WAIT_TIMEOUT_SECS: u64 = 20;
+
+        let (dir, source) = page_dir("worker-known-hash", 2, BIG);
+        let root = TempDir::new("worker-known-hash-store");
+        let requested_hash = page_hash(&source, 0);
+        let prefetched_hash = page_hash(&source, 1);
+        let (events, sink) = Updates::new();
+        let worker = TestWorker::spawn_at(
+            Arc::clone(&source),
+            Some(0),
+            root.path(),
+            sink,
+        );
+
+        worker.set_requests(vec![request_fit(0)]);
+        events
+            .ready("initial fit", |page, role| page == 0 && is_fit(role));
+        let store = Store::at(root.path());
+        testkit::eventually(
+            WAIT_TIMEOUT_SECS,
+            "warmed fit and thumb never persisted",
+            || {
+                (store.load(requested_hash, Role::Fit).is_some()
+                    && store.load(requested_hash, Role::Thumb).is_some()
+                    && store.load(prefetched_hash, Role::Fit).is_some())
+                .then_some(())
+            },
+        );
+
+        for name in ["p0000.png", "p0001.png"] {
+            fs::remove_file(dir.path().join(name))
+                .expect("source file removes");
+        }
+        worker.set_requests(Vec::new());
+        worker.set_requests(vec![
+            request_fit(0),
+            request_thumb(0),
+            request_fit(1),
+        ]);
+        testkit::eventually(
+            WAIT_TIMEOUT_SECS,
+            "known-hash store hits never delivered from shared store",
+            || {
+                (events.delivered(0, is_fit) >= 2
+                    && events.delivered(0, is_thumb) >= 1
+                    && events.delivered(1, is_fit) >= 1)
+                    .then_some(())
+            },
+        );
+        assert_eq!(events.failures(0), 0);
+        assert_eq!(events.failures(1), 0);
+    }
+
+    #[test]
+    fn thumb_miss_derives_from_cached_fit_without_decoding() {
+        const SENTINEL_HEIGHT: u32 = 300;
+        const SENTINEL_WIDTH: u32 = SENTINEL_HEIGHT * 2;
+
+        let (_dir, source) = page_dir("worker-derive-fit", 1, BIG);
+        let root = TempDir::new("worker-derive-fit-store");
+        let hash = page_hash(&source, 0);
+        let landscape_fit = decode::decode(
+            &testkit::tiny_png(
+                SENTINEL_WIDTH,
+                SENTINEL_HEIGHT,
+                [1, 2, 3, 255],
+            ),
+            "sentinel.png",
+        )
+        .expect("sentinel decodes");
+        let store = Store::at(root.path());
+        assert!(store.save(hash, Role::Fit, &landscape_fit).persisted);
+        drop(store);
+
+        let (events, sink) = Updates::new();
+        let worker = TestWorker::spawn_at(
+            Arc::clone(&source),
+            None,
+            root.path(),
+            sink,
+        );
+        worker.set_requests(vec![request_thumb(0)]);
+        let thumb = events
+            .ready("derived thumb never arrived", |page, role| {
+                page == 0 && is_thumb(role)
+            });
+        assert_eq!(thumb.width(), cache::THUMB_EDGE);
+        assert_eq!(thumb.height() * 2, thumb.width());
+    }
+
+    #[test]
+    fn fit_and_full_requested_together_serve_both() {
+        const PAGE_WIDTH: u32 = cache::FIT_EDGE + 40;
+        const PAGE_HEIGHT: u32 = 16;
+
+        let dir = TempDir::new("worker-fit-full");
+        dir.write(
+            "p0000.png",
+            &testkit::tiny_png(PAGE_WIDTH, PAGE_HEIGHT, [10, 20, 30, 255]),
+        );
+        let source =
+            Arc::new(Source::open(dir.path()).expect("temp source opens"));
+        let root = TempDir::new("worker-fit-full-store");
+        let (events, sink) = Updates::new();
+        let worker = TestWorker::spawn_at(
+            Arc::clone(&source),
+            None,
+            root.path(),
+            sink,
+        );
+
+        worker.set_requests(vec![
+            request_fit(0),
+            request_full(0),
+            request_thumb(0),
+        ]);
+        events.ready("thumb never arrived", |page, role| {
+            page == 0 && is_thumb(role)
+        });
+        let fit = events.ready("fit never arrived", |page, role| {
+            page == 0 && is_fit(role)
+        });
+        let full = events.ready("full never arrived", |page, role| {
+            page == 0 && role == Role::Full
+        });
+        assert_eq!(
+            (fit.width(), fit.height()),
+            (cache::FIT_EDGE, PAGE_HEIGHT)
+        );
+        assert_eq!(
+            (full.width(), full.height()),
+            (PAGE_WIDTH, PAGE_HEIGHT)
+        );
+        assert_eq!(events.delivered(0, |role| role == Role::Full), 1);
     }
 }

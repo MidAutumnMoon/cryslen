@@ -14,7 +14,7 @@ Animated pages store only frame 0; later frames are not persisted.
 
 `$TMPDIR/cryslen-cache/{thumb,view}/<xxh3-128 of the encoded page bytes>`. Content addressing gives free invalidation and shares pages across books. Every child opens the same tree, so switches keep its entries. The `view` namespace stores the fit role; the name is kept for existing entries.
 
-Entries are little-endian, versioned, and carry the target edge in the header. A changed edge is a miss that re-derives, as is a corrupt file. Writes are atomic (temp file, then rename); a writer holds an exclusive lock on its temp until the rename, so opening the store sweeps temps no live writer holds.
+Entries are little-endian, versioned, and carry the target edge in the header. A changed edge is a miss that re-derives, as is a corrupt file. Writes are atomic (per-write unique temp file, then rename); a writer holds an exclusive lock on its temp until the rename, so opening the store sweeps temps no live writer holds.
 
 Entry identity is the format version, page hash, role, and target edge; the resampling kernel is outside it, so cached entries keep their look until pruned.
 
@@ -26,13 +26,13 @@ The prefetch is one ordered, bounded list from the origin: neighbours by page di
 
 ## Production
 
-One decode thread per book. Requests come first, grouped per page so one decode serves all its roles. A request hits the store or decodes once; a missing preview is derived and persisted. Derivation is a SIMD convolution: a box kernel for thumbs, Hamming for fit images. RGBA averages straight alpha because the renderer premultiplies at draw; that bleeds color across transparent edges. Alpha-aware resampling removes the bleed but needs a source-sized temporary and roughly double the time. The prefetch warms ahead; work beyond the head is preload and waits for a quiet period of app silence. Motion picks fit images for still reading and thumbs for skims. A page-turn key the platform auto-repeats starts a skim; a key release or focus loss ends it.
+Two lanes per book share a synchronized hash, store-resident, and failure ledger: the foreground loop serves `SetRequests` and `Playback` frames directly to IPC (`"request"` lane), while a sibling `cy-prefetch` thread warms the store (`"prefetch"` lane), each head page's fit image before its thumb while still, and skips pages claimed by foreground. Both lanes check known hashes and the store before reading source bytes, publish foreground frames before persisting, and keep a per-lane 1-slot fit cache in memory so a missing thumb derives from it (or a stored fit image) without re-decoding; a cold foreground fit decode also serves a pending full request for the same page. Derivation is a SIMD convolution: a box kernel for thumbs, Hamming for fit images. RGBA averages straight alpha because the renderer premultiplies at draw; that bleeds color across transparent edges. Alpha-aware resampling removes the bleed but needs a source-sized temporary and roughly double the time. Prefetch warms ahead; work beyond the head is preload and waits for a quiet period of app silence. Motion picks fit images for still reading and thumbs for skims. A page-turn key the platform auto-repeats starts a skim; a key release or focus loss ends it.
 
 ## Presentation
 
 A spread is presentable when every seat has a page fact plus a resident texture, or the page failed. Draw the target spread when presentable; otherwise the nearest presentable start between shown and target; otherwise the shown spread. Seats use page dimensions, so pairing survives promotion.
 
-Each frame requests the missing roles for the on-screen spread (the shown spread, or the target while nothing is presentable) and a demand spread: the target spread while still, the next spread in the travel direction while skimming. Still frames request fit images and thumbs, plus full for an upscaled on-screen page; skims request thumbs.
+Each frame requests the missing roles for the on-screen spread (the shown spread, or the target while nothing is presentable) and a demand spread: the target spread while still, the next spread in the travel direction while skimming. Still frames request fit images when nothing settled is resident, plus full for an upscaled on-screen page; skims request thumbs when no role is resident.
 
 Ending a skim commits the shown spread into the target, promoting the looked-at thumb in place. The target is the prefetch's lookahead; the shown spread carries its mode, so a pairing change cannot commit it. A still turn moves the target ahead; unseen turns are discarded at exit.
 
@@ -40,6 +40,6 @@ Retention is derived from the frame: every request, plus role-bounded extras (th
 
 ## Limits
 
-A missing role costs a decode; decoders return the page at its encoded size. A cold page costs its decode before showing.
+A miss without a resident fit image to derive a thumb from costs a decode; decoders return the page at its encoded size. A cold page costs its decode before showing.
 
 Slow frames, slow uploads, and long waits for a view log at info; everything else needs `RUST_LOG=debug`.
