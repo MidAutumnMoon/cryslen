@@ -22,6 +22,7 @@ use std::fs::TryLockError;
 use std::io;
 use std::io::Read as _;
 use std::io::Write as _;
+use std::mem::DropGuard;
 use std::os::unix::fs::DirBuilderExt as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
@@ -643,29 +644,24 @@ fn write_atomic(
     final_path: &Path,
     bytes: &[u8],
 ) -> io::Result<()> {
-    let result = (|| {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(temp)?;
-        // Hold until the rename: clean_temps treats a free lock as a dead
-        // writer.
-        file.lock()?;
-        file.write_all(bytes)?;
-        fs::rename(temp, final_path)
-    })();
-    if result.is_err() {
-        discard(temp);
-    }
-    result
-}
-
-fn discard(path: &Path) {
-    if let Err(error) = fs::remove_file(path) {
-        tracing::debug!(%error, "leftover preview temp file");
-    }
+    let guard = DropGuard::new(temp, |path| {
+        if let Err(error) = fs::remove_file(path) {
+            tracing::debug!(%error, "leftover preview temp file");
+        }
+    });
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(*guard)?;
+    // Hold until the rename: clean_temps treats a free lock as a dead
+    // writer.
+    file.lock()?;
+    file.write_all(bytes)?;
+    fs::rename(*guard, final_path)?;
+    DropGuard::dismiss(guard);
+    Ok(())
 }
 
 const MAGIC: [u8; 4] = *b"CYPV";

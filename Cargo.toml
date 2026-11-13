@@ -2,6 +2,7 @@
 name = "cryslen"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.100"
 description = "minimal wayland image viewer with manga mode"
 
 [lib]
