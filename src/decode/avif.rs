@@ -1,6 +1,7 @@
 //! AVIF decode through libavif. The FFI `unsafe` is confined to this
 //! module.
 
+use libavif_sys::AVIF_IMAGE_CONTENT_SAMPLE_TRANSFORMS;
 use libavif_sys::AVIF_MATRIX_COEFFICIENTS_BT470BG;
 use libavif_sys::AVIF_MATRIX_COEFFICIENTS_BT601;
 use libavif_sys::AVIF_MATRIX_COEFFICIENTS_BT709;
@@ -17,6 +18,7 @@ use libavif_sys::AVIF_TRANSFER_CHARACTERISTICS_HLG;
 use libavif_sys::AVIF_TRANSFER_CHARACTERISTICS_SMPTE2084;
 use libavif_sys::AVIF_TRANSFORM_IMIR;
 use libavif_sys::AVIF_TRANSFORM_IROT;
+use libavif_sys::AVIF_TRUE;
 use libavif_sys::avifDecoder;
 use libavif_sys::avifDecoderCreate;
 use libavif_sys::avifDecoderDestroy;
@@ -377,12 +379,22 @@ impl<'bytes> DecoderGuard<'bytes> {
             // edge cap so tall strips under `MAX_PIXELS` still decode.
             decoder.imageSizeLimit = super::MAX_PIXELS;
             decoder.imageDimensionLimit = NO_DIMENSION_LIMIT;
+            // Opt into 16-bit sample-transform items (off by default in
+            // libavif 1.4); gain maps stay off as rendering skips them.
+            decoder.imageContentToDecode |=
+                AVIF_IMAGE_CONTENT_SAMPLE_TRANSFORMS;
+            // Neither EXIF nor XMP is read from decoded AVIF frames; skipping
+            // Exif also avoids failing on malformed Exif TIFF offsets.
+            let enable = AVIF_TRUE.cast_signed();
+            decoder.ignoreExif = enable;
+            decoder.ignoreXMP = enable;
         }
         // SAFETY: `guard.ptr` is uniquely owned and `bytes` stays live until
         // `guard` drops.
-        unsafe {
-            avifDecoderSetIOMemory(guard.ptr, bytes.as_ptr(), bytes.len());
-        }
+        let io = unsafe {
+            avifDecoderSetIOMemory(guard.ptr, bytes.as_ptr(), bytes.len())
+        };
+        check(io, "avif io").union()?;
         // SAFETY: `guard.ptr` is valid with attached input bytes.
         let parsed = unsafe { avifDecoderParse(guard.ptr) };
         check(parsed, "avif parse").union()?;
