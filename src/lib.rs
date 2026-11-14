@@ -17,6 +17,7 @@ mod catalog;
 mod decode;
 mod fault;
 mod geometry;
+mod presentation;
 mod render;
 mod source;
 mod ui;

@@ -27,7 +27,7 @@ pub struct PlaybackId {
     pub generation: u32,
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub enum PlaybackCommand {
     /// Open the page's stream and fix its role.
     Start { id: PlaybackId, role: Role },

@@ -3,10 +3,6 @@
 //! file format is described in `docs/internal/cache.md`.
 
 #![expect(
-    clippy::definition_in_module_root,
-    reason = "the cache's store and derivation live in its module root by design"
-)]
-#![expect(
     clippy::little_endian_bytes,
     reason = "the cache file format is defined little-endian"
 )]
@@ -63,9 +59,6 @@ use crate::decode::Transfer;
 use crate::decode::YuvImage;
 use crate::fault::DecodeRefusal;
 use crate::fault::TextureFault;
-
-pub mod prefetch;
-pub mod presentation;
 
 pub const THUMB_EDGE: u32 = 192;
 pub const THUMB_CAP_BYTES: u64 = 512 * 1024 * 1024;

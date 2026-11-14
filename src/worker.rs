@@ -30,13 +30,15 @@ use rustix::process::Pid;
 use rustix::process::Signal;
 
 use crate::browse;
+use crate::browse::Direction;
 use crate::browse::Motion;
 use crate::browse::PageCount;
+use crate::browse::ReadingMode;
 use crate::browse::Request;
 use crate::browse::Role;
 use crate::browse::Roles;
+use crate::browse::Spread;
 use crate::cache;
-use crate::cache::prefetch::Prefetch;
 use crate::cache::ImageLimits;
 use crate::cache::Store;
 use crate::decode;
@@ -170,6 +172,105 @@ impl PlaybackSession {
             Loops::Finite(total) => self.passes < total,
         }
     }
+}
+
+const PREFETCH_AHEAD_PAGES: usize = 512;
+const PREFETCH_BEHIND_PAGES: usize = 64;
+const PREFETCH_HEAD_SPREADS: usize = 3;
+
+/// Ordered prefetch spreads for one navigation step.
+#[derive(Debug, Clone)]
+struct Prefetch {
+    spreads: Vec<Spread>,
+    head: usize,
+}
+
+impl Prefetch {
+    fn build(
+        origin: Spread,
+        direction: Direction,
+        mode: ReadingMode,
+        len: PageCount,
+    ) -> Self {
+        let (ahead, behind) = match direction {
+            Direction::Forward => {
+                (PREFETCH_AHEAD_PAGES, PREFETCH_BEHIND_PAGES)
+            }
+            Direction::Backward => {
+                (PREFETCH_BEHIND_PAGES, PREFETCH_AHEAD_PAGES)
+            }
+        };
+        let increasing = walk_spreads(
+            origin.first,
+            Direction::Forward,
+            mode,
+            len,
+            ahead,
+        );
+        let decreasing = walk_spreads(
+            origin.first,
+            Direction::Backward,
+            mode,
+            len,
+            behind,
+        );
+        let mut spreads =
+            Vec::with_capacity(1 + increasing.len() + decreasing.len());
+        spreads.push(origin);
+        for distance in 0..increasing.len().max(decreasing.len()) {
+            let (travel, opposite) = match direction {
+                Direction::Forward => {
+                    (increasing.get(distance), decreasing.get(distance))
+                }
+                Direction::Backward => {
+                    (decreasing.get(distance), increasing.get(distance))
+                }
+            };
+            spreads.extend(travel);
+            spreads.extend(opposite);
+        }
+        let head = spreads.len().min(PREFETCH_HEAD_SPREADS);
+        Self { spreads, head }
+    }
+
+    fn spreads(&self) -> &[Spread] {
+        &self.spreads
+    }
+
+    /// Leading spreads that need a fit image rather than a thumbnail.
+    fn head(&self) -> &[Spread] {
+        self.spreads.get(..self.head).unwrap_or_default()
+    }
+}
+
+fn walk_spreads(
+    start: usize,
+    direction: Direction,
+    mode: ReadingMode,
+    len: PageCount,
+    limit: usize,
+) -> Vec<Spread> {
+    let mut spreads = Vec::new();
+    let mut current = start;
+    loop {
+        let next = browse::advance(current, direction, mode, len);
+        let forward = direction == Direction::Forward;
+        let wrapped = if forward {
+            next <= current
+        } else {
+            next >= current
+        };
+        if wrapped {
+            break;
+        }
+        let distance = if forward { next - start } else { start - next };
+        if distance > limit {
+            break;
+        }
+        spreads.push(browse::spread_for(next, mode, len));
+        current = next;
+    }
+    spreads
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1346,8 +1447,6 @@ mod tests {
     use image::ImageError;
 
     use super::*;
-    use crate::browse::Direction;
-    use crate::browse::ReadingMode;
     use crate::cache::Store;
     use crate::decode::Pixels;
     use crate::fault::DecodeRefusal;
@@ -2298,5 +2397,125 @@ mod tests {
             (PAGE_WIDTH, PAGE_HEIGHT)
         );
         assert_eq!(events.delivered(0, |role| role == Role::Full), 1);
+    }
+
+    fn page_count(count: usize) -> PageCount {
+        PageCount::new(count).expect("test book is non-empty")
+    }
+
+    fn prefetch_starts(prefetch: &Prefetch) -> Vec<usize> {
+        prefetch
+            .spreads()
+            .iter()
+            .map(|spread| spread.first)
+            .collect()
+    }
+
+    #[test]
+    fn prefetch_walks_out_from_the_origin() {
+        let book = page_count(10);
+        let origin = browse::spread_for(4, ReadingMode::Normal, book);
+        let forward = Prefetch::build(
+            origin,
+            Direction::Forward,
+            ReadingMode::Normal,
+            book,
+        );
+        assert_eq!(
+            prefetch_starts(&forward),
+            vec![4, 5, 3, 6, 2, 7, 1, 8, 0, 9]
+        );
+        assert!(forward
+            .spreads()
+            .iter()
+            .all(|spread| spread.second.is_none()));
+
+        let backward = Prefetch::build(
+            origin,
+            Direction::Backward,
+            ReadingMode::Normal,
+            book,
+        );
+        assert_eq!(
+            prefetch_starts(&backward),
+            vec![4, 3, 5, 2, 6, 1, 7, 0, 8, 9]
+        );
+    }
+
+    #[test]
+    fn prefetch_ends_do_not_wrap() {
+        let long_book = page_count(1200);
+        let opening =
+            browse::spread_for(0, ReadingMode::Normal, long_book);
+        let before = Prefetch::build(
+            opening,
+            Direction::Backward,
+            ReadingMode::Normal,
+            long_book,
+        );
+        assert_eq!(before.spreads().first(), Some(&opening));
+        assert_eq!(before.spreads().len(), 1 + PREFETCH_BEHIND_PAGES);
+        assert!(before
+            .spreads()
+            .iter()
+            .all(|spread| spread.first <= PREFETCH_BEHIND_PAGES));
+
+        let closing =
+            browse::spread_for(1199, ReadingMode::Normal, long_book);
+        let after = Prefetch::build(
+            closing,
+            Direction::Forward,
+            ReadingMode::Normal,
+            long_book,
+        );
+        assert_eq!(after.spreads().first(), Some(&closing));
+        assert_eq!(after.spreads().len(), 1 + PREFETCH_BEHIND_PAGES);
+        assert!(after
+            .spreads()
+            .iter()
+            .all(|spread| spread.first >= 1199 - PREFETCH_BEHIND_PAGES));
+
+        let single = page_count(1);
+        let only = browse::spread_for(0, ReadingMode::Manga, single);
+        for direction in [Direction::Forward, Direction::Backward] {
+            let alone = Prefetch::build(
+                only,
+                direction,
+                ReadingMode::Manga,
+                single,
+            );
+            assert_eq!(alone.spreads(), &[only]);
+            assert_eq!(alone.head(), &[only]);
+        }
+    }
+
+    #[test]
+    fn prefetch_bounds_are_respected_and_unique() {
+        use std::collections::BTreeSet;
+
+        let book = page_count(1200);
+        let origin = browse::spread_for(600, ReadingMode::Normal, book);
+        let prefetch = Prefetch::build(
+            origin,
+            Direction::Forward,
+            ReadingMode::Normal,
+            book,
+        );
+        assert_eq!(
+            prefetch.spreads().len(),
+            1 + PREFETCH_AHEAD_PAGES + PREFETCH_BEHIND_PAGES
+        );
+        assert_eq!(prefetch.spreads().first(), Some(&origin));
+        assert_eq!(prefetch.head().len(), PREFETCH_HEAD_SPREADS);
+        assert!(prefetch.spreads().iter().all(|spread| {
+            (600 - PREFETCH_BEHIND_PAGES..=600 + PREFETCH_AHEAD_PAGES)
+                .contains(&spread.first)
+        }));
+        let unique: BTreeSet<usize> = prefetch
+            .spreads()
+            .iter()
+            .map(|spread| spread.first)
+            .collect();
+        assert_eq!(unique.len(), prefetch.spreads().len());
     }
 }
