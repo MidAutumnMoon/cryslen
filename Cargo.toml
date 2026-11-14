@@ -34,7 +34,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 indoc = "2"
 parking_lot = "0.13"
 zip = { version = "9", default-features = false, features = ["deflate"] }
-sevenz-rust2 = { version = "0.24", default-features = false, features = ["bzip2"] }
+sevenz-rust2 = { version = "0.25", default-features = false, features = ["bzip2"] }
 libavif-sys = { version = "0.17", default-features = false, features = ["codec-dav1d"] }
 jxl = "0.8"
 
