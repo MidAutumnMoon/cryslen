@@ -1,6 +1,6 @@
 //! Page source: a directory or archive as a natural-sorted page list.
-//! An archive materializes once on a background thread; `wait_ready`
-//! gates `bytes`, which is total after it returns.
+//! Archives unpack progressively into per-page slots on a background
+//! thread; [`Source::bytes`] waits on the requested page's slot.
 
 use std::collections::HashMap;
 use std::fs;
@@ -12,14 +12,13 @@ use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::time::Duration;
 use std::time::Instant;
 
-use crossbeam_channel::Receiver;
-use crossbeam_channel::Sender;
 use eros::ErrorUnion;
 use eros::IntoUnion as _;
+use parking_lot::Condvar;
+use parking_lot::Mutex;
 
 use crate::browse::PageCount;
 use crate::catalog;
@@ -32,12 +31,62 @@ use crate::fault::PageError;
 use crate::fault::PanicFault;
 
 type PageRead = Result<Arc<[u8]>, Arc<PageError>>;
-type PageSet = Vec<PageRead>;
+
+#[derive(Debug)]
+struct ArchiveSlots {
+    slots: Mutex<Box<[Option<PageRead>]>>,
+    ready: Condvar,
+}
+
+impl ArchiveSlots {
+    fn new(count: usize) -> Self {
+        Self {
+            slots: Mutex::new(vec![None; count].into_boxed_slice()),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn get(&self, index: usize) -> PageRead {
+        let mut slots = self.slots.lock();
+        loop {
+            match slots.get(index) {
+                Some(Some(page)) => return page.clone(),
+                Some(None) => self.ready.wait(&mut slots),
+                None => return Err(Arc::new(ErrorUnion::new(BadIndex))),
+            }
+        }
+    }
+
+    fn fill(&self, index: usize, page: PageRead) {
+        {
+            let mut slots = self.slots.lock();
+            if let Some(slot @ None) = slots.get_mut(index) {
+                *slot = Some(page);
+            }
+        }
+        self.ready.notify_all();
+    }
+
+    fn finish(&self, verdict: Result<(), Arc<PageError>>) {
+        let fallback = verdict
+            .err()
+            .unwrap_or_else(|| Arc::new(ErrorUnion::new(BadIndex)));
+        {
+            let mut slots = self.slots.lock();
+            for slot in &mut *slots {
+                if slot.is_none() {
+                    *slot = Some(Err(Arc::clone(&fallback)));
+                }
+            }
+        }
+        self.ready.notify_all();
+    }
+}
 
 #[derive(Debug)]
 enum Backend {
     Directory(PathBuf),
-    Archive { page_set_rx: Receiver<PageSet> },
+    Archive(Arc<ArchiveSlots>),
 }
 
 #[derive(Debug)]
@@ -45,8 +94,6 @@ pub struct Source {
     names: Vec<String>,
     count: PageCount,
     backend: Backend,
-    /// Filled once by `wait_ready`; `bytes` reads it for archives.
-    pages: OnceLock<PageSet>,
 }
 
 impl Source {
@@ -73,20 +120,14 @@ impl Source {
     }
 
     fn open_dir(dir: &Path) -> Result<Self, OpenError> {
-        #[expect(
-            clippy::filetype_is_file,
-            reason = "the entry's own type is wanted, so symlinks stay out; `is_file()` would follow them"
-        )]
         let mut names: Vec<String> = fs::read_dir(dir)
             .union()?
             .filter_map(Result::ok)
-            .filter(|entry| {
-                entry
-                    .file_type()
-                    .is_ok_and(|file_type| file_type.is_file())
+            .filter_map(|entry| {
+                let name = entry.file_name().into_string().ok()?;
+                decode::format_from_name(&name)?;
+                catalog::entry_is_file(&entry).then_some(name)
             })
-            .filter_map(|entry| entry.file_name().into_string().ok())
-            .filter(|name| decode::format_from_name(name).is_some())
             .collect();
         sort_page_names(&mut names);
         Self::from_names(Backend::Directory(dir.to_path_buf()), names)
@@ -110,14 +151,8 @@ impl Source {
                 listed.push((name, entry.size()));
             }
         }
-        let (names, unpacked) = validated_listing(listed).union()?;
-        guard_memory(unpacked, mem_available_bytes()).union()?;
-        let (page_set_tx, page_set_rx) = crossbeam_channel::bounded(1);
-        let source = Self::from_names(
-            Backend::Archive { page_set_rx },
-            names.clone(),
-        )?;
-        spawn_zip_materialize(zip, names, &page_set_tx);
+        let (source, slots) = Self::archive_from_listing(listed)?;
+        spawn_zip_materialize(zip, source.names.clone(), &slots);
         Ok(source)
     }
 
@@ -139,15 +174,20 @@ impl Source {
             })
             .map(|entry| (entry.name.clone(), entry.size()))
             .collect();
+        let (source, slots) = Self::archive_from_listing(listed)?;
+        spawn_sevenzip_materialize(archive, &source.names, &slots);
+        Ok(source)
+    }
+
+    fn archive_from_listing(
+        listed: Vec<(String, u64)>,
+    ) -> Result<(Self, Arc<ArchiveSlots>), OpenError> {
         let (names, unpacked) = validated_listing(listed).union()?;
         guard_memory(unpacked, mem_available_bytes()).union()?;
-        let (page_set_tx, page_set_rx) = crossbeam_channel::bounded(1);
-        let source = Self::from_names(
-            Backend::Archive { page_set_rx },
-            names.clone(),
-        )?;
-        spawn_sevenzip_materialize(archive, &names, &page_set_tx);
-        Ok(source)
+        let slots = Arc::new(ArchiveSlots::new(names.len()));
+        let source =
+            Self::from_names(Backend::Archive(Arc::clone(&slots)), names)?;
+        Ok((source, slots))
     }
 
     fn from_names(
@@ -161,7 +201,6 @@ impl Source {
             names,
             count,
             backend,
-            pages: OnceLock::new(),
         })
     }
 
@@ -180,31 +219,8 @@ impl Source {
         self.names.get(index).map(String::as_str)
     }
 
-    /// Blocks until an archive's pages are materialized; a directory is
-    /// always ready. Afterwards [`Self::bytes`] is total.
-    pub fn wait_ready(&self) -> Result<(), Arc<PageError>> {
-        if self.pages.get().is_some() {
-            return Ok(());
-        }
-        let Backend::Archive { page_set_rx } = &self.backend else {
-            return Ok(());
-        };
-        let page_set = page_set_rx.recv().map_err(|error| {
-            Arc::new(ErrorUnion::new(PanicFault {
-                origin: "unpack",
-                message: format!(
-                    "the unpack thread stopped without a page set: {error}"
-                ),
-            }))
-        })?;
-        if self.pages.set(page_set).is_err() {
-            tracing::debug!("the page set was already materialized");
-        }
-        Ok(())
-    }
-
-    /// The encoded bytes of one page. For an archive the caller must
-    /// have called [`Self::wait_ready`] first.
+    /// The encoded bytes of one page. For an archive, waits until that
+    /// page's slot is filled.
     pub fn bytes(&self, index: usize) -> PageRead {
         let Some(name) = self.names.get(index) else {
             return Err(Arc::new(ErrorUnion::new(BadIndex)));
@@ -214,19 +230,12 @@ impl Source {
                 Ok(bytes) => Ok(bytes.into()),
                 Err(error) => Err(Arc::new(ErrorUnion::new(error))),
             },
-            Backend::Archive { .. } => self
-                .pages
-                .get()
-                .and_then(|page_set| page_set.get(index))
-                .cloned()
-                .unwrap_or_else(|| {
-                    Err(Arc::new(ErrorUnion::new(BadIndex)))
-                }),
+            Backend::Archive(slots) => slots.get(index),
         }
     }
 
     pub fn is_archive(&self) -> bool {
-        matches!(&self.backend, Backend::Archive { .. })
+        matches!(&self.backend, Backend::Archive(_))
     }
 }
 
@@ -299,18 +308,15 @@ fn read_member(
 fn spawn_zip_materialize(
     mut zip: zip::ZipArchive<BufReader<File>>,
     names: Vec<String>,
-    tx: &Sender<PageSet>,
+    slots: &Arc<ArchiveSlots>,
 ) {
-    let page_count = names.len();
-    spawn_materialize(page_count, tx, move |slots| {
+    spawn_materialize(slots, move |slots| {
         for (index, name) in names.iter().enumerate() {
             let page = match zip.by_name(name) {
                 Ok(mut entry) => read_member(&mut entry).map_err(Arc::new),
                 Err(error) => Err(Arc::new(ErrorUnion::new(error))),
             };
-            if let Some(slot) = slots.get_mut(index) {
-                *slot = Some(page);
-            }
+            slots.fill(index, page);
         }
         Ok(())
     });
@@ -319,23 +325,20 @@ fn spawn_zip_materialize(
 /// The thread detaches when its handle drops, so quitting proceeds
 /// immediately; a failed spawn answers every page with the spawn error.
 fn spawn_materialize(
-    page_count: usize,
-    tx: &Sender<PageSet>,
-    body: impl FnOnce(&mut [Option<PageRead>]) -> Result<(), PageError>
-        + Send
-        + 'static,
+    slots: &Arc<ArchiveSlots>,
+    body: impl FnOnce(&ArchiveSlots) -> Result<(), PageError> + Send + 'static,
 ) {
     use std::panic;
     use std::panic::AssertUnwindSafe;
     use std::thread::Builder;
 
-    let thread_tx = tx.clone();
+    let thread_slots = Arc::clone(slots);
     let spawned =
         Builder::new().name("cy-unpack".into()).spawn(move || {
             let started = Instant::now();
-            let mut slots: Vec<Option<PageRead>> = vec![None; page_count];
-            let outcome =
-                panic::catch_unwind(AssertUnwindSafe(|| body(&mut slots)));
+            let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+                body(&thread_slots)
+            }));
             let verdict = match outcome {
                 Ok(Ok(())) => Ok(()),
                 Ok(Err(reason)) => {
@@ -351,33 +354,13 @@ fn spawn_materialize(
                 ok = verdict.is_ok(),
                 "unpack pass ended"
             );
-            if thread_tx.send(finish_pages(slots, verdict)).is_err() {
-                tracing::debug!("the page set has no reader");
-            }
+            thread_slots.finish(verdict);
         });
     if let Err(error) = spawned {
         tracing::warn!(?error, "could not start the unpack thread");
         let error: Arc<PageError> = Arc::new(ErrorUnion::new(error));
-        let page_set = vec![Err(Arc::clone(&error)); page_count];
-        if tx.send(page_set).is_err() {
-            tracing::debug!("the page set has no reader");
-        }
+        slots.finish(Err(error));
     }
-}
-
-/// An unfilled page takes the pass verdict, or `BadIndex` if the pass
-/// ended whole.
-fn finish_pages(
-    slots: Vec<Option<PageRead>>,
-    verdict: Result<(), Arc<PageError>>,
-) -> PageSet {
-    let fallback = verdict
-        .err()
-        .unwrap_or_else(|| Arc::new(ErrorUnion::new(BadIndex)));
-    slots
-        .into_iter()
-        .map(|slot| slot.unwrap_or_else(|| Err(Arc::clone(&fallback))))
-        .collect()
 }
 
 /// Materialize a 7z's pages in storage order, the only order a solid
@@ -385,23 +368,25 @@ fn finish_pages(
 fn spawn_sevenzip_materialize(
     mut reader: sevenz_rust2::ArchiveReader<File>,
     names: &[String],
-    tx: &Sender<PageSet>,
+    slots: &Arc<ArchiveSlots>,
 ) {
     let by_name: HashMap<String, usize> = names
         .iter()
         .enumerate()
         .map(|(index, name)| (name.clone(), index))
         .collect();
-    let page_count = names.len();
-    spawn_materialize(page_count, tx, move |slots| {
+    spawn_materialize(slots, move |slots| {
         reader
             .for_each_entries(|entry, data| {
-                match by_name.get(&entry.name) {
-                    Some(&index) => {
-                        if let Some(slot) = slots.get_mut(index) {
-                            *slot =
-                                Some(read_member(data).map_err(Arc::new));
-                        }
+                let page_index = (!entry.is_directory())
+                    .then(|| by_name.get(&entry.name).copied())
+                    .flatten();
+                match page_index {
+                    Some(index) => {
+                        slots.fill(
+                            index,
+                            read_member(data).map_err(Arc::new),
+                        );
                     }
                     None => {
                         // A solid block yields its later members only
@@ -493,30 +478,28 @@ mod tests {
         let good: Arc<[u8]> = Arc::from(&b"a"[..]);
         let bad = testkit::failed_page("bad page");
         let fatal = testkit::failed_page("stream broke");
-        let pages = finish_pages(
-            vec![
-                Some(Ok(Arc::clone(&good))),
-                Some(Err(Arc::clone(&bad))),
-                None,
-            ],
-            Err(Arc::clone(&fatal)),
+        let slots = ArchiveSlots::new(3);
+        slots.fill(0, Ok(Arc::clone(&good)));
+        slots.fill(1, Err(Arc::clone(&bad)));
+        slots.finish(Err(Arc::clone(&fatal)));
+        assert!(
+            matches!(slots.get(0), Ok(bytes) if Arc::ptr_eq(&bytes, &good))
         );
-        let [first, second, third] = pages.as_slice() else {
-            panic!("three page slots");
-        };
-        assert!(matches!(first, Ok(bytes) if Arc::ptr_eq(bytes, &good)));
-        assert!(matches!(second, Err(error) if Arc::ptr_eq(error, &bad)));
-        assert!(matches!(third, Err(error) if Arc::ptr_eq(error, &fatal)));
+        assert!(
+            matches!(slots.get(1), Err(error) if Arc::ptr_eq(&error, &bad))
+        );
+        assert!(
+            matches!(slots.get(2), Err(error) if Arc::ptr_eq(&error, &fatal))
+        );
 
         // A whole pass that missed a page reports `BadIndex`.
-        let whole =
-            finish_pages(vec![Some(Ok(Arc::clone(&good))), None], Ok(()));
-        let [_, missing] = whole.as_slice() else {
-            panic!("two page slots");
-        };
-        assert!(
-            matches!(missing, Err(error) if error.downcast_inner_ref::<BadIndex>().is_some())
-        );
+        let whole = ArchiveSlots::new(2);
+        whole.fill(0, Ok(Arc::clone(&good)));
+        whole.finish(Ok(()));
+        assert!(matches!(
+            whole.get(1),
+            Err(error) if error.downcast_inner_ref::<BadIndex>().is_some()
+        ));
     }
 
     #[test]
@@ -686,25 +669,37 @@ mod tests {
 
     #[test]
     fn a_panicking_materializer_answers_unfilled_pages() {
-        let (tx, rx) = crossbeam_channel::bounded(1);
-        spawn_materialize(2, &tx, |slots| {
-            if let Some(slot) = slots.get_mut(0) {
-                *slot = Some(Ok(Arc::from(&b"a"[..])));
-            }
+        let slots = Arc::new(ArchiveSlots::new(2));
+        spawn_materialize(&slots, |slots| {
+            slots.fill(0, Ok(Arc::from(&b"a"[..])));
             panic!("boom");
         });
-        let pages = rx.recv().expect("the materializer sends a page set");
-        let [first, second] = pages.as_slice() else {
-            panic!("two page slots");
-        };
-        assert!(first.is_ok());
-        let Err(error) = second else {
+        assert_eq!(slots.get(0).unwrap().as_ref(), b"a");
+        let Err(error) = slots.get(1) else {
             panic!("the unfilled page takes the panic verdict");
         };
         let fault = error
             .downcast_inner_ref::<PanicFault>()
             .expect("a panic settles as a PanicFault");
         assert!(fault.message.contains("boom"));
+    }
+
+    #[test]
+    fn archive_slots_serve_filled_pages_before_pass_ends() {
+        use std::sync::mpsc;
+
+        let slots = Arc::new(ArchiveSlots::new(2));
+        let (release_tx, release_rx) = mpsc::channel();
+        spawn_materialize(&slots, move |slots| {
+            slots.fill(0, Ok(Arc::from(&b"first"[..])));
+            release_rx.recv().expect("gate releases slot 1");
+            slots.fill(1, Ok(Arc::from(&b"second"[..])));
+            Ok(())
+        });
+
+        assert_eq!(slots.get(0).expect("slot 0 ready").as_ref(), b"first");
+        release_tx.send(()).expect("release slot 1");
+        assert_eq!(slots.get(1).expect("slot 1 ready").as_ref(), b"second");
     }
 
     #[test]
@@ -756,7 +751,6 @@ mod tests {
     fn sevenz_materializes_once_and_drains_non_page_members() {
         let source = Source::open(Path::new(MIXED_SEVENZ_FIXTURE))
             .expect("7z opens");
-        source.wait_ready().expect("7z materializes");
         assert_eq!(source.len().get(), 2);
         let mut pages = Vec::new();
         for index in 0..source.len().get() {
@@ -805,6 +799,39 @@ mod tests {
         let expected = testkit::tiny_png(1, 1, [7, 8, 9, 255]);
         assert!(
             matches!(source.bytes(1), Ok(read) if read.as_ref() == expected.as_slice())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dir_listing_follows_symlinks_and_skips_broken_entries() {
+        use std::os::unix::fs::symlink;
+
+        let target_dir = TempDir::new("symlink-targets");
+        let target_png = testkit::tiny_png(2, 2, [9, 8, 7, 255]);
+        target_dir.write("real.png", &target_png);
+        let nested_dir = target_dir.path().join("subdir");
+        fs::create_dir_all(&nested_dir).expect("nested dir creates");
+
+        let book = TempDir::new("symlink-book");
+        symlink(
+            target_dir.path().join("real.png"),
+            book.path().join("page.png"),
+        )
+        .expect("file symlink creates");
+        symlink(
+            target_dir.path().join("missing.png"),
+            book.path().join("broken.png"),
+        )
+        .expect("broken symlink creates");
+        symlink(&nested_dir, book.path().join("subdir.png"))
+            .expect("dir symlink creates");
+
+        let source = Source::open(book.path()).expect("dir opens");
+        assert_eq!(source.names, ["page.png"]);
+        assert_eq!(
+            source.bytes(0).expect("symlinked page reads").as_ref(),
+            target_png.as_slice()
         );
     }
 

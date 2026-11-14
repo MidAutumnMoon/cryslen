@@ -95,8 +95,6 @@ impl WireImage {
         }
     }
 
-    /// Rebuild the decoded image, validating extents through
-    /// [`Decoded::rgba`] / [`Decoded::yuv`].
     pub fn to_decoded(&self) -> Result<Decoded, DecodeRefusal> {
         let decoded = match &self.pixels {
             WirePixels::Rgba8(bytes) => Decoded::rgba(
@@ -185,8 +183,6 @@ pub enum ChildMsg {
         fault: PageFault,
     },
     Playback(PlaybackEvent<WireImage>),
-    Unpacked,
-    Fatal(String),
 }
 
 /// What the child sends on connect: the receiver for its messages and the

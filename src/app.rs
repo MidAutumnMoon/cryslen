@@ -445,9 +445,7 @@ impl App {
             name: self.book.view().page_name(spread_status.named_page),
             page,
             zoom: placed.scale,
-            waiting: self
-                .timers
-                .wait_word(now, || self.book.view().unpacking),
+            waiting: self.timers.waiting(now),
             fault: ui::fault_to_show(
                 spread_status.fault,
                 self.book.fault(),
@@ -972,7 +970,6 @@ impl App {
                         }
                     }
                 },
-                BookUpdate::Unpacked => self.book.mark_unpacked(),
                 BookUpdate::Died(detail) => {
                     let change = self.book.step(BookControl::Died(detail));
                     self.apply_book_change(change);
@@ -1756,20 +1753,20 @@ pub fn main(args: &[OsString]) -> ExitCode {
 }
 
 fn classify(path: &Path) -> Result<Argument, OpenRefusal> {
-    let Some(name) = path.file_name() else {
-        return Ok(Argument::Book(path.to_path_buf()));
+    let normalized = catalog::normalize_path(path);
+    let Some(name) = normalized.file_name() else {
+        return Ok(Argument::Book(normalized));
     };
-    if !path.is_file() || catalog::is_archive(path) {
-        return Ok(Argument::Book(path.to_path_buf()));
+    if !normalized.is_file() || catalog::is_archive(&normalized) {
+        return Ok(Argument::Book(normalized));
     }
     let name = name.to_string_lossy().into_owned();
     if decode::format_from_name(&name).is_none() {
-        return Err(OpenRefusal::Unsupported(path.to_path_buf()));
+        return Err(OpenRefusal::Unsupported(normalized));
     }
-    // Path::parent() yields Some("") for bare relative names ("pic.jpg").
-    let dir = path
+    let dir = normalized
         .parent()
-        .filter(|parent| !parent.is_empty())
+        .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     Ok(Argument::Image {
         dir: dir.to_path_buf(),
@@ -1809,17 +1806,35 @@ fn run(open_path: &Path, land_on: Option<&str>) -> eros::Result<()> {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "a panic in test code is inconsequential"
+)]
 mod argv_tests {
     use super::*;
     use crate::testkit::TempDir;
 
     #[test]
     fn classify_argument_kinds() {
+        use std::env;
+        use std::fs;
+        use std::os::unix::fs::symlink;
+
         // classify never reads the content, only the extension.
         let dir = TempDir::new("parent-arg");
         dir.write("page.png", b"x");
         dir.write("book.cbz", b"not really a zip");
         dir.write("notes.txt", b"not a page");
+        fs::create_dir_all(dir.path().join("sub")).expect("mkdir sub");
+        symlink(dir.path().join("page.png"), dir.path().join("link.png"))
+            .expect("symlink page");
+        symlink(dir.path().join("sub"), dir.path().join("link_dir"))
+            .expect("symlink dir");
+        symlink(
+            dir.path().join("missing.png"),
+            dir.path().join("broken.png"),
+        )
+        .expect("broken symlink");
 
         let rows = [
             (
@@ -1827,6 +1842,13 @@ mod argv_tests {
                 Ok(Argument::Image {
                     dir: dir.path().to_path_buf(),
                     name: String::from("page.png"),
+                }),
+            ),
+            (
+                dir.path().join("link.png"),
+                Ok(Argument::Image {
+                    dir: dir.path().to_path_buf(),
+                    name: String::from("link.png"),
                 }),
             ),
             (
@@ -1838,9 +1860,23 @@ mod argv_tests {
                 Ok(Argument::Book(dir.path().to_path_buf())),
             ),
             (
+                dir.path().join("link_dir/."),
+                Ok(Argument::Book(dir.path().join("link_dir"))),
+            ),
+            (
+                dir.path().join("broken.png"),
+                Ok(Argument::Book(dir.path().join("broken.png"))),
+            ),
+            (
                 dir.path().join("notes.txt"),
                 Err(OpenRefusal::Unsupported(
                     dir.path().join("notes.txt"),
+                )),
+            ),
+            (
+                PathBuf::from("."),
+                Ok(Argument::Book(
+                    env::current_dir().expect("current dir"),
                 )),
             ),
         ];

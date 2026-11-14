@@ -31,8 +31,8 @@ pub struct StatusLine<'fault> {
     pub page: Option<PageStatus>,
     /// Placement scale, screen px per image px.
     pub zoom: f32,
-    /// The wait flag, once a waiting spread has outlived the grace.
-    pub waiting: Option<Wait>,
+    /// Whether to show `loading…`.
+    pub waiting: bool,
     pub fault: Option<StatusFault<'fault>>,
 }
 
@@ -94,22 +94,12 @@ impl Timers {
         WAIT_GRACE.checked_sub(now - since)
     }
 
-    /// The wait word once the grace has elapsed; `unpacking` runs only
-    /// when the word will show.
-    pub fn wait_word(
-        &self,
-        now: Instant,
-        unpacking: impl FnOnce() -> bool,
-    ) -> Option<Wait> {
-        let since = self.waiting_since?;
-        if now - since < WAIT_GRACE {
-            return None;
-        }
-        Some(if unpacking() {
-            Wait::Unpacking
-        } else {
-            Wait::Decoding
-        })
+    /// Whether an active wait has passed the grace period.
+    pub fn waiting(&self, now: Instant) -> bool {
+        let Some(since) = self.waiting_since else {
+            return false;
+        };
+        now - since >= WAIT_GRACE
     }
 
     /// Expire the toast and return the delay until it does.
@@ -122,21 +112,6 @@ impl Timers {
 
     pub fn toasting(&self) -> bool {
         self.toast_since.is_some()
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Wait {
-    Unpacking,
-    Decoding,
-}
-
-impl Wait {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Unpacking => "unpacking…",
-            Self::Decoding => "decoding…",
-        }
     }
 }
 
@@ -406,8 +381,8 @@ fn line(style: &Style, status: &StatusLine<'_>) -> LayoutJob {
         section(&mut job, &dims_text, plain);
     }
     section(&mut job, &format!(" · {:.0}%", status.zoom * 100.0), plain);
-    if let Some(wait) = status.waiting {
-        section(&mut job, &format!(" · {}", wait.label()), plain);
+    if status.waiting {
+        section(&mut job, " · loading…", plain);
     }
     if let Some(fault) = &status.fault {
         section(&mut job, &format!(" · {fault}"), plain);
@@ -432,8 +407,6 @@ mod tests {
         let start = Instant::now();
         let mut timers = Timers::default();
 
-        // A waiting spread arms the grace; the word appears only after
-        // it elapses, and mid-grace the wake is what remains of it.
         assert_eq!(timers.tick_wait(start, true), Some(WAIT_GRACE));
         assert_eq!(
             timers.tick_wait(start + Duration::from_millis(100), true),
@@ -442,31 +415,18 @@ mod tests {
         let almost_due = (start + WAIT_GRACE)
             .checked_sub(Duration::from_millis(1))
             .expect("time moves forward");
-        assert_eq!(
-            timers.wait_word(almost_due, || false),
-            None,
-            "the word appears only once the grace has fully elapsed"
+        assert!(
+            !timers.waiting(almost_due),
+            "waiting becomes true only once the grace has fully elapsed"
         );
-        // The grace boundary itself is due: the word shows and the
-        // wake is immediate.
         assert_eq!(
             timers.tick_wait(start + WAIT_GRACE, true),
             Some(Duration::ZERO)
         );
-        assert_eq!(
-            timers.wait_word(start + WAIT_GRACE, || false),
-            Some(Wait::Decoding)
-        );
-        assert_eq!(
-            timers.wait_word(start + WAIT_GRACE * 2, || true),
-            Some(Wait::Unpacking)
-        );
+        assert!(timers.waiting(start + WAIT_GRACE));
         // A decided spread clears the wait and disarms its wake.
         assert_eq!(timers.tick_wait(start + WAIT_GRACE * 2, false), None);
-        assert_eq!(
-            timers.wait_word(start + WAIT_GRACE * 3, || false),
-            None
-        );
+        assert!(!timers.waiting(start + WAIT_GRACE * 3));
 
         // The toast expires on its own schedule.
         timers.toast(start);
@@ -525,7 +485,7 @@ mod tests {
                 claimed: Some(Format::Png),
             }),
             zoom: 0.866,
-            waiting: None,
+            waiting: false,
             fault: None,
         }
     }

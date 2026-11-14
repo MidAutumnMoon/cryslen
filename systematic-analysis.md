@@ -73,16 +73,18 @@ Instead of adding a complex multi-role scheduler, remove the work that shouldn't
     - *Step A (zero concurrency)*: With `Thumb` removed from still requests, `fast_image_resize` landed, and `IDLE_PRELOAD` tuned above normal reading turn cadence, measure whether head-of-line stalls remain.
     - *Step B (if slow JXL/AVIF decodes still stall cached turns)*: Because prefetch **never** publishes to the parent (it only writes to `Store`, which is already safe for concurrent writers via PID temp locks), run store warm-up on a background thread that only writes to `Store`, while the main child thread serves `SetRequests` (hitting `Store` in ~1.5 ms without waiting on any in-flight decode) and `Playback` directly onto `child_tx`—eliminating `cy-writer` as well.
 
-### 2. Progressive Archive Slots Without Extra Concepts (`source.rs`, `catalog.rs`, `app.rs`)
+### 2. [Done] Progressive Archive Slots Without Extra Concepts (`source.rs`, `catalog.rs`, `app.rs`, `book.rs`, `protocol.rs`, `worker.rs`, `ui.rs`)
 
 - **Replace `OnceLock<PageSet>` + `page_set_rx` with per-page slots (`src/source.rs`)**:
-  - Give `Backend::Archive` an `Arc<[OnceLock<PageRead>]>` (one slot per listed page) and a `Condvar`.
-  - `cy-unpack` fills slots as each entry is read and notifies the `Condvar` (filling any remaining slots with the error verdict on early abort/panic).
-  - `Source::bytes(index)` waits on slot `index` if not yet filled.
-  - **Result**: `Source::wait_ready()` and `page_set_rx` are deleted; `Source::bytes(index)` is unconditionally total for both directories and archives; and page 0 decodes as soon as entry 0 unpacks instead of waiting for the whole archive.
-- **Unify file/symlink rules in `catalog.rs` and move `sibling` off the UI thread**:
-  - Share one entry-classification rule across `app::classify`, `catalog::sibling`, and `Source::open_dir`.
-  - Run `catalog::sibling` inside the background switch thread in `book.rs` rather than synchronously in `Book::step`.
+  - Give `Backend::Archive` an `Arc<ArchiveSlots>` containing `Mutex<Box<[Option<PageRead>]>>` (one slot per listed page) and a `Condvar`.
+  - `cy-unpack` fills each slot as its entry is read and notifies all waiters on the `Condvar` (filling any remaining empty slots with the error verdict on early abort/panic).
+  - `Source::bytes(index)` waits on slot `index` until it is filled.
+  - **Result**: `Source::wait_ready()` and `page_set_rx` are deleted; `Source::bytes(index)` is total for both directories and archives; and page 0 decodes as soon as entry 0 unpacks instead of waiting for the whole archive.
+- **Remove cross-process unpack/fatal states and simplify the wait indicator (`protocol.rs`, `worker.rs`, `book.rs`, `ui.rs`)**:
+  - Delete `ChildMsg::{Unpacked, Fatal}`, `ChildEvent::{Unpacked, Fatal}`, `BookUpdate::Unpacked`, `BookView::unpacking`, `Book::mark_unpacked`, and `ui::Wait`; display `" · loading…"` once the wait grace elapses.
+- **Unify symlink rules and normalize CLI paths in `catalog.rs`**:
+  - Share symlink-following `entry_is_file` across `catalog::sibling` and `Source::open_dir`, plus `normalize_path` so relative and `.` CLI arguments resolve against the working directory while preserving symlinks.
+  - Keep `catalog::sibling` synchronous inside `Book::step` so `PendingBookOpen::begin` stays on the event-loop thread (preserving Linux `PR_SET_PDEATHSIG` ownership).
 
 ### 3. Low-Copy Pixels & Decoder Reuse (`decode/`, `cache/mod.rs`)
 
@@ -133,7 +135,7 @@ Rather than splitting `app.rs` and `render.rs` into many small files, **reduce**
 |---|---|---|
 | `Thumb` blocking `Fit` on still turns (`performance-plan.md` §2) | Multi-stage priority preemption inside `Session::serve` | Stop requesting `Thumb` on `Still` frames; single-role worker steps + 1-slot `last_fit` memo |
 | Cached turn blocked by preload (`performance-plan.md` §4) | 3+ threads with shared mutable session state and writer queue | Flatten child to 1–2 threads; prefetch only writes to `Store`, main child thread serves `SetRequests` directly |
-| Archive first-page latency (`source.rs`) | Separate random-access ZIP reader vs streaming 7z reader | Per-page `OnceLock<PageRead>` slots + `Condvar`; delete `wait_ready()` |
+| Archive first-page latency (`source.rs`) | Separate random-access ZIP reader vs streaming 7z reader | Per-page `Mutex<Box<[Option<PageRead>]>>` + `Condvar` (`ArchiveSlots`); delete `wait_ready()`, `Unpacked`, and `Fatal` |
 | `FIT_EDGE` on 4K displays (`analysis.md` #2) | Dynamic per-viewport `fit_edge` (thrashes disk cache on every window resize) | Stable display-ceiling `fit_edge` or gate `full_wanted` on active zoom (`user_moved` / `scale > 1.0`) |
 | Initial book open (`analysis.md` #7) | Async initial open in `App` (forces `Option<BookView>` everywhere) | Keep synchronous initial header open (preserves non-empty `BookView` invariant); fold `BookInfo` into `Hello` |
 | Module organization (`src/`) | Split `app.rs` and `render.rs` into 6+ new subfiles | Flatten `src/cache/` directory; keep shaders + color math together in `render.rs` |

@@ -86,23 +86,17 @@ pub fn failed_page(message: &'static str) -> Arc<PageError> {
     Arc::new(ErrorUnion::new(DecodeRefusal::Corrupt(message)))
 }
 
-/// Materialize the source and return one page's bytes; panics if that
-/// page fails.
 pub fn readable_page(source: &Source, index: usize) -> Arc<[u8]> {
-    source.wait_ready().expect("source materialized");
     match source.bytes(index) {
         Ok(bytes) => bytes,
         Err(error) => panic!("page {index} failed: {error}"),
     }
 }
 
-/// Materialize the source and return one page's failure; panics if that
-/// page reads.
 pub fn unreadable_page(source: &Source, index: usize) -> Arc<PageError> {
-    source.wait_ready().expect("source materialized");
     match source.bytes(index) {
         Err(error) => error,
-        Ok(_) => panic!("page {index} materialized"),
+        Ok(_) => panic!("page {index} succeeded"),
     }
 }
 

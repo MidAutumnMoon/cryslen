@@ -70,8 +70,6 @@ enum ChildEvent<'image> {
         error: &'image Arc<PageError>,
     },
     Playback(PlaybackEvent<&'image Decoded>),
-    Unpacked,
-    Fatal(&'image str),
 }
 
 enum CommandPoll {
@@ -118,10 +116,6 @@ impl EventSink for IpcSender<ChildMsg> {
             ChildEvent::Playback(event) => ChildMsg::Playback(
                 event.map_image(WireImage::from_decoded),
             ),
-            ChildEvent::Unpacked => ChildMsg::Unpacked,
-            ChildEvent::Fatal(summary) => {
-                ChildMsg::Fatal(summary.to_owned())
-            }
         };
         self.send(message).is_ok()
     }
@@ -1081,22 +1075,12 @@ where
 fn run<Sink>(
     source: &Source,
     rx: &impl CommandReceiver,
-    page_count: PageCount,
     store: Store,
     sink: Sink,
-) -> bool
-where
+) where
     Sink: EventSink + Send,
 {
-    if let Err(error) = source.wait_ready() {
-        let _sent = sink.emit(ChildEvent::Fatal(&error.to_string()));
-        return false;
-    }
-    if source.is_archive() && !sink.emit(ChildEvent::Unpacked) {
-        return true;
-    }
-
-    let shared = Shared::new(page_count, store, sink);
+    let shared = Shared::new(source.len(), store, sink);
     let mut requested_at = Instant::now();
     let mut last_fit = None;
     let mut playback = PlaybackRunner::new();
@@ -1146,7 +1130,6 @@ where
         }
         shared.stop();
     });
-    true
 }
 
 fn decode_page(
@@ -1243,11 +1226,8 @@ pub fn main(args: &[OsString]) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    if run(&opened, &parent_rx, opened.len(), Store::open(), child_tx) {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    }
+    run(&opened, &parent_rx, Store::open(), child_tx);
+    ExitCode::SUCCESS
 }
 
 fn parse(args: &[OsString]) -> Option<(&OsStr, &Path)> {
@@ -1299,7 +1279,6 @@ mod tests {
             error: Arc<PageError>,
         },
         Playback(DecodedEvent),
-        Other,
     }
 
     impl CommandReceiver for mpsc::Receiver<ParentMsg> {
@@ -1344,9 +1323,6 @@ mod tests {
                 ChildEvent::Playback(playback) => Update::Playback(
                     playback.map_image(|image| Box::new(image.clone())),
                 ),
-                ChildEvent::Unpacked | ChildEvent::Fatal(_) => {
-                    Update::Other
-                }
             };
             // A dropped receiver means the test already ended; keep the
             // worker alive until commands close.
@@ -1374,7 +1350,7 @@ mod tests {
             let handle = thread::Builder::new()
                 .name("test-worker".into())
                 .spawn(move || {
-                    run(&source, &rx, source.len(), store, sink);
+                    run(&source, &rx, store, sink);
                 })
                 .expect("test worker thread spawns");
             let worker = Self {
@@ -1551,8 +1527,7 @@ mod tests {
                     }
                     Update::Ready { .. }
                     | Update::Failed { .. }
-                    | Update::Playback(_)
-                    | Update::Other => None,
+                    | Update::Playback(_) => None,
                 })
             })
         }
@@ -1568,8 +1543,7 @@ mod tests {
                     } if *failed == page => Some(Arc::clone(error)),
                     Update::Ready { .. }
                     | Update::Failed { .. }
-                    | Update::Playback(_)
-                    | Update::Other => None,
+                    | Update::Playback(_) => None,
                 })
             })
         }
@@ -1600,8 +1574,7 @@ mod tests {
                     } if *failed == page => Some(error),
                     Update::Ready { .. }
                     | Update::Failed { .. }
-                    | Update::Playback(_)
-                    | Update::Other => None,
+                    | Update::Playback(_) => None,
                 })
                 .count()
         }
@@ -1627,8 +1600,7 @@ mod tests {
                         }
                         Update::Ready { .. }
                         | Update::Failed { .. }
-                        | Update::Playback(_)
-                        | Update::Other => None,
+                        | Update::Playback(_) => None,
                     })
                     .nth(offset)
             })
@@ -1653,7 +1625,7 @@ mod tests {
     }
 
     #[test]
-    fn an_archive_materializes_before_serving() {
+    fn an_archive_serves_pages() {
         const SEVENZ_FIXTURE: &str = concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/two_pages.7z"

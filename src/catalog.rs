@@ -2,8 +2,10 @@
 //! natural order shared by listings and sibling walks.
 
 use std::cmp::Ordering;
-use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::fs;
+use std::fs::DirEntry;
+use std::path;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -35,6 +37,46 @@ pub fn is_archive(path: &Path) -> bool {
     archive_kind(path).is_some()
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DirTarget {
+    File,
+    Dir,
+}
+
+fn entry_target(entry: &DirEntry) -> Option<DirTarget> {
+    let file_type = entry.file_type().ok()?;
+    #[expect(
+        clippy::filetype_is_file,
+        reason = "fast path for regular files; symlinks and unknown types fall through to fs::metadata"
+    )]
+    if file_type.is_file() {
+        return Some(DirTarget::File);
+    }
+    if file_type.is_dir() {
+        return Some(DirTarget::Dir);
+    }
+    let metadata = fs::metadata(entry.path()).ok()?;
+    if metadata.is_dir() {
+        Some(DirTarget::Dir)
+    } else if metadata.is_file() {
+        Some(DirTarget::File)
+    } else {
+        None
+    }
+}
+
+/// Whether `entry` resolves to a regular file, following symlinks.
+pub fn entry_is_file(entry: &DirEntry) -> bool {
+    entry_target(entry) == Some(DirTarget::File)
+}
+
+/// Resolve relative paths against the working directory and strip `.` components, preserving symlinks.
+pub fn normalize_path(path: &Path) -> PathBuf {
+    let absolute =
+        path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    absolute.components().collect()
+}
+
 /// The next or previous sibling book of the same kind, in natural order;
 /// none at either end.
 pub fn sibling(
@@ -42,34 +84,38 @@ pub fn sibling(
     archive: bool,
     forward: bool,
 ) -> Option<PathBuf> {
-    let parent = path.parent()?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     let current = path.file_name()?;
-    let mut siblings: Vec<(String, PathBuf)> = fs::read_dir(parent)
+    let mut siblings: Vec<(String, OsString, PathBuf)> = fs::read_dir(parent)
         .ok()?
         .filter_map(Result::ok)
-        .map(|entry| entry.path())
         .filter(|entry| {
             if archive {
-                entry.is_file() && is_archive(entry)
+                is_archive(Path::new(&entry.file_name()))
+                    && entry_is_file(entry)
             } else {
-                entry.is_dir()
+                entry_target(entry) == Some(DirTarget::Dir)
             }
         })
-        .filter_map(|entry| {
-            let name = entry.file_name()?.to_string_lossy().into_owned();
-            Some((name, entry))
+        .map(|entry| {
+            let file_name = entry.file_name();
+            let sort_key = file_name.to_string_lossy().into_owned();
+            (sort_key, file_name, entry.path())
         })
         .collect();
     siblings.sort_by(|left, right| compare_names(&left.0, &right.0));
     let position = siblings
         .iter()
-        .position(|(name, _)| OsStr::new(name.as_str()) == current)?;
+        .position(|(_, file_name, _)| file_name.as_os_str() == current)?;
     let next = if forward {
         position.checked_add(1)?
     } else {
         position.checked_sub(1)?
     };
-    siblings.get(next).map(|(_, sibling)| sibling.clone())
+    siblings.get(next).map(|(_, _, sibling)| sibling.clone())
 }
 
 /// The index of the entry a file argument names, or the first page when
@@ -177,6 +223,10 @@ fn compare_digit_runs(left: &[u8], right: &[u8]) -> Ordering {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "a panic in test code is inconsequential"
+)]
 mod tests {
     use super::*;
 
@@ -187,5 +237,43 @@ mod tests {
         assert_eq!(landing(names(), "Page2.png"), 1);
         assert_eq!(landing(names(), "page2.PNG"), 1);
         assert_eq!(landing(names(), "missing.png"), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sibling_follows_symlinks_and_skips_invalid_entries() {
+        use std::os::unix::fs::symlink;
+
+        use crate::testkit::TempDir;
+
+        let root = TempDir::new("catalog-siblings");
+        let books = root.path().join("books");
+        let targets = root.path().join("targets");
+        fs::create_dir_all(&books).expect("mkdir books");
+        fs::create_dir_all(&targets).expect("mkdir targets");
+
+        fs::create_dir_all(books.join("1-dir")).expect("1-dir");
+        symlink(targets.join("missing"), books.join("2-broken"))
+            .expect("broken dir symlink");
+        fs::create_dir_all(targets.join("real-dir")).expect("real dir");
+        symlink(targets.join("real-dir"), books.join("3-link"))
+            .expect("symlink dir");
+        assert_eq!(
+            sibling(&books.join("1-dir"), false, true),
+            Some(books.join("3-link"))
+        );
+
+        fs::write(books.join("1-book.cbz"), b"z").expect("1-book.cbz");
+        symlink(targets.join("missing.cbz"), books.join("2-broken.cbz"))
+            .expect("broken archive symlink");
+        symlink(targets.join("real-dir"), books.join("3-dir.cbz"))
+            .expect("archive symlink pointing at dir");
+        fs::write(targets.join("real-book.cbz"), b"z").expect("real-book.cbz");
+        symlink(targets.join("real-book.cbz"), books.join("4-link.cbz"))
+            .expect("symlink archive");
+        assert_eq!(
+            sibling(&books.join("1-book.cbz"), true, true),
+            Some(books.join("4-link.cbz"))
+        );
     }
 }

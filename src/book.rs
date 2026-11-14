@@ -53,7 +53,6 @@ pub struct BookView {
     pub dir_name: Option<String>,
     pub names: Vec<String>,
     pub count: PageCount,
-    pub unpacking: bool,
 }
 
 impl BookView {
@@ -79,7 +78,6 @@ impl BookView {
             dir_name,
             names: info.names,
             count,
-            unpacking: archive,
         })
     }
 
@@ -120,7 +118,6 @@ pub enum BookUpdate {
     Ready(Delivery),
     Playback(DecodedEvent),
     Failed { page: usize, fault: PageFault },
-    Unpacked,
     Died(String),
 }
 
@@ -245,10 +242,6 @@ impl Book {
                 String::from("the book switch ended without a book"),
             ))),
         }
-    }
-
-    pub fn mark_unpacked(&mut self) {
-        self.view.unpacking = false;
     }
 
     pub fn step(&mut self, control: BookControl) -> BookChange {
@@ -569,8 +562,6 @@ fn event_from_message(message: ChildMsg) -> BookUpdate {
         ChildMsg::Failed { page, fault } => {
             BookUpdate::Failed { page, fault }
         }
-        ChildMsg::Unpacked => BookUpdate::Unpacked,
-        ChildMsg::Fatal(detail) => BookUpdate::Died(detail),
     }
 }
 

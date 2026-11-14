@@ -26,7 +26,7 @@ At 20 pages/s with 1.8 pages/s of decoding, 60 cached pages buy about 3.3 s of c
 
 Item numbers stay fixed because other documents cite them. Items 1 and 7 are described in `docs/internal/process.md`.
 
-1. **A requested job can wait out at most one book's in-flight decode.** A switch kills the old child, so its decode, materialized pages, and store handles end with it: no switch runs two decodes, and the new book waits only on its own worker. Inside one book a request can still wait for the decode already inside `decode::decode` (up to ~0.75 s for a 50 MP JXL), because the worker is still one thread; the first request of an archive also waits for its whole materialization pass. A still frame keeps the previous spread up meanwhile. Decoder-side cancellation remains the lever if that in-book wait bites.
+1. **A requested job can wait out at most one book's in-flight decode.** A switch kills the old child, so its decode, unpacked pages, and store handles end with it: no switch runs two decodes, and the new book waits only on its own worker. Inside one book a request can still wait for the decode already inside `decode::decode` (up to ~0.75 s for a 50 MP JXL), because the worker is still one thread, or for its archive entry to be reached in the unpack pass. A still frame keeps the previous spread up meanwhile. Decoder-side cancellation remains the lever if that in-book wait bites.
 
 3. **A held-key skim ends at the release.** A page-turn key the platform repeats starts a skim; `Released` or focus loss ends it. The final page's fit request is sent in the release frame, so the store hit or decode starts there instead of after `SKIM_DECAY`. Rapid taps request their own fit image.
 
