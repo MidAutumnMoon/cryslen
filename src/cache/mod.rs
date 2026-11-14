@@ -33,11 +33,13 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 use std::time::SystemTime;
 
-use fast_image_resize::images::Image;
-use fast_image_resize::images::ImageRef;
+use fast_image_resize::images::TypedImage;
+use fast_image_resize::images::TypedImageRef;
+use fast_image_resize::pixels::Pixel;
+use fast_image_resize::pixels::PixelComponent;
 use fast_image_resize::FilterType;
 use fast_image_resize::ImageBufferError;
-use fast_image_resize::PixelType;
+use fast_image_resize::PixelTrait;
 use fast_image_resize::ResizeAlg;
 use fast_image_resize::ResizeError;
 use fast_image_resize::ResizeOptions;
@@ -160,12 +162,11 @@ fn resample_page(
     let mut resizer = Resizer::new();
     match page.pixels() {
         Pixels::Rgba8(bytes) => {
-            let bytes = resize_buffer(
+            let pixels = resize_typed::<_, u8, 4>(
                 &mut resizer,
-                bytes,
+                bytes.as_chunks::<4>().0,
                 dims,
                 target,
-                PixelType::U8x4,
                 filter,
             )?;
             Decoded::rgba(
@@ -173,7 +174,7 @@ fn resample_page(
                 target.1,
                 page.format(),
                 page.transfer(),
-                bytes.into_boxed_slice(),
+                pixels.into_flattened().into_boxed_slice(),
             )
             .map_err(ResampleError::Extent)
         }
@@ -244,45 +245,59 @@ fn resize_plane(
         return Ok(plane.clone());
     }
     Ok(match plane {
-        Plane::U8(bytes) => {
-            let bytes = resize_buffer(
+        Plane::U8(bytes) => Plane::U8(
+            resize_typed::<_, u8, 1>(
                 resizer,
                 bytes,
                 source_dims,
                 target_dims,
-                PixelType::U8,
                 filter,
-            )?;
-            Plane::U8(bytes.into_boxed_slice())
-        }
-        Plane::U16(words) => {
-            let source = bytemuck::cast_slice(words);
-            let bytes = resize_buffer(
+            )?
+            .into_boxed_slice(),
+        ),
+        Plane::U16(words) => Plane::U16(
+            resize_typed::<_, u16, 1>(
                 resizer,
-                source,
+                words,
                 source_dims,
                 target_dims,
-                PixelType::U16,
                 filter,
-            )?;
-            let pixels = bytemuck::pod_collect_to_vec(&bytes);
-            Plane::U16(pixels.into_boxed_slice())
-        }
+            )?
+            .into_boxed_slice(),
+        ),
     })
 }
 
-fn resize_buffer(
+fn resize_typed<S, C, const N: usize>(
     resizer: &mut Resizer,
-    source: &[u8],
+    source: &[S],
     source_dims: (u32, u32),
     target_dims: (u32, u32),
-    pixel: PixelType,
     filter: FilterType,
-) -> Result<Vec<u8>, ResampleError> {
-    let source =
-        ImageRef::new(source_dims.0, source_dims.1, source, pixel)
-            .map_err(ResampleError::Buffer)?;
-    let mut target = Image::new(target_dims.0, target_dims.1, pixel);
+) -> Result<Vec<S>, ResampleError>
+where
+    S: Default + PartialEq + bytemuck::Pod,
+    C: PixelComponent,
+    Pixel<S, C, N>: PixelTrait,
+{
+    let count = usize::try_from(
+        u64::from(target_dims.0) * u64::from(target_dims.1),
+    )
+    .ok()
+    .ok_or(ResampleError::Buffer(ImageBufferError::InvalidBufferSize))?;
+    let mut out = vec![S::default(); count];
+    let source = TypedImageRef::<Pixel<S, C, N>>::from_buffer(
+        source_dims.0,
+        source_dims.1,
+        bytemuck::cast_slice(source),
+    )
+    .map_err(ResampleError::Buffer)?;
+    let mut target = TypedImage::<Pixel<S, C, N>>::from_buffer(
+        target_dims.0,
+        target_dims.1,
+        bytemuck::cast_slice_mut(&mut out),
+    )
+    .map_err(ResampleError::Buffer)?;
     // Straight alpha: the renderer premultiplies at draw. Alpha-aware
     // resampling avoids the color bleed at transparent edges but costs a
     // source-sized temporary and about double the time.
@@ -290,9 +305,9 @@ fn resize_buffer(
         .resize_alg(ResizeAlg::Convolution(filter))
         .use_alpha(false);
     resizer
-        .resize(&source, &mut target, &options)
+        .resize_typed(&source, &mut target, &options)
         .map_err(ResampleError::Resize)?;
-    Ok(target.into_vec())
+    Ok(out)
 }
 
 /// The shared preview cache. A store that could not claim a real

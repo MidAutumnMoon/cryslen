@@ -44,7 +44,6 @@ rustfs-mimalloc = { version = "0.7.3", features = ["override", "no_profile"] }
 xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
 
 [profile.release]
-lto = "thin"
 strip = "debuginfo"
 
 [profile.release.build-override]
