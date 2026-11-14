@@ -1,12 +1,11 @@
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 
 use eros::ErrorUnion;
-use image::codecs::gif::Repeat;
 use image::Delay;
 use image::DynamicImage;
 use image::Frame;
@@ -15,6 +14,7 @@ use image::Rgb;
 use image::RgbImage;
 use image::Rgba;
 use image::RgbaImage;
+use image::codecs::gif::Repeat;
 
 use crate::fault::DecodeRefusal;
 use crate::fault::PageError;

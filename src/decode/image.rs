@@ -4,10 +4,10 @@ use eros::IntoUnion as _;
 use crate::fault::DecodeError;
 use crate::fault::DecodeRefusal;
 
-use super::admit_dims;
 use super::Decoded;
 use super::Format;
 use super::Transfer;
+use super::admit_dims;
 
 /// Decode with a concrete decoder so EXIF orientation is readable, then
 /// apply it.
@@ -31,7 +31,7 @@ pub(super) fn decode(
         Format::Avif | Format::Jxl => {
             return Err(ErrorUnion::new(DecodeRefusal::Unsupported(
                 "internal dispatch",
-            )))
+            )));
         }
     };
     let reader =

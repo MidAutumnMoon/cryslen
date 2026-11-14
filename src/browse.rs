@@ -446,11 +446,7 @@ fn spread_number(page: usize) -> usize {
 }
 
 fn spread_start(number: usize) -> usize {
-    if number > 0 {
-        2 * number - 1
-    } else {
-        0
-    }
+    if number > 0 { 2 * number - 1 } else { 0 }
 }
 
 fn spread_count(len: usize) -> usize {

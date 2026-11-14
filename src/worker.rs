@@ -2,10 +2,10 @@
 //! playback in the foreground while `cy-prefetch` warms the store.
 
 use std::borrow::Cow;
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::collections::hash_map::Entry;
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::panic;
@@ -19,10 +19,10 @@ use std::time::Duration;
 use std::time::Instant;
 
 use eros::ErrorUnion;
+use ipc_channel::TryRecvError as IpcTryRecvError;
 use ipc_channel::ipc;
 use ipc_channel::ipc::IpcReceiver;
 use ipc_channel::ipc::IpcSender;
-use ipc_channel::TryRecvError as IpcTryRecvError;
 use parking_lot::Condvar;
 use parking_lot::Mutex;
 use rustix::process;
@@ -913,11 +913,10 @@ fn produce_preview<Sink>(
 {
     let started = Instant::now();
     let known_hash = shared.hash_of(page);
-    if let Some(hash) = known_hash {
-        if serve_cached(shared, last_fit, page, role, hash, kind, started)
-        {
-            return;
-        }
+    if let Some(hash) = known_hash
+        && serve_cached(shared, last_fit, page, role, hash, kind, started)
+    {
+        return;
     }
 
     let Some(bytes) = shared.read_source(source, page) else {
@@ -943,13 +942,13 @@ fn produce_preview<Sink>(
     if kind.is_request() {
         shared.publish(page, role, &derived);
         kind.report(page, role, false, started.elapsed());
-        if role == Role::Fit && shared.wants_unserved(page, Role::Full) {
-            if let Some(full) =
+        if role == Role::Fit
+            && shared.wants_unserved(page, Role::Full)
+            && let Some(full) =
                 shared.derive_for(page, Role::Full, &native, kind.lane())
-            {
-                shared.publish(page, Role::Full, &full);
-                kind.report(page, Role::Full, false, started.elapsed());
-            }
+        {
+            shared.publish(page, Role::Full, &full);
+            kind.report(page, Role::Full, false, started.elapsed());
         }
     } else {
         kind.report(page, role, false, started.elapsed());
@@ -1443,8 +1442,8 @@ mod tests {
     use std::fs;
     use std::sync::mpsc;
 
-    use image::codecs::gif::Repeat;
     use image::ImageError;
+    use image::codecs::gif::Repeat;
 
     use super::*;
     use crate::cache::Store;
@@ -1589,10 +1588,10 @@ mod tests {
     impl Drop for TestWorker {
         fn drop(&mut self) {
             drop(self.tx.take());
-            if let Some(handle) = self.handle.take() {
-                if handle.join().is_err() {
-                    tracing::warn!("test worker panicked");
-                }
+            if let Some(handle) = self.handle.take()
+                && handle.join().is_err()
+            {
+                tracing::warn!("test worker panicked");
             }
         }
     }
@@ -2425,10 +2424,12 @@ mod tests {
             prefetch_starts(&forward),
             vec![4, 5, 3, 6, 2, 7, 1, 8, 0, 9]
         );
-        assert!(forward
-            .spreads()
-            .iter()
-            .all(|spread| spread.second.is_none()));
+        assert!(
+            forward
+                .spreads()
+                .iter()
+                .all(|spread| spread.second.is_none())
+        );
 
         let backward = Prefetch::build(
             origin,
@@ -2455,10 +2456,12 @@ mod tests {
         );
         assert_eq!(before.spreads().first(), Some(&opening));
         assert_eq!(before.spreads().len(), 1 + PREFETCH_BEHIND_PAGES);
-        assert!(before
-            .spreads()
-            .iter()
-            .all(|spread| spread.first <= PREFETCH_BEHIND_PAGES));
+        assert!(
+            before
+                .spreads()
+                .iter()
+                .all(|spread| spread.first <= PREFETCH_BEHIND_PAGES)
+        );
 
         let closing =
             browse::spread_for(1199, ReadingMode::Normal, long_book);

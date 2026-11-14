@@ -5,7 +5,6 @@ use std::iter;
 use std::time::Duration;
 use std::time::Instant;
 
-use egui::text::LayoutJob;
 use egui::Color32;
 use egui::Context;
 use egui::Rect;
@@ -13,6 +12,7 @@ use egui::Response;
 use egui::Style;
 use egui::TextFormat;
 use egui::Ui;
+use egui::text::LayoutJob;
 
 use crate::browse::PageInfo;
 use crate::browse::ReadingMode;
@@ -671,9 +671,11 @@ mod tests {
             find(&toast, "right to left").rect.right()
                 < find(&toast, "Comic (c)").rect.left()
         );
-        assert!(plain
-            .iter()
-            .all(|item| !item.text.contains(status().mode.effect())));
+        assert!(
+            plain
+                .iter()
+                .all(|item| !item.text.contains(status().mode.effect()))
+        );
 
         let facts = find(&narrow, "12-13");
         assert!(facts.elided, "facts must elide on a narrow screen");

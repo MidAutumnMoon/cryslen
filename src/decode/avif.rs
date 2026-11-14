@@ -1,19 +1,10 @@
 //! AVIF decode through libavif. The FFI `unsafe` is confined to this
 //! module.
 
-use libavif_sys::avifDecoder;
-use libavif_sys::avifDecoderCreate;
-use libavif_sys::avifDecoderDestroy;
-use libavif_sys::avifDecoderNextImage;
-use libavif_sys::avifDecoderParse;
-use libavif_sys::avifDecoderSetIOMemory;
-use libavif_sys::avifImage;
-use libavif_sys::avifResult;
-use libavif_sys::avifResultToString;
-use libavif_sys::AVIF_MATRIX_COEFFICIENTS_BT2020_NCL;
 use libavif_sys::AVIF_MATRIX_COEFFICIENTS_BT470BG;
 use libavif_sys::AVIF_MATRIX_COEFFICIENTS_BT601;
 use libavif_sys::AVIF_MATRIX_COEFFICIENTS_BT709;
+use libavif_sys::AVIF_MATRIX_COEFFICIENTS_BT2020_NCL;
 use libavif_sys::AVIF_MATRIX_COEFFICIENTS_IDENTITY;
 use libavif_sys::AVIF_MATRIX_COEFFICIENTS_UNSPECIFIED;
 use libavif_sys::AVIF_PIXEL_FORMAT_YUV400;
@@ -26,6 +17,15 @@ use libavif_sys::AVIF_TRANSFER_CHARACTERISTICS_HLG;
 use libavif_sys::AVIF_TRANSFER_CHARACTERISTICS_SMPTE2084;
 use libavif_sys::AVIF_TRANSFORM_IMIR;
 use libavif_sys::AVIF_TRANSFORM_IROT;
+use libavif_sys::avifDecoder;
+use libavif_sys::avifDecoderCreate;
+use libavif_sys::avifDecoderDestroy;
+use libavif_sys::avifDecoderNextImage;
+use libavif_sys::avifDecoderParse;
+use libavif_sys::avifDecoderSetIOMemory;
+use libavif_sys::avifImage;
+use libavif_sys::avifResult;
+use libavif_sys::avifResultToString;
 use std::marker::PhantomData;
 
 use eros::ErrorUnion;
@@ -53,11 +53,8 @@ const MAX_THREADS: usize = 8;
     reason = "Cb and Cr are the YUV plane names the two locals hold"
 )]
 pub(super) fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
-    // SAFETY: `DecoderGuard::new`'s contract leaves callers the `'bytes`
-    // borrow, which the signature enforces.
-    let decoder = unsafe { DecoderGuard::new(bytes)? };
-    // SAFETY: the decoder is untouched since `new`.
-    let frame = unsafe { decoder.image()? };
+    let decoder = DecoderGuard::new(bytes)?;
+    let frame = decoder.image()?;
 
     let (width, height) = (frame.width, frame.height);
     let depth = match frame.depth {
@@ -68,7 +65,7 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
         _ => {
             return Err(ErrorUnion::new(DecodeRefusal::Corrupt(
                 "avif: bad depth",
-            )))
+            )));
         }
     };
     super::admit_dims(width, height, "avif: bad dimensions").union()?;
@@ -80,7 +77,7 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
         _ => {
             return Err(ErrorUnion::new(DecodeRefusal::Unsupported(
                 "avif: pixel format",
-            )))
+            )));
         }
     };
     let full_range = frame.yuvRange == AVIF_RANGE_FULL;
@@ -95,7 +92,7 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
         _ => {
             return Err(ErrorUnion::new(DecodeRefusal::Unsupported(
                 "avif: matrix coefficients",
-            )))
+            )));
         }
     };
     // HLG has no fixed SDR map; a wrong render is worse than a
@@ -239,17 +236,17 @@ fn threads() -> i32 {
         .min(MAX_THREADS) as i32
 }
 
-unsafe fn check(
-    code: avifResult,
-    what: &'static str,
-) -> Result<(), AvifFault> {
+fn check(code: avifResult, what: &'static str) -> Result<(), AvifFault> {
     use std::ffi::CStr;
 
     if code == AVIF_RESULT_OK {
         return Ok(());
     }
-    let detail =
-        CStr::from_ptr(avifResultToString(code)).to_string_lossy();
+    // SAFETY: `avifResultToString` returns a static NUL-terminated string for
+    // any `avifResult`.
+    let message_ptr = unsafe { avifResultToString(code) };
+    // SAFETY: `message_ptr` points to a static NUL-terminated string.
+    let detail = unsafe { CStr::from_ptr(message_ptr) }.to_string_lossy();
     Err(AvifFault {
         step: what,
         detail: detail.into_owned(),
@@ -355,17 +352,11 @@ struct DecoderGuard<'bytes> {
 }
 
 impl<'bytes> DecoderGuard<'bytes> {
-    /// Creates the decoder and decodes the first image.
-    ///
-    /// # Safety
-    ///
-    /// The marker exists because the body performs unchecked libavif
-    /// calls. Input retention is carried by the `'bytes` lifetime, so
-    /// callers owe nothing beyond it.
-    unsafe fn new(bytes: &'bytes [u8]) -> Result<Self, DecodeError> {
+    fn new(bytes: &'bytes [u8]) -> Result<Self, DecodeError> {
         const NO_DIMENSION_LIMIT: u32 = 0;
 
-        let ptr = avifDecoderCreate();
+        // SAFETY: allocates an independent decoder instance.
+        let ptr = unsafe { avifDecoderCreate() };
         if ptr.is_null() {
             return Err(ErrorUnion::new(DecodeRefusal::Unsupported(
                 "avif: decoder create",
@@ -375,35 +366,44 @@ impl<'bytes> DecoderGuard<'bytes> {
             ptr,
             _bytes: PhantomData,
         };
-        (*guard.ptr).maxThreads = threads();
-        // The decoder's pixel cap runs before the pixel decode, so an
-        // oversized hostile file fails at parse instead of funding a
-        // multi-gigabyte dav1d picture first. Clear libavif's per-axis
-        // edge cap so tall strips under `MAX_PIXELS` still decode.
-        (*guard.ptr).imageSizeLimit = super::MAX_PIXELS;
-        (*guard.ptr).imageDimensionLimit = NO_DIMENSION_LIMIT;
-        avifDecoderSetIOMemory(guard.ptr, bytes.as_ptr(), bytes.len());
-        check(avifDecoderParse(guard.ptr), "avif parse").union()?;
-        check(avifDecoderNextImage(guard.ptr), "avif image").union()?;
+        {
+            // SAFETY: `guard.ptr` is newly allocated, non-null, and uniquely
+            // owned; the mutable borrow ends before subsequent C calls.
+            let decoder = unsafe { &mut *guard.ptr };
+            decoder.maxThreads = threads();
+            // The decoder's pixel cap runs before the pixel decode, so an
+            // oversized hostile file fails at parse instead of funding a
+            // multi-gigabyte dav1d picture first. Clear libavif's per-axis
+            // edge cap so tall strips under `MAX_PIXELS` still decode.
+            decoder.imageSizeLimit = super::MAX_PIXELS;
+            decoder.imageDimensionLimit = NO_DIMENSION_LIMIT;
+        }
+        // SAFETY: `guard.ptr` is uniquely owned and `bytes` stays live until
+        // `guard` drops.
+        unsafe {
+            avifDecoderSetIOMemory(guard.ptr, bytes.as_ptr(), bytes.len());
+        }
+        // SAFETY: `guard.ptr` is valid with attached input bytes.
+        let parsed = unsafe { avifDecoderParse(guard.ptr) };
+        check(parsed, "avif parse").union()?;
+        // SAFETY: `guard.ptr` parsed cleanly above.
+        let next = unsafe { avifDecoderNextImage(guard.ptr) };
+        check(next, "avif image").union()?;
         Ok(guard)
     }
 
-    /// The decoded frame. The decoder owns it, so copy from it before
-    /// the guard drops.
-    ///
-    /// # Safety
-    ///
-    /// The marker exists because the body dereferences the decoder
-    /// pointer. The decoder must be untouched since `new`, and module
-    /// privacy ensures no other decoder call happens between the two.
-    unsafe fn image(&self) -> Result<&avifImage, DecodeError> {
-        let frame = (*self.ptr).image;
+    fn image(&self) -> Result<&avifImage, DecodeError> {
+        // SAFETY: `self.ptr` stays live while `self` is borrowed and was
+        // decoded in `new`.
+        let frame = unsafe { (*self.ptr).image };
         if frame.is_null() {
             return Err(ErrorUnion::new(DecodeRefusal::Corrupt(
                 "avif: no image",
             )));
         }
-        Ok(&*frame)
+        // SAFETY: `frame` is non-null and owned by `self.ptr` while `&self`
+        // stays live.
+        Ok(unsafe { &*frame })
     }
 }
 

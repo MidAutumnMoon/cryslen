@@ -364,13 +364,12 @@ impl PageTextures {
             .pages
             .get(&page)
             .and_then(|slots| role_slot(slots, role))
+            && *present_dims == dims
+            && *transfer == image.transfer
+            && let WirePixels::Rgba8(bytes) = &image.pixels
         {
-            if *present_dims == dims && *transfer == image.transfer {
-                if let WirePixels::Rgba8(bytes) = &image.pixels {
-                    update_rgba(&self.gl, *texture, bytes, dims);
-                    return Ok(());
-                }
-            }
+            update_rgba(&self.gl, *texture, bytes, dims);
+            return Ok(());
         }
         let empty = self.pages.get_mut(&page).is_some_and(|slots| {
             *role_slot_mut(slots, role) = None;
@@ -533,7 +532,9 @@ impl Drop for ShaderGuard<'_> {
     fn drop(&mut self) {
         // SAFETY: `self.gl` is the current context and `self.shader` is owned
         // uniquely by this guard.
-        unsafe { self.gl.delete_shader(self.shader); }
+        unsafe {
+            self.gl.delete_shader(self.shader);
+        }
     }
 }
 
@@ -597,7 +598,9 @@ fn create_pipeline(
         Ok(vao) => vao,
         Err(error) => {
             // SAFETY: `program` was just created on the current context.
-            unsafe { gl.delete_program(program); }
+            unsafe {
+                gl.delete_program(program);
+            }
             return Err(eros::error!(
                 "GL vertex array object creation failed: {error}"
             ));
@@ -606,8 +609,11 @@ fn create_pipeline(
     let objects = PipelineObjects { gl, program, vao };
 
     {
-        let vertex_shader =
-            compile_shader(&objects.gl, glow::VERTEX_SHADER, vertex_source)?;
+        let vertex_shader = compile_shader(
+            &objects.gl,
+            glow::VERTEX_SHADER,
+            vertex_source,
+        )?;
         let fragment_shader = compile_shader(
             &objects.gl,
             glow::FRAGMENT_SHADER,
@@ -626,7 +632,9 @@ fn create_pipeline(
             if !objects.gl.get_program_link_status(objects.program) {
                 let info =
                     objects.gl.get_program_info_log(objects.program);
-                return Err(eros::error!("GL program link failed: {info}"));
+                return Err(eros::error!(
+                    "GL program link failed: {info}"
+                ));
             }
         }
     }
@@ -697,7 +705,11 @@ fn create_pipeline(
 /// Set the frame state the page draws depend on: the viewport, the
 /// premultiplied compositing pages draw with, and the window-size
 /// uniform. egui's own paint re-sets its blend state afterwards.
-fn begin_frame(gl: &Context, pipeline: &Pipeline, window_size: (u32, u32)) {
+fn begin_frame(
+    gl: &Context,
+    pipeline: &Pipeline,
+    window_size: (u32, u32),
+) {
     let window_px = geometry::px_f32(window_size);
     // SAFETY: Caller holds the current context; `pipeline` handles are live.
     unsafe {
@@ -820,7 +832,9 @@ fn gl_int(value: u32) -> i32 {
 fn label(gl: &Context, identifier: u32, name: u32, text: &str) {
     if gl.supports_debug() {
         // SAFETY: `gl` is current with `KHR_debug` supported and `name` is live.
-        unsafe { gl.object_label(identifier, name, Some(text)); }
+        unsafe {
+            gl.object_label(identifier, name, Some(text));
+        }
     }
 }
 
@@ -1058,7 +1072,10 @@ fn upload_plane(
     clippy::similar_names,
     reason = "Cb and Cr are the YUV plane names the two textures hold"
 )]
-fn upload_page_texture(gl: &Arc<Context>, image: &WireImage) -> PageTexture {
+fn upload_page_texture(
+    gl: &Arc<Context>,
+    image: &WireImage,
+) -> PageTexture {
     let dims = (image.width, image.height);
     let magnification_filter = magnification_filter(dims, image.page_dims);
     let page_uv_per_pixel = page_uv_per_pixel(image.page_dims);
@@ -1506,7 +1523,8 @@ impl Window {
         // SAFETY: `translucent_template` sets no raw window handle.
         let mut configs =
             unsafe { gl_display.find_configs(translucent_template) }?;
-        let (gl_config, translucent) = if let Some(config) = configs.next() {
+        let (gl_config, translucent) = if let Some(config) = configs.next()
+        {
             (config, true)
         } else {
             // The second pass drops the alpha demand. The default

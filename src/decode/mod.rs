@@ -516,9 +516,9 @@ struct Frames {
 
 impl Frames {
     fn new(bytes: Arc<[u8]>, format: Format) -> Result<Self, DecodeError> {
-        use ::image::codecs::gif::GifDecoder;
         use ::image::AnimationDecoder as _;
         use ::image::ImageDecoder as _;
+        use ::image::codecs::gif::GifDecoder;
 
         if format != Format::Gif {
             return Err(ErrorUnion::new(DecodeRefusal::Unsupported(
@@ -1005,11 +1005,9 @@ mod tests {
         let Pixels::Rgba8(wide_rgba) = &wide.pixels else {
             panic!("jxl must decode to rgba")
         };
-        assert!(wide_rgba
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .all(|px| px[3] == 0xFF));
+        assert!(
+            wide_rgba.as_chunks::<4>().0.iter().all(|px| px[3] == 0xFF)
+        );
 
         // animated: the numbered frames paint digits, so the first frame
         // carries non-black pixels
@@ -1020,11 +1018,13 @@ mod tests {
         let Pixels::Rgba8(animated_rgba) = &animated.pixels else {
             panic!("jxl must decode to rgba")
         };
-        assert!(animated_rgba
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .any(|px| px[0] != 0 || px[1] != 0 || px[2] != 0));
+        assert!(
+            animated_rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|px| px[0] != 0 || px[1] != 0 || px[2] != 0)
+        );
     }
 
     fn arc(bytes: Vec<u8>) -> Arc<[u8]> {

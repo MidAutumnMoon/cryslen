@@ -341,20 +341,20 @@ impl Reading {
                 }
                 BookUpdate::Playback(event) => match event {
                     PlaybackEvent::Frame { id, delay, image } => {
-                        if let Some(player) = self.player_mut(id) {
-                            if !player.on_frame(delay, image) {
-                                tracing::debug!(
-                                    ?id,
-                                    "unrequested playback frame"
-                                );
-                            }
+                        if let Some(player) = self.player_mut(id)
+                            && !player.on_frame(delay, image)
+                        {
+                            tracing::debug!(
+                                ?id,
+                                "unrequested playback frame"
+                            );
                         }
                     }
                     PlaybackEvent::Finished { id } => {
-                        if let Some(player) = self.player_mut(id) {
-                            if player.on_finished() {
-                                tracing::debug!(?id, "playback finished");
-                            }
+                        if let Some(player) = self.player_mut(id)
+                            && player.on_finished()
+                        {
+                            tracing::debug!(?id, "playback finished");
                         }
                     }
                     PlaybackEvent::Failed { id } => {
@@ -523,10 +523,8 @@ impl Reading {
                 }
                 Some(PagePlayback::Refused) | None => true,
             };
-            if !keep {
-                if let Some(command) = state.stop_playback() {
-                    commands.push(command);
-                }
+            if !keep && let Some(command) = state.stop_playback() {
+                commands.push(command);
             }
         }
         for &(page, role) in targets.iter().flatten() {
@@ -756,16 +754,16 @@ fn present_frame(
         [size.width, size.height],
         clear_color(gl.window.translucent()),
     );
-    if let (Some(draw), Some(placement)) = (spread, drawn) {
-        if let Some(shown) = draw.shown {
-            gl.window.pages().draw(
-                (size.width, size.height),
-                viewport,
-                &draw.layout,
-                shown.seats(status.mode),
-                &placement,
-            );
-        }
+    if let (Some(draw), Some(placement)) = (spread, drawn)
+        && let Some(shown) = draw.shown
+    {
+        gl.window.pages().draw(
+            (size.width, size.height),
+            viewport,
+            &draw.layout,
+            shown.seats(status.mode),
+            &placement,
+        );
     }
     gl.egui.paint(gl.window.winit());
     gl.window.pre_present_and_swap()?;
@@ -856,9 +854,9 @@ impl App {
     }
 
     fn roles(&self, page: usize) -> Roles {
-        self.gl
-            .as_ref()
-            .map_or_else(Roles::default, |gl| gl.window.pages().roles(page))
+        self.gl.as_ref().map_or_else(Roles::default, |gl| {
+            gl.window.pages().roles(page)
+        })
     }
 
     fn role_name(&self, page: Option<usize>) -> &'static str {
@@ -1165,9 +1163,8 @@ impl App {
                 live.book.send(ParentMsg::Playback(command));
             }
             if let Some(gl) = gl.as_mut() {
-                let (deadline, commands) = live
-                    .reading
-                    .tick_playback(now, gl.window.pages_mut());
+                let (deadline, commands) =
+                    live.reading.tick_playback(now, gl.window.pages_mut());
                 for command in commands {
                     live.book.send(ParentMsg::Playback(command));
                 }
@@ -1452,10 +1449,10 @@ impl App {
             digit.is_ascii_digit().then(|| char::from(*digit))
         });
         if let Some(digit) = digit {
-            if let Some(live) = self.live_mut() {
-                if let Some(digits) = &mut live.reading.jump_digits {
-                    digits.push(digit);
-                }
+            if let Some(live) = self.live_mut()
+                && let Some(digits) = &mut live.reading.jump_digits
+            {
+                digits.push(digit);
             }
             self.request_redraw();
             return;
@@ -1465,10 +1462,10 @@ impl App {
             return;
         };
         if code == KeyCode::Backspace {
-            if let Some(live) = self.live_mut() {
-                if let Some(digits) = &mut live.reading.jump_digits {
-                    digits.pop();
-                }
+            if let Some(live) = self.live_mut()
+                && let Some(digits) = &mut live.reading.jump_digits
+            {
+                digits.pop();
             }
             self.request_redraw();
             return;
@@ -1619,10 +1616,9 @@ impl ApplicationHandler<WakeEvent> for App {
                 };
                 if let ControlFlow::WaitUntil(armed) =
                     event_loop.control_flow()
+                    && armed <= deadline
                 {
-                    if armed <= deadline {
-                        return;
-                    }
+                    return;
                 }
                 event_loop
                     .set_control_flow(ControlFlow::WaitUntil(deadline));
@@ -2035,18 +2031,14 @@ mod tests {
         ]);
         let mut textures = FakeTextures::new(LARGE_MAX_EDGE);
         assert!(reading.drain_deliveries(&mut textures));
-        assert!(reading
-            .pages
-            .get(&0)
-            .and_then(|state| state.info)
-            .is_some());
+        assert!(
+            reading.pages.get(&0).and_then(|state| state.info).is_some()
+        );
         assert!(!reading.pages.contains_key(&1));
         assert!(!reading.drain_deliveries(&mut textures));
-        assert!(reading
-            .pages
-            .get(&1)
-            .and_then(|state| state.info)
-            .is_some());
+        assert!(
+            reading.pages.get(&1).and_then(|state| state.info).is_some()
+        );
 
         let mut capped_textures = FakeTextures::new(SMALL_MAX_EDGE);
         reading.apply_updates([
@@ -2243,11 +2235,9 @@ mod tests {
                 id: faulted_playback
             }]
         );
-        assert!(reading
-            .pages
-            .get(&1)
-            .and_then(|state| state.info)
-            .is_some());
+        assert!(
+            reading.pages.get(&1).and_then(|state| state.info).is_some()
+        );
         assert_eq!(
             reading.sync_playback([Some((1, Role::Fit)), None]),
             []

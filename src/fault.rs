@@ -28,11 +28,20 @@ pub enum OpenRefusal {
 impl fmt::Display for OpenRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NotFound(path) => write!(f, "not found: {}", path.display()),
-            Self::Unsupported(path) => write!(f, "unsupported source: {}", path.display()),
+            Self::NotFound(path) => {
+                write!(f, "not found: {}", path.display())
+            }
+            Self::Unsupported(path) => {
+                write!(f, "unsupported source: {}", path.display())
+            }
             Self::Empty => write!(f, "no image pages found"),
-            Self::Duplicate(name) => write!(f, "duplicate entry name: {name}"),
-            Self::TooBig { unpacked, available } => write!(
+            Self::Duplicate(name) => {
+                write!(f, "duplicate entry name: {name}")
+            }
+            Self::TooBig {
+                unpacked,
+                available,
+            } => write!(
                 f,
                 "archive too big: {unpacked} bytes claimed, {available} bytes available"
             ),

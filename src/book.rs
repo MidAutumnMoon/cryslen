@@ -151,10 +151,10 @@ impl BookProcess {
     /// an explicit switch and `Drop` can rely on it.
     pub fn kill(&mut self) {
         self.child.kill();
-        if let Some(reader) = self.reader.take() {
-            if reader.join().is_err() {
-                tracing::warn!("the book reader panicked");
-            }
+        if let Some(reader) = self.reader.take()
+            && reader.join().is_err()
+        {
+            tracing::warn!("the book reader panicked");
         }
     }
 }
@@ -352,7 +352,7 @@ fn finish_open(
         Err(RecvTimeoutError::Disconnected) => {
             return Err(BookFault::Handshake(String::from(
                 "the book accept thread stopped",
-            )))
+            )));
         }
     };
     let (_, hello) = match accepted {
