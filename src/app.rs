@@ -2647,7 +2647,7 @@ mod argv_tests {
     fn classify_argument_kinds() {
         use std::env;
         use std::fs;
-        use std::os::unix::fs::symlink;
+        use std::os::unix::fs as unix_fs;
 
         // classify never reads the content, only the extension.
         let dir = TempDir::new("parent-arg");
@@ -2655,11 +2655,17 @@ mod argv_tests {
         dir.write("book.cbz", b"not really a zip");
         dir.write("notes.txt", b"not a page");
         fs::create_dir_all(dir.path().join("sub")).expect("mkdir sub");
-        symlink(dir.path().join("page.png"), dir.path().join("link.png"))
-            .expect("symlink page");
-        symlink(dir.path().join("sub"), dir.path().join("link_dir"))
-            .expect("symlink dir");
-        symlink(
+        unix_fs::symlink(
+            dir.path().join("page.png"),
+            dir.path().join("link.png"),
+        )
+        .expect("symlink page");
+        unix_fs::symlink(
+            dir.path().join("sub"),
+            dir.path().join("link_dir"),
+        )
+        .expect("symlink dir");
+        unix_fs::symlink(
             dir.path().join("missing.png"),
             dir.path().join("broken.png"),
         )

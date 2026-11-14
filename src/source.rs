@@ -804,7 +804,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn dir_listing_follows_symlinks_and_skips_broken_entries() {
-        use std::os::unix::fs::symlink;
+        use std::os::unix::fs as unix_fs;
 
         let target_dir = TempDir::new("symlink-targets");
         let target_png = testkit::tiny_png(2, 2, [9, 8, 7, 255]);
@@ -813,17 +813,17 @@ mod tests {
         fs::create_dir_all(&nested_dir).expect("nested dir creates");
 
         let book = TempDir::new("symlink-book");
-        symlink(
+        unix_fs::symlink(
             target_dir.path().join("real.png"),
             book.path().join("page.png"),
         )
         .expect("file symlink creates");
-        symlink(
+        unix_fs::symlink(
             target_dir.path().join("missing.png"),
             book.path().join("broken.png"),
         )
         .expect("broken symlink creates");
-        symlink(&nested_dir, book.path().join("subdir.png"))
+        unix_fs::symlink(&nested_dir, book.path().join("subdir.png"))
             .expect("dir symlink creates");
 
         let source = Source::open(book.path()).expect("dir opens");

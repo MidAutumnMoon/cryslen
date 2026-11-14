@@ -262,7 +262,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn sibling_follows_symlinks_and_skips_invalid_entries() {
-        use std::os::unix::fs::symlink;
+        use std::os::unix::fs as unix_fs;
 
         use crate::testkit::TempDir;
 
@@ -273,10 +273,10 @@ mod tests {
         fs::create_dir_all(&targets).expect("mkdir targets");
 
         fs::create_dir_all(books.join("1-dir")).expect("1-dir");
-        symlink(targets.join("missing"), books.join("2-broken"))
+        unix_fs::symlink(targets.join("missing"), books.join("2-broken"))
             .expect("broken dir symlink");
         fs::create_dir_all(targets.join("real-dir")).expect("real dir");
-        symlink(targets.join("real-dir"), books.join("3-link"))
+        unix_fs::symlink(targets.join("real-dir"), books.join("3-link"))
             .expect("symlink dir");
         assert_eq!(
             sibling(&books.join("1-dir"), false, true),
@@ -284,14 +284,23 @@ mod tests {
         );
 
         fs::write(books.join("1-book.cbz"), b"z").expect("1-book.cbz");
-        symlink(targets.join("missing.cbz"), books.join("2-broken.cbz"))
-            .expect("broken archive symlink");
-        symlink(targets.join("real-dir"), books.join("3-dir.cbz"))
-            .expect("archive symlink pointing at dir");
+        unix_fs::symlink(
+            targets.join("missing.cbz"),
+            books.join("2-broken.cbz"),
+        )
+        .expect("broken archive symlink");
+        unix_fs::symlink(
+            targets.join("real-dir"),
+            books.join("3-dir.cbz"),
+        )
+        .expect("archive symlink pointing at dir");
         fs::write(targets.join("real-book.cbz"), b"z")
             .expect("real-book.cbz");
-        symlink(targets.join("real-book.cbz"), books.join("4-link.cbz"))
-            .expect("symlink archive");
+        unix_fs::symlink(
+            targets.join("real-book.cbz"),
+            books.join("4-link.cbz"),
+        )
+        .expect("symlink archive");
         assert_eq!(
             sibling(&books.join("1-book.cbz"), true, true),
             Some(books.join("4-link.cbz"))

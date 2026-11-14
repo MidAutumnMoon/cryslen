@@ -336,7 +336,7 @@ impl PageTextures {
         }
         let dims = (image.width, image.height);
         check_texture_dims(dims, self.max_texture_edge)?;
-        let texture = upload_page_texture(&self.gl, image);
+        let texture = upload_page_texture(Arc::clone(&self.gl), image);
         label_entry(&self.gl, page, role, &texture);
         *role_slot_mut(self.pages.entry(page).or_default(), role) =
             Some(texture);
@@ -1073,28 +1073,24 @@ fn upload_plane(
     reason = "Cb and Cr are the YUV plane names the two textures hold"
 )]
 fn upload_page_texture(
-    gl: &Arc<Context>,
+    gl: Arc<Context>,
     image: &WireImage,
 ) -> PageTexture {
     let dims = (image.width, image.height);
     let magnification_filter = magnification_filter(dims, image.page_dims);
     let page_uv_per_pixel = page_uv_per_pixel(image.page_dims);
     match &image.pixels {
-        WirePixels::Rgba8(rgba_bytes) => PageTexture {
-            gl: Arc::clone(gl),
-            page_uv_per_pixel,
-            transfer: image.transfer,
-            needs_dither: needs_dither(image.transfer, None),
-            layout: PixelLayout::Rgba {
-                texture: upload_rgba(
-                    gl,
-                    rgba_bytes,
-                    dims,
-                    magnification_filter,
-                ),
-                dims,
-            },
-        },
+        WirePixels::Rgba8(rgba_bytes) => {
+            let texture =
+                upload_rgba(&gl, rgba_bytes, dims, magnification_filter);
+            PageTexture {
+                gl,
+                page_uv_per_pixel,
+                transfer: image.transfer,
+                needs_dither: needs_dither(image.transfer, None),
+                layout: PixelLayout::Rgba { texture, dims },
+            }
+        }
         WirePixels::Yuv {
             depth,
             subsampling,
@@ -1144,7 +1140,7 @@ fn upload_page_texture(
                 );
             }
             let luma_texture = upload_plane(
-                gl,
+                &gl,
                 luma,
                 (luma_w, luma_h),
                 wide,
@@ -1156,20 +1152,20 @@ fn upload_page_texture(
                     // quantization anchor cancels exactly.
                     let neutral_code = 1_u32 << (depth - 1);
                     (
-                        upload_constant_plane(gl, depth, neutral_code),
-                        upload_constant_plane(gl, depth, neutral_code),
+                        upload_constant_plane(&gl, depth, neutral_code),
+                        upload_constant_plane(&gl, depth, neutral_code),
                     )
                 } else {
                     (
                         upload_plane(
-                            gl,
+                            &gl,
                             cb,
                             (chroma_w, chroma_h),
                             wide,
                             MagnificationFilter::Linear,
                         ),
                         upload_plane(
-                            gl,
+                            &gl,
                             cr,
                             (chroma_w, chroma_h),
                             wide,
@@ -1180,10 +1176,10 @@ fn upload_page_texture(
             let alpha_texture = alpha.as_ref().map_or_else(
                 // 1x1 opaque: the max code, which the alpha normalization
                 // maps to 1.0.
-                || upload_constant_plane(gl, depth, (1_u32 << depth) - 1),
+                || upload_constant_plane(&gl, depth, (1_u32 << depth) - 1),
                 |alpha| {
                     upload_plane(
-                        gl,
+                        &gl,
                         alpha,
                         dims,
                         wide,
@@ -1192,7 +1188,7 @@ fn upload_page_texture(
                 },
             );
             PageTexture {
-                gl: Arc::clone(gl),
+                gl,
                 page_uv_per_pixel,
                 transfer: image.transfer,
                 needs_dither: needs_dither(image.transfer, Some(depth)),

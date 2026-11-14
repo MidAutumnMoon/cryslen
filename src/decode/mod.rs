@@ -5,7 +5,6 @@
     reason = "the decode tree's shared vocabulary lives in its module root by design"
 )]
 
-use std::io::Cursor;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -519,6 +518,7 @@ impl Frames {
         use ::image::AnimationDecoder as _;
         use ::image::ImageDecoder as _;
         use ::image::codecs::gif::GifDecoder;
+        use std::io::Cursor;
 
         if format != Format::Gif {
             return Err(ErrorUnion::new(DecodeRefusal::Unsupported(
@@ -589,6 +589,7 @@ pub fn open_animation(
 fn gif_loops(bytes: &[u8]) -> Loops {
     use gif::DecodeOptions;
     use gif::Repeat;
+    use std::io::Cursor;
 
     match DecodeOptions::new().read_info(Cursor::new(bytes)) {
         Ok(decoder) => match decoder.repeat() {

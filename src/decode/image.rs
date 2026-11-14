@@ -7,7 +7,6 @@ use crate::fault::DecodeRefusal;
 use super::Decoded;
 use super::Format;
 use super::Transfer;
-use super::admit_dims;
 
 /// Decode with a concrete decoder so EXIF orientation is readable, then
 /// apply it.
@@ -40,7 +39,7 @@ pub(super) fn decode(
     // Orientation only swaps w and h, and the cap checks both, so this
     // pre-orientation check catches rotated pages too.
     let (width, height) = decoder.dimensions();
-    admit_dims(width, height, "bad dimensions").union()?;
+    super::admit_dims(width, height, "bad dimensions").union()?;
     let orientation = decoder.orientation().union()?;
     let mut oriented = DynamicImage::from_decoder(decoder).union()?;
     oriented.apply_orientation(orientation);

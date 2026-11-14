@@ -14,6 +14,7 @@ use serde::Serialize;
 use crate::decode;
 use crate::decode::Decoded;
 use crate::decode::Pixels;
+use crate::decode::Plane;
 use crate::fault::DecodeRefusal;
 
 pub use crate::animation::PlaybackCommand;
@@ -143,7 +144,7 @@ impl WireImage {
     }
 }
 
-fn shared_plane(plane: &decode::Plane) -> IpcSharedMemory {
+fn shared_plane(plane: &Plane) -> IpcSharedMemory {
     IpcSharedMemory::from_bytes(decode::plane_bytes(plane))
 }
 

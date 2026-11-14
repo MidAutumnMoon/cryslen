@@ -5,7 +5,6 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
-use std::collections::hash_map::Entry;
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::panic;
@@ -785,6 +784,8 @@ where
     }
 
     fn record_failure(&self, page: usize, error: &Arc<PageError>) {
+        use std::collections::hash_map::Entry;
+
         let is_new = match self.state.lock().failed.entry(page) {
             Entry::Vacant(entry) => {
                 entry.insert(Arc::clone(error));
