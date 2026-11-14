@@ -89,23 +89,24 @@ pub fn sibling(
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     let current = path.file_name()?;
-    let mut siblings: Vec<(String, OsString, PathBuf)> = fs::read_dir(parent)
-        .ok()?
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            if archive {
-                is_archive(Path::new(&entry.file_name()))
-                    && entry_is_file(entry)
-            } else {
-                entry_target(entry) == Some(DirTarget::Dir)
-            }
-        })
-        .map(|entry| {
-            let file_name = entry.file_name();
-            let sort_key = file_name.to_string_lossy().into_owned();
-            (sort_key, file_name, entry.path())
-        })
-        .collect();
+    let mut siblings: Vec<(String, OsString, PathBuf)> =
+        fs::read_dir(parent)
+            .ok()?
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                if archive {
+                    is_archive(Path::new(&entry.file_name()))
+                        && entry_is_file(entry)
+                } else {
+                    entry_target(entry) == Some(DirTarget::Dir)
+                }
+            })
+            .map(|entry| {
+                let file_name = entry.file_name();
+                let sort_key = file_name.to_string_lossy().into_owned();
+                (sort_key, file_name, entry.path())
+            })
+            .collect();
     siblings.sort_by(|left, right| compare_names(&left.0, &right.0));
     let position = siblings
         .iter()
@@ -152,6 +153,25 @@ pub fn page_name(
     } else {
         dir_name.map(str::to_owned)
     };
+    PageName { parent_dir, file }
+}
+
+/// Status-line display name for a book before its listing arrives.
+pub fn opening_name(path: &Path, land_on: Option<&str>) -> PageName {
+    let book_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned());
+    if let Some(file) = land_on {
+        return PageName {
+            parent_dir: book_name,
+            file: file.to_owned(),
+        };
+    }
+    let parent_dir = path
+        .parent()
+        .and_then(Path::file_name)
+        .map(|name| name.to_string_lossy().into_owned());
+    let file = book_name.unwrap_or_else(|| path.display().to_string());
     PageName { parent_dir, file }
 }
 
@@ -268,7 +288,8 @@ mod tests {
             .expect("broken archive symlink");
         symlink(targets.join("real-dir"), books.join("3-dir.cbz"))
             .expect("archive symlink pointing at dir");
-        fs::write(targets.join("real-book.cbz"), b"z").expect("real-book.cbz");
+        fs::write(targets.join("real-book.cbz"), b"z")
+            .expect("real-book.cbz");
         symlink(targets.join("real-book.cbz"), books.join("4-link.cbz"))
             .expect("symlink archive");
         assert_eq!(

@@ -7,7 +7,7 @@ winit owns the window and events, glutin binds EGL, glow calls GL, egui-winit fe
 - Present without blocking; a blocking swap would own the event loop. Notify the window before presenting so Wayland's frame callback paces frames.
 - Park the loop in a blocking wait; delayed work arms a deadline and the resume event redraws. Keep arming and firing separate, or a repaint clobbers the tighter deadline.
 - egui's repaint callback posts a user event through a proxy created before the loop runs.
-- While no seat of the on-screen spread has a texture and none failed, arm the status grace so the wait word can appear.
+- Arm the wait grace while opening a book, or while no seat of the on-screen spread has page info or a fault.
 
 ## GL rules
 

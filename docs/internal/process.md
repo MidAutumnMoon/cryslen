@@ -1,16 +1,15 @@
 # Processes: one child per book
 
-`cy` is the windowed parent; `cy --worker` is the child that serves one book. The parent mode runs the windowed app and owns the parent's handle to a child; the child mode runs one book's serving loop; both share one wire vocabulary.
+`cy` is the windowed parent; `cy --worker` serves one book over shared wire types.
 
-The boundary follows ownership. The parent owns the window, UI, GL, the app state, the request set, and the texture maps. The child owns its book's source, store, decode, derivation, and archive unpacking. A switch kills the old book's process, so its queue dies with it. The child decodes; the UI thread draws. A child crash becomes a book fault.
+The parent owns the window, UI, GL, app state, request set, and textures; the child owns the book's source, store, decode, derivation, and archive unpacking. A child crash becomes a book fault.
 
 ## Reading order
 
-- Open: spawn, then handshake. The handshake must start on the event-loop thread, because the child's parent-death signal follows the thread that forked it.
+- Open: fork on the event-loop thread so the child's parent-death signal stays bound to it, then finish the handshake off the loop.
 - Archive: list pages immediately, unpack entries into per-page slots in the background, and serve each page as its slot fills. Per-page failures stay page-local; an aborted pass fills empty slots with its error. A directory is ready immediately.
-- Switch: kill the old child, open the new one off the event loop, and adopt its view when it lands. The book owns the lifecycle; the app keeps the last frame on screen meanwhile.
+- Switch: kill the old child, start a new open, and adopt its view when it lands; the app keeps the last frame on screen meanwhile.
 - Child: foreground loop serving requests and playback directly to the parent IPC channel, paired with a `cy-prefetch` thread that warms the store.
-- Only one update type reaches the UI thread; wire messages stop at the reader thread.
 - A page fault is text; a book fault is the process.
 - The store, prefetch, and retention are in `docs/internal/cache.md`.
 
@@ -25,9 +24,8 @@ The boundary follows ownership. The parent owns the window, UI, GL, the app stat
 - Page identity is the index in the book the child was spawned with; no message carries a path.
 - The app sends the whole request set and uses its texture maps as the authority; the child acknowledges nothing.
 - Pixels cross as a wire image (metadata plus one shared-memory block per plane), avoiding serialization; the parent validates extents and uploads directly to GL.
-- A child that never connects cannot be woken from the wait, so the handshake accepts on its own thread under the same deadline as the first message.
-- Killing the old child at switch start ends switch-time decode concurrency; see the limits in `analysis.md`.
+- A child that never connects cannot be woken from `accept(2)`, so the child connects before opening the source and the parent accepts on its own thread under the open timeout.
 
 ## Limits
 
-The child has the user's full filesystem access. Every image is copied once into shared memory. Child and parent log to the same stderr target, so a line can come from either process. The initial open blocks startup; switches are asynchronous. A page request in an archive waits only until its own entry unpacks or fails; switches and quit stop running unpacks and decodes by killing the child.
+The child has the user's full filesystem access. Every image is copied once into shared memory. Child and parent share stderr. A page request in an archive waits only until its own entry unpacks or fails; switches and quit stop running unpacks and decodes by killing the child.

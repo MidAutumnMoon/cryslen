@@ -3,6 +3,7 @@
 //! Pure: no clocks, IO, or GL.
 
 use std::num::NonZeroUsize;
+use std::ops::Deref;
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -20,6 +21,56 @@ impl PageCount {
 
     pub fn get(self) -> usize {
         self.0.get()
+    }
+}
+
+/// Non-empty page names in reading order.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "Vec<String>")]
+pub struct PageNames {
+    names: Vec<String>,
+    count: PageCount,
+}
+
+impl PageNames {
+    pub fn new(names: Vec<String>) -> Option<Self> {
+        let count = PageCount::new(names.len())?;
+        Some(Self { names, count })
+    }
+
+    pub fn count(&self) -> PageCount {
+        self.count
+    }
+}
+
+impl Deref for PageNames {
+    type Target = [String];
+
+    fn deref(&self) -> &Self::Target {
+        &self.names
+    }
+}
+
+impl<const N: usize> PartialEq<[&str; N]> for PageNames {
+    fn eq(&self, other: &[&str; N]) -> bool {
+        self.names == other
+    }
+}
+
+impl TryFrom<Vec<String>> for PageNames {
+    type Error = &'static str;
+
+    fn try_from(names: Vec<String>) -> Result<Self, Self::Error> {
+        Self::new(names).ok_or("the book has no pages")
+    }
+}
+
+impl Serialize for PageNames {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.names.serialize(serializer)
     }
 }
 
@@ -148,8 +199,8 @@ impl Role {
         self as usize
     }
 
-    /// The role's stable name. The store keeps `thumb` and `view` for
-    /// existing entries; full images bypass the store.
+    /// The role's stable name (`Fit` uses `view` in the store; full images
+    /// bypass the store).
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {

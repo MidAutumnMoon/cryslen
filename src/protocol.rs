@@ -21,6 +21,7 @@ pub use crate::animation::PlaybackEvent;
 pub use crate::animation::PlaybackId;
 pub use crate::browse::Direction;
 pub use crate::browse::Motion;
+pub use crate::browse::PageNames;
 pub use crate::browse::ReadingMode;
 pub use crate::browse::Request;
 pub use crate::browse::Role;
@@ -35,7 +36,7 @@ pub use crate::fault::PageFault;
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[non_exhaustive]
 pub struct BookInfo {
-    pub names: Vec<String>,
+    pub names: PageNames,
     pub archive: bool,
 }
 
@@ -161,8 +162,6 @@ pub enum ParentMsg {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub enum ChildMsg {
-    BookInfo(BookInfo),
-    OpenFailed(String),
     Ready {
         page: usize,
         role: Role,
@@ -175,9 +174,16 @@ pub enum ChildMsg {
     Playback(PlaybackEvent<WireImage>),
 }
 
-/// What the child sends on connect: the receiver for its messages and the
-/// sender for the parent's.
-pub type Hello = (IpcReceiver<ChildMsg>, IpcSender<ParentMsg>);
+/// Initial worker handshake sent on connect.
+#[derive(Debug, Deserialize, Serialize)]
+pub enum Hello {
+    Opened {
+        info: BookInfo,
+        messages: IpcReceiver<ChildMsg>,
+        commands: IpcSender<ParentMsg>,
+    },
+    Failed(String),
+}
 
 #[cfg(test)]
 #[expect(

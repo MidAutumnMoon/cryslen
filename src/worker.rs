@@ -1267,6 +1267,27 @@ pub fn main(args: &[OsString]) -> ExitCode {
         tracing::error!("the ipc server name is not utf-8");
         return ExitCode::FAILURE;
     };
+    // Connect before opening the source so a crash or kill during open
+    // closes the accepted socket instead of holding `accept(2)` until
+    // timeout.
+    let hello = match IpcSender::<Hello>::connect(server_name.to_owned()) {
+        Ok(hello) => hello,
+        Err(error) => {
+            tracing::error!(?error, "could not connect to the parent");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let opened = match Source::open(path) {
+        Ok(source) => source,
+        Err(error) => {
+            tracing::warn!(?error, "book open refused");
+            if hello.send(Hello::Failed(error.to_string())).is_err() {
+                tracing::warn!("the parent left before the open verdict");
+            }
+            return ExitCode::FAILURE;
+        }
+    };
     let (child_tx, child_rx) = match ipc::channel::<ChildMsg>() {
         Ok(channels) => channels,
         Err(error) => {
@@ -1281,37 +1302,19 @@ pub fn main(args: &[OsString]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let hello = match IpcSender::<Hello>::connect(server_name.to_owned()) {
-        Ok(hello) => hello,
-        Err(error) => {
-            tracing::error!(?error, "could not connect to the parent");
-            return ExitCode::FAILURE;
-        }
-    };
-    if hello.send((child_rx, parent_tx)).is_err() {
-        tracing::error!("could not hand the channels to the parent");
-        return ExitCode::FAILURE;
-    }
-
-    let opened = match Source::open(path) {
-        Ok(source) => source,
-        Err(error) => {
-            tracing::warn!(?error, "book open refused");
-            if child_tx
-                .send(ChildMsg::OpenFailed(error.to_string()))
-                .is_err()
-            {
-                tracing::warn!("the parent left before the open verdict");
-            }
-            return ExitCode::FAILURE;
-        }
-    };
     let info = BookInfo {
-        names: opened.names().to_vec(),
+        names: opened.names().clone(),
         archive: opened.is_archive(),
     };
-    if child_tx.send(ChildMsg::BookInfo(info)).is_err() {
-        tracing::warn!("the parent left before the book info");
+    if hello
+        .send(Hello::Opened {
+            info,
+            messages: child_rx,
+            commands: parent_tx,
+        })
+        .is_err()
+    {
+        tracing::warn!("the parent left before the handshake");
         return ExitCode::FAILURE;
     }
 

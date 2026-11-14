@@ -12,7 +12,7 @@ Animated pages store only frame 0; later frames are not persisted.
 
 ## Store
 
-`$TMPDIR/cryslen-cache/{thumb,view}/<xxh3-128 of the encoded page bytes>`. Content addressing gives free invalidation and shares pages across books. Every child opens the same tree, so switches keep its entries. The `view` namespace stores the fit role; the name is kept for existing entries.
+`$TMPDIR/cryslen-cache/{thumb,view}/<xxh3-128 of the encoded page bytes>`. Content addressing gives free invalidation and shares pages across books. Every child opens the same tree, so switches keep its entries. The `view` namespace stores the fit role.
 
 Entries are little-endian, versioned, and carry the target edge in the header. A changed edge is a miss that re-derives, as is a corrupt file. Writes are atomic (per-write unique temp file, then rename); a writer holds an exclusive lock on its temp until the rename, so opening the store sweeps temps no live writer holds.
 
@@ -30,7 +30,7 @@ Two lanes per book share a synchronized hash, store-resident, and failure ledger
 
 ## Presentation
 
-A spread is presentable when every seat has a page fact plus a resident texture, or the page failed. Draw the target spread when presentable; otherwise the nearest presentable start between shown and target; otherwise the shown spread. Seats use page dimensions, so pairing survives promotion.
+A spread is presentable when every seat failed, or has a page fact plus a resident texture (settled while still, any role while skimming). Draw the target spread when presentable; otherwise the nearest presentable start between shown and target; otherwise the shown spread. Seats use page dimensions, so pairing survives promotion.
 
 Each frame requests the missing roles for the on-screen spread (the shown spread, or the target while nothing is presentable) and a demand spread: the target spread while still, the next spread in the travel direction while skimming. Still frames request fit images when nothing settled is resident, plus full for an upscaled on-screen page; skims request thumbs when no role is resident.
 
@@ -42,4 +42,4 @@ Retention is derived from the frame: every request, plus role-bounded extras (th
 
 A miss without a resident fit image to derive a thumb from costs a decode; decoders return the page at its encoded size. A cold page costs its decode before showing.
 
-Slow frames, slow uploads, and long waits for a view log at info; everything else needs `RUST_LOG=debug`.
+Slow frames, slow uploads, and long waits for a fit image log at info; everything else needs `RUST_LOG=debug`.

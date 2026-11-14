@@ -21,6 +21,7 @@ use parking_lot::Condvar;
 use parking_lot::Mutex;
 
 use crate::browse::PageCount;
+use crate::browse::PageNames;
 use crate::catalog;
 use crate::catalog::ArchiveKind;
 use crate::decode;
@@ -91,8 +92,7 @@ enum Backend {
 
 #[derive(Debug)]
 pub struct Source {
-    names: Vec<String>,
-    count: PageCount,
+    names: PageNames,
     backend: Backend,
 }
 
@@ -152,7 +152,7 @@ impl Source {
             }
         }
         let (source, slots) = Self::archive_from_listing(listed)?;
-        spawn_zip_materialize(zip, source.names.clone(), &slots);
+        spawn_zip_materialize(zip, source.names.to_vec(), &slots);
         Ok(source)
     }
 
@@ -194,22 +194,18 @@ impl Source {
         backend: Backend,
         names: Vec<String>,
     ) -> Result<Self, OpenError> {
-        let Some(count) = PageCount::new(names.len()) else {
+        let Some(names) = PageNames::new(names) else {
             return Err(ErrorUnion::new(OpenRefusal::Empty));
         };
-        Ok(Self {
-            names,
-            count,
-            backend,
-        })
+        Ok(Self { names, backend })
     }
 
     pub fn len(&self) -> PageCount {
-        self.count
+        self.names.count()
     }
 
     /// Every page's entry name, in reading order.
-    pub fn names(&self) -> &[String] {
+    pub fn names(&self) -> &PageNames {
         &self.names
     }
 
@@ -699,7 +695,10 @@ mod tests {
 
         assert_eq!(slots.get(0).expect("slot 0 ready").as_ref(), b"first");
         release_tx.send(()).expect("release slot 1");
-        assert_eq!(slots.get(1).expect("slot 1 ready").as_ref(), b"second");
+        assert_eq!(
+            slots.get(1).expect("slot 1 ready").as_ref(),
+            b"second"
+        );
     }
 
     #[test]

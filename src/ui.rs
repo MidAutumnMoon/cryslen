@@ -22,15 +22,19 @@ use crate::decode::Format;
 use crate::fault::BookFault;
 use crate::fault::PageFault;
 
-pub struct StatusLine<'fault> {
+pub struct ReadingStatus {
     pub page_count: usize,
     pub spread: Spread,
-    pub mode: ReadingMode,
-    pub toast: bool,
-    pub name: PageName,
     pub page: Option<PageStatus>,
     /// Placement scale, screen px per image px.
     pub zoom: f32,
+}
+
+pub struct StatusLine<'fault> {
+    pub reading: Option<ReadingStatus>,
+    pub mode: ReadingMode,
+    pub toast: bool,
+    pub name: PageName,
     /// Whether to show `loading…`.
     pub waiting: bool,
     pub fault: Option<StatusFault<'fault>>,
@@ -197,10 +201,16 @@ pub fn show(
         });
     }
     let content = ui.available_rect_before_wrap();
-    let response =
-        ui.interact(content, ui.scope_id().with("page"), Sense::DRAG);
+    let interactive = status.reading.is_some();
+    let sense = if interactive {
+        Sense::DRAG
+    } else {
+        Sense::hover()
+    };
+    let response = ui.interact(content, ui.scope_id().with("page"), sense);
     // Set after the bar so a drag over it keeps the move icon.
-    if response.is_pointer_button_down_on()
+    if interactive
+        && response.is_pointer_button_down_on()
         && ui.ctx().input(|i| i.pointer.primary_down())
     {
         ui.ctx().set_cursor_icon(CursorIcon::Move);
@@ -356,31 +366,41 @@ fn line(style: &Style, status: &StatusLine<'_>) -> LayoutJob {
     };
     let mut job = LayoutJob::default();
 
-    let head = status.spread.second.map_or_else(
-        || format!("{}", status.spread.first + 1),
-        |second| format!("{}-{}", status.spread.first + 1, second + 1),
-    );
-    section(&mut job, &head, HEAD_COLOR);
-    section(&mut job, &format!("/{}", status.page_count), plain);
+    if let Some(reading) = &status.reading {
+        let head = reading.spread.second.map_or_else(
+            || format!("{}", reading.spread.first + 1),
+            |second| {
+                format!("{}-{}", reading.spread.first + 1, second + 1)
+            },
+        );
+        section(&mut job, &head, HEAD_COLOR);
+        section(&mut job, &format!("/{}", reading.page_count), plain);
+        section(&mut job, " · ", plain);
+    }
 
-    section(&mut job, " · ", plain);
     if let Some(parent_dir) = &status.name.parent_dir {
         section(&mut job, parent_dir, plain);
         section(&mut job, "/", plain);
     }
     section(&mut job, &status.name.file, NAME_COLOR);
 
-    if let Some(facts) = &status.page {
-        section(&mut job, " · ", plain);
-        let (width, height) = facts.info.dims;
-        let dims_text = if facts.claimed == Some(facts.info.format) {
-            format!("{width}x{height}")
-        } else {
-            format!("{} {width}x{height}", facts.info.format.label())
-        };
-        section(&mut job, &dims_text, plain);
+    if let Some(reading) = &status.reading {
+        if let Some(facts) = &reading.page {
+            section(&mut job, " · ", plain);
+            let (width, height) = facts.info.dims;
+            let dims_text = if facts.claimed == Some(facts.info.format) {
+                format!("{width}x{height}")
+            } else {
+                format!("{} {width}x{height}", facts.info.format.label())
+            };
+            section(&mut job, &dims_text, plain);
+        }
+        section(
+            &mut job,
+            &format!(" · {:.0}%", reading.zoom * 100.0),
+            plain,
+        );
     }
-    section(&mut job, &format!(" · {:.0}%", status.zoom * 100.0), plain);
     if status.waiting {
         section(&mut job, " · loading…", plain);
     }
@@ -464,27 +484,29 @@ mod tests {
 
     fn status() -> StatusLine<'static> {
         StatusLine {
-            page_count: 214,
-            spread: Spread {
-                first: 11,
-                second: Some(12),
-            },
+            reading: Some(ReadingStatus {
+                page_count: 214,
+                spread: Spread {
+                    first: 11,
+                    second: Some(12),
+                },
+                // The name claims png and the page decodes as jxl, so the
+                // format label prefixes the dims.
+                page: Some(PageStatus {
+                    info: PageInfo {
+                        dims: (6000, 4000),
+                        format: Format::Jxl,
+                    },
+                    claimed: Some(Format::Png),
+                }),
+                zoom: 0.866,
+            }),
             mode: ReadingMode::Manga,
             toast: false,
             name: PageName {
                 parent_dir: Some("b".into()),
                 file: "010.png".into(),
             },
-            // The name claims png and the page decodes as jxl, so the
-            // format label prefixes the dims.
-            page: Some(PageStatus {
-                info: PageInfo {
-                    dims: (6000, 4000),
-                    format: Format::Jxl,
-                },
-                claimed: Some(Format::Png),
-            }),
-            zoom: 0.866,
             waiting: false,
             fault: None,
         }

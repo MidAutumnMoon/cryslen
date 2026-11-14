@@ -136,22 +136,11 @@ fn write_page(dir: &Path) {
         .expect("write the test page");
 }
 
-#[test]
-fn child_serves_a_decoded_thumb() {
-    const FIT_EDGE: u32 = 2560;
-    const MAX_TEXTURE_EDGE: u32 = 8192;
-
-    let binary = env!("CARGO_BIN_EXE_cy");
-
-    // `root` outlives the child guard below, so the child is dead before
-    // its scratch dirs go away.
-    let root = TempRoot::new();
-    let book = root.path().join("book");
-    let store = root.path().join("store");
-    fs::create_dir_all(&book).expect("create the book directory");
-    fs::create_dir_all(&store).expect("create the child's tmpdir");
-    write_page(&book);
-
+fn accept_hello(
+    binary: &str,
+    book: &Path,
+    store: &Path,
+) -> (ChildGuard, Hello) {
     let (server, name) = IpcOneShotServer::<Hello>::new()
         .expect("start a one-shot ipc server");
 
@@ -160,8 +149,8 @@ fn child_serves_a_decoded_thumb() {
     let child = Command::new(binary)
         .arg("--worker")
         .arg(&name)
-        .arg(&book)
-        .env("TMPDIR", &store)
+        .arg(book)
+        .env("TMPDIR", store)
         .env("RUST_LOG", "off")
         .stdin(Stdio::null())
         .spawn()
@@ -170,8 +159,8 @@ fn child_serves_a_decoded_thumb() {
         });
     let mut guard = ChildGuard::new(child);
 
-    // `accept` blocks until a client connects, so it runs beside a wait
-    // that notices a child that died before the handshake.
+    // `accept` blocks until a client connects and sends its hello, so it
+    // runs beside a wait that notices a child that died early.
     let (accepted_tx, accepted_rx) = mpsc::channel();
     let accept_thread = thread::spawn(move || {
         let _sent = accepted_tx.send(server.accept());
@@ -204,12 +193,33 @@ fn child_serves_a_decoded_thumb() {
         .join()
         .expect("the accept thread finished before the handshake");
 
-    let (messages, commands) = hello;
+    (guard, hello)
+}
 
-    let info = match messages.try_recv_timeout(STEP_TIMEOUT) {
-        Ok(ChildMsg::BookInfo(info)) => info,
-        Ok(message) => panic!("expected BookInfo first, got {message:?}"),
-        Err(error) => panic!("no BookInfo from the child: {error}"),
+#[test]
+fn child_serves_a_decoded_thumb() {
+    const FIT_EDGE: u32 = 2560;
+    const MAX_TEXTURE_EDGE: u32 = 8192;
+
+    let binary = env!("CARGO_BIN_EXE_cy");
+
+    // `root` outlives the child guard below, so the child is dead before
+    // its scratch dirs go away.
+    let root = TempRoot::new();
+    let book = root.path().join("book");
+    let store = root.path().join("store");
+    fs::create_dir_all(&book).expect("create the book directory");
+    fs::create_dir_all(&store).expect("create the child's tmpdir");
+    write_page(&book);
+
+    let (_guard, hello) = accept_hello(binary, &book, &store);
+    let Hello::Opened {
+        info,
+        messages,
+        commands,
+    } = hello
+    else {
+        panic!("expected Hello::Opened for a valid book, got {hello:?}");
     };
     assert_eq!(
         info.names.len(),
@@ -277,4 +287,19 @@ fn child_serves_a_decoded_thumb() {
         expected,
         "the thumb holds the page's color",
     );
+}
+
+#[test]
+fn child_reports_open_failure_in_hello() {
+    let binary = env!("CARGO_BIN_EXE_cy");
+    let root = TempRoot::new();
+    let missing = root.path().join("missing-book");
+    let store = root.path().join("store");
+    fs::create_dir_all(&store).expect("create the child's tmpdir");
+
+    let (_guard, hello) = accept_hello(binary, &missing, &store);
+    let Hello::Failed(detail) = hello else {
+        panic!("expected Hello::Failed for missing path, got {hello:?}");
+    };
+    assert_ne!(detail, "");
 }
