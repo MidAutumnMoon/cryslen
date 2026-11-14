@@ -85,11 +85,7 @@ impl Decoded {
         transfer: Transfer,
         bytes: Box<[u8]>,
     ) -> Result<Self, DecodeRefusal> {
-        check_dims(width, height)?;
-        let want = checked_extent(width, height, 4)?;
-        if bytes.len() != want {
-            return Err(DecodeRefusal::Corrupt("rgba extent"));
-        }
+        validate_rgba_extent(width, height, bytes.len())?;
         Ok(Self {
             width,
             height,
@@ -107,21 +103,26 @@ impl Decoded {
         transfer: Transfer,
         yuv: YuvImage,
     ) -> Result<Self, DecodeRefusal> {
-        check_dims(width, height)?;
-        let (_, (chroma_width, chroma_height)) =
-            plane_dims((width, height), yuv.subsampling);
-        if yuv.luma.sample_count() != width as usize * height as usize
-            || yuv.alpha.as_ref().is_some_and(|alpha| {
-                alpha.sample_count() != width as usize * height as usize
-            })
+        let wide = yuv.depth > BYTE_DEPTH;
+        let matches_depth =
+            |plane: &Plane| matches!(plane, Plane::U16(_)) == wide;
+        if !matches_depth(&yuv.luma)
+            || yuv
+                .alpha
+                .as_ref()
+                .is_some_and(|alpha| !matches_depth(alpha))
             || (yuv.subsampling != Subsampling::Mono
-                && (yuv.cb.sample_count()
-                    != chroma_width as usize * chroma_height as usize
-                    || yuv.cr.sample_count()
-                        != chroma_width as usize * chroma_height as usize))
+                && (!matches_depth(&yuv.cb) || !matches_depth(&yuv.cr)))
         {
-            return Err(DecodeRefusal::Corrupt("yuv plane extent"));
+            return Err(DecodeRefusal::Corrupt("yuv plane depth"));
         }
+        validate_yuv_extents(
+            (width, height),
+            yuv.depth,
+            yuv.subsampling,
+            [yuv.luma.byte_len(), yuv.cb.byte_len(), yuv.cr.byte_len()],
+            yuv.alpha.as_ref().map(Plane::byte_len),
+        )?;
         Ok(Self {
             width,
             height,
@@ -145,24 +146,72 @@ impl Decoded {
     }
 }
 
-fn checked_pixels(
+/// 8-bit storage; deeper planes store one `u16` per sample.
+pub const BYTE_DEPTH: u8 = 8;
+
+const MAX_SAMPLE_DEPTH: u8 = 16;
+
+/// Confirms non-empty `(width, height)` fits `MAX_PIXELS` and
+/// `DECODE_EDGE_LIMIT`, returning pixel count.
+pub fn admit_dims(
     width: u32,
     height: u32,
-    what: &'static str,
+    bad_dims_reason: &'static str,
 ) -> Result<u32, DecodeRefusal> {
-    width
+    let pixels = width
         .checked_mul(height)
         .filter(|&count| (1..=MAX_PIXELS).contains(&count))
-        .ok_or(DecodeRefusal::Corrupt(what))
+        .ok_or(DecodeRefusal::Corrupt(bad_dims_reason))?;
+    if width > DECODE_EDGE_LIMIT || height > DECODE_EDGE_LIMIT {
+        return Err(DecodeRefusal::Unsupported(
+            "page edge over the GPU texture limit",
+        ));
+    }
+    Ok(pixels)
 }
 
-fn checked_extent(
+pub fn validate_rgba_extent(
     width: u32,
     height: u32,
-    bytes_per_pixel: usize,
-) -> Result<usize, DecodeRefusal> {
-    Ok(checked_pixels(width, height, "bad dimensions")? as usize
-        * bytes_per_pixel)
+    bytes: usize,
+) -> Result<(), DecodeRefusal> {
+    let pixels = admit_dims(width, height, "bad dimensions")?;
+    if bytes != pixels as usize * 4 {
+        return Err(DecodeRefusal::Corrupt("rgba extent"));
+    }
+    Ok(())
+}
+
+pub fn validate_yuv_extents(
+    dims: (u32, u32),
+    depth: u8,
+    subsampling: Subsampling,
+    [luma_bytes, chroma_blue_bytes, chroma_red_bytes]: [usize; 3],
+    alpha_bytes: Option<usize>,
+) -> Result<(), DecodeRefusal> {
+    let (width, height) = dims;
+    let luma_pixels = admit_dims(width, height, "bad dimensions")?;
+    let bytes_per_sample = match depth {
+        1..=BYTE_DEPTH => 1,
+        9..=MAX_SAMPLE_DEPTH => size_of::<u16>(),
+        _ => return Err(DecodeRefusal::Corrupt("yuv depth")),
+    };
+    let expected_luma_bytes = luma_pixels as usize * bytes_per_sample;
+    let (_, (chroma_width, chroma_height)) =
+        plane_dims((width, height), subsampling);
+    let expected_chroma_bytes =
+        admit_dims(chroma_width, chroma_height, "bad dimensions")?
+            as usize
+            * bytes_per_sample;
+    if luma_bytes != expected_luma_bytes
+        || alpha_bytes.is_some_and(|len| len != expected_luma_bytes)
+        || (subsampling != Subsampling::Mono
+            && (chroma_blue_bytes != expected_chroma_bytes
+                || chroma_red_bytes != expected_chroma_bytes))
+    {
+        return Err(DecodeRefusal::Corrupt("yuv plane extent"));
+    }
+    Ok(())
 }
 
 /// The image crate's 512 MiB allocation ceiling, as RGBA pixels.
@@ -175,15 +224,6 @@ const MAX_PIXELS: u32 = (512 << 20) / 4;
 /// Admission cap on a page edge; the renderer still checks the GPU's
 /// `MAX_TEXTURE_SIZE` at upload.
 const DECODE_EDGE_LIMIT: u32 = 0x4000;
-
-fn check_dims(width: u32, height: u32) -> Result<(), DecodeRefusal> {
-    if width > DECODE_EDGE_LIMIT || height > DECODE_EDGE_LIMIT {
-        return Err(DecodeRefusal::Unsupported(
-            "page edge over the GPU texture limit",
-        ));
-    }
-    Ok(())
-}
 
 #[derive(Clone)]
 pub enum Pixels {
@@ -344,84 +384,79 @@ impl DisplayTransform {
         mirror_axis: None,
     };
 
-    pub fn is_upright(self) -> bool {
-        self == Self::UPRIGHT
-    }
-
     pub fn swaps_dims(self) -> bool {
         self.quarters % 2 == 1
     }
+
+    #[must_use]
+    pub fn out_dims(self, (width, height): (u32, u32)) -> (u32, u32) {
+        if self.swaps_dims() {
+            (height, width)
+        } else {
+            (width, height)
+        }
+    }
 }
 
-/// Apply `transform` to one plane, returning the plane and its new dims.
-/// Empty planes (mono's chroma stubs) pass through untouched.
-fn transform_plane(
+/// Transforms one row-major plane; empty stub planes stay empty.
+pub fn transform_plane(
     plane: Plane,
     dims: (u32, u32),
     transform: DisplayTransform,
-) -> (Plane, (u32, u32)) {
-    if transform.is_upright() {
-        return (plane, dims);
+) -> Plane {
+    if transform == DisplayTransform::UPRIGHT {
+        return plane;
     }
     match plane {
-        Plane::U8(bytes) => {
-            let (samples, dims) =
-                transform_samples(bytes, dims, transform);
-            (Plane::U8(samples), dims)
+        Plane::U8(samples) if samples.is_empty() => Plane::U8(samples),
+        Plane::U16(samples) if samples.is_empty() => Plane::U16(samples),
+        Plane::U8(samples) => {
+            Plane::U8(transform_samples(&samples, dims, transform))
         }
-        Plane::U16(words) => {
-            let (samples, dims) =
-                transform_samples(words, dims, transform);
-            (Plane::U16(samples), dims)
+        Plane::U16(samples) => {
+            Plane::U16(transform_samples(&samples, dims, transform))
         }
     }
 }
 
-/// Mirror-then-rotate resampling by sample index. Mirroring runs first,
-/// matching the property order HEIF writers use.
+/// Mirroring runs before rotation, matching the property order HEIF writers use.
 fn transform_samples<T>(
-    samples: Box<[T]>,
+    samples: &[T],
     (width, height): (u32, u32),
     transform: DisplayTransform,
-) -> (Box<[T]>, (u32, u32))
+) -> Box<[T]>
 where
     T: Copy,
 {
-    if samples.is_empty() {
-        return (samples, (width, height));
-    }
-    let (out_width, out_height) = if transform.swaps_dims() {
-        (height, width)
-    } else {
-        (width, height)
-    };
+    let (out_width, out_height) = transform.out_dims((width, height));
     let (width, height) = (width as usize, height as usize);
-    let source_index = |x: usize, y: usize| {
-        let (mut sx, mut sy) = match transform.quarters {
-            1 => (width - 1 - y, x),
-            2 => (width - 1 - x, height - 1 - y),
-            3 => (y, height - 1 - x),
-            _ => (x, y),
-        };
-        match transform.mirror_axis {
-            Some(1) => sx = width - 1 - sx,
-            Some(_) => sy = height - 1 - sy,
-            None => {}
-        }
-        sy * width + sx
-    };
+    debug_assert_eq!(
+        samples.len(),
+        width * height,
+        "plane sample count must match dimensions"
+    );
     let mut out = Vec::with_capacity(samples.len());
-    for y in 0..out_height as usize {
-        for x in 0..out_width as usize {
-            let index = source_index(x, y);
+    for out_y in 0..out_height as usize {
+        for out_x in 0..out_width as usize {
+            let (mut source_x, mut source_y) = match transform.quarters {
+                1 => (width - 1 - out_y, out_x),
+                2 => (width - 1 - out_x, height - 1 - out_y),
+                3 => (out_y, height - 1 - out_x),
+                _ => (out_x, out_y),
+            };
+            match transform.mirror_axis {
+                Some(1) => source_x = width - 1 - source_x,
+                Some(_) => source_y = height - 1 - source_y,
+                None => {}
+            }
             #[expect(
                 clippy::indexing_slicing,
-                reason = "out dims keep the sample count, so the mapped index stays in range"
+                reason = "source coordinates stay within (width, height)"
             )]
-            out.push(samples[index]);
+            out.push(samples[source_y * width + source_x]);
         }
     }
-    (out.into_boxed_slice(), (out_width, out_height))
+    out.into_boxed_slice()
 }
 
 /// Decode one page's first raster. `name` is the page filename, used as
@@ -496,7 +531,7 @@ impl Frames {
         }
         let decoder = GifDecoder::new(Cursor::new(bytes)).union()?;
         let (width, height) = decoder.dimensions();
-        check_dims(width, height).union()?;
+        admit_dims(width, height, "bad dimensions").union()?;
         Ok(Self {
             inner: decoder.into_frames(),
             format,
@@ -861,12 +896,12 @@ mod tests {
             want_dims: (u32, u32),
             want_samples: &[u8],
         ) {
+            assert_eq!(transform.out_dims(dims), want_dims);
             let plane = Plane::U8(samples.to_vec().into_boxed_slice());
-            let (plane, dims) = transform_plane(plane, dims, transform);
-            assert_eq!(
-                (dims, plane_bytes(&plane)),
-                (want_dims, want_samples)
-            );
+            assert!(matches!(
+                transform_plane(plane, dims, transform),
+                Plane::U8(got) if *got == *want_samples
+            ));
         }
         // A 2x1 plane [A B]: 90° CCW stands B above A.
         let quarters = |quarters: u8| DisplayTransform {
@@ -894,11 +929,10 @@ mod tests {
             mirror_axis: Some(1),
         };
         check(b"ABCD", (2, 2), mirrored_then_turned, (2, 2), b"ACBD");
-        // Empty planes (mono chroma stubs) pass through.
-        let (empty, dims) =
-            transform_plane(Plane::U8(Box::new([])), (0, 0), quarters(1));
-        assert!(matches!(empty, Plane::U8(bytes) if bytes.is_empty()));
-        assert_eq!(dims, (0, 0));
+        assert!(matches!(
+            transform_plane(Plane::U8(Box::new([])), (1, 1), quarters(1)),
+            Plane::U8(got) if got.is_empty()
+        ));
     }
 
     // 32x16 10-bit 4:0:0 fixture, a black-to-white grayscale gradient.

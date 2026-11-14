@@ -14,8 +14,6 @@ use serde::Serialize;
 use crate::decode;
 use crate::decode::Decoded;
 use crate::decode::Pixels;
-use crate::decode::Plane;
-use crate::decode::YuvImage;
 use crate::fault::DecodeRefusal;
 
 pub use crate::animation::PlaybackCommand;
@@ -95,66 +93,56 @@ impl WireImage {
         }
     }
 
-    pub fn to_decoded(&self) -> Result<Decoded, DecodeRefusal> {
-        let decoded = match &self.pixels {
-            WirePixels::Rgba8(bytes) => Decoded::rgba(
+    /// Checks that the pixel buffers match the declared extents, bit
+    /// depth, and admission bounds.
+    pub fn validate(&self) -> Result<(), DecodeRefusal> {
+        match &self.pixels {
+            WirePixels::Rgba8(bytes) => decode::validate_rgba_extent(
                 self.width,
                 self.height,
-                self.format,
-                self.transfer,
-                bytes.to_vec().into_boxed_slice(),
-            )?,
+                bytes.len(),
+            ),
             WirePixels::Yuv {
                 depth,
                 subsampling,
-                full_range,
-                matrix,
                 luma,
                 cb,
                 cr,
                 alpha,
-            } => Decoded::yuv(
-                self.width,
-                self.height,
-                self.format,
-                self.transfer,
-                YuvImage {
-                    depth: *depth,
-                    subsampling: *subsampling,
-                    full_range: *full_range,
-                    matrix: *matrix,
-                    luma: plane_from_shared(luma, *depth),
-                    cb: plane_from_shared(cb, *depth),
-                    cr: plane_from_shared(cr, *depth),
-                    alpha: alpha
-                        .as_ref()
-                        .map(|plane| plane_from_shared(plane, *depth)),
-                },
-            )?,
-        };
-        Ok(decoded.with_page_dims(self.page_dims))
+                ..
+            } => decode::validate_yuv_extents(
+                (self.width, self.height),
+                *depth,
+                *subsampling,
+                [luma.len(), cb.len(), cr.len()],
+                alpha.as_ref().map(|plane| plane.len()),
+            ),
+        }
+    }
+
+    /// Bytes held across all shared-memory pixel planes.
+    #[must_use]
+    pub fn resident_bytes(&self) -> usize {
+        match &self.pixels {
+            WirePixels::Rgba8(bytes) => bytes.len(),
+            WirePixels::Yuv {
+                luma,
+                cb,
+                cr,
+                alpha,
+                ..
+            } => {
+                luma.len()
+                    + cb.len()
+                    + cr.len()
+                    + alpha.as_ref().map_or(0, |plane| plane.len())
+            }
+        }
     }
 }
 
-fn shared_plane(plane: &Plane) -> IpcSharedMemory {
+fn shared_plane(plane: &decode::Plane) -> IpcSharedMemory {
     IpcSharedMemory::from_bytes(decode::plane_bytes(plane))
-}
-
-/// Deeper planes travel as native-endian byte pairs, matching
-/// [`decode::plane_bytes`].
-fn plane_from_shared(shared: &IpcSharedMemory, depth: u8) -> Plane {
-    if depth > 8 {
-        // The cast is the fast path; the fallback keeps an unaligned
-        // block from panicking.
-        let bytes = shared;
-        let words = bytemuck::try_cast_slice(bytes).map_or_else(
-            |_| bytemuck::pod_collect_to_vec(bytes),
-            <[u16]>::to_vec,
-        );
-        Plane::U16(words.into_boxed_slice())
-    } else {
-        Plane::U8(shared.to_vec().into_boxed_slice())
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -234,32 +222,53 @@ mod tests {
             pixels.to_vec(),
             "the wire keeps the pixels",
         );
+        assert_eq!(wire.resident_bytes(), pixels.len());
+        wire.validate().expect("valid rgba wire image validates");
 
-        let back = wire.to_decoded().expect("the wire image decodes");
-        assert_eq!(
-            (back.width(), back.height()),
-            (3, 2),
-            "the pixels decode back at the same extents",
-        );
-        assert_eq!(
-            back.page_dims(),
-            (3, 2),
-            "the page dimensions survive the trip",
-        );
-        assert_eq!(
-            back.format(),
-            Format::Png,
-            "the format survives the trip",
-        );
-        match back.pixels() {
-            Pixels::Rgba8(back_bytes) => {
-                assert_eq!(
-                    back_bytes.to_vec(),
-                    pixels.to_vec(),
-                    "the pixels survive the trip",
-                );
-            }
-            Pixels::Yuv(_) => panic!("an rgba page decodes as rgba"),
+        let mut truncated = wire;
+        truncated.width = 4;
+        assert!(matches!(
+            truncated.validate(),
+            Err(DecodeRefusal::Corrupt("rgba extent"))
+        ));
+    }
+
+    #[test]
+    fn yuv_wire_validation_checks_depth_and_plane_extents() {
+        use crate::decode::Plane;
+        use crate::decode::YuvImage;
+
+        let yuv = YuvImage {
+            depth: 10,
+            subsampling: Subsampling::Yuv420,
+            full_range: false,
+            matrix: Matrix::Bt709,
+            luma: Plane::U16(vec![512_u16; 4 * 2].into_boxed_slice()),
+            cb: Plane::U16(vec![512_u16; 2].into_boxed_slice()),
+            cr: Plane::U16(vec![512_u16; 2].into_boxed_slice()),
+            alpha: None,
+        };
+        let decoded =
+            Decoded::yuv(4, 2, Format::Avif, Transfer::Srgb, yuv)
+                .expect("valid yuv page");
+        let wire = WireImage::from_decoded(&decoded);
+        assert_eq!(wire.resident_bytes(), (8 + 2 + 2) * 2);
+        wire.validate().expect("valid yuv wire image validates");
+
+        let mut bad_depth = wire.clone();
+        if let WirePixels::Yuv { depth, .. } = &mut bad_depth.pixels {
+            *depth = 0;
         }
+        assert!(matches!(
+            bad_depth.validate(),
+            Err(DecodeRefusal::Corrupt("yuv depth"))
+        ));
+
+        let mut bad_dims = wire;
+        bad_dims.width = 6;
+        assert!(matches!(
+            bad_dims.validate(),
+            Err(DecodeRefusal::Corrupt("yuv plane extent"))
+        ));
     }
 }

@@ -71,9 +71,7 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
             )))
         }
     };
-    super::checked_pixels(width, height, "avif: bad dimensions")
-        .union()?;
-    super::check_dims(width, height).union()?;
+    super::admit_dims(width, height, "avif: bad dimensions").union()?;
     let subsampling = match frame.yuvFormat {
         AVIF_PIXEL_FORMAT_YUV444 => Subsampling::Yuv444,
         AVIF_PIXEL_FORMAT_YUV422 => Subsampling::Yuv422,
@@ -132,7 +130,7 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
             frame.yuvRowBytes[0],
             width,
             height,
-            u32::from(depth),
+            depth,
         )
     }?;
     let (cb_plane, cr_plane) = if subsampling == Subsampling::Mono {
@@ -146,7 +144,7 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
                     frame.yuvRowBytes[1],
                     chroma_width,
                     chroma_height,
-                    u32::from(depth),
+                    depth,
                 )
             }?,
             // SAFETY: same contract as the luma plane.
@@ -156,7 +154,7 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
                     frame.yuvRowBytes[2],
                     chroma_width,
                     chroma_height,
-                    u32::from(depth),
+                    depth,
                 )
             }?,
         )
@@ -170,34 +168,28 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
                     frame.alphaRowBytes,
                     width,
                     height,
-                    u32::from(depth),
+                    depth,
                 )
             })
             .transpose()?
     };
 
-    // The display transform applies to every plane alike; chroma
-    // dimensions rotate coherently with the luma grid.
-    let (luma_plane, _) =
+    let luma_plane =
         super::transform_plane(luma_plane, (width, height), transform);
-    let (cb_plane, _) = super::transform_plane(
+    let cb_plane = super::transform_plane(
         cb_plane,
         (chroma_width, chroma_height),
         transform,
     );
-    let (cr_plane, _) = super::transform_plane(
+    let cr_plane = super::transform_plane(
         cr_plane,
         (chroma_width, chroma_height),
         transform,
     );
-    let alpha_plane = alpha_plane.map(|alpha| {
-        super::transform_plane(alpha, (width, height), transform).0
+    let alpha_plane = alpha_plane.map(|plane| {
+        super::transform_plane(plane, (width, height), transform)
     });
-    let (width, height) = if transform.swaps_dims() {
-        (height, width)
-    } else {
-        (width, height)
-    };
+    let (width, height) = transform.out_dims((width, height));
 
     Decoded::yuv(
         width,
@@ -264,69 +256,93 @@ unsafe fn check(
     })
 }
 
-/// Copies one plane row by row. libavif pads rows to `stride`.
-///
 /// # Safety
 ///
-/// `plane_ptr` must be a live plane's pointer paired with `row_stride`
-/// as that plane's stride, holding `height` rows of samples.
+/// When non-null, `plane_ptr` must hold `height` live rows spaced by
+/// `row_stride` bytes.
 unsafe fn copy_plane(
     plane_ptr: *const u8,
     row_stride: u32,
     width: u32,
     height: u32,
-    depth: u32,
+    depth: u8,
 ) -> Result<Plane, DecodeError> {
-    use std::slice;
-
     if plane_ptr.is_null() {
         return Err(ErrorUnion::new(DecodeRefusal::Corrupt(
             "avif: missing plane",
         )));
     }
-    let (width, height) = (width as usize, height as usize);
+    let width = width as usize;
+    let height = height as usize;
     let row_stride = row_stride as usize;
-    if depth == 8 {
-        if row_stride < width {
-            return Err(ErrorUnion::new(DecodeRefusal::Corrupt(
-                "avif: bad stride",
-            )));
-        }
-        let mut out = Vec::with_capacity(width * height);
-        for row in 0..height {
-            let src = slice::from_raw_parts(
-                plane_ptr.add(row * row_stride),
-                width,
+    let wide = depth > super::BYTE_DEPTH;
+    let sample_bytes = if wide { size_of::<u16>() } else { 1 };
+    let row_bytes = width * sample_bytes;
+    if row_stride < row_bytes {
+        return Err(ErrorUnion::new(DecodeRefusal::Corrupt(
+            "avif: bad stride",
+        )));
+    }
+    if width == 0 || height == 0 {
+        return Ok(if wide {
+            Plane::U16(Box::new([]))
+        } else {
+            Plane::U8(Box::new([]))
+        });
+    }
+    if wide {
+        let mut out = vec![0_u16; width * height];
+        // SAFETY: `plane_ptr` holds `height` live rows at `row_stride >= row_bytes`.
+        unsafe {
+            copy_strided_bytes(
+                plane_ptr,
+                row_stride,
+                row_bytes,
+                height,
+                bytemuck::cast_slice_mut(&mut out),
             );
-            out.extend_from_slice(src);
+        }
+        Ok(Plane::U16(out.into_boxed_slice()))
+    } else {
+        let mut out = vec![0_u8; width * height];
+        // SAFETY: `plane_ptr` holds `height` live rows at `row_stride >= row_bytes`.
+        unsafe {
+            copy_strided_bytes(
+                plane_ptr, row_stride, row_bytes, height, &mut out,
+            );
         }
         Ok(Plane::U8(out.into_boxed_slice()))
-    } else {
-        let bytes = width * 2;
-        if row_stride < bytes {
-            return Err(ErrorUnion::new(DecodeRefusal::Corrupt(
-                "avif: bad stride",
-            )));
-        }
-        let mut raw = Vec::with_capacity(bytes * height);
-        for row in 0..height {
-            let src = slice::from_raw_parts(
-                plane_ptr.add(row * row_stride),
-                bytes,
-            );
-            raw.extend_from_slice(src);
-        }
-        #[expect(
-            clippy::host_endian_bytes,
-            reason = "libavif's u16 plane samples are native-endian C arrays"
-        )]
-        let samples = raw
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|pair| u16::from_ne_bytes(*pair))
-            .collect::<Box<[u16]>>();
-        Ok(Plane::U16(samples))
+    }
+}
+
+/// # Safety
+///
+/// `plane_ptr` must hold `height` live rows at `row_stride`, each at
+/// least `row_bytes` wide, and `target.len() == row_bytes * height`.
+unsafe fn copy_strided_bytes(
+    plane_ptr: *const u8,
+    row_stride: usize,
+    row_bytes: usize,
+    height: usize,
+    target: &mut [u8],
+) {
+    use std::slice;
+
+    if row_stride == row_bytes {
+        // SAFETY: `row_stride == row_bytes` means all rows are contiguous.
+        let source = unsafe {
+            slice::from_raw_parts(plane_ptr, row_bytes * height)
+        };
+        target.copy_from_slice(source);
+        return;
+    }
+    for (row, target_row) in target.chunks_exact_mut(row_bytes).enumerate()
+    {
+        // SAFETY: `row < height`, so the row pointer stays within the allocated plane.
+        let row_ptr = unsafe { plane_ptr.add(row * row_stride) };
+        // SAFETY: each row holds `row_bytes` live sample bytes.
+        let source = unsafe { slice::from_raw_parts(row_ptr, row_bytes) };
+        target_row.copy_from_slice(source);
     }
 }
 
@@ -395,5 +411,41 @@ impl Drop for DecoderGuard<'_> {
         unsafe {
             avifDecoderDestroy(self.ptr);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copy_plane_handles_contiguous_and_padded_strides() {
+        let raw_u8 = [10_u8, 20, 30, 40];
+        // SAFETY: `raw_u8` holds two contiguous 2-byte rows.
+        let contiguous_u8 =
+            unsafe { copy_plane(raw_u8.as_ptr(), 2, 2, 2, 8) };
+        assert!(matches!(
+            contiguous_u8,
+            Ok(Plane::U8(bytes)) if *bytes == [10, 20, 30, 40]
+        ));
+
+        let padded_u8 = [10_u8, 20, 0xff, 0xff, 30, 40];
+        // SAFETY: `padded_u8` holds 2 rows at stride 4 with the last row 2 bytes wide.
+        let strided_u8 =
+            unsafe { copy_plane(padded_u8.as_ptr(), 4, 2, 2, 8) };
+        assert!(matches!(
+            strided_u8,
+            Ok(Plane::U8(bytes)) if *bytes == [10, 20, 30, 40]
+        ));
+
+        let padded_u16 = [100_u16, 200, 0xffff, 300, 400];
+        let raw_u16: &[u8] = bytemuck::cast_slice(&padded_u16);
+        // SAFETY: `raw_u16` holds 2 rows of 4 bytes spaced by stride 6 (10 bytes total).
+        let strided_u16 =
+            unsafe { copy_plane(raw_u16.as_ptr(), 6, 2, 2, 10) };
+        assert!(matches!(
+            strided_u16,
+            Ok(Plane::U16(words)) if *words == [100, 200, 300, 400]
+        ));
     }
 }

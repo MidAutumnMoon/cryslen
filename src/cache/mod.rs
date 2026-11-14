@@ -11,6 +11,7 @@
     reason = "the cache file format is defined little-endian"
 )]
 
+use std::borrow::Cow;
 use std::env;
 use std::ffi::OsStr;
 use std::ffi::OsString;
@@ -20,6 +21,7 @@ use std::fs::File;
 use std::fs::FileTimes;
 use std::fs::TryLockError;
 use std::io;
+use std::io::IoSlice;
 use std::io::Read as _;
 use std::io::Write as _;
 use std::mem::DropGuard;
@@ -86,11 +88,12 @@ pub fn content_hash(bytes: &[u8]) -> u128 {
     xxh3_128(bytes)
 }
 
-/// Downsample to the role's long edge; returns `page` unchanged when it
+/// Downsample to the role's long edge; borrows `page` unchanged when it
 /// already fits or the resample fails.
-pub fn derive(page: &Decoded, role: Role) -> Decoded {
+#[must_use]
+pub fn derive(page: &Decoded, role: Role) -> Cow<'_, Decoded> {
     let Some((edge, filter)) = derivation(role) else {
-        return page.clone();
+        return Cow::Borrowed(page);
     };
     derive_to_edge(page, edge, filter)
 }
@@ -99,22 +102,22 @@ fn derive_to_edge(
     page: &Decoded,
     edge: u32,
     filter: FilterType,
-) -> Decoded {
+) -> Cow<'_, Decoded> {
     let page_dims = page.page_dims();
     let dims = (page.width(), page.height());
     let target = fit_dims(dims, edge);
     if target == dims {
-        return page.clone();
+        return Cow::Borrowed(page);
     }
     match resample_page(page, target, filter) {
-        Ok(derived) => derived.with_page_dims(page_dims),
+        Ok(derived) => Cow::Owned(derived.with_page_dims(page_dims)),
         Err(error) => {
             tracing::warn!(
                 %error,
                 target = ?target,
                 "resample failed; keeping the page"
             );
-            page.clone()
+            Cow::Borrowed(page)
         }
     }
 }
@@ -398,11 +401,10 @@ impl Store {
         let path = namespace.path(hash);
         let temp = namespace.temp_path(hash);
         let started = Instant::now();
-        let encoded = encode(page, role);
-        let size = u64::try_from(encoded.len()).unwrap_or(u64::MAX);
-        if write_atomic(&temp, &path, &encoded).is_err() {
+        let Ok(size) = write_encoded_atomic(&temp, &path, page, role)
+        else {
             return SaveResult::default();
-        }
+        };
         let prev = namespace.total.fetch_add(size, Ordering::Relaxed);
         let over = prev.saturating_add(size) > namespace.cap;
         tracing::debug!(
@@ -664,8 +666,8 @@ fn make_dir(path: &Path) -> Option<()> {
 fn write_atomic(
     temp: &Path,
     final_path: &Path,
-    bytes: &[u8],
-) -> io::Result<()> {
+    mut slices: &mut [IoSlice<'_>],
+) -> io::Result<u64> {
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -679,10 +681,23 @@ fn write_atomic(
     // Hold until the rename: clean_temps treats a free lock as a dead
     // writer.
     file.lock()?;
-    file.write_all(bytes)?;
+    let total: usize = slices.iter().map(|slice| slice.len()).sum();
+    while !slices.is_empty() {
+        match file.write_vectored(slices) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "short vectored write",
+                ));
+            }
+            Ok(written) => IoSlice::advance_slices(&mut slices, written),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
     fs::rename(*guard, final_path)?;
     DropGuard::dismiss(guard);
-    Ok(())
+    Ok(u64::try_from(total).unwrap_or(u64::MAX))
 }
 
 const MAGIC: [u8; 4] = *b"CYPV";
@@ -707,84 +722,118 @@ const MAX_EDGE: u32 = 0x0001_0000;
 /// Mirror of the decoder's 512 MiB RGBA allocation ceiling, in pixels.
 const MAX_SAMPLES: usize = 128 << 20;
 
-fn encode(page: &Decoded, role: Role) -> Vec<u8> {
-    let mut out = Vec::with_capacity(32 + page.resident_bytes());
+fn write_encoded_atomic(
+    temp: &Path,
+    final_path: &Path,
+    page: &Decoded,
+    role: Role,
+) -> io::Result<u64> {
+    match page.pixels() {
+        Pixels::Rgba8(bytes) => {
+            let header = header_bytes(page, role, encode_len(bytes.len()));
+            let mut slices = [IoSlice::new(&header), IoSlice::new(bytes)];
+            write_atomic(temp, final_path, &mut slices)
+        }
+        Pixels::Yuv(yuv) => {
+            // Header + 3 YUV (prefix, plane) pairs + optional alpha (prefix, plane).
+            const YUV_MAX_SLICES: usize = 1 + 3 * 2 + 2;
+            let header = header_bytes(
+                page,
+                role,
+                [
+                    yuv.depth,
+                    subsampling_tag(yuv.subsampling),
+                    u8::from(yuv.full_range),
+                    matrix_tag(yuv.matrix),
+                ],
+            );
+            let yuv_planes = [&yuv.luma, &yuv.cb, &yuv.cr];
+            let prefixes = yuv_planes
+                .map(|plane| plane_prefix(plane, PLANE_U8, PLANE_U16));
+            let plane_bytes = yuv_planes.map(little_endian_plane_bytes);
+            let alpha_pair = yuv.alpha.as_ref().map(|alpha| {
+                (
+                    plane_prefix(alpha, ALPHA_U8, ALPHA_U16),
+                    little_endian_plane_bytes(alpha),
+                )
+            });
+            let absent = [ALPHA_ABSENT];
+            let mut slices = Vec::with_capacity(YUV_MAX_SLICES);
+            slices.push(IoSlice::new(&header));
+            for (prefix, bytes) in prefixes.iter().zip(&plane_bytes) {
+                slices.push(IoSlice::new(prefix));
+                slices.push(IoSlice::new(bytes));
+            }
+            if let Some((alpha_prefix, alpha_bytes)) = &alpha_pair {
+                slices.push(IoSlice::new(alpha_prefix));
+                slices.push(IoSlice::new(alpha_bytes));
+            } else {
+                slices.push(IoSlice::new(&absent));
+            }
+            write_atomic(temp, final_path, &mut slices)
+        }
+    }
+}
+
+fn header_bytes(page: &Decoded, role: Role, trailer: [u8; 4]) -> Vec<u8> {
+    // Magic (4), version (2), role, pixel, 5 u32 fields, format, transfer, trailer (4).
+    const HEADER_BYTES: usize = 4 + 2 + 1 + 1 + 5 * 4 + 1 + 1 + 4;
+    let pixel = match page.pixels() {
+        Pixels::Rgba8(_) => PIXEL_RGBA,
+        Pixels::Yuv(_) => PIXEL_YUV,
+    };
+    let mut out = Vec::with_capacity(HEADER_BYTES);
     out.extend_from_slice(&MAGIC);
     out.extend_from_slice(&VERSION.to_le_bytes());
     out.push(role_tag(role));
-    out.push(match page.pixels() {
-        Pixels::Rgba8(_) => PIXEL_RGBA,
-        Pixels::Yuv(_) => PIXEL_YUV,
-    });
-    push_u32(&mut out, edge(role).unwrap_or(0));
-    for value in [
-        page.page_dims().0,
-        page.page_dims().1,
-        page.width(),
-        page.height(),
-    ] {
-        push_u32(&mut out, value);
-    }
+    out.push(pixel);
+    out.extend_from_slice(&edge(role).unwrap_or(0).to_le_bytes());
+    out.extend_from_slice(&page.page_dims().0.to_le_bytes());
+    out.extend_from_slice(&page.page_dims().1.to_le_bytes());
+    out.extend_from_slice(&page.width().to_le_bytes());
+    out.extend_from_slice(&page.height().to_le_bytes());
     out.push(format_tag(page.format()));
     out.push(transfer_tag(page.transfer()));
-    match page.pixels() {
-        Pixels::Rgba8(bytes) => {
-            push_len(&mut out, bytes.len());
-            out.extend_from_slice(bytes);
-        }
-        Pixels::Yuv(yuv) => {
-            out.push(yuv.depth);
-            out.push(subsampling_tag(yuv.subsampling));
-            out.push(u8::from(yuv.full_range));
-            out.push(matrix_tag(yuv.matrix));
-            encode_plane(&mut out, &yuv.luma);
-            encode_plane(&mut out, &yuv.cb);
-            encode_plane(&mut out, &yuv.cr);
-            match yuv.alpha.as_ref() {
-                None => out.push(ALPHA_ABSENT),
-                Some(alpha) => {
-                    encode_plane_with(
-                        &mut out, alpha, ALPHA_U8, ALPHA_U16,
-                    );
-                }
-            }
-        }
-    }
+    out.extend_from_slice(&trailer);
+    debug_assert_eq!(
+        out.len(),
+        HEADER_BYTES,
+        "header byte count must match reserved capacity"
+    );
     out
 }
 
-fn encode_plane(out: &mut Vec<u8>, plane: &Plane) {
-    encode_plane_with(out, plane, PLANE_U8, PLANE_U16);
+fn plane_prefix(plane: &Plane, u8_tag: u8, u16_tag: u8) -> [u8; 5] {
+    let (tag, bytes) = match plane {
+        Plane::U8(bytes) => (u8_tag, bytes.len()),
+        Plane::U16(words) => (u16_tag, words.len() * size_of::<u16>()),
+    };
+    let mut prefix = [tag, 0, 0, 0, 0];
+    let (_, len_bytes) = prefix.split_at_mut(1);
+    len_bytes.copy_from_slice(&encode_len(bytes));
+    prefix
 }
 
-fn encode_plane_with(
-    out: &mut Vec<u8>,
-    plane: &Plane,
-    u8_tag: u8,
-    u16_tag: u8,
-) {
+fn little_endian_plane_bytes(plane: &Plane) -> Cow<'_, [u8]> {
     match plane {
-        Plane::U8(bytes) => {
-            out.push(u8_tag);
-            push_len(out, bytes.len());
-            out.extend_from_slice(bytes);
-        }
+        Plane::U8(bytes) => Cow::Borrowed(bytes),
         Plane::U16(words) => {
-            out.push(u16_tag);
-            push_len(out, words.len() * 2);
-            for word in words.as_ref() {
-                out.extend_from_slice(&word.to_le_bytes());
+            if cfg!(target_endian = "little") {
+                Cow::Borrowed(bytemuck::cast_slice(words))
+            } else {
+                let mut out =
+                    Vec::with_capacity(words.len() * size_of::<u16>());
+                for word in words {
+                    out.extend_from_slice(&word.to_le_bytes());
+                }
+                Cow::Owned(out)
             }
         }
     }
 }
 
-fn push_u32(out: &mut Vec<u8>, value: u32) {
-    out.extend_from_slice(&value.to_le_bytes());
-}
-
-fn push_len(out: &mut Vec<u8>, value: usize) {
-    push_u32(out, u32::try_from(value).unwrap_or(u32::MAX));
+fn encode_len(value: usize) -> [u8; 4] {
+    u32::try_from(value).unwrap_or(u32::MAX).to_le_bytes()
 }
 
 fn role_tag(role: Role) -> u8 {
@@ -894,17 +943,23 @@ impl Reader {
     }
 
     fn array<const N: usize>(&mut self) -> Option<[u8; N]> {
-        self.bytes(N)?.try_into().ok()
+        let mut buffer = [0_u8; N];
+        self.read_into(&mut buffer)?;
+        Some(buffer)
     }
 
-    fn bytes(&mut self, len: usize) -> Option<Vec<u8>> {
-        let needed = u64::try_from(len).ok()?;
+    fn read_into(&mut self, target: &mut [u8]) -> Option<()> {
+        let needed = u64::try_from(target.len()).ok()?;
         if needed > self.remaining {
             return None;
         }
         self.remaining -= needed;
+        self.file.read_exact(target).ok()
+    }
+
+    fn bytes(&mut self, len: usize) -> Option<Vec<u8>> {
         let mut buffer = vec![0_u8; len];
-        self.file.read_exact(&mut buffer).ok()?;
+        self.read_into(&mut buffer)?;
         Some(buffer)
     }
 
@@ -1026,31 +1081,28 @@ fn read_plane_tag(
     tag: u8,
     samples: usize,
 ) -> Option<Plane> {
-    let bytes_per_sample = match tag {
-        PLANE_U8 => 1,
-        PLANE_U16 => 2,
+    let want = match tag {
+        PLANE_U8 => samples,
+        PLANE_U16 => samples.checked_mul(size_of::<u16>())?,
         _ => return None,
     };
-    let want = samples.checked_mul(bytes_per_sample)?;
     if usize::try_from(reader.u32()?).ok()? != want {
         return None;
     }
-    let bytes = reader.bytes(want)?;
-    Some(if bytes_per_sample == 1 {
-        Plane::U8(bytes.into_boxed_slice())
+    if tag == PLANE_U8 {
+        let mut bytes = vec![0_u8; want];
+        reader.read_into(&mut bytes)?;
+        Some(Plane::U8(bytes.into_boxed_slice()))
     } else {
-        Plane::U16(words(&bytes))
-    })
-}
-
-fn words(bytes: &[u8]) -> Box<[u16]> {
-    bytes
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|pair| u16::from_le_bytes(*pair))
-        .collect::<Vec<_>>()
-        .into_boxed_slice()
+        let mut words = vec![0_u16; samples];
+        reader.read_into(bytemuck::cast_slice_mut(&mut words))?;
+        if cfg!(not(target_endian = "little")) {
+            for word in &mut words {
+                *word = u16::from_le(*word);
+            }
+        }
+        Some(Plane::U16(words.into_boxed_slice()))
+    }
 }
 
 /// Pixel count of a `dims` plane, refusing implausible extents and more
@@ -1617,9 +1669,19 @@ mod tests {
     fn prune_drops_the_oldest_first() {
         let dir = TempDir::new("preview-prune");
         let root = dir.path().join("cache");
+        let probe_root = dir.path().join("probe");
         let page = rgba_page(4, 4);
-        let size =
-            u64::try_from(encode(&page, Role::Thumb).len()).expect("size");
+        let probe_hash = content_hash(b"probe");
+        assert!(
+            Store::with_caps(&probe_root, THUMB_CAP_BYTES, FIT_CAP_BYTES)
+                .save(probe_hash, Role::Thumb, &page)
+                .persisted
+        );
+        let size = fs::metadata(
+            probe_root.join("thumb").join(format!("{probe_hash:032x}")),
+        )
+        .expect("probe entry metadata")
+        .len();
         let store = Store::with_caps(&root, size + 1, FIT_CAP_BYTES);
 
         let first = content_hash(b"first");

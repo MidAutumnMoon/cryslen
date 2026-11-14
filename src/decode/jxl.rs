@@ -61,9 +61,7 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
         u32::try_from(info.size.1).map_err(|_| bad_dimensions())?,
     );
     let pixel_count =
-        super::checked_pixels(width, height, "jxl: bad dimensions")
-            .union()?;
-    super::check_dims(width, height).union()?;
+        super::admit_dims(width, height, "jxl: bad dimensions").union()?;
 
     let extra_channels = info.extra_channels.len();
     decoder

@@ -4,7 +4,7 @@ use eros::IntoUnion as _;
 use crate::fault::DecodeError;
 use crate::fault::DecodeRefusal;
 
-use super::check_dims;
+use super::admit_dims;
 use super::Decoded;
 use super::Format;
 use super::Transfer;
@@ -40,7 +40,7 @@ pub(super) fn decode(
     // Orientation only swaps w and h, and the cap checks both, so this
     // pre-orientation check catches rotated pages too.
     let (width, height) = decoder.dimensions();
-    check_dims(width, height).union()?;
+    admit_dims(width, height, "bad dimensions").union()?;
     let orientation = decoder.orientation().union()?;
     let mut oriented = DynamicImage::from_decoder(decoder).union()?;
     oriented.apply_orientation(orientation);

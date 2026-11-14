@@ -21,19 +21,17 @@ use ipc_channel::ipc::IpcReceiver;
 use ipc_channel::ipc::IpcSender;
 use ipc_channel::TryRecvError as IpcTryRecvError;
 
-use crate::animation::DecodedEvent;
+use crate::animation::PlaybackEvent;
 use crate::browse::PageCount;
 use crate::browse::Role;
 use crate::catalog;
 use crate::catalog::PageName;
-use crate::decode::Decoded;
 use crate::fault::BookFault;
 use crate::fault::PageFault;
 use crate::protocol::BookInfo;
 use crate::protocol::ChildMsg;
 use crate::protocol::Hello;
 use crate::protocol::ParentMsg;
-use crate::protocol::PlaybackEvent;
 use crate::protocol::WireImage;
 
 /// A child that has not answered by now is wedged; the parent reports a
@@ -111,12 +109,12 @@ impl BookView {
 pub struct Delivery {
     pub page: usize,
     pub role: Role,
-    pub image: Box<Decoded>,
+    pub image: Box<WireImage>,
 }
 
 pub enum BookUpdate {
     Ready(Delivery),
-    Playback(DecodedEvent),
+    Playback(PlaybackEvent<Box<WireImage>>),
     Failed { page: usize, fault: PageFault },
     Died(String),
 }
@@ -543,21 +541,19 @@ fn event_from_message(message: ChildMsg) -> BookUpdate {
                 "the child repeated its handshake",
             ))
         }
-        ChildMsg::Ready { page, role, image } => {
-            match image.to_decoded() {
-                Ok(decoded) => BookUpdate::Ready(Delivery {
-                    page,
-                    role,
-                    image: Box::new(decoded),
-                }),
-                Err(refusal) => BookUpdate::Failed {
-                    page,
-                    fault: PageFault::new(refusal.to_string()),
-                },
-            }
-        }
+        ChildMsg::Ready { page, role, image } => match image.validate() {
+            Ok(()) => BookUpdate::Ready(Delivery {
+                page,
+                role,
+                image: Box::new(image),
+            }),
+            Err(refusal) => BookUpdate::Failed {
+                page,
+                fault: PageFault::new(refusal.to_string()),
+            },
+        },
         ChildMsg::Playback(event) => {
-            BookUpdate::Playback(decoded_event(event))
+            BookUpdate::Playback(validated_event(event))
         }
         ChildMsg::Failed { page, fault } => {
             BookUpdate::Failed { page, fault }
@@ -566,14 +562,16 @@ fn event_from_message(message: ChildMsg) -> BookUpdate {
 }
 
 /// A malformed frame answers `Failed`.
-fn decoded_event(event: PlaybackEvent<WireImage>) -> DecodedEvent {
+fn validated_event(
+    event: PlaybackEvent<WireImage>,
+) -> PlaybackEvent<Box<WireImage>> {
     match event {
         PlaybackEvent::Frame { id, delay, image } => {
-            match image.to_decoded() {
-                Ok(decoded) => DecodedEvent::Frame {
+            match image.validate() {
+                Ok(()) => PlaybackEvent::Frame {
                     id,
                     delay,
-                    image: Box::new(decoded),
+                    image: Box::new(image),
                 },
                 Err(refusal) => {
                     tracing::warn!(
@@ -581,12 +579,12 @@ fn decoded_event(event: PlaybackEvent<WireImage>) -> DecodedEvent {
                         %refusal,
                         "playback frame refused"
                     );
-                    DecodedEvent::Failed { id }
+                    PlaybackEvent::Failed { id }
                 }
             }
         }
-        PlaybackEvent::Finished { id } => DecodedEvent::Finished { id },
-        PlaybackEvent::Failed { id } => DecodedEvent::Failed { id },
+        PlaybackEvent::Finished { id } => PlaybackEvent::Finished { id },
+        PlaybackEvent::Failed { id } => PlaybackEvent::Failed { id },
     }
 }
 

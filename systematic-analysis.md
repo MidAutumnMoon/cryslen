@@ -86,16 +86,20 @@ Instead of adding a complex multi-role scheduler, remove the work that shouldn't
   - Share symlink-following `entry_is_file` across `catalog::sibling` and `Source::open_dir`, plus `normalize_path` so relative and `.` CLI arguments resolve against the working directory while preserving symlinks.
   - Keep `catalog::sibling` synchronous inside `Book::step` so `PendingBookOpen::begin` stays on the event-loop thread (preserving Linux `PR_SET_PDEATHSIG` ownership).
 
-### 3. Low-Copy Pixels & Decoder Reuse (`decode/`, `cache/mod.rs`)
+### 3. Low-Copy Pixels (`decode/`, `cache/mod.rs`, `protocol.rs`, `render.rs`) [Done]
 
-- **Use `Arc<[u8]>` / `Arc<[u16]>` for planes in `Decoded` (`src/decode/mod.rs`)**:
-  - Making `Decoded` cheaply cloneable turns identity derivations (`page_edge <= FIT_EDGE` in `cache::derive`) into an O(1) refcount bump instead of a multi-megabyte allocation and memcpy.
-- **Write `Store::save` directly from header + plane slices (`src/cache/mod.rs`)**:
-  - Write the small header buffer followed by `decode::plane_bytes` directly to the locked temp file instead of concatenating a full-image `Vec<u8>` in `encode()`. Use `bytemuck::cast_slice` / `pod_collect_to_vec` for `Plane::U16` in `cache` just as `protocol.rs` already does.
-- **Single-allocation >8-bit plane copy in `decode/avif.rs`**:
-  - Copy >8-bit rows directly into `Vec<u16>` instead of `Vec<u8>` → `Box<[u16]>`.
-- **Persistent worker pool for `decode/jxl.rs` (`analysis.md` #5)**:
-  - Keep a small reusable thread pool in the child process for `JxlParallelRunner` instead of spawning and joining scoped OS threads per callback.
+- **Eliminate parent-side IPC pixel copies (`src/protocol.rs`, `src/book.rs`, `src/animation.rs`, `src/app.rs`, `src/render.rs`)**:
+  - Validate `WireImage` extents, bounds, and YUV depth in place (`WireImage::validate`) and upload GL textures directly from shared memory (`&WireImage` / `&WirePixels`). Delete `WireImage::to_decoded()` and make `animation::{Player, PlaybackEvent, Due}` generic over `Image`.
+  - Replace per-upload `constant_plane` heap allocations in `render.rs` with stack-backed `upload_constant_plane` uploads.
+- **Borrow unchanged pages in `cache::derive` (`src/cache/mod.rs`, `src/worker.rs`)**:
+  - Return `Cow<'_, Decoded>` from `cache::derive` and `derive_timed` instead of wrapping planes in `Arc<[T]>`, avoiding whole-image clones when `Role::Full`, `page_edge <= FIT_EDGE`, or playback frames fit.
+- **Stream `Store::save` and `Plane::U16` `Store::load` (`src/cache/mod.rs`)**:
+  - Write the 34-byte header, 5-byte plane prefixes, and pixel slices directly via `write_vectored` / `IoSlice::advance_slices` instead of concatenating a full-image `Vec<u8>` in `encode()`. Pass through little-endian `Plane::U16` bytes directly via `bytemuck::cast_slice`.
+  - Read headers into stack arrays (`Reader::read_into`) and read `PLANE_U16` directly into `Vec<u16>` via `bytemuck::cast_slice_mut`.
+- **Single-allocation AVIF planes and pre-decode bounds (`src/decode/avif.rs`, `src/decode/image.rs`, `src/decode/jxl.rs`, `src/decode/mod.rs`)**:
+  - Share strided row copying between 8-bit and >8-bit AVIF planes (`copy_strided_bytes`), writing >8-bit samples directly into `Vec<u16>` via `bytemuck::cast_slice_mut` (with a contiguous fast path), while keeping `DisplayTransform` (`transform_plane`) encapsulated in `decode/mod.rs`.
+  - Unify pre-decode and extent bounds checks (`MAX_PIXELS` overflow/cap and `DECODE_EDGE_LIMIT`) in `decode::admit_dims` across `image.rs`, `avif.rs`, `jxl.rs`, `decode::Frames`, and extent validation.
+  - *Skipped decoder reuse and `jxl::Pool`*: `avifDecoderParse` cleans up codecs per call, `JxlDecoder::reset` retains internal scratch buffers across pages, and dual-lane workers already cap `max_threads <= 1`.
 
 ### 4. Pragmatic Resolution & Texture-Limit Handling (`cache/`, `render.rs`, `app.rs`, `fault.rs`)
 

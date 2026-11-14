@@ -1,6 +1,7 @@
 //! Per-book decode worker (`cy --worker`): serves requests and
 //! playback in the foreground while `cy-prefetch` warms the store.
 
+use std::borrow::Cow;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -651,25 +652,36 @@ where
     }
 }
 
-fn derive_thumb_from_fit<Sink>(
+fn serve_thumb_from_fit<Sink>(
     shared: &Shared<Sink>,
     last_fit: &mut Option<(u128, Decoded)>,
     page: usize,
     hash: u128,
-    lane: &str,
-) -> Option<Decoded>
+    kind: ServeKind,
+    serve_started: Instant,
+) -> bool
 where
     Sink: EventSink,
 {
-    if let Some((fit_hash, fit)) = last_fit {
-        if *fit_hash == hash {
-            return Some(derive_timed(page, Role::Thumb, fit, lane));
-        }
+    if last_fit
+        .as_ref()
+        .is_none_or(|(fit_hash, _)| *fit_hash != hash)
+    {
+        let Some(fit) = shared.load_cached(hash, Role::Fit) else {
+            return false;
+        };
+        *last_fit = Some((hash, fit));
     }
-    let fit = shared.load_cached(hash, Role::Fit)?;
-    let thumb = derive_timed(page, Role::Thumb, &fit, lane);
-    *last_fit = Some((hash, fit));
-    Some(thumb)
+    let Some((_, fit)) = last_fit.as_ref() else {
+        return false;
+    };
+    let thumb = derive_timed(page, Role::Thumb, fit, kind.lane());
+    if kind.is_request() {
+        shared.publish(page, Role::Thumb, &thumb);
+    }
+    kind.report(page, Role::Thumb, false, serve_started.elapsed());
+    shared.persist(page, hash, Role::Thumb, &thumb);
+    true
 }
 
 fn serve_cached<Sink>(
@@ -694,23 +706,15 @@ where
         }
         return true;
     }
-    if role == Role::Thumb {
-        if let Some(thumb) = derive_thumb_from_fit(
+    role == Role::Thumb
+        && serve_thumb_from_fit(
             shared,
             last_fit,
             page,
             hash,
-            kind.lane(),
-        ) {
-            if kind.is_request() {
-                shared.publish(page, Role::Thumb, &thumb);
-            }
-            kind.report(page, Role::Thumb, false, serve_started.elapsed());
-            shared.persist(page, hash, Role::Thumb, &thumb);
-            return true;
-        }
-    }
-    false
+            kind,
+            serve_started,
+        )
 }
 
 fn produce_preview<Sink>(
@@ -775,7 +779,11 @@ fn produce_preview<Sink>(
     }
     shared.persist(page, hash, role, &derived);
     if role == Role::Fit {
-        *last_fit = Some((hash, derived));
+        let fit = match derived {
+            Cow::Owned(fit) => fit,
+            Cow::Borrowed(_) => native,
+        };
+        *last_fit = Some((hash, fit));
     }
 }
 
@@ -1035,12 +1043,12 @@ impl PlaybackRunner {
     }
 }
 
-fn derive_timed(
+fn derive_timed<'source>(
     page: usize,
     role: Role,
-    source: &Decoded,
+    source: &'source Decoded,
     lane: &str,
-) -> Decoded {
+) -> Cow<'source, Decoded> {
     let started = Instant::now();
     let derived = cache::derive(source, role);
     tracing::debug!(
@@ -1254,7 +1262,6 @@ mod tests {
     use image::ImageError;
 
     use super::*;
-    use crate::animation::DecodedEvent;
     use crate::browse::Direction;
     use crate::browse::ReadingMode;
     use crate::cache::Store;
@@ -1278,7 +1285,7 @@ mod tests {
             page: usize,
             error: Arc<PageError>,
         },
-        Playback(DecodedEvent),
+        Playback(PlaybackEvent<Box<Decoded>>),
     }
 
     impl CommandReceiver for mpsc::Receiver<ParentMsg> {
@@ -1591,7 +1598,7 @@ mod tests {
                 let seen = self.seen.lock();
                 seen.iter()
                     .filter_map(|event| match event {
-                        Update::Playback(DecodedEvent::Frame {
+                        Update::Playback(PlaybackEvent::Frame {
                             id,
                             delay,
                             image,
@@ -1614,7 +1621,7 @@ mod tests {
                     .any(|event| {
                         matches!(
                             event,
-                            Update::Playback(DecodedEvent::Finished {
+                            Update::Playback(PlaybackEvent::Finished {
                                 id,
                             }) if id.page == page
                         )

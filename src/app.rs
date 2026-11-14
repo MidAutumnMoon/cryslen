@@ -31,9 +31,9 @@ use winit::keyboard::KeyCode;
 use winit::keyboard::ModifiersState;
 use winit::window::WindowId;
 
-use crate::animation::DecodedEvent;
 use crate::animation::Due;
 use crate::animation::PlaybackCommand;
+use crate::animation::PlaybackEvent;
 use crate::animation::PlaybackId;
 use crate::animation::Player;
 use crate::book::Book;
@@ -65,6 +65,7 @@ use crate::geometry::Fit;
 use crate::geometry::FitMode;
 use crate::geometry::Viewport;
 use crate::protocol::ParentMsg;
+use crate::protocol::WireImage;
 use crate::render::PageTextures;
 use crate::render::Window;
 use crate::ui;
@@ -136,7 +137,7 @@ impl HeldKeys {
 /// `Refused` is sticky for the book, so a decoder that already stopped
 /// is not retried on every return.
 enum PagePlayback {
-    Playing(Player),
+    Playing(Player<Box<WireImage>>),
     Refused,
 }
 
@@ -562,8 +563,8 @@ impl App {
             else {
                 break;
             };
-            let dims = delivery.image.page_dims();
-            let format = delivery.image.format();
+            let dims = delivery.image.page_dims;
+            let format = delivery.image.format;
             match self.reading.facts.entry(delivery.page) {
                 Entry::Vacant(entry) => {
                     entry.insert(PageInfo { dims, format });
@@ -584,8 +585,8 @@ impl App {
             tracing::debug!(
                 page = delivery.page,
                 role = ?delivery.role,
-                width = delivery.image.width(),
-                height = delivery.image.height(),
+                width = delivery.image.width,
+                height = delivery.image.height,
                 elapsed = ?elapsed,
                 "uploaded"
             );
@@ -593,8 +594,8 @@ impl App {
                 tracing::info!(
                     page = delivery.page,
                     role = ?delivery.role,
-                    width = delivery.image.width(),
-                    height = delivery.image.height(),
+                    width = delivery.image.width,
+                    height = delivery.image.height,
                     elapsed = ?elapsed,
                     "slow upload"
                 );
@@ -688,7 +689,10 @@ impl App {
         )
     }
 
-    fn player_mut(&mut self, id: PlaybackId) -> Option<&mut Player> {
+    fn player_mut(
+        &mut self,
+        id: PlaybackId,
+    ) -> Option<&mut Player<Box<WireImage>>> {
         match self.reading.playback.get_mut(&id.page) {
             Some(PagePlayback::Playing(player)) if player.id() == id => {
                 Some(player)
@@ -946,7 +950,7 @@ impl App {
                     self.reading.faults.insert(page, fault);
                 }
                 BookUpdate::Playback(event) => match event {
-                    DecodedEvent::Frame { id, delay, image } => {
+                    PlaybackEvent::Frame { id, delay, image } => {
                         if let Some(player) = self.player_mut(id) {
                             if !player.on_frame(delay, image) {
                                 tracing::debug!(
@@ -956,14 +960,14 @@ impl App {
                             }
                         }
                     }
-                    DecodedEvent::Finished { id } => {
+                    PlaybackEvent::Finished { id } => {
                         if let Some(player) = self.player_mut(id) {
                             if player.on_finished() {
                                 tracing::debug!(?id, "playback finished");
                             }
                         }
                     }
-                    DecodedEvent::Failed { id } => {
+                    PlaybackEvent::Failed { id } => {
                         if self.is_current_playback(id) {
                             tracing::warn!(?id, "playback failed");
                             self.refuse_playback(id.page);

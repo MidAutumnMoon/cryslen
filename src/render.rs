@@ -29,19 +29,17 @@ use winit::window::Window as WinitWindow;
 use crate::browse::Role;
 use crate::browse::Roles;
 use crate::decode;
-use crate::decode::Decoded;
 use crate::decode::Matrix;
-use crate::decode::Pixels;
-use crate::decode::Plane;
 use crate::decode::Subsampling;
 use crate::decode::Transfer;
-use crate::decode::YuvImage;
 use crate::fault::TextureError;
 use crate::fault::TextureFault;
 use crate::geometry;
 use crate::geometry::Placement;
 use crate::geometry::SpreadLayout;
 use crate::geometry::Viewport;
+use crate::protocol::WireImage;
+use crate::protocol::WirePixels;
 
 // The quad is a fixed -1..1 strip generated from gl_VertexID; uniforms
 // place it at the seat rect. Clip space is bottom-origin; winit coords
@@ -295,12 +293,12 @@ impl PageTextures {
         &mut self,
         page: usize,
         role: Role,
-        image: &Decoded,
+        image: &WireImage,
     ) -> Result<(), TextureError> {
         if self.has(page, role) {
             return Ok(());
         }
-        let dims = (image.width(), image.height());
+        let dims = (image.width, image.height);
         check_texture_dims(dims, self.max_texture_edge)?;
         // SAFETY: the size check above keeps the page inside this
         // context's texture limit, and `upload_page_texture` asserts its
@@ -321,9 +319,9 @@ impl PageTextures {
         &mut self,
         page: usize,
         role: Role,
-        image: &Decoded,
+        image: &WireImage,
     ) -> Result<(), TextureError> {
-        let dims = (image.width(), image.height());
+        let dims = (image.width, image.height);
         check_texture_dims(dims, self.max_texture_edge)?;
         if let Some(PageTexture {
             layout:
@@ -338,10 +336,10 @@ impl PageTextures {
             .get(&page)
             .and_then(|slots| role_slot(slots, role))
         {
-            if *present_dims == dims && *transfer == image.transfer() {
-                if let Pixels::Rgba8(bytes) = image.pixels() {
-                    // SAFETY: the size check above and `Decoded`'s
-                    // extent check keep the byte length right, and the
+            if *present_dims == dims && *transfer == image.transfer {
+                if let WirePixels::Rgba8(bytes) = &image.pixels {
+                    // SAFETY: the size check above and `WireImage`'s
+                    // validation keep the byte length right, and the
                     // texture is live until this entry is removed.
                     unsafe {
                         update_rgba(&self.gl, *texture, bytes, dims);
@@ -889,8 +887,11 @@ impl MagnificationFilter {
     }
 }
 
-fn magnification_filter(decoded: &Decoded) -> MagnificationFilter {
-    if (decoded.width(), decoded.height()) == decoded.page_dims() {
+fn magnification_filter(
+    dims: (u32, u32),
+    page_dims: (u32, u32),
+) -> MagnificationFilter {
+    if dims == page_dims {
         MagnificationFilter::Nearest
     } else {
         MagnificationFilter::Linear
@@ -1050,13 +1051,14 @@ unsafe fn upload_plane(
 )]
 unsafe fn upload_page_texture(
     gl: &Context,
-    decoded: &Decoded,
+    image: &WireImage,
 ) -> PageTexture {
-    let magnification_filter = magnification_filter(decoded);
-    let page_uv_per_pixel = page_uv_per_pixel(decoded.page_dims());
-    let (width, height) = (decoded.width(), decoded.height());
-    match &decoded.pixels() {
-        Pixels::Rgba8(rgba_bytes) => {
+    let dims = (image.width, image.height);
+    let magnification_filter = magnification_filter(dims, image.page_dims);
+    let page_uv_per_pixel = page_uv_per_pixel(image.page_dims);
+    let (width, height) = dims;
+    match &image.pixels {
+        WirePixels::Rgba8(rgba_bytes) => {
             assert_eq!(
                 rgba_bytes.len(),
                 width as usize * height as usize * 4,
@@ -1064,120 +1066,106 @@ unsafe fn upload_page_texture(
             );
             PageTexture {
                 page_uv_per_pixel,
-                transfer: decoded.transfer(),
-                needs_dither: needs_dither(decoded.transfer(), None),
+                transfer: image.transfer,
+                needs_dither: needs_dither(image.transfer, None),
                 layout: PixelLayout::Rgba {
                     texture: upload_rgba(
                         gl,
                         rgba_bytes,
-                        (width, height),
+                        dims,
                         magnification_filter,
                     ),
-                    dims: (width, height),
+                    dims,
                 },
             }
         }
-        Pixels::Yuv(yuv) => {
+        WirePixels::Yuv {
+            depth,
+            subsampling,
+            full_range,
+            matrix,
+            luma,
+            cb,
+            cr,
+            alpha,
+        } => {
             let ((luma_w, luma_h), (chroma_w, chroma_h)) =
-                decode::plane_dims((width, height), yuv.subsampling);
-            let wide = matches!(yuv.luma, Plane::U16(_));
-            let depth = yuv.depth.clamp(MIN_PLANE_DEPTH, MAX_PLANE_DEPTH);
-            let expect = |plane: &Plane,
-                          want_samples: usize,
-                          what: &str| {
-                let want_bytes = want_samples * if wide { 2 } else { 1 };
-                assert_eq!(
-                    plane.byte_len(),
-                    want_bytes,
-                    "{what} plane bytes"
-                );
-            };
-            expect(&yuv.luma, luma_w as usize * luma_h as usize, "luma");
-            let luma_bytes = decode::plane_bytes(&yuv.luma);
+                decode::plane_dims(dims, *subsampling);
+            let wide = *depth > BYTE_DEPTH;
+            let depth = (*depth).clamp(MIN_PLANE_DEPTH, MAX_PLANE_DEPTH);
+            let assert_plane_bytes =
+                |plane: &[u8], want_samples: usize, plane_name: &str| {
+                    let want_bytes = want_samples
+                        * if wide { size_of::<u16>() } else { 1 };
+                    assert_eq!(
+                        plane.len(),
+                        want_bytes,
+                        "{plane_name} plane bytes"
+                    );
+                };
+            assert_plane_bytes(
+                luma,
+                luma_w as usize * luma_h as usize,
+                "luma",
+            );
             let luma_texture = upload_plane(
                 gl,
-                luma_bytes,
+                luma,
                 (luma_w, luma_h),
                 wide,
                 magnification_filter,
             );
-            let (cb_texture, cr_texture) = if yuv.subsampling
-                == Subsampling::Mono
-            {
-                // 1x1 chroma at the neutral code, which the folded
-                // quantization anchor cancels exactly.
-                let neutral = constant_plane(depth, 1_u32 << (depth - 1));
-                let neutral_bytes = decode::plane_bytes(&neutral);
-                (
-                    upload_plane(
-                        gl,
-                        neutral_bytes,
-                        (1, 1),
-                        wide,
-                        MagnificationFilter::Linear,
-                    ),
-                    upload_plane(
-                        gl,
-                        neutral_bytes,
-                        (1, 1),
-                        wide,
-                        MagnificationFilter::Linear,
-                    ),
-                )
-            } else {
-                expect(
-                    &yuv.cb,
-                    chroma_w as usize * chroma_h as usize,
-                    "cb",
-                );
-                expect(
-                    &yuv.cr,
-                    chroma_w as usize * chroma_h as usize,
-                    "cr",
-                );
-                let cb_bytes = decode::plane_bytes(&yuv.cb);
-                let cr_bytes = decode::plane_bytes(&yuv.cr);
-                (
-                    upload_plane(
-                        gl,
-                        cb_bytes,
-                        (chroma_w, chroma_h),
-                        wide,
-                        MagnificationFilter::Linear,
-                    ),
-                    upload_plane(
-                        gl,
-                        cr_bytes,
-                        (chroma_w, chroma_h),
-                        wide,
-                        MagnificationFilter::Linear,
-                    ),
-                )
-            };
-            let alpha_texture = yuv.alpha.as_ref().map_or_else(
+            let (cb_texture, cr_texture) =
+                if *subsampling == Subsampling::Mono {
+                    // 1x1 chroma at the neutral code, which the folded
+                    // quantization anchor cancels exactly.
+                    let neutral_code = 1_u32 << (depth - 1);
+                    (
+                        upload_constant_plane(gl, depth, neutral_code),
+                        upload_constant_plane(gl, depth, neutral_code),
+                    )
+                } else {
+                    assert_plane_bytes(
+                        cb,
+                        chroma_w as usize * chroma_h as usize,
+                        "cb",
+                    );
+                    assert_plane_bytes(
+                        cr,
+                        chroma_w as usize * chroma_h as usize,
+                        "cr",
+                    );
+                    (
+                        upload_plane(
+                            gl,
+                            cb,
+                            (chroma_w, chroma_h),
+                            wide,
+                            MagnificationFilter::Linear,
+                        ),
+                        upload_plane(
+                            gl,
+                            cr,
+                            (chroma_w, chroma_h),
+                            wide,
+                            MagnificationFilter::Linear,
+                        ),
+                    )
+                };
+            let alpha_texture = alpha.as_ref().map_or_else(
                 // 1x1 opaque: the max code, which the alpha normalization
                 // maps to 1.0.
-                || {
-                    let opaque =
-                        constant_plane(depth, (1_u32 << depth) - 1);
-                    upload_plane(
-                        gl,
-                        decode::plane_bytes(&opaque),
-                        (1, 1),
-                        wide,
-                        MagnificationFilter::Linear,
-                    )
-                },
+                || upload_constant_plane(gl, depth, (1_u32 << depth) - 1),
                 |alpha| {
-                    expect(
+                    assert_plane_bytes(
                         alpha,
                         width as usize * height as usize,
                         "alpha",
                     );
                     upload_plane(
                         gl,
-                        decode::plane_bytes(alpha),
-                        (width, height),
+                        alpha,
+                        dims,
                         wide,
                         MagnificationFilter::Linear,
                     )
@@ -1185,21 +1173,24 @@ unsafe fn upload_page_texture(
             );
             PageTexture {
                 page_uv_per_pixel,
-                transfer: decoded.transfer(),
-                needs_dither: needs_dither(
-                    decoded.transfer(),
-                    Some(depth),
-                ),
+                transfer: image.transfer,
+                needs_dither: needs_dither(image.transfer, Some(depth)),
                 layout: PixelLayout::Yuv {
                     luma: luma_texture,
                     cb: cb_texture,
                     cr: cr_texture,
                     alpha: alpha_texture,
                     chroma_uv_per_pixel: chroma_uv_per_pixel(
-                        decoded.page_dims(),
-                        yuv.subsampling,
+                        image.page_dims,
+                        *subsampling,
                     ),
-                    color_conversion: page_color_conversion(yuv, wide),
+                    color_conversion: page_color_conversion(
+                        depth,
+                        *subsampling,
+                        *full_range,
+                        *matrix,
+                        wide,
+                    ),
                     alpha_normalization: depth_normalization(depth, wide),
                 },
             }
@@ -1225,21 +1216,43 @@ fn chroma_uv_per_pixel(
     (ratio.0 / chroma_px.0, ratio.1 / chroma_px.1)
 }
 
-fn constant_plane(depth: u8, code: u32) -> Plane {
+/// # Safety
+///
+/// The context must be current.
+unsafe fn upload_constant_plane(
+    gl: &Context,
+    depth: u8,
+    sample_code: u32,
+) -> Texture {
     if depth > BYTE_DEPTH {
         #[expect(
             clippy::cast_possible_truncation,
-            reason = "callers pass a depth clamped to 16, so the code fits u16"
+            reason = "callers clamp depth to MAX_PLANE_DEPTH, so sample_code fits u16"
         )]
-        let wide = code as u16;
-        Plane::U16(vec![wide].into_boxed_slice())
+        let wide = sample_code as u16;
+        #[expect(
+            clippy::host_endian_bytes,
+            reason = "GL UNSIGNED_SHORT uploads expect native-endian bytes"
+        )]
+        upload_plane(
+            gl,
+            &wide.to_ne_bytes(),
+            (1, 1),
+            true,
+            MagnificationFilter::Linear,
+        )
     } else {
         #[expect(
             clippy::cast_possible_truncation,
-            reason = "an 8-bit depth keeps codes within u8"
+            reason = "depths up to BYTE_DEPTH keep codes within u8"
         )]
-        let byte = code as u8;
-        Plane::U8(vec![byte].into_boxed_slice())
+        upload_plane(
+            gl,
+            &[sample_code as u8],
+            (1, 1),
+            false,
+            MagnificationFilter::Linear,
+        )
     }
 }
 
@@ -1326,9 +1339,15 @@ fn code_quantization(
 /// Fold storage samples to gamma RGB: depth normalization, quantization,
 /// and the KR/KB matrix (or GBR permutation). The offset is the matrix
 /// times the anchor codes.
-fn page_color_conversion(yuv: &YuvImage, wide: bool) -> ColorConversion {
-    let depth = yuv.depth.clamp(MIN_PLANE_DEPTH, MAX_PLANE_DEPTH);
-    let quantization = code_quantization(depth, yuv.full_range, wide);
+fn page_color_conversion(
+    depth: u8,
+    subsampling: Subsampling,
+    full_range: bool,
+    color_matrix: Matrix,
+    wide: bool,
+) -> ColorConversion {
+    let depth = depth.clamp(MIN_PLANE_DEPTH, MAX_PLANE_DEPTH);
+    let quantization = code_quantization(depth, full_range, wide);
     let normalization = depth_normalization(depth, wide);
     let (
         base_matrix,
@@ -1336,12 +1355,12 @@ fn page_color_conversion(yuv: &YuvImage, wide: bool) -> ColorConversion {
         chroma_scale,
         luma_black,
         chroma_neutral,
-    ) = if yuv.matrix == Matrix::Identity {
+    ) = if color_matrix == Matrix::Identity {
         // H.273 identity planes are GBR in the (Y, Cb, Cr) slots,
         // quantized as luma on all three axes: permute into RGB and
         // anchor every axis at luma black. Mono identity repeats the
         // luma plane to RGB.
-        let base_matrix = if yuv.subsampling == Subsampling::Mono {
+        let base_matrix = if subsampling == Subsampling::Mono {
             [1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
         } else {
             [0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0]
@@ -1355,7 +1374,7 @@ fn page_color_conversion(yuv: &YuvImage, wide: bool) -> ColorConversion {
         )
     } else {
         (
-            yuv_to_rgb_matrix(yuv.matrix),
+            yuv_to_rgb_matrix(color_matrix),
             quantization.luma_scale,
             quantization.chroma_scale,
             quantization.luma_black,
@@ -1630,16 +1649,8 @@ const INITIAL_WINDOW_WIDTH: f64 = 1000.0;
 const INITIAL_WINDOW_HEIGHT: f64 = 750.0;
 
 #[cfg(test)]
-#[expect(
-    clippy::expect_used,
-    clippy::panic,
-    reason = "a panic in test code is inconsequential"
-)]
 mod tests {
     use super::*;
-    use crate::decode::Format;
-    use crate::decode::Transfer;
-    use crate::decode::YuvImage;
 
     // GL needs a context; these tests pin the CPU-side values it consumes.
 
@@ -1650,58 +1661,6 @@ mod tests {
     )]
     fn element(matrix: &[f32; 9], row: usize, col: usize) -> f32 {
         matrix[col * 3 + row]
-    }
-
-    /// A zero-filled YUV page of `depth` bits, `subsampling`, range, and
-    /// matrix. U16 storage for depths past 8, matching the decoder's tie.
-    fn yuv_page(
-        depth: u8,
-        subsampling: Subsampling,
-        full_range: bool,
-        matrix: Matrix,
-    ) -> Decoded {
-        let size = (4_u32, 4);
-        let ((luma_w, luma_h), (chroma_w, chroma_h)) =
-            decode::plane_dims(size, subsampling);
-        let plane = |samples: usize| {
-            if depth > 8 {
-                Plane::U16(vec![0_u16; samples].into_boxed_slice())
-            } else {
-                Plane::U8(vec![0_u8; samples].into_boxed_slice())
-            }
-        };
-        let (cb, cr) = if subsampling == Subsampling::Mono {
-            (Plane::U8(Box::new([])), Plane::U8(Box::new([])))
-        } else {
-            (
-                plane(chroma_w as usize * chroma_h as usize),
-                plane(chroma_w as usize * chroma_h as usize),
-            )
-        };
-        Decoded::yuv(
-            size.0,
-            size.1,
-            Format::Avif,
-            Transfer::Srgb,
-            YuvImage {
-                depth,
-                subsampling,
-                full_range,
-                matrix,
-                luma: plane(luma_w as usize * luma_h as usize),
-                cb,
-                cr,
-                alpha: None,
-            },
-        )
-        .expect("yuv page")
-    }
-
-    fn yuv_image(decoded: &Decoded) -> &YuvImage {
-        let Pixels::Yuv(yuv) = decoded.pixels() else {
-            panic!("test page must be YUV");
-        };
-        yuv
     }
 
     /// The folded conversion through one row: `matrix * samples - offset`.
@@ -1751,14 +1710,11 @@ mod tests {
     fn color_conversion_anchors_black_and_white_at_every_depth() {
         for depth in [8_u8, 10, 12, 16] {
             for full_range in [true, false] {
-                let decoded = yuv_page(
+                let conversion = page_color_conversion(
                     depth,
                     Subsampling::Yuv444,
                     full_range,
                     Matrix::Bt601,
-                );
-                let conversion = page_color_conversion(
-                    yuv_image(&decoded),
                     depth > BYTE_DEPTH,
                 );
                 let (black, white, neutral, storage_max) =
@@ -1787,12 +1743,10 @@ mod tests {
     #[test]
     fn identity_pages_permute_gbr() {
         let color = page_color_conversion(
-            yuv_image(&yuv_page(
-                8,
-                Subsampling::Yuv444,
-                true,
-                Matrix::Identity,
-            )),
+            8,
+            Subsampling::Yuv444,
+            true,
+            Matrix::Identity,
             false,
         );
         // Column j is plane j's contribution: Y->G, U->B, V->R.
@@ -1810,12 +1764,10 @@ mod tests {
         assert_eq!(color.offset, [0.0; 3]);
 
         let mono = page_color_conversion(
-            yuv_image(&yuv_page(
-                10,
-                Subsampling::Mono,
-                true,
-                Matrix::Identity,
-            )),
+            10,
+            Subsampling::Mono,
+            true,
+            Matrix::Identity,
             true,
         );
         for row in 0..3 {
@@ -1852,21 +1804,12 @@ mod tests {
 
     #[test]
     fn magnification_filter_uses_page_resolution() {
-        let page = Decoded::rgba(
-            100,
-            100,
-            Format::Png,
-            Transfer::Srgb,
-            vec![0_u8; 100 * 100 * 4].into_boxed_slice(),
-        )
-        .expect("valid page");
         assert!(matches!(
-            magnification_filter(&page),
+            magnification_filter((100, 100), (100, 100)),
             MagnificationFilter::Nearest
         ));
-        let preview = page.with_page_dims((1000, 2000));
         assert!(matches!(
-            magnification_filter(&preview),
+            magnification_filter((100, 100), (1000, 2000)),
             MagnificationFilter::Linear
         ));
     }

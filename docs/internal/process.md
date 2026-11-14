@@ -24,10 +24,10 @@ The boundary follows ownership. The parent owns the window, UI, GL, the app stat
 
 - Page identity is the index in the book the child was spawned with; no message carries a path.
 - The app sends the whole request set and uses its texture maps as the authority; the child acknowledges nothing.
-- Pixels cross as a wire image: metadata plus one shared-memory block per plane. The shared blocks avoid serialization; each plane is copied once per direction.
+- Pixels cross as a wire image (metadata plus one shared-memory block per plane), avoiding serialization; the parent validates extents and uploads directly to GL.
 - A child that never connects cannot be woken from the wait, so the handshake accepts on its own thread under the same deadline as the first message.
 - Killing the old child at switch start ends switch-time decode concurrency; see the limits in `analysis.md`.
 
 ## Limits
 
-The child has the user's full filesystem access. Every image is copied twice. Child and parent log to the same stderr target, so a line can come from either process. The initial open blocks startup; switches are asynchronous. A page request in an archive waits only until its own entry unpacks or fails; switches and quit stop running unpacks and decodes by killing the child.
+The child has the user's full filesystem access. Every image is copied once into shared memory. Child and parent log to the same stderr target, so a line can come from either process. The initial open blocks startup; switches are asynchronous. A page request in an archive waits only until its own entry unpacks or fails; switches and quit stop running unpacks and decodes by killing the child.

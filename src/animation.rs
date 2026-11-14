@@ -10,7 +10,6 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::browse::Role;
-use crate::decode::Decoded;
 
 /// Below this a GIF delay is a stuck frame.
 const MIN_FRAME_DELAY: Duration = Duration::from_millis(20);
@@ -54,8 +53,6 @@ pub enum PlaybackEvent<Image> {
     Failed { id: PlaybackId },
 }
 
-pub type DecodedEvent = PlaybackEvent<Box<Decoded>>;
-
 impl<Image> PlaybackEvent<Image> {
     #[must_use]
     pub fn map_image<Next>(
@@ -74,8 +71,8 @@ impl<Image> PlaybackEvent<Image> {
     }
 }
 
-struct BufferedFrame {
-    image: Box<Decoded>,
+struct BufferedFrame<Image> {
+    image: Image,
     delay: Duration,
 }
 
@@ -91,25 +88,22 @@ enum RequestState {
     Sent,
 }
 
-pub struct Player {
+pub struct Player<Image> {
     id: PlaybackId,
     role: Role,
-    buffered: VecDeque<BufferedFrame>,
+    buffered: VecDeque<BufferedFrame<Image>>,
     request: RequestState,
     shown: Option<ShownFrame>,
     finished: bool,
 }
 
-pub enum Due {
-    Show {
-        image: Box<Decoded>,
-        delay: Duration,
-    },
+pub enum Due<Image> {
+    Show { image: Image, delay: Duration },
     Wait(Duration),
     Idle,
 }
 
-impl Player {
+impl<Image> Player<Image> {
     pub fn new(id: PlaybackId, role: Role) -> Self {
         Self {
             id,
@@ -133,11 +127,7 @@ impl Player {
 
     /// Buffer a frame the child answered. A frame without a sent request
     /// is stale.
-    pub fn on_frame(
-        &mut self,
-        delay: Duration,
-        image: Box<Decoded>,
-    ) -> bool {
+    pub fn on_frame(&mut self, delay: Duration, image: Image) -> bool {
         if !matches!(self.request, RequestState::Sent) {
             return false;
         }
@@ -172,7 +162,7 @@ impl Player {
     }
 
     /// A late frame shows on arrival and its delay starts then.
-    pub fn tick(&mut self, now: Instant) -> Due {
+    pub fn tick(&mut self, now: Instant) -> Due<Image> {
         if self.finished && self.buffered.is_empty() {
             return Due::Idle;
         }
@@ -188,7 +178,11 @@ impl Player {
         Due::Idle
     }
 
-    fn show(&mut self, frame: BufferedFrame, now: Instant) -> Due {
+    fn show(
+        &mut self,
+        frame: BufferedFrame<Image>,
+        now: Instant,
+    ) -> Due<Image> {
         self.shown = Some(ShownFrame {
             delay: frame.delay,
             shown_at: now,
@@ -220,16 +214,10 @@ fn frame_delay(delay: Duration) -> Duration {
 }
 
 #[cfg(test)]
-#[expect(
-    clippy::expect_used,
-    reason = "a panic in test code is inconsequential"
-)]
 mod tests {
     use super::*;
-    use crate::decode::Format;
-    use crate::decode::Transfer;
 
-    fn player(generation: u32) -> Player {
+    fn player(generation: u32) -> Player<u8> {
         Player::new(
             PlaybackId {
                 page: 0,
@@ -239,18 +227,7 @@ mod tests {
         )
     }
 
-    fn frame(shade: u8) -> Decoded {
-        Decoded::rgba(
-            1,
-            1,
-            Format::Gif,
-            Transfer::Srgb,
-            vec![shade, 0, 0, 255].into_boxed_slice(),
-        )
-        .expect("test frame constructs")
-    }
-
-    fn shown_delay(due: &Due) -> Option<Duration> {
+    fn shown_delay<Image>(due: &Due<Image>) -> Option<Duration> {
         match due {
             Due::Show { delay, .. } => Some(*delay),
             Due::Wait(_) | Due::Idle => None,
@@ -263,9 +240,7 @@ mod tests {
         assert!(player.take_next());
 
         let start = Instant::now();
-        assert!(
-            player.on_frame(Duration::from_millis(50), Box::new(frame(1)))
-        );
+        assert!(player.on_frame(Duration::from_millis(50), 1));
         assert_eq!(
             shown_delay(&player.tick(start)),
             Some(Duration::from_millis(50))
@@ -276,9 +251,7 @@ mod tests {
             player.tick(start + Duration::from_millis(20)),
             Due::Wait(_)
         ));
-        assert!(
-            player.on_frame(Duration::from_millis(50), Box::new(frame(2)))
-        );
+        assert!(player.on_frame(Duration::from_millis(50), 2));
         assert_eq!(
             shown_delay(&player.tick(start + Duration::from_millis(50))),
             Some(Duration::from_millis(50))
@@ -297,7 +270,7 @@ mod tests {
     fn tiny_delays_are_clamped() {
         let mut player = player(1);
         assert!(player.take_next());
-        assert!(player.on_frame(Duration::ZERO, Box::new(frame(1))));
+        assert!(player.on_frame(Duration::ZERO, 1));
         assert_eq!(
             shown_delay(&player.tick(Instant::now())),
             Some(FALLBACK_FRAME_DELAY)
@@ -307,15 +280,11 @@ mod tests {
     #[test]
     fn frames_need_a_request() {
         let mut player = player(1);
-        assert!(!player
-            .on_frame(Duration::from_millis(20), Box::new(frame(1))));
+        assert!(!player.on_frame(Duration::from_millis(20), 1));
         assert!(!player.on_finished());
         assert!(player.take_next());
-        assert!(
-            player.on_frame(Duration::from_millis(20), Box::new(frame(1)))
-        );
-        assert!(!player
-            .on_frame(Duration::from_millis(20), Box::new(frame(1))));
+        assert!(player.on_frame(Duration::from_millis(20), 1));
+        assert!(!player.on_frame(Duration::from_millis(20), 1));
         assert!(!player.on_finished());
     }
 
@@ -324,9 +293,7 @@ mod tests {
         let mut player = player(1);
         let start = Instant::now();
         assert!(player.take_next());
-        assert!(
-            player.on_frame(Duration::from_millis(50), Box::new(frame(1)))
-        );
+        assert!(player.on_frame(Duration::from_millis(50), 1));
         assert!(player.take_next());
         assert!(player.on_finished());
 
