@@ -1,6 +1,6 @@
 # Decoding: choices and traps
 
-The ratios here are one laptop's measurements; benchmark rules are in `build-and-bench.md`.
+The ratios here are one laptop's measurements.
 
 ## Choices
 
@@ -29,7 +29,7 @@ The ratios here are one laptop's measurements; benchmark rules are in `build-and
 
 ## Guards
 
-The decode entry point rejects a pixel count over the 512 MiB allocation ceiling and an edge over the decoder's limit before allocating. The renderer's maximum texture size is the final GPU check.
+The decode entry point rejects a zero edge or a pixel count over the 512 MiB RGBA allocation ceiling (`decode::MAX_PIXELS`) before allocating. `cache::derive` clamps derived roles to `max_texture_edge` (failing past it if resampling errors), and `PageTextures` enforces `max_texture_edge` at GPU upload.
 
 EXIF orientation: read the orientation before constructing the decoded image, then apply it. Orientation fixtures need real files; the test encoder cannot write EXIF tags.
 

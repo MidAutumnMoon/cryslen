@@ -13,6 +13,7 @@ use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
@@ -36,6 +37,7 @@ use crate::browse::Role;
 use crate::browse::Roles;
 use crate::cache;
 use crate::cache::prefetch::Prefetch;
+use crate::cache::ImageLimits;
 use crate::cache::Store;
 use crate::decode;
 use crate::decode::Animation;
@@ -235,6 +237,8 @@ struct BookState {
     stored: HashMap<u128, Roles>,
     /// A page's first failure is its verdict for the session.
     failed: HashMap<usize, Arc<PageError>>,
+    /// Pages whose `Role::Full` derivation failed and must not retry.
+    failed_full: HashSet<usize>,
     /// The request foreground is currently decoding, so prefetch skips it
     /// even if a new `SetRequests` drops it mid-decode.
     active_request: Option<Request>,
@@ -255,6 +259,7 @@ impl BookState {
             hashes: HashMap::new(),
             stored: HashMap::new(),
             failed: HashMap::new(),
+            failed_full: HashSet::new(),
             active_request: None,
             requests: Vec::new(),
             served: HashSet::new(),
@@ -276,6 +281,8 @@ impl BookState {
                 self.activity_sequence.wrapping_add(1);
         }
         match message {
+            // Handled on `Shared` before locking `state`.
+            ParentMsg::SetLimits(_) => false,
             ParentMsg::SetView {
                 page,
                 mode,
@@ -313,10 +320,15 @@ impl BookState {
         }
     }
 
+    fn role_failed(&self, page: usize, role: Role) -> bool {
+        self.failed.contains_key(&page)
+            || (role == Role::Full && self.failed_full.contains(&page))
+    }
+
     fn take_request(&mut self) -> Option<Request> {
         let request = *self.requests.iter().find(|request| {
             !self.served.contains(request)
-                && !self.failed.contains_key(&request.page)
+                && !self.role_failed(request.page, request.role)
         })?;
         self.active_request = Some(request);
         Some(request)
@@ -324,7 +336,9 @@ impl BookState {
 
     fn wants_unserved(&self, page: usize, role: Role) -> bool {
         let request = Request::new(page, role);
-        self.requests.contains(&request) && !self.served.contains(&request)
+        self.requests.contains(&request)
+            && !self.served.contains(&request)
+            && !self.role_failed(page, role)
     }
 
     fn is_claimed(&self, page: usize, role: Role) -> bool {
@@ -404,6 +418,7 @@ impl<Sink> Drop for RequestGuard<'_, Sink> {
 
 struct Shared<Sink> {
     store: Store,
+    limits: OnceLock<ImageLimits>,
     state: Mutex<BookState>,
     wake: Condvar,
     sink: Mutex<Sink>,
@@ -425,6 +440,7 @@ where
     fn new(page_count: PageCount, store: Store, sink: Sink) -> Self {
         Self {
             store,
+            limits: OnceLock::new(),
             state: Mutex::new(BookState::new(page_count)),
             wake: Condvar::new(),
             sink: Mutex::new(sink),
@@ -448,6 +464,25 @@ where
         playback: &mut PlaybackRunner,
         requested_at: &mut Instant,
     ) {
+        if let ParentMsg::SetLimits(limits) = message {
+            match self.limits.set(limits) {
+                Ok(()) => tracing::debug!(
+                    fit_edge = limits.fit_edge(),
+                    max_texture_edge = limits.max_texture_edge(),
+                    "limits set"
+                ),
+                Err(existing) => tracing::debug!(
+                    fit_edge = existing.fit_edge(),
+                    max_texture_edge = existing.max_texture_edge(),
+                    "ignoring duplicate limits"
+                ),
+            }
+            // Acquire and release `state` before notifying so `prefetch`
+            // cannot observe `None` and park after `notify_one`.
+            drop(self.state.lock());
+            self.wake.notify_one();
+            return;
+        }
         if matches!(message, ParentMsg::SetRequests(_)) {
             *requested_at = Instant::now();
         }
@@ -475,8 +510,13 @@ where
     }
 
     fn next_request(&self) -> Option<(Request, RequestGuard<'_, Sink>)> {
+        self.limits.get()?;
         let request = self.state.lock().take_request()?;
         Some((request, RequestGuard { shared: self }))
+    }
+
+    fn limits(&self) -> Option<ImageLimits> {
+        self.limits.get().copied()
     }
 
     #[expect(
@@ -490,6 +530,11 @@ where
             loop {
                 if state.stopped {
                     return None;
+                }
+                if self.limits.get().is_none() {
+                    preload_wait = None;
+                    self.wake.wait(&mut state);
+                    continue;
                 }
                 let Some((step, motion)) = state.next_prefetch_job()
                 else {
@@ -548,7 +593,8 @@ where
     }
 
     fn load_cached(&self, hash: u128, role: Role) -> Option<Decoded> {
-        let image = self.store.load(hash, role)?;
+        let limits = self.limits()?;
+        let image = self.store.load(hash, role, limits.fit_edge())?;
         self.state.lock().mark_stored(hash, role);
         Some(image)
     }
@@ -560,7 +606,10 @@ where
         role: Role,
         image: &Decoded,
     ) {
-        let saved = self.store.save(hash, role, image);
+        let Some(limits) = self.limits() else {
+            return;
+        };
+        let saved = self.store.save(hash, role, image, limits.fit_edge());
         if !saved.persisted {
             tracing::debug!(page, ?role, "preview not persisted");
         }
@@ -571,6 +620,41 @@ where
             }
         }
         state.mark_stored(hash, role);
+    }
+
+    fn derive_for<'source>(
+        &self,
+        page: usize,
+        role: Role,
+        source: &'source Decoded,
+        lane: &str,
+    ) -> Option<Cow<'source, Decoded>> {
+        let limits = self.limits()?;
+        let started = Instant::now();
+        match cache::derive(source, role, limits) {
+            Ok(derived) => {
+                tracing::debug!(
+                    page,
+                    ?role,
+                    lane,
+                    elapsed = ?started.elapsed(),
+                    "derived"
+                );
+                Some(derived)
+            }
+            Err(fault) => {
+                match role {
+                    Role::Full => {
+                        self.state.lock().failed_full.insert(page);
+                    }
+                    Role::Thumb | Role::Fit => {
+                        let error = Arc::new(ErrorUnion::new(fault));
+                        self.record_failure(page, &error);
+                    }
+                }
+                None
+            }
+        }
     }
 
     fn wants_unserved(&self, page: usize, role: Role) -> bool {
@@ -658,7 +742,7 @@ fn serve_thumb_from_fit<Sink>(
     page: usize,
     hash: u128,
     kind: ServeKind,
-    serve_started: Instant,
+    started: Instant,
 ) -> bool
 where
     Sink: EventSink,
@@ -675,11 +759,15 @@ where
     let Some((_, fit)) = last_fit.as_ref() else {
         return false;
     };
-    let thumb = derive_timed(page, Role::Thumb, fit, kind.lane());
+    let Some(thumb) =
+        shared.derive_for(page, Role::Thumb, fit, kind.lane())
+    else {
+        return true;
+    };
     if kind.is_request() {
         shared.publish(page, Role::Thumb, &thumb);
     }
-    kind.report(page, Role::Thumb, false, serve_started.elapsed());
+    kind.report(page, Role::Thumb, false, started.elapsed());
     shared.persist(page, hash, Role::Thumb, &thumb);
     true
 }
@@ -691,7 +779,7 @@ fn serve_cached<Sink>(
     role: Role,
     hash: u128,
     kind: ServeKind,
-    serve_started: Instant,
+    started: Instant,
 ) -> bool
 where
     Sink: EventSink,
@@ -700,7 +788,7 @@ where
         if kind.is_request() {
             shared.publish(page, role, &image);
         }
-        kind.report(page, role, true, serve_started.elapsed());
+        kind.report(page, role, true, started.elapsed());
         if role == Role::Fit {
             *last_fit = Some((hash, image));
         }
@@ -708,12 +796,7 @@ where
     }
     role == Role::Thumb
         && serve_thumb_from_fit(
-            shared,
-            last_fit,
-            page,
-            hash,
-            kind,
-            serve_started,
+            shared, last_fit, page, hash, kind, started,
         )
 }
 
@@ -727,18 +810,11 @@ fn produce_preview<Sink>(
 ) where
     Sink: EventSink,
 {
-    let serve_started = Instant::now();
+    let started = Instant::now();
     let known_hash = shared.hash_of(page);
     if let Some(hash) = known_hash {
-        if serve_cached(
-            shared,
-            last_fit,
-            page,
-            role,
-            hash,
-            kind,
-            serve_started,
-        ) {
+        if serve_cached(shared, last_fit, page, role, hash, kind, started)
+        {
             return;
         }
     }
@@ -749,15 +825,7 @@ fn produce_preview<Sink>(
     let hash =
         known_hash.unwrap_or_else(|| shared.insert_hash(page, &bytes));
     if known_hash.is_none()
-        && serve_cached(
-            shared,
-            last_fit,
-            page,
-            role,
-            hash,
-            kind,
-            serve_started,
-        )
+        && serve_cached(shared, last_fit, page, role, hash, kind, started)
     {
         return;
     }
@@ -766,16 +834,24 @@ fn produce_preview<Sink>(
     else {
         return;
     };
-    let derived = derive_timed(page, role, &native, kind.lane());
+    let Some(derived) =
+        shared.derive_for(page, role, &native, kind.lane())
+    else {
+        return;
+    };
     if kind.is_request() {
         shared.publish(page, role, &derived);
-        kind.report(page, role, false, serve_started.elapsed());
+        kind.report(page, role, false, started.elapsed());
         if role == Role::Fit && shared.wants_unserved(page, Role::Full) {
-            shared.publish(page, Role::Full, &native);
-            kind.report(page, Role::Full, false, serve_started.elapsed());
+            if let Some(full) =
+                shared.derive_for(page, Role::Full, &native, kind.lane())
+            {
+                shared.publish(page, Role::Full, &full);
+                kind.report(page, Role::Full, false, started.elapsed());
+            }
         }
     } else {
-        kind.report(page, role, false, serve_started.elapsed());
+        kind.report(page, role, false, started.elapsed());
     }
     shared.persist(page, hash, role, &derived);
     if role == Role::Fit {
@@ -804,7 +880,12 @@ fn serve_full<Sink>(
     else {
         return;
     };
-    shared.publish(page, Role::Full, &native);
+    let Some(full) =
+        shared.derive_for(page, Role::Full, &native, kind.lane())
+    else {
+        return;
+    };
+    shared.publish(page, Role::Full, &full);
     kind.report(page, Role::Full, false, serve_started.elapsed());
 }
 
@@ -972,12 +1053,30 @@ impl PlaybackRunner {
             tracing::debug!(?id, "stale playback frame");
             return;
         }
+        let Some(limits) = shared.limits() else {
+            tracing::debug!(?id, "playback frame before limits arrived");
+            self.fail_playback(id, shared);
+            return;
+        };
         let role = session.role;
         let produced =
             panic::catch_unwind(AssertUnwindSafe(|| session.advance()));
         match produced {
             Ok(Ok(Some(frame))) => {
-                let image = cache::derive(&frame.image, role);
+                let image = match cache::derive(&frame.image, role, limits)
+                {
+                    Ok(image) => image,
+                    Err(fault) => {
+                        tracing::warn!(
+                            ?id,
+                            ?role,
+                            %fault,
+                            "playback frame exceeds texture limit"
+                        );
+                        self.fail_playback(id, shared);
+                        return;
+                    }
+                };
                 tracing::debug!(
                     ?id,
                     ?role,
@@ -1041,24 +1140,6 @@ impl PlaybackRunner {
         self.steps.retain(|step| step.id() != id);
         shared.emit(ChildEvent::Playback(PlaybackEvent::Failed { id }));
     }
-}
-
-fn derive_timed<'source>(
-    page: usize,
-    role: Role,
-    source: &'source Decoded,
-    lane: &str,
-) -> Cow<'source, Decoded> {
-    let started = Instant::now();
-    let derived = cache::derive(source, role);
-    tracing::debug!(
-        page,
-        ?role,
-        lane,
-        elapsed = ?started.elapsed(),
-        "derived"
-    );
-    derived
 }
 
 fn prefetch_loop<Sink>(source: &Source, shared: &Shared<Sink>)
@@ -1274,6 +1355,12 @@ mod tests {
     /// larger than the thumb edge, smaller than the fit edge, so the
     /// thumb is scaled and the fit image is the page itself.
     const BIG: u32 = 1400;
+    const TEST_FIT_EDGE: u32 = 2560;
+
+    fn test_limits() -> ImageLimits {
+        const MAX_TEXTURE_EDGE: u32 = 16_384;
+        ImageLimits::new(TEST_FIT_EDGE, MAX_TEXTURE_EDGE)
+    }
 
     enum Update {
         Ready {
@@ -1364,6 +1451,7 @@ mod tests {
                 tx: Some(tx),
                 handle: Some(handle),
             };
+            worker.send(ParentMsg::SetLimits(test_limits()));
             if let Some(page) = initial_view {
                 worker.set_view(page);
             }
@@ -1681,18 +1769,18 @@ mod tests {
         assert_eq!(long_edge(&thumb), cache::THUMB_EDGE);
         assert_eq!(
             long_edge(&view),
-            cache::FIT_EDGE.min(BIG),
+            TEST_FIT_EDGE.min(BIG),
             "the fit image's long edge matches the target edge"
         );
 
         let store = Store::at(root.path());
         let hash = page_hash(&source, 0);
         assert!(
-            store.load(hash, Role::Thumb).is_some(),
+            store.load(hash, Role::Thumb, TEST_FIT_EDGE).is_some(),
             "the thumb was not persisted"
         );
         assert!(
-            store.load(hash, Role::Fit).is_some(),
+            store.load(hash, Role::Fit, TEST_FIT_EDGE).is_some(),
             "the fit image was not persisted"
         );
     }
@@ -1715,7 +1803,11 @@ mod tests {
                 "the head never reached the store",
                 || {
                     store
-                        .load(page_hash(&source, page), Role::Thumb)
+                        .load(
+                            page_hash(&source, page),
+                            Role::Thumb,
+                            TEST_FIT_EDGE,
+                        )
                         .is_some()
                         .then_some(())
                 },
@@ -1726,7 +1818,7 @@ mod tests {
         // been silent for the preload window.
         testkit::eventually(20, "the tail never preloaded", || {
             store
-                .load(page_hash(&source, 3), Role::Thumb)
+                .load(page_hash(&source, 3), Role::Thumb, TEST_FIT_EDGE)
                 .is_some()
                 .then_some(())
         });
@@ -1773,7 +1865,11 @@ mod tests {
             "the failure stalled the prefetch",
             || {
                 store
-                    .load(page_hash(&source, 4), Role::Thumb)
+                    .load(
+                        page_hash(&source, 4),
+                        Role::Thumb,
+                        TEST_FIT_EDGE,
+                    )
                     .is_some()
                     .then_some(())
             },
@@ -1803,7 +1899,7 @@ mod tests {
             "the prefetch never produced the head fit image",
             || {
                 store
-                    .load(page_hash(&source, 0), Role::Fit)
+                    .load(page_hash(&source, 0), Role::Fit, TEST_FIT_EDGE)
                     .is_some()
                     .then_some(())
             },
@@ -1979,7 +2075,7 @@ mod tests {
         assert_eq!(long_edge(&thumb), cache::THUMB_EDGE);
         assert_eq!(
             long_edge(&view),
-            cache::FIT_EDGE.min(BIG),
+            TEST_FIT_EDGE.min(BIG),
             "the fit image's long edge matches the target edge"
         );
         drop(worker);
@@ -1987,11 +2083,11 @@ mod tests {
         let hash = page_hash(&source, 0);
         let store = Store::at(store_root);
         assert!(
-            store.load(hash, Role::Thumb).is_some(),
+            store.load(hash, Role::Thumb, TEST_FIT_EDGE).is_some(),
             "the thumb was not persisted"
         );
         assert!(
-            store.load(hash, Role::Fit).is_some(),
+            store.load(hash, Role::Fit, TEST_FIT_EDGE).is_some(),
             "the fit image was not persisted"
         );
 
@@ -2003,8 +2099,16 @@ mod tests {
             "sentinel.png",
         )
         .expect("sentinel decodes");
-        assert!(store.save(hash, Role::Thumb, &sentinel).persisted);
-        assert!(store.save(hash, Role::Fit, &sentinel).persisted);
+        assert!(
+            store
+                .save(hash, Role::Thumb, &sentinel, TEST_FIT_EDGE)
+                .persisted
+        );
+        assert!(
+            store
+                .save(hash, Role::Fit, &sentinel, TEST_FIT_EDGE)
+                .persisted
+        );
         drop(store);
 
         // A second worker on the same root loads the cached roles.
@@ -2037,7 +2141,7 @@ mod tests {
 
         // Loading leaves the roles it read unchanged.
         let kept = Store::at(store_root)
-            .load(hash, Role::Fit)
+            .load(hash, Role::Fit, TEST_FIT_EDGE)
             .expect("the sentinel fit stays");
         assert_eq!((kept.width(), kept.height()), (7, 7));
     }
@@ -2066,9 +2170,15 @@ mod tests {
             WAIT_TIMEOUT_SECS,
             "warmed fit and thumb never persisted",
             || {
-                (store.load(requested_hash, Role::Fit).is_some()
-                    && store.load(requested_hash, Role::Thumb).is_some()
-                    && store.load(prefetched_hash, Role::Fit).is_some())
+                (store
+                    .load(requested_hash, Role::Fit, TEST_FIT_EDGE)
+                    .is_some()
+                    && store
+                        .load(requested_hash, Role::Thumb, TEST_FIT_EDGE)
+                        .is_some()
+                    && store
+                        .load(prefetched_hash, Role::Fit, TEST_FIT_EDGE)
+                        .is_some())
                 .then_some(())
             },
         );
@@ -2115,7 +2225,11 @@ mod tests {
         )
         .expect("sentinel decodes");
         let store = Store::at(root.path());
-        assert!(store.save(hash, Role::Fit, &landscape_fit).persisted);
+        assert!(
+            store
+                .save(hash, Role::Fit, &landscape_fit, TEST_FIT_EDGE)
+                .persisted
+        );
         drop(store);
 
         let (events, sink) = Updates::new();
@@ -2136,7 +2250,7 @@ mod tests {
 
     #[test]
     fn fit_and_full_requested_together_serve_both() {
-        const PAGE_WIDTH: u32 = cache::FIT_EDGE + 40;
+        const PAGE_WIDTH: u32 = TEST_FIT_EDGE + 40;
         const PAGE_HEIGHT: u32 = 16;
 
         let dir = TempDir::new("worker-fit-full");
@@ -2171,7 +2285,7 @@ mod tests {
         });
         assert_eq!(
             (fit.width(), fit.height()),
-            (cache::FIT_EDGE, PAGE_HEIGHT)
+            (TEST_FIT_EDGE, PAGE_HEIGHT)
         );
         assert_eq!(
             (full.width(), full.height()),

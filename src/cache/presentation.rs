@@ -15,7 +15,7 @@ use crate::browse::Role;
 use crate::browse::Roles;
 use crate::browse::ShownSpread;
 use crate::browse::Spread;
-use crate::cache::FIT_EDGE;
+use crate::cache::ImageLimits;
 use crate::fault::PageFault;
 
 pub struct FrameInput<'frame> {
@@ -25,6 +25,7 @@ pub struct FrameInput<'frame> {
     pub motion: Motion,
     pub direction: Direction,
     pub len: PageCount,
+    pub limits: ImageLimits,
     pub facts: &'frame BTreeMap<usize, PageInfo>,
     pub faults: &'frame BTreeMap<usize, PageFault>,
     pub measurable: bool,
@@ -156,7 +157,7 @@ pub fn build_frame(
         |page| {
             input.measurable
                 && input.facts.get(&page).is_some_and(|entry| {
-                    full_wanted(on_screen_scale, entry.dims)
+                    full_wanted(on_screen_scale, entry.dims, input.limits)
                 })
         },
         roles,
@@ -192,11 +193,20 @@ pub fn cold_requests(spread: Spread, mode: ReadingMode) -> Vec<Request> {
 
 #[expect(
     clippy::cast_precision_loss,
-    reason = "page edges and the fixed fit edge stay far below f32's exact-integer range, so the threshold comparison holds"
+    reason = "page edges and image limits stay far below f32's exact-integer range, so the threshold comparison holds"
 )]
-fn full_wanted(scale: f32, page_dims: (u32, u32)) -> bool {
+fn full_wanted(
+    scale: f32,
+    page_dims: (u32, u32),
+    limits: ImageLimits,
+) -> bool {
+    const ROUNDING_MARGIN_PX: f32 = 1.0;
+
     let page_edge = page_dims.0.max(page_dims.1);
-    page_edge > FIT_EDGE && scale > FIT_EDGE as f32 / page_edge as f32
+    let full_edge = page_edge.min(limits.max_texture_edge());
+    full_edge > limits.fit_edge()
+        && scale * page_edge as f32
+            > limits.fit_edge() as f32 + ROUNDING_MARGIN_PX
 }
 
 /// While skimming, demand the next spread instead of the far target:
@@ -333,16 +343,26 @@ mod tests {
     use crate::browse::ReadingPosition;
     use crate::decode::Format;
 
+    fn test_limits() -> ImageLimits {
+        const FIT_EDGE: u32 = 2560;
+        const MAX_TEXTURE_EDGE: u32 = 16_384;
+        ImageLimits::new(FIT_EDGE, MAX_TEXTURE_EDGE)
+    }
+
     #[test]
     fn a_full_image_is_only_requested_when_the_fit_has_fewer_pixels() {
-        assert!(!full_wanted(16.0, (1920, 1080)));
-        assert!(!full_wanted(16.0, (FIT_EDGE, 1440)));
+        let limits = test_limits();
+        assert!(!full_wanted(16.0, (1920, 1080), limits));
+        assert!(!full_wanted(16.0, (2560, 1440), limits));
         let four_k = (3840, 2160);
-        assert!(!full_wanted(0.66, four_k));
-        assert!(full_wanted(0.67, four_k));
+        assert!(!full_wanted(0.66, four_k, limits));
+        assert!(full_wanted(0.67, four_k, limits));
+        // Fractional Wayland scales can push fit rendering a sub-pixel past fit_edge.
+        assert!(!full_wanted(2560.5 / 5000.0, (5000, 3000), limits));
         let ten_k = (10080, 5640);
-        assert!(!full_wanted(0.25, ten_k));
-        assert!(full_wanted(0.26, ten_k));
+        assert!(!full_wanted(0.25, ten_k, limits));
+        assert!(full_wanted(0.26, ten_k, limits));
+        assert!(!full_wanted(16.0, ten_k, ImageLimits::new(2560, 2560)));
     }
 
     #[test]
@@ -361,6 +381,7 @@ mod tests {
                 motion: Motion::Still,
                 direction: Direction::Forward,
                 len,
+                limits: test_limits(),
                 facts: &facts,
                 faults: &faults,
                 measurable: false,
@@ -396,6 +417,7 @@ mod tests {
                 motion: Motion::Still,
                 direction: Direction::Forward,
                 len,
+                limits: test_limits(),
                 facts: &facts,
                 faults: &faults,
                 measurable: true,
@@ -569,6 +591,7 @@ mod tests {
                 motion: Motion::Skimming,
                 direction: Direction::Forward,
                 len,
+                limits: test_limits(),
                 facts: &facts,
                 faults: &faults,
                 measurable: true,
@@ -620,6 +643,7 @@ mod tests {
                     motion,
                     direction: Direction::Forward,
                     len,
+                    limits: test_limits(),
                     facts: &facts,
                     faults: &faults,
                     measurable: false,
@@ -680,6 +704,7 @@ mod tests {
                 motion: Motion::Still,
                 direction: Direction::Forward,
                 len,
+                limits: test_limits(),
                 facts: &facts,
                 faults: &faults,
                 measurable: true,
@@ -719,6 +744,7 @@ mod tests {
                 motion: Motion::Skimming,
                 direction: Direction::Forward,
                 len,
+                limits: test_limits(),
                 facts: &facts,
                 faults: &faults,
                 measurable: true,

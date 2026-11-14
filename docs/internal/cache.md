@@ -4,7 +4,7 @@
 
 The parent holds the book view and the GPU textures. The child holds one book's source, store, decode, and derivation. The app's texture maps decide what is missing; the worker serves that set and fills the store from the prefetch.
 
-Thumbs serve skims, fit images serve settled reading at fit, and full images are the page's own decode for zoom, bypassing the store. The fit edge must cover the fitted page's long edge. A full image is requested only when the page's own long edge and the fitted edge both exceed the fit edge.
+Thumbs serve skims, fit images serve settled reading at the session's `fit_edge` (the max monitor long edge, falling back to the initial window edge, clamped to `[THUMB_EDGE, max_texture_edge]`), and full images serve zoom up to `max_texture_edge`, bypassing the store. A full image is requested only when both `min(page_edge, max_texture_edge)` and the fitted edge (with a 1 px rounding margin) exceed `fit_edge`.
 
 A decoded image's dimensions can differ from its page's; layout and status use the page's, so promoting a thumb to a full image leaves the layout unchanged.
 

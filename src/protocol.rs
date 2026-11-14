@@ -24,6 +24,7 @@ pub use crate::browse::Motion;
 pub use crate::browse::ReadingMode;
 pub use crate::browse::Request;
 pub use crate::browse::Role;
+pub use crate::cache::ImageLimits;
 pub use crate::decode::Format;
 pub use crate::decode::Matrix;
 pub use crate::decode::Subsampling;
@@ -147,6 +148,7 @@ fn shared_plane(plane: &decode::Plane) -> IpcSharedMemory {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub enum ParentMsg {
+    SetLimits(ImageLimits),
     SetView {
         page: usize,
         mode: ReadingMode,

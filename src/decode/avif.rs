@@ -363,6 +363,8 @@ impl<'bytes> DecoderGuard<'bytes> {
     /// calls. Input retention is carried by the `'bytes` lifetime, so
     /// callers owe nothing beyond it.
     unsafe fn new(bytes: &'bytes [u8]) -> Result<Self, DecodeError> {
+        const NO_DIMENSION_LIMIT: u32 = 0;
+
         let ptr = avifDecoderCreate();
         if ptr.is_null() {
             return Err(ErrorUnion::new(DecodeRefusal::Unsupported(
@@ -374,11 +376,12 @@ impl<'bytes> DecoderGuard<'bytes> {
             _bytes: PhantomData,
         };
         (*guard.ptr).maxThreads = threads();
-        // The decoder's own caps run before the pixel decode, so an
+        // The decoder's pixel cap runs before the pixel decode, so an
         // oversized hostile file fails at parse instead of funding a
-        // multi-gigabyte dav1d picture first.
+        // multi-gigabyte dav1d picture first. Clear libavif's per-axis
+        // edge cap so tall strips under `MAX_PIXELS` still decode.
         (*guard.ptr).imageSizeLimit = super::MAX_PIXELS;
-        (*guard.ptr).imageDimensionLimit = super::DECODE_EDGE_LIMIT;
+        (*guard.ptr).imageDimensionLimit = NO_DIMENSION_LIMIT;
         avifDecoderSetIOMemory(guard.ptr, bytes.as_ptr(), bytes.len());
         check(avifDecoderParse(guard.ptr), "avif parse").union()?;
         check(avifDecoderNextImage(guard.ptr), "avif image").union()?;

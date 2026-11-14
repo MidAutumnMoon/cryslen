@@ -153,8 +153,6 @@ pub type OpenError =
 pub type DecodeError =
     ErrorUnion<(DecodeRefusal, AvifFault, ImageError, JxlError)>;
 
-pub type TextureError = ErrorUnion<(TextureFault,)>;
-
 /// A page's failure as text; the error types stay in the child.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PageFault {
@@ -183,6 +181,12 @@ impl From<PageError> for PageFault {
 
 impl From<Arc<PageError>> for PageFault {
     fn from(error: Arc<PageError>) -> Self {
+        Self::new(error.to_string())
+    }
+}
+
+impl From<TextureFault> for PageFault {
+    fn from(error: TextureFault) -> Self {
         Self::new(error.to_string())
     }
 }

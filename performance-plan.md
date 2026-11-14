@@ -1,8 +1,6 @@
 # Performance: remaining levers
 
-Derivation (`fast_image_resize`), request/`cy-prefetch` lane separation, hash-before-read store hits, and low-copy store/IPC paths are in place. Decoding dominates cold pages.
-
-JPEG scaled decode and `zune-png` were measured and rejected (`docs/internal/decoding.md`).
+Decoding dominates cold pages; measured/rejected decoder alternatives are in `docs/internal/decoding.md`.
 
 ## Measured JPEG backend comparison
 

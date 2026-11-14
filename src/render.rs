@@ -15,7 +15,6 @@ use egui_glow::glow::Texture;
 use egui_glow::glow::UniformLocation;
 use egui_glow::glow::VertexArray;
 use egui_winit::winit;
-use eros::ErrorUnion;
 use glutin::context::PossiblyCurrentContext;
 use glutin::surface::Surface;
 use glutin::surface::WindowSurface;
@@ -28,11 +27,11 @@ use winit::window::Window as WinitWindow;
 
 use crate::browse::Role;
 use crate::browse::Roles;
+use crate::cache;
 use crate::decode;
 use crate::decode::Matrix;
 use crate::decode::Subsampling;
 use crate::decode::Transfer;
-use crate::fault::TextureError;
 use crate::fault::TextureFault;
 use crate::geometry;
 use crate::geometry::Placement;
@@ -249,10 +248,10 @@ fn best_texture(
 fn check_texture_dims(
     dims: (u32, u32),
     max_edge: u32,
-) -> Result<(), TextureError> {
+) -> Result<(), TextureFault> {
     if dims.0 == 0 || dims.1 == 0 || dims.0 > max_edge || dims.1 > max_edge
     {
-        return Err(ErrorUnion::new(TextureFault { dims, max_edge }));
+        return Err(TextureFault { dims, max_edge });
     }
     Ok(())
 }
@@ -280,6 +279,12 @@ impl PageTextures {
         .map_err(|_| {
             eros::error!("GL MAX_TEXTURE_SIZE is not a positive GLint")
         })?;
+        if max_texture_edge < cache::THUMB_EDGE {
+            return Err(eros::error!(
+                "GL MAX_TEXTURE_SIZE ({max_texture_edge}) is below THUMB_EDGE ({})",
+                cache::THUMB_EDGE
+            ));
+        }
         Ok(Self {
             gl,
             pipeline,
@@ -288,13 +293,17 @@ impl PageTextures {
         })
     }
 
+    pub fn max_texture_edge(&self) -> u32 {
+        self.max_texture_edge
+    }
+
     /// Upload `image` as `page`'s `role`; no-op if present, never evicts.
     pub fn insert(
         &mut self,
         page: usize,
         role: Role,
         image: &WireImage,
-    ) -> Result<(), TextureError> {
+    ) -> Result<(), TextureFault> {
         if self.has(page, role) {
             return Ok(());
         }
@@ -320,7 +329,7 @@ impl PageTextures {
         page: usize,
         role: Role,
         image: &WireImage,
-    ) -> Result<(), TextureError> {
+    ) -> Result<(), TextureFault> {
         let dims = (image.width, image.height);
         check_texture_dims(dims, self.max_texture_edge)?;
         if let Some(PageTexture {

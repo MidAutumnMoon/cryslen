@@ -33,6 +33,7 @@ use cryslen::protocol::ChildMsg;
 use cryslen::protocol::Direction;
 use cryslen::protocol::Format;
 use cryslen::protocol::Hello;
+use cryslen::protocol::ImageLimits;
 use cryslen::protocol::ParentMsg;
 use cryslen::protocol::ReadingMode;
 use cryslen::protocol::Request;
@@ -137,6 +138,9 @@ fn write_page(dir: &Path) {
 
 #[test]
 fn child_serves_a_decoded_thumb() {
+    const FIT_EDGE: u32 = 2560;
+    const MAX_TEXTURE_EDGE: u32 = 8192;
+
     let binary = env!("CARGO_BIN_EXE_cy");
 
     // `root` outlives the child guard below, so the child is dead before
@@ -215,6 +219,12 @@ fn child_serves_a_decoded_thumb() {
     assert_eq!(info.names, ["page.png"], "the child lists the page");
     assert!(!info.archive, "a directory is not an archive");
 
+    commands
+        .send(ParentMsg::SetLimits(ImageLimits::new(
+            FIT_EDGE,
+            MAX_TEXTURE_EDGE,
+        )))
+        .expect("send SetLimits");
     commands
         .send(ParentMsg::SetView {
             page: 0,

@@ -151,23 +151,23 @@ pub const BYTE_DEPTH: u8 = 8;
 
 const MAX_SAMPLE_DEPTH: u8 = 16;
 
-/// Confirms non-empty `(width, height)` fits `MAX_PIXELS` and
-/// `DECODE_EDGE_LIMIT`, returning pixel count.
+/// Pixel count of `(width, height)` when non-empty and within
+/// [`MAX_PIXELS`].
+pub fn pixel_count(width: u32, height: u32) -> Option<u32> {
+    width
+        .checked_mul(height)
+        .filter(|&count| (1..=MAX_PIXELS).contains(&count))
+}
+
+/// Validated [`pixel_count`], mapping failure to
+/// [`DecodeRefusal::Corrupt`].
 pub fn admit_dims(
     width: u32,
     height: u32,
     bad_dims_reason: &'static str,
 ) -> Result<u32, DecodeRefusal> {
-    let pixels = width
-        .checked_mul(height)
-        .filter(|&count| (1..=MAX_PIXELS).contains(&count))
-        .ok_or(DecodeRefusal::Corrupt(bad_dims_reason))?;
-    if width > DECODE_EDGE_LIMIT || height > DECODE_EDGE_LIMIT {
-        return Err(DecodeRefusal::Unsupported(
-            "page edge over the GPU texture limit",
-        ));
-    }
-    Ok(pixels)
+    pixel_count(width, height)
+        .ok_or(DecodeRefusal::Corrupt(bad_dims_reason))
 }
 
 pub fn validate_rgba_extent(
@@ -219,11 +219,7 @@ pub fn validate_yuv_extents(
     clippy::integer_division,
     reason = "the 512 MiB ceiling in 4-byte pixels divides exactly"
 )]
-const MAX_PIXELS: u32 = (512 << 20) / 4;
-
-/// Admission cap on a page edge; the renderer still checks the GPU's
-/// `MAX_TEXTURE_SIZE` at upload.
-const DECODE_EDGE_LIMIT: u32 = 0x4000;
+pub const MAX_PIXELS: u32 = (512 << 20) / 4;
 
 #[derive(Clone)]
 pub enum Pixels {
@@ -779,29 +775,32 @@ mod tests {
 
     #[test]
     fn constructor_caps() {
+        const WIDE_EDGE: u32 = 32_768;
+
         Decoded::rgba(
-            DECODE_EDGE_LIMIT,
+            WIDE_EDGE,
             1,
             Format::Png,
             Transfer::Srgb,
-            vec![0_u8; 4 * DECODE_EDGE_LIMIT as usize].into_boxed_slice(),
+            vec![0_u8; 4 * WIDE_EDGE as usize].into_boxed_slice(),
         )
-        .expect("page at the edge cap constructs");
-        let over = Decoded::rgba(
-            DECODE_EDGE_LIMIT + 1,
-            1,
-            Format::Png,
-            Transfer::Srgb,
-            vec![0_u8; 4 * (DECODE_EDGE_LIMIT + 1) as usize]
-                .into_boxed_slice(),
-        );
-        assert!(matches!(over, Err(DecodeRefusal::Unsupported(_))));
-        // Dims inside the edge cap can still exceed the pixel-count cap,
-        // which must reject the page before any buffer is sized for it.
+        .expect("tall or wide strip under MAX_PIXELS constructs");
         assert!(matches!(
             Decoded::rgba(
-                DECODE_EDGE_LIMIT,
-                DECODE_EDGE_LIMIT,
+                0,
+                10,
+                Format::Png,
+                Transfer::Srgb,
+                Box::default(),
+            ),
+            Err(DecodeRefusal::Corrupt("bad dimensions"))
+        ));
+        // Over the pixel-count cap must reject the page before any buffer
+        // is sized for it.
+        assert!(matches!(
+            Decoded::rgba(
+                WIDE_EDGE,
+                WIDE_EDGE,
                 Format::Png,
                 Transfer::Srgb,
                 Box::default()

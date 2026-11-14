@@ -56,6 +56,7 @@ use crate::browse::Roles;
 use crate::browse::Spread;
 use crate::cache::presentation;
 use crate::cache::presentation::FrameInput;
+use crate::cache::ImageLimits;
 use crate::catalog;
 use crate::decode;
 use crate::fault::OpenRefusal;
@@ -93,9 +94,39 @@ pub fn post(proxy: &EventLoopProxy<WakeEvent>, event: WakeEvent) {
 
 struct Gl {
     pages: PageTextures,
+    limits: ImageLimits,
     egui: EguiGlow,
     // Must drop last: owns the GL context used by the fields above.
     window: Window,
+}
+
+fn display_limits(
+    event_loop: &ActiveEventLoop,
+    window: &Window,
+    max_texture_edge: u32,
+) -> ImageLimits {
+    let monitor_edge = event_loop
+        .available_monitors()
+        .map(|monitor| {
+            let size = monitor.size();
+            size.width.max(size.height)
+        })
+        .max()
+        .filter(|&edge| edge > 0);
+    let window_size = window.winit().inner_size();
+    let window_edge = window_size.width.max(window_size.height);
+    let limits = ImageLimits::new(
+        monitor_edge.unwrap_or(window_edge),
+        max_texture_edge,
+    );
+    tracing::debug!(
+        ?monitor_edge,
+        window_edge,
+        fit_edge = limits.fit_edge(),
+        max_texture_edge = limits.max_texture_edge(),
+        "display limits"
+    );
+    limits
 }
 
 impl Drop for Gl {
@@ -162,18 +193,8 @@ struct Reading {
 }
 
 impl Reading {
-    /// The first frame is a frame away, so compute the cold requests up
-    /// front: the child serves the visible page before it starts the prefetch.
-    fn new(
-        view: &BookView,
-        mode: ReadingMode,
-        index: usize,
-    ) -> (Self, Vec<Request>) {
-        let cold = presentation::cold_requests(
-            browse::spread_for(index, mode, view.len()),
-            mode,
-        );
-        let reading = Self {
+    fn new(index: usize) -> Self {
+        Self {
             position: ReadingPosition::new(index),
             facts: BTreeMap::new(),
             faults: BTreeMap::new(),
@@ -183,24 +204,28 @@ impl Reading {
             last_turn: None,
             hold_since: None,
             hold_logged: false,
-            sent_requests: cold.clone(),
+            sent_requests: Vec::new(),
             direction: Direction::Forward,
             playback: BTreeMap::new(),
             next_generation: 0,
-        };
-        (reading, cold)
+        }
     }
+}
 
-    fn start(book: &Book, mode: ReadingMode, index: usize) -> Self {
-        let (reading, cold) = Self::new(book.view(), mode, index);
-        book.send(ParentMsg::SetView {
-            page: index,
-            mode,
-            direction: Direction::Forward,
-        });
-        book.send(ParentMsg::SetRequests(cold));
-        reading
-    }
+fn begin_reading(book: &Book, index: usize, mode: ReadingMode) -> Reading {
+    let mut reading = Reading::new(index);
+    let requests = presentation::cold_requests(
+        browse::spread_for(index, mode, book.view().len()),
+        mode,
+    );
+    book.send(ParentMsg::SetView {
+        page: index,
+        mode,
+        direction: reading.direction,
+    });
+    book.send(ParentMsg::SetRequests(requests.clone()));
+    reading.sent_requests = requests;
+    reading
 }
 
 /// The 1-based page a digit buffer names, if it is within the book.
@@ -246,7 +271,7 @@ impl App {
             move || post(&proxy, WakeEvent::Wake)
         });
         let book = Book::new(view, process, wake);
-        let reading = Reading::start(&book, mode, index);
+        let reading = begin_reading(&book, index, mode);
         Self {
             book,
             gl: None,
@@ -312,6 +337,9 @@ impl App {
             len,
         );
 
+        let Some(limits) = self.gl.as_ref().map(|gl| gl.limits) else {
+            return Ok(());
+        };
         let (view_width, view_height) = self.last_viewport.size();
         let measurable = view_width > 0.0 && view_height > 0.0;
         let frame = presentation::build_frame(
@@ -322,6 +350,7 @@ impl App {
                 motion: self.reading.motion,
                 direction: self.reading.direction,
                 len,
+                limits,
                 facts: &self.reading.facts,
                 faults: &self.reading.faults,
                 measurable,
@@ -576,37 +605,53 @@ impl App {
                 ),
             }
             let upload_started = Instant::now();
-            let refused = gl.pages.insert(
+            match gl.pages.insert(
                 delivery.page,
                 delivery.role,
                 &delivery.image,
-            );
-            let elapsed = upload_started.elapsed();
-            tracing::debug!(
-                page = delivery.page,
-                role = ?delivery.role,
-                width = delivery.image.width,
-                height = delivery.image.height,
-                elapsed = ?elapsed,
-                "uploaded"
-            );
-            if elapsed >= Duration::from_millis(30) {
-                tracing::info!(
-                    page = delivery.page,
-                    role = ?delivery.role,
-                    width = delivery.image.width,
-                    height = delivery.image.height,
-                    elapsed = ?elapsed,
-                    "slow upload"
-                );
+            ) {
+                Ok(()) => {
+                    let elapsed = upload_started.elapsed();
+                    tracing::debug!(
+                        page = delivery.page,
+                        role = ?delivery.role,
+                        width = delivery.image.width,
+                        height = delivery.image.height,
+                        elapsed = ?elapsed,
+                        "uploaded"
+                    );
+                    if elapsed >= Duration::from_millis(30) {
+                        tracing::info!(
+                            page = delivery.page,
+                            role = ?delivery.role,
+                            width = delivery.image.width,
+                            height = delivery.image.height,
+                            elapsed = ?elapsed,
+                            "slow upload"
+                        );
+                    }
+                    uploaded += 1;
+                    bytes = bytes.saturating_add(cost);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        page = delivery.page,
+                        role = ?delivery.role,
+                        %error,
+                        "texture upload refused"
+                    );
+                    if delivery.role != Role::Thumb
+                        && !gl
+                            .pages
+                            .roles(delivery.page)
+                            .has_settled_image()
+                    {
+                        self.reading
+                            .faults
+                            .insert(delivery.page, PageFault::from(error));
+                    }
+                }
             }
-            if let Err(error) = refused {
-                self.reading
-                    .faults
-                    .insert(delivery.page, PageFault::from(error.widen()));
-            }
-            uploaded += 1;
-            bytes = bytes.saturating_add(cost);
         }
         if uploaded > 0 {
             tracing::debug!(
@@ -918,13 +963,13 @@ impl App {
             BookChange::None => {}
             BookChange::Adopted => {
                 let index = browse::first_spread();
-                self.reading =
-                    Reading::start(&self.book, self.mode, index);
                 self.jump_digits = None;
                 self.fit.refit();
                 if let Some(gl) = self.gl.as_mut() {
                     gl.pages.clear_all();
+                    self.book.send(ParentMsg::SetLimits(gl.limits));
                 }
+                self.reading = begin_reading(&self.book, index, self.mode);
                 tracing::debug!(
                     path = %self.book.view().path.display(),
                     count = self.book.view().len().get(),
@@ -1118,6 +1163,11 @@ impl ApplicationHandler<WakeEvent> for App {
                 return;
             }
         };
+        let limits =
+            display_limits(event_loop, &window, pages.max_texture_edge());
+        // Send display limits before egui and system font scanning so
+        // the child can decode page 0 concurrently.
+        self.book.send(ParentMsg::SetLimits(limits));
         // `EguiGlow::new` panics if its painter cannot initialize; accepted
         // upstream risk.
         let egui =
@@ -1139,6 +1189,7 @@ impl ApplicationHandler<WakeEvent> for App {
         window.winit().request_redraw();
         self.gl = Some(Gl {
             pages,
+            limits,
             egui,
             window,
         });
