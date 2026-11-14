@@ -59,6 +59,10 @@ const STEP_TIMEOUT: Duration = Duration::from_secs(30);
 /// How often the handshake wait rechecks the child process.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// Grace window so an in-flight `accept` finishes after `Hello::Failed`
+/// lets the child exit.
+const POST_EXIT_GRACE: Duration = Duration::from_secs(1);
+
 static ROOTS: AtomicU64 = AtomicU64::new(0);
 
 /// A scratch root unique within this test process, removed on drop.
@@ -167,20 +171,25 @@ fn accept_hello(
     });
 
     let started = Instant::now();
-    let hello = loop {
+    let accepted = loop {
         match accepted_rx.recv_timeout(POLL_INTERVAL) {
-            Ok(Ok((_, hello))) => break hello,
-            Ok(Err(error)) => {
-                panic!("the child failed the handshake: {error}");
-            }
+            Ok(accepted) => break accepted,
             Err(RecvTimeoutError::Disconnected) => {
                 panic!("the accept thread ended without a handshake");
             }
             Err(RecvTimeoutError::Timeout) => {
                 if let Some(status) = guard.exited() {
-                    panic!(
-                        "{binary} exited before the handshake: {status}"
-                    );
+                    match accepted_rx.recv_timeout(POST_EXIT_GRACE) {
+                        Ok(accepted) => break accepted,
+                        Err(RecvTimeoutError::Timeout) => panic!(
+                            "{binary} exited before the handshake: {status}"
+                        ),
+                        Err(RecvTimeoutError::Disconnected) => {
+                            panic!(
+                                "the accept thread ended without a handshake"
+                            );
+                        }
+                    }
                 }
                 assert!(
                     started.elapsed() <= STEP_TIMEOUT,
@@ -189,6 +198,9 @@ fn accept_hello(
             }
         }
     };
+    let (_, hello) = accepted.unwrap_or_else(|error| {
+        panic!("the child failed the handshake: {error}")
+    });
     accept_thread
         .join()
         .expect("the accept thread finished before the handshake");

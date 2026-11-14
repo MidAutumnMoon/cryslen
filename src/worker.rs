@@ -1775,6 +1775,9 @@ mod tests {
             TEST_FIT_EDGE.min(BIG),
             "the fit image's long edge matches the target edge"
         );
+        // `publish` runs before `persist`; join the worker so both files
+        // finish persisting before inspecting the store.
+        drop(worker);
 
         let store = Store::at(root.path());
         let hash = page_hash(&source, 0);

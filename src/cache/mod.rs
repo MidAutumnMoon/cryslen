@@ -26,6 +26,7 @@ use std::io::Read as _;
 use std::io::Write as _;
 use std::mem::DropGuard;
 use std::os::unix::fs::DirBuilderExt as _;
+use std::os::unix::fs::MetadataExt as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
 use std::path::PathBuf;
@@ -435,12 +436,14 @@ impl Store {
         let Some(target) = self.role_target(role, fit_edge) else {
             return SaveResult::default();
         };
-        let path = target.namespace.path(hash);
-        let temp = target.namespace.temp_path(hash);
         let started = Instant::now();
-        let Ok(size) =
-            write_encoded_atomic(&temp, &path, page, role, target.edge)
-        else {
+        let Ok(size) = write_encoded_atomic(
+            target.namespace,
+            hash,
+            page,
+            role,
+            target.edge,
+        ) else {
             return SaveResult::default();
         };
         let prev =
@@ -624,34 +627,9 @@ fn clean_temps(dir: &Path) {
         if !is_temp_name(&name) {
             continue;
         }
-        let path = dir.join(&name);
-        let Ok(file) = File::open(&path) else {
-            continue;
-        };
-        let stale = match file.try_lock() {
-            Ok(()) => true,
-            Err(TryLockError::WouldBlock) => false,
-            Err(TryLockError::Error(error)) => {
-                tracing::debug!(
-                    %error,
-                    path = %path.display(),
-                    "preview temp lock failed"
-                );
-                false
-            }
-        };
-        if !stale {
-            continue;
+        if remove_if_unlocked(&dir.join(&name)) {
+            removed += 1;
         }
-        if let Err(error) = fs::remove_file(&path) {
-            tracing::debug!(
-                %error,
-                path = %path.display(),
-                "stale preview temp"
-            );
-            continue;
-        }
-        removed += 1;
     }
     if removed > 0 {
         tracing::debug!(
@@ -660,6 +638,35 @@ fn clean_temps(dir: &Path) {
             "cleaned stale preview temps"
         );
     }
+}
+
+fn remove_if_unlocked(path: &Path) -> bool {
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(TryLockError::WouldBlock) => return false,
+        Err(TryLockError::Error(error)) => {
+            tracing::debug!(
+                %error,
+                path = %path.display(),
+                "preview temp lock failed"
+            );
+            return false;
+        }
+    }
+    // Hold the lock across unlink so a racing writer waits for removal.
+    if let Err(error) = fs::remove_file(path) {
+        tracing::debug!(
+            %error,
+            path = %path.display(),
+            "stale preview temp"
+        );
+        return false;
+    }
+    drop(file);
+    true
 }
 
 /// Whether `name` is a writer's temp: `<hash:032x>.<pid>[-<sequence>].tmp`.
@@ -718,24 +725,59 @@ fn make_dir(path: &Path) -> Option<()> {
     (metadata.is_dir() && !metadata.file_type().is_symlink()).then_some(())
 }
 
+type TempGuard = DropGuard<PathBuf, fn(PathBuf)>;
+
+fn remove_temp(path: PathBuf) {
+    if let Err(error) = fs::remove_file(path) {
+        tracing::debug!(%error, "leftover preview temp file");
+    }
+}
+
+fn file_identity(metadata: &fs::Metadata) -> (u64, u64) {
+    (metadata.dev(), metadata.ino())
+}
+
+/// Retries if `clean_temps` sweeps the entry before `file.lock()` lands;
+/// keep the returned `File` locked until rename so cleaners see a live writer.
+fn open_locked_temp(
+    namespace: &Namespace,
+    hash: u128,
+) -> io::Result<(File, TempGuard)> {
+    const MAX_ATTEMPTS: usize = 8;
+
+    for _ in 0..MAX_ATTEMPTS {
+        let temp = namespace.temp_path(hash);
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp)?;
+        let guard: TempGuard = DropGuard::new(temp, remove_temp);
+        file.lock()?;
+        let opened = file_identity(&file.metadata()?);
+        let on_disk = match fs::symlink_metadata(&*guard) {
+            Ok(metadata) => Some(file_identity(&metadata)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        if on_disk == Some(opened) {
+            return Ok((file, guard));
+        }
+        // Disarm before retrying so a replaced path's inode stays intact.
+        drop(DropGuard::dismiss(guard));
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "temp file was swept before it could be locked",
+    ))
+}
+
 fn write_atomic(
-    temp: &Path,
-    final_path: &Path,
+    namespace: &Namespace,
+    hash: u128,
     mut slices: &mut [IoSlice<'_>],
 ) -> io::Result<u64> {
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(temp)?;
-    let guard = DropGuard::new(temp, |path| {
-        if let Err(error) = fs::remove_file(path) {
-            tracing::debug!(%error, "leftover preview temp file");
-        }
-    });
-    // Hold until the rename: clean_temps treats a free lock as a dead
-    // writer.
-    file.lock()?;
+    let (mut file, guard) = open_locked_temp(namespace, hash)?;
     let total: usize = slices.iter().map(|slice| slice.len()).sum();
     while !slices.is_empty() {
         match file.write_vectored(slices) {
@@ -750,8 +792,8 @@ fn write_atomic(
             Err(error) => return Err(error),
         }
     }
-    fs::rename(*guard, final_path)?;
-    DropGuard::dismiss(guard);
+    fs::rename(&*guard, namespace.path(hash))?;
+    drop(DropGuard::dismiss(guard));
     Ok(u64::try_from(total).unwrap_or(u64::MAX))
 }
 
@@ -770,8 +812,8 @@ const ALPHA_U8: u8 = 1;
 const ALPHA_U16: u8 = 2;
 
 fn write_encoded_atomic(
-    temp: &Path,
-    final_path: &Path,
+    namespace: &Namespace,
+    hash: u128,
     page: &Decoded,
     role: Role,
     target_edge: u32,
@@ -785,7 +827,7 @@ fn write_encoded_atomic(
                 encode_len(bytes.len()),
             );
             let mut slices = [IoSlice::new(&header), IoSlice::new(bytes)];
-            write_atomic(temp, final_path, &mut slices)
+            write_atomic(namespace, hash, &mut slices)
         }
         Pixels::Yuv(yuv) => {
             // Header + 3 YUV (prefix, plane) pairs + optional alpha (prefix, plane).
@@ -824,7 +866,7 @@ fn write_encoded_atomic(
             } else {
                 slices.push(IoSlice::new(&absent));
             }
-            write_atomic(temp, final_path, &mut slices)
+            write_atomic(namespace, hash, &mut slices)
         }
     }
 }
@@ -1334,17 +1376,22 @@ mod tests {
 
     #[test]
     fn concurrent_saves_do_not_collide() {
+        use std::sync::atomic::AtomicUsize;
+
         const WRITER_COUNT: usize = 2;
         const SAVES_PER_WRITER: usize = 20;
 
         let dir = TempDir::new("preview-concurrent-save");
+        let root = dir.path();
         let page = rgba_page(8, 8);
         let hash = content_hash(b"same-entry");
-        let store = Store::at(dir.path());
+        let store = Store::at(root);
+        let active_writers = AtomicUsize::new(WRITER_COUNT);
 
         thread::scope(|scope| {
             let store = &store;
             let page = &page;
+            let active_writers = &active_writers;
             for _ in 0..WRITER_COUNT {
                 scope.spawn(move || {
                     for _ in 0..SAVES_PER_WRITER {
@@ -1354,11 +1401,17 @@ mod tests {
                                 .persisted
                         );
                     }
+                    active_writers.fetch_sub(1, Ordering::Relaxed);
                 });
             }
+            scope.spawn(move || {
+                while active_writers.load(Ordering::Relaxed) > 0 {
+                    drop(Store::at(root));
+                }
+            });
         });
 
-        let loaded = Store::at(dir.path())
+        let loaded = Store::at(root)
             .load(hash, Role::Fit, TEST_FIT_EDGE)
             .expect("kept");
         assert_eq!((loaded.width(), loaded.height()), (8, 8));
