@@ -1,6 +1,11 @@
 //! GL rendering: window, EGL surface, and the page quad. GL runs on the
 //! main thread with the context current. Texture-creation failure panics.
 
+#![expect(
+    clippy::multiple_unsafe_ops_per_block,
+    reason = "scoped to render.rs, where batched GL calls share one current-context invariant"
+)]
+
 use core::num::NonZeroU32;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -22,6 +27,7 @@ use indoc::indoc;
 
 use winit::dpi::PhysicalSize;
 use winit::event_loop::ActiveEventLoop;
+use winit::event_loop::OwnedDisplayHandle;
 use winit::raw_window_handle::HasWindowHandle as _;
 use winit::window::Window as WinitWindow;
 
@@ -168,11 +174,37 @@ struct UniformLocations {
 
 /// One cached role's GPU state.
 struct PageTexture {
+    gl: Arc<Context>,
     /// Screen px -> page fraction, before the zoom-scale divide.
     page_uv_per_pixel: (f32, f32),
     transfer: Transfer,
     needs_dither: bool,
     layout: PixelLayout,
+}
+
+impl Drop for PageTexture {
+    fn drop(&mut self) {
+        // SAFETY: `Window` drops `PageTextures` while the context is still
+        // current and alive, and `self` owns these texture handles uniquely.
+        unsafe {
+            match self.layout {
+                PixelLayout::Rgba { texture, .. } => {
+                    self.gl.delete_texture(texture);
+                }
+                PixelLayout::Yuv {
+                    luma,
+                    cb,
+                    cr,
+                    alpha,
+                    ..
+                } => {
+                    for texture in [luma, cb, cr, alpha] {
+                        self.gl.delete_texture(texture);
+                    }
+                }
+            }
+        }
+    }
 }
 
 enum PixelLayout {
@@ -257,22 +289,17 @@ fn check_texture_dims(
 }
 
 impl PageTextures {
-    pub fn new(gl: Arc<Context>) -> eros::Result<Self> {
-        // SAFETY: the returned names land in Self, whose Drop deletes
-        // them. The error path below leaks them into the process-fatal
-        // exit.
-        let pipeline = unsafe {
-            create_pipeline(
-                &gl,
-                VERTEX_SHADER_SOURCE,
-                FRAGMENT_SHADER_SOURCE,
-            )
-        }?;
+    fn new(gl: Arc<Context>) -> eros::Result<Self> {
+        let pipeline = create_pipeline(
+            Arc::clone(&gl),
+            VERTEX_SHADER_SOURCE,
+            FRAGMENT_SHADER_SOURCE,
+        )?;
         #[expect(
             clippy::map_err_ignore,
             reason = "the dropped conversion error says only that the value is out of range, which the message states"
         )]
-        // SAFETY: MAX_TEXTURE_SIZE is a pure query with no object names.
+        // SAFETY: MAX_TEXTURE_SIZE is a pure query on the current context.
         let max_texture_edge = u32::try_from(unsafe {
             gl.get_parameter_i32(glow::MAX_TEXTURE_SIZE)
         })
@@ -309,15 +336,8 @@ impl PageTextures {
         }
         let dims = (image.width, image.height);
         check_texture_dims(dims, self.max_texture_edge)?;
-        // SAFETY: the size check above keeps the page inside this
-        // context's texture limit, and `upload_page_texture` asserts its
-        // own plane byte extents.
-        let texture = unsafe { upload_page_texture(&self.gl, image) };
-        // SAFETY: the context is current and the entry's names are live
-        // until the cache removes it.
-        unsafe {
-            label_entry(&self.gl, page, role, &texture);
-        }
+        let texture = upload_page_texture(&self.gl, image);
+        label_entry(&self.gl, page, role, &texture);
         *role_slot_mut(self.pages.entry(page).or_default(), role) =
             Some(texture);
         Ok(())
@@ -347,28 +367,15 @@ impl PageTextures {
         {
             if *present_dims == dims && *transfer == image.transfer {
                 if let WirePixels::Rgba8(bytes) = &image.pixels {
-                    // SAFETY: the size check above and `WireImage`'s
-                    // validation keep the byte length right, and the
-                    // texture is live until this entry is removed.
-                    unsafe {
-                        update_rgba(&self.gl, *texture, bytes, dims);
-                    }
+                    update_rgba(&self.gl, *texture, bytes, dims);
                     return Ok(());
                 }
             }
         }
-        let empty = if let Some(slots) = self.pages.get_mut(&page) {
-            if let Some(texture) = role_slot_mut(slots, role).take() {
-                // SAFETY: the entry left the slots, so this is its only
-                // deletion.
-                unsafe {
-                    delete_entry(&self.gl, &texture);
-                }
-            }
+        let empty = self.pages.get_mut(&page).is_some_and(|slots| {
+            *role_slot_mut(slots, role) = None;
             slots.iter().all(Option::is_none)
-        } else {
-            false
-        };
+        });
         if empty {
             self.pages.remove(&page);
         }
@@ -402,18 +409,10 @@ impl PageTextures {
 
     /// Drop every texture whose page and role `keep` rejects.
     pub fn retain(&mut self, keep: impl Fn(usize, Role) -> bool) {
-        let gl = &self.gl;
         self.pages.retain(|&page, slots| {
             for (slot, role) in slots.iter_mut().zip(Role::ALL) {
-                if slot.is_none() || keep(page, role) {
-                    continue;
-                }
-                if let Some(texture) = slot.take() {
-                    // SAFETY: the texture leaves the slots in this same
-                    // step, so this is its only deletion.
-                    unsafe {
-                        delete_entry(gl, &texture);
-                    }
+                if slot.is_some() && !keep(page, role) {
+                    *slot = None;
                 }
             }
             slots.iter().any(Option::is_some)
@@ -421,7 +420,7 @@ impl PageTextures {
     }
 
     pub fn clear_all(&mut self) {
-        self.retain(|_, _| false);
+        self.pages.clear();
     }
 
     /// Draw the shown spread, clipped to `viewport`; each seat draws its
@@ -437,10 +436,7 @@ impl PageTextures {
         if window_size.0 == 0 || window_size.1 == 0 {
             return;
         }
-        // SAFETY: the pipeline is Self's field, live until Drop.
-        unsafe {
-            begin_frame(&self.gl, &self.pipeline, window_size);
-        }
+        begin_frame(&self.gl, &self.pipeline, window_size);
         // GL scissor is bottom-origin and the viewport hugs the window's
         // top-left, so only the height converts.
         #[expect(
@@ -450,12 +446,9 @@ impl PageTextures {
         )]
         let (width, height) =
             (viewport.size().0 as u32, viewport.size().1 as u32);
-        // SAFETY: the context is current. This only toggles scissor state.
+        // SAFETY: the context is current.
         unsafe {
             self.gl.enable(glow::SCISSOR_TEST);
-        }
-        // SAFETY: same contract as above, setting the scissor box.
-        unsafe {
             self.gl.scissor(
                 0,
                 gl_int(window_size.1.saturating_sub(height)),
@@ -514,17 +507,14 @@ impl PageTextures {
             if screen_size.0 <= 0.0 || screen_size.1 <= 0.0 {
                 continue;
             }
-            // SAFETY: &self pins the texture, so its GL names outlive the call.
-            unsafe {
-                draw_page(
-                    &self.gl,
-                    &self.pipeline,
-                    texture,
-                    screen_origin,
-                    screen_size,
-                    placement.scale,
-                );
-            }
+            draw_page(
+                &self.gl,
+                &self.pipeline,
+                texture,
+                screen_origin,
+                screen_size,
+                placement.scale,
+            );
         }
         // SAFETY: the context is current. This restores unclipped raster
         // state.
@@ -534,105 +524,142 @@ impl PageTextures {
     }
 }
 
-impl Drop for PageTextures {
+struct ShaderGuard<'gl> {
+    gl: &'gl Context,
+    shader: Shader,
+}
+
+impl Drop for ShaderGuard<'_> {
     fn drop(&mut self) {
-        // GL objects must be deleted while their context is alive. The
-        // window that owns the context is dropped after this struct.
-        self.clear_all();
-        // SAFETY: the context outlives this drop. These names are
-        // deleted once, here.
-        unsafe {
-            delete_pipeline(&self.gl, &self.pipeline);
-        }
+        // SAFETY: `self.gl` is the current context and `self.shader` is owned
+        // uniquely by this guard.
+        unsafe { self.gl.delete_shader(self.shader); }
     }
 }
 
-/// # Safety
-///
-/// The context must be current. The caller must delete the returned name.
-unsafe fn compile_shader(
-    gl: &Context,
+fn compile_shader<'gl>(
+    gl: &'gl Context,
     kind: u32,
     src: &str,
-) -> eros::Result<Shader> {
-    let shader = gl.create_shader(kind).map_err(|error| {
+) -> eros::Result<ShaderGuard<'gl>> {
+    // SAFETY: Caller ensures the GL context is current on the render thread.
+    let raw = unsafe { gl.create_shader(kind) }.map_err(|error| {
         eros::error!("GL shader object creation failed: {error}")
     })?;
-    gl.shader_source(shader, src);
-    gl.compile_shader(shader);
-    if !gl.get_shader_compile_status(shader) {
-        return Err(eros::error!(
-            "GL shader compile failed: {}",
-            gl.get_shader_info_log(shader)
-        ));
+    let guard = ShaderGuard { gl, shader: raw };
+    // SAFETY: `guard.shader` was just created on the current context.
+    unsafe {
+        gl.shader_source(guard.shader, src);
+        gl.compile_shader(guard.shader);
+        if !gl.get_shader_compile_status(guard.shader) {
+            let info = gl.get_shader_info_log(guard.shader);
+            return Err(eros::error!("GL shader compile failed: {info}"));
+        }
     }
-    Ok(shader)
+    Ok(guard)
+}
+
+struct PipelineObjects {
+    gl: Arc<Context>,
+    program: Program,
+    vao: VertexArray,
+}
+
+impl Drop for PipelineObjects {
+    fn drop(&mut self) {
+        // SAFETY: `Window` drops `PageTextures` while the context is still
+        // current and alive, and `self` owns both objects uniquely.
+        unsafe {
+            self.gl.delete_program(self.program);
+            self.gl.delete_vertex_array(self.vao);
+        }
+    }
 }
 
 /// The linked program, cached uniform locations, and the empty VAO a
 /// core profile requires.
 struct Pipeline {
-    program: Program,
+    objects: PipelineObjects,
     uniform_locations: UniformLocations,
-    vao: VertexArray,
 }
 
-/// Create the linked program and empty VAO. Objects from a failed step
-/// leak into the process-fatal exit.
-///
-/// # Safety
-///
-/// The context must be current. The returned names are live until deleted.
-unsafe fn create_pipeline(
-    gl: &Context,
+fn create_pipeline(
+    gl: Arc<Context>,
     vertex_source: &str,
     fragment_source: &str,
 ) -> eros::Result<Pipeline> {
-    let program = gl.create_program().map_err(|error| {
+    // SAFETY: Caller ensures the GL context is current on the render thread.
+    let program = unsafe { gl.create_program() }.map_err(|error| {
         eros::error!("GL program object creation failed: {error}")
     })?;
-    let vao = gl.create_vertex_array().map_err(|error| {
-        eros::error!("GL vertex array object creation failed: {error}")
-    })?;
+    // SAFETY: Caller ensures the GL context is current on the render thread.
+    let vao = match unsafe { gl.create_vertex_array() } {
+        Ok(vao) => vao,
+        Err(error) => {
+            // SAFETY: `program` was just created on the current context.
+            unsafe { gl.delete_program(program); }
+            return Err(eros::error!(
+                "GL vertex array object creation failed: {error}"
+            ));
+        }
+    };
+    let objects = PipelineObjects { gl, program, vao };
 
-    let vertex_shader =
-        compile_shader(gl, glow::VERTEX_SHADER, vertex_source)?;
-    gl.attach_shader(program, vertex_shader);
-    let fragment_shader =
-        compile_shader(gl, glow::FRAGMENT_SHADER, fragment_source)?;
-    gl.attach_shader(program, fragment_shader);
-    gl.link_program(program);
-    if !gl.get_program_link_status(program) {
-        return Err(eros::error!(
-            "GL program link failed: {}",
-            gl.get_program_info_log(program)
-        ));
+    {
+        let vertex_shader =
+            compile_shader(&objects.gl, glow::VERTEX_SHADER, vertex_source)?;
+        let fragment_shader = compile_shader(
+            &objects.gl,
+            glow::FRAGMENT_SHADER,
+            fragment_source,
+        )?;
+        // SAFETY: `objects.program` and both compiled shaders are live on the
+        // current context.
+        unsafe {
+            objects
+                .gl
+                .attach_shader(objects.program, vertex_shader.shader);
+            objects
+                .gl
+                .attach_shader(objects.program, fragment_shader.shader);
+            objects.gl.link_program(objects.program);
+            if !objects.gl.get_program_link_status(objects.program) {
+                let info =
+                    objects.gl.get_program_info_log(objects.program);
+                return Err(eros::error!("GL program link failed: {info}"));
+            }
+        }
     }
-    gl.delete_shader(vertex_shader);
-    gl.delete_shader(fragment_shader);
 
-    // A core profile still requires a VAO.
-    gl.bind_vertex_array(Some(vao));
-
-    // Sampler units are fixed. Draw rebinds textures only. A silently
-    // skipped sampler uniform would point every unit at 0, so a missing
-    // location fails creation.
-    gl.use_program(Some(program));
     let location = |name: &str| {
+        // SAFETY: `objects.program` is linked and live on the current context.
+        let found = unsafe {
+            objects.gl.get_uniform_location(objects.program, name)
+        };
         #[expect(
             clippy::expect_used,
             reason = "declared and used in the in-tree shader sources, so a miss is an in-tree regression"
         )]
-        gl.get_uniform_location(program, name)
-            .expect("uniform location in page shader")
+        found.expect("uniform location in page shader")
     };
-    for (unit, name) in [
-        (0_i32, "u_rgba_or_luma"),
-        (1, "u_cb"),
-        (2, "u_cr"),
-        (3, "u_alpha"),
-    ] {
-        gl.uniform_1_i32(Some(&location(name)), unit);
+    let sampler_locations = [
+        (0_i32, location("u_rgba_or_luma")),
+        (1, location("u_cb")),
+        (2, location("u_cr")),
+        (3, location("u_alpha")),
+    ];
+    // SAFETY: `objects.vao` and `objects.program` are live on the current
+    // context, and all sampler locations belong to `objects.program`.
+    unsafe {
+        // A core profile still requires a VAO.
+        objects.gl.bind_vertex_array(Some(objects.vao));
+        // Sampler units are fixed. Draw rebinds textures only. A silently
+        // skipped sampler uniform would point every unit at 0, so a missing
+        // location fails creation.
+        objects.gl.use_program(Some(objects.program));
+        for (unit, loc) in sampler_locations {
+            objects.gl.uniform_1_i32(Some(&loc), unit);
+        }
     }
     let uniform_locations = UniformLocations {
         window_size: location("u_window_size"),
@@ -648,54 +675,53 @@ unsafe fn create_pipeline(
         dither: location("u_dither"),
     };
 
-    label(gl, glow::PROGRAM, program.0.get(), "page program");
-    label(gl, glow::VERTEX_ARRAY, vao.0.get(), "page quad");
+    label(
+        &objects.gl,
+        glow::PROGRAM,
+        objects.program.0.get(),
+        "page program",
+    );
+    label(
+        &objects.gl,
+        glow::VERTEX_ARRAY,
+        objects.vao.0.get(),
+        "page quad",
+    );
 
     Ok(Pipeline {
-        program,
+        objects,
         uniform_locations,
-        vao,
     })
 }
 
 /// Set the frame state the page draws depend on: the viewport, the
 /// premultiplied compositing pages draw with, and the window-size
 /// uniform. egui's own paint re-sets its blend state afterwards.
-///
-/// # Safety
-///
-/// The context must be current. `pipeline`'s names are live.
-unsafe fn begin_frame(
-    gl: &Context,
-    pipeline: &Pipeline,
-    window_size: (u32, u32),
-) {
-    gl.viewport(0, 0, gl_int(window_size.0), gl_int(window_size.1));
-    gl.enable(glow::BLEND);
-    gl.blend_func_separate(
-        glow::ONE,
-        glow::ONE_MINUS_SRC_ALPHA,
-        glow::ONE,
-        glow::ONE_MINUS_SRC_ALPHA,
-    );
-    gl.use_program(Some(pipeline.program));
-    gl.bind_vertex_array(Some(pipeline.vao));
+fn begin_frame(gl: &Context, pipeline: &Pipeline, window_size: (u32, u32)) {
     let window_px = geometry::px_f32(window_size);
-    gl.uniform_2_f32(
-        Some(&pipeline.uniform_locations.window_size),
-        window_px.0,
-        window_px.1,
-    );
+    // SAFETY: Caller holds the current context; `pipeline` handles are live.
+    unsafe {
+        gl.viewport(0, 0, gl_int(window_size.0), gl_int(window_size.1));
+        gl.enable(glow::BLEND);
+        gl.blend_func_separate(
+            glow::ONE,
+            glow::ONE_MINUS_SRC_ALPHA,
+            glow::ONE,
+            glow::ONE_MINUS_SRC_ALPHA,
+        );
+        gl.use_program(Some(pipeline.objects.program));
+        gl.bind_vertex_array(Some(pipeline.objects.vao));
+        gl.uniform_2_f32(
+            Some(&pipeline.uniform_locations.window_size),
+            window_px.0,
+            window_px.1,
+        );
+    }
 }
 
 /// Draw one seat's quad. `u_pixel_layout` guards the layout-specific
 /// uniforms.
-///
-/// # Safety
-///
-/// The context must be current. `pipeline`'s names and `page_texture`'s
-/// texture names are live for the duration of the call.
-unsafe fn draw_page(
+fn draw_page(
     gl: &Context,
     pipeline: &Pipeline,
     page_texture: &PageTexture,
@@ -704,106 +730,81 @@ unsafe fn draw_page(
     scale: f32,
 ) {
     let locations = &pipeline.uniform_locations;
-    gl.use_program(Some(pipeline.program));
-    gl.uniform_2_f32(
-        Some(&locations.seat_offset),
-        screen_origin.0,
-        screen_origin.1,
-    );
-    gl.uniform_2_f32(
-        Some(&locations.seat_size),
-        screen_size.0,
-        screen_size.1,
-    );
-    gl.uniform_1_i32(
-        Some(&locations.pixel_layout),
-        page_texture.layout.shader_code(),
-    );
-    gl.uniform_1_i32(
-        Some(&locations.transfer_code),
-        transfer_code(page_texture.transfer),
-    );
-    gl.uniform_1_i32(
-        Some(&locations.dither),
-        i32::from(page_texture.needs_dither),
-    );
-    gl.uniform_2_f32(
-        Some(&locations.page_uv_per_pixel),
-        page_texture.page_uv_per_pixel.0 / scale,
-        page_texture.page_uv_per_pixel.1 / scale,
-    );
-    gl.active_texture(glow::TEXTURE0);
-    match &page_texture.layout {
-        PixelLayout::Rgba { texture, .. } => {
-            gl.bind_texture(glow::TEXTURE_2D, Some(*texture));
+    // SAFETY: The context is current, the empty VAO is bound by `begin_frame`,
+    // and `pipeline` and `page_texture` own live GL objects for this call.
+    unsafe {
+        gl.use_program(Some(pipeline.objects.program));
+        gl.uniform_2_f32(
+            Some(&locations.seat_offset),
+            screen_origin.0,
+            screen_origin.1,
+        );
+        gl.uniform_2_f32(
+            Some(&locations.seat_size),
+            screen_size.0,
+            screen_size.1,
+        );
+        gl.uniform_1_i32(
+            Some(&locations.pixel_layout),
+            page_texture.layout.shader_code(),
+        );
+        gl.uniform_1_i32(
+            Some(&locations.transfer_code),
+            transfer_code(page_texture.transfer),
+        );
+        gl.uniform_1_i32(
+            Some(&locations.dither),
+            i32::from(page_texture.needs_dither),
+        );
+        gl.uniform_2_f32(
+            Some(&locations.page_uv_per_pixel),
+            page_texture.page_uv_per_pixel.0 / scale,
+            page_texture.page_uv_per_pixel.1 / scale,
+        );
+        gl.active_texture(glow::TEXTURE0);
+        match &page_texture.layout {
+            PixelLayout::Rgba { texture, .. } => {
+                gl.bind_texture(glow::TEXTURE_2D, Some(*texture));
+            }
+            PixelLayout::Yuv {
+                luma,
+                cb,
+                cr,
+                alpha,
+                chroma_uv_per_pixel,
+                color_conversion,
+                alpha_normalization,
+            } => {
+                gl.uniform_2_f32(
+                    Some(&locations.chroma_uv_per_pixel),
+                    chroma_uv_per_pixel.0 / scale,
+                    chroma_uv_per_pixel.1 / scale,
+                );
+                gl.uniform_1_f32(
+                    Some(&locations.alpha_normalization),
+                    *alpha_normalization,
+                );
+                gl.uniform_matrix_3_f32_slice(
+                    Some(&locations.color_matrix),
+                    false,
+                    &color_conversion.matrix,
+                );
+                gl.uniform_3_f32(
+                    Some(&locations.color_offset),
+                    color_conversion.offset[0],
+                    color_conversion.offset[1],
+                    color_conversion.offset[2],
+                );
+                gl.bind_texture(glow::TEXTURE_2D, Some(*luma));
+                gl.active_texture(glow::TEXTURE1);
+                gl.bind_texture(glow::TEXTURE_2D, Some(*cb));
+                gl.active_texture(glow::TEXTURE2);
+                gl.bind_texture(glow::TEXTURE_2D, Some(*cr));
+                gl.active_texture(glow::TEXTURE3);
+                gl.bind_texture(glow::TEXTURE_2D, Some(*alpha));
+            }
         }
-        PixelLayout::Yuv {
-            luma,
-            cb,
-            cr,
-            alpha,
-            chroma_uv_per_pixel,
-            color_conversion,
-            alpha_normalization,
-        } => {
-            gl.uniform_2_f32(
-                Some(&locations.chroma_uv_per_pixel),
-                chroma_uv_per_pixel.0 / scale,
-                chroma_uv_per_pixel.1 / scale,
-            );
-            gl.uniform_1_f32(
-                Some(&locations.alpha_normalization),
-                *alpha_normalization,
-            );
-            gl.uniform_matrix_3_f32_slice(
-                Some(&locations.color_matrix),
-                false,
-                &color_conversion.matrix,
-            );
-            gl.uniform_3_f32(
-                Some(&locations.color_offset),
-                color_conversion.offset[0],
-                color_conversion.offset[1],
-                color_conversion.offset[2],
-            );
-            gl.bind_texture(glow::TEXTURE_2D, Some(*luma));
-            gl.active_texture(glow::TEXTURE1);
-            gl.bind_texture(glow::TEXTURE_2D, Some(*cb));
-            gl.active_texture(glow::TEXTURE2);
-            gl.bind_texture(glow::TEXTURE_2D, Some(*cr));
-            gl.active_texture(glow::TEXTURE3);
-            gl.bind_texture(glow::TEXTURE_2D, Some(*alpha));
-        }
-    }
-    gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
-}
-
-/// # Safety
-///
-/// The context must be current. Each name is live and deleted at most once.
-unsafe fn delete_pipeline(gl: &Context, pipeline: &Pipeline) {
-    gl.delete_program(pipeline.program);
-    gl.delete_vertex_array(pipeline.vao);
-}
-
-/// # Safety
-///
-/// The context must be current. The names are live and deleted at most once.
-unsafe fn delete_entry(gl: &Context, page_texture: &PageTexture) {
-    match &page_texture.layout {
-        PixelLayout::Rgba { texture, .. } => gl.delete_texture(*texture),
-        PixelLayout::Yuv {
-            luma,
-            cb,
-            cr,
-            alpha,
-            ..
-        } => {
-            gl.delete_texture(*luma);
-            gl.delete_texture(*cb);
-            gl.delete_texture(*cr);
-            gl.delete_texture(*alpha);
-        }
+        gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
     }
 }
 
@@ -816,20 +817,14 @@ fn gl_int(value: u32) -> i32 {
 }
 
 /// Name one object when the driver exposes `KHR_debug`.
-///
-/// # Safety
-///
-/// The context must be current and `name` must be live.
-unsafe fn label(gl: &Context, identifier: u32, name: u32, text: &str) {
+fn label(gl: &Context, identifier: u32, name: u32, text: &str) {
     if gl.supports_debug() {
-        gl.object_label(identifier, name, Some(text));
+        // SAFETY: `gl` is current with `KHR_debug` supported and `name` is live.
+        unsafe { gl.object_label(identifier, name, Some(text)); }
     }
 }
 
-/// # Safety
-///
-/// The context must be current and the textures' names must be live.
-unsafe fn label_entry(
+fn label_entry(
     gl: &Context,
     page: usize,
     role: Role,
@@ -916,178 +911,173 @@ fn needs_dither(transfer: Transfer, plane_depth: Option<u8>) -> bool {
 
 /// Create a texture with mipmapped minification and the requested
 /// magnification filter.
-///
-/// # Safety
-///
-/// The context must be current. The returned name is live until deleted.
-unsafe fn new_texture(
+fn new_texture(
     gl: &Context,
     magnification_filter: MagnificationFilter,
 ) -> Texture {
-    #[expect(
-        clippy::expect_used,
-        reason = "texture-creation failure panics by policy"
-    )]
-    let texture = gl.create_texture().expect("GL texture object");
-    gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-    gl.tex_parameter_i32(
-        glow::TEXTURE_2D,
-        glow::TEXTURE_WRAP_S,
-        gl_int(glow::CLAMP_TO_EDGE),
-    );
-    gl.tex_parameter_i32(
-        glow::TEXTURE_2D,
-        glow::TEXTURE_WRAP_T,
-        gl_int(glow::CLAMP_TO_EDGE),
-    );
     let min_filter = glow::LINEAR_MIPMAP_LINEAR;
     let mag_filter = magnification_filter.gl_filter();
-    gl.tex_parameter_i32(
-        glow::TEXTURE_2D,
-        glow::TEXTURE_MIN_FILTER,
-        gl_int(min_filter),
-    );
-    gl.tex_parameter_i32(
-        glow::TEXTURE_2D,
-        glow::TEXTURE_MAG_FILTER,
-        gl_int(mag_filter),
-    );
-    texture
+    // SAFETY: Caller ensures the GL context is current on the render thread.
+    unsafe {
+        #[expect(
+            clippy::expect_used,
+            reason = "texture-creation failure panics by policy"
+        )]
+        let texture = gl.create_texture().expect("GL texture object");
+        gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_WRAP_S,
+            gl_int(glow::CLAMP_TO_EDGE),
+        );
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_WRAP_T,
+            gl_int(glow::CLAMP_TO_EDGE),
+        );
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_MIN_FILTER,
+            gl_int(min_filter),
+        );
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_MAG_FILTER,
+            gl_int(mag_filter),
+        );
+        texture
+    }
 }
 
-/// # Safety
-///
-/// The context must be current. `data` holds exactly `dims.0 * dims.1 * 4`
-/// bytes and each dim is within `MAX_TEXTURE_SIZE`.
-unsafe fn upload_rgba(
+fn upload_rgba(
     gl: &Context,
     data: &[u8],
     dims: (u32, u32),
     magnification_filter: MagnificationFilter,
 ) -> Texture {
-    let texture = new_texture(gl, magnification_filter);
-    gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-    gl.tex_image_2d(
-        glow::TEXTURE_2D,
-        0,
-        gl_int(glow::RGBA8),
-        gl_int(dims.0),
-        gl_int(dims.1),
-        0,
-        glow::RGBA,
-        glow::UNSIGNED_BYTE,
-        PixelUnpackData::Slice(Some(data)),
+    assert_eq!(
+        data.len(),
+        dims.0 as usize * dims.1 as usize * 4,
+        "rgba byte length"
     );
-    gl.generate_mipmap(glow::TEXTURE_2D);
+    let texture = new_texture(gl, magnification_filter);
+    // SAFETY: `texture` was just created on the current context and `data`
+    // matches `dims.0 * dims.1 * 4` RGBA8 bytes.
+    unsafe {
+        gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+        gl.tex_image_2d(
+            glow::TEXTURE_2D,
+            0,
+            gl_int(glow::RGBA8),
+            gl_int(dims.0),
+            gl_int(dims.1),
+            0,
+            glow::RGBA,
+            glow::UNSIGNED_BYTE,
+            PixelUnpackData::Slice(Some(data)),
+        );
+        gl.generate_mipmap(glow::TEXTURE_2D);
+    }
     texture
 }
 
-/// # Safety
-///
-/// The context must be current, `texture` is live, and `data` holds
-/// exactly `dims.0 * dims.1 * 4` bytes.
-unsafe fn update_rgba(
+fn update_rgba(
     gl: &Context,
     texture: Texture,
     data: &[u8],
     dims: (u32, u32),
 ) {
-    debug_assert_eq!(
+    assert_eq!(
         data.len(),
         dims.0 as usize * dims.1 as usize * 4,
         "rgba byte length"
     );
-    gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-    gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
-    gl.tex_sub_image_2d(
-        glow::TEXTURE_2D,
-        0,
-        0,
-        0,
-        gl_int(dims.0),
-        gl_int(dims.1),
-        glow::RGBA,
-        glow::UNSIGNED_BYTE,
-        PixelUnpackData::Slice(Some(data)),
-    );
-    gl.generate_mipmap(glow::TEXTURE_2D);
+    // SAFETY: `texture` is owned live by a `PageTexture` entry on the current
+    // context, and `data` matches `dims.0 * dims.1 * 4` RGBA8 bytes.
+    unsafe {
+        gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+        gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
+        gl.tex_sub_image_2d(
+            glow::TEXTURE_2D,
+            0,
+            0,
+            0,
+            gl_int(dims.0),
+            gl_int(dims.1),
+            glow::RGBA,
+            glow::UNSIGNED_BYTE,
+            PixelUnpackData::Slice(Some(data)),
+        );
+        gl.generate_mipmap(glow::TEXTURE_2D);
+    }
 }
 
-/// # Safety
-///
-/// The context must be current. `data` holds one sample per texel of
-/// `dims`, two bytes each when `wide`, and each dim is within
-/// `MAX_TEXTURE_SIZE`.
-unsafe fn upload_plane(
+fn upload_plane(
     gl: &Context,
     data: &[u8],
     dims: (u32, u32),
     wide: bool,
     magnification_filter: MagnificationFilter,
 ) -> Texture {
+    let sample_bytes = if wide { size_of::<u16>() } else { 1 };
+    assert_eq!(
+        data.len(),
+        dims.0 as usize * dims.1 as usize * sample_bytes,
+        "plane byte length"
+    );
     let (internal, ty) = if wide {
         (glow::R16, glow::UNSIGNED_SHORT)
     } else {
         (glow::R8, glow::UNSIGNED_BYTE)
     };
     let texture = new_texture(gl, magnification_filter);
-    gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-    // Odd row widths: GL's default 4-byte unpack alignment would desync
-    // every row after the first.
-    gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
-    gl.tex_image_2d(
-        glow::TEXTURE_2D,
-        0,
-        gl_int(internal),
-        gl_int(dims.0),
-        gl_int(dims.1),
-        0,
-        glow::RED,
-        ty,
-        PixelUnpackData::Slice(Some(data)),
-    );
-    gl.generate_mipmap(glow::TEXTURE_2D);
+    // SAFETY: `texture` was just created on the current context and `data`
+    // matches `dims.0 * dims.1 * sample_bytes` bytes.
+    unsafe {
+        gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+        // Odd row widths: GL's default 4-byte unpack alignment would desync
+        // every row after the first.
+        gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+        gl.tex_image_2d(
+            glow::TEXTURE_2D,
+            0,
+            gl_int(internal),
+            gl_int(dims.0),
+            gl_int(dims.1),
+            0,
+            glow::RED,
+            ty,
+            PixelUnpackData::Slice(Some(data)),
+        );
+        gl.generate_mipmap(glow::TEXTURE_2D);
+    }
     texture
 }
 
-/// # Safety
-///
-/// The context must be current. The asserts inside enforce the plane
-/// byte-length precondition of the uploads.
 #[expect(
     clippy::similar_names,
     reason = "Cb and Cr are the YUV plane names the two textures hold"
 )]
-unsafe fn upload_page_texture(
-    gl: &Context,
-    image: &WireImage,
-) -> PageTexture {
+fn upload_page_texture(gl: &Arc<Context>, image: &WireImage) -> PageTexture {
     let dims = (image.width, image.height);
     let magnification_filter = magnification_filter(dims, image.page_dims);
     let page_uv_per_pixel = page_uv_per_pixel(image.page_dims);
-    let (width, height) = dims;
     match &image.pixels {
-        WirePixels::Rgba8(rgba_bytes) => {
-            assert_eq!(
-                rgba_bytes.len(),
-                width as usize * height as usize * 4,
-                "rgba byte length"
-            );
-            PageTexture {
-                page_uv_per_pixel,
-                transfer: image.transfer,
-                needs_dither: needs_dither(image.transfer, None),
-                layout: PixelLayout::Rgba {
-                    texture: upload_rgba(
-                        gl,
-                        rgba_bytes,
-                        dims,
-                        magnification_filter,
-                    ),
+        WirePixels::Rgba8(rgba_bytes) => PageTexture {
+            gl: Arc::clone(gl),
+            page_uv_per_pixel,
+            transfer: image.transfer,
+            needs_dither: needs_dither(image.transfer, None),
+            layout: PixelLayout::Rgba {
+                texture: upload_rgba(
+                    gl,
+                    rgba_bytes,
                     dims,
-                },
-            }
-        }
+                    magnification_filter,
+                ),
+                dims,
+            },
+        },
         WirePixels::Yuv {
             depth,
             subsampling,
@@ -1117,6 +1107,25 @@ unsafe fn upload_page_texture(
                 luma_w as usize * luma_h as usize,
                 "luma",
             );
+            if *subsampling != Subsampling::Mono {
+                assert_plane_bytes(
+                    cb,
+                    chroma_w as usize * chroma_h as usize,
+                    "cb",
+                );
+                assert_plane_bytes(
+                    cr,
+                    chroma_w as usize * chroma_h as usize,
+                    "cr",
+                );
+            }
+            if let Some(alpha) = alpha.as_ref() {
+                assert_plane_bytes(
+                    alpha,
+                    dims.0 as usize * dims.1 as usize,
+                    "alpha",
+                );
+            }
             let luma_texture = upload_plane(
                 gl,
                 luma,
@@ -1134,16 +1143,6 @@ unsafe fn upload_page_texture(
                         upload_constant_plane(gl, depth, neutral_code),
                     )
                 } else {
-                    assert_plane_bytes(
-                        cb,
-                        chroma_w as usize * chroma_h as usize,
-                        "cb",
-                    );
-                    assert_plane_bytes(
-                        cr,
-                        chroma_w as usize * chroma_h as usize,
-                        "cr",
-                    );
                     (
                         upload_plane(
                             gl,
@@ -1166,11 +1165,6 @@ unsafe fn upload_page_texture(
                 // maps to 1.0.
                 || upload_constant_plane(gl, depth, (1_u32 << depth) - 1),
                 |alpha| {
-                    assert_plane_bytes(
-                        alpha,
-                        width as usize * height as usize,
-                        "alpha",
-                    );
                     upload_plane(
                         gl,
                         alpha,
@@ -1181,6 +1175,7 @@ unsafe fn upload_page_texture(
                 },
             );
             PageTexture {
+                gl: Arc::clone(gl),
                 page_uv_per_pixel,
                 transfer: image.transfer,
                 needs_dither: needs_dither(image.transfer, Some(depth)),
@@ -1225,10 +1220,7 @@ fn chroma_uv_per_pixel(
     (ratio.0 / chroma_px.0, ratio.1 / chroma_px.1)
 }
 
-/// # Safety
-///
-/// The context must be current.
-unsafe fn upload_constant_plane(
+fn upload_constant_plane(
     gl: &Context,
     depth: u8,
     sample_code: u32,
@@ -1453,13 +1445,17 @@ const BT601_KR_KB: (f32, f32) = (0.299, 0.114);
 const BT709_KR_KB: (f32, f32) = (0.2126, 0.0722);
 const BT2020_KR_KB: (f32, f32) = (0.2627, 0.0593);
 
-/// Window + EGL context + surface. vsync is `DontWait`, so the app must call
-/// `pre_present_and_swap()` to present.
+/// Window, EGL context, and page texture store. vsync is `DontWait`, so
+/// the app must call `pre_present_and_swap()` to present.
 pub struct Window {
-    winit: WinitWindow,
+    // Drop order: `pages` while `context` is current, `context` before
+    // `surface`, `surface` before `winit`, and `_display` last.
+    pages: PageTextures,
     gl: Arc<Context>,
-    surface: Surface<WindowSurface>,
     context: PossiblyCurrentContext,
+    surface: Surface<WindowSurface>,
+    winit: WinitWindow,
+    _display: OwnedDisplayHandle,
     /// Alpha config matched. The fallback may still carry alpha bits; the
     /// opaque hint and clear hide them.
     translucent: bool,
@@ -1469,13 +1465,8 @@ pub struct Window {
 }
 
 impl Window {
-    /// Create the window and its desktop OpenGL 3.3 core context.
-    ///
-    /// # Safety
-    ///
-    /// The event loop must outlive the returned window. The platform
-    /// display behind its raw handle backs every GL object created here.
-    pub unsafe fn new(event_loop: &ActiveEventLoop) -> eros::Result<Self> {
+    /// Create the window with a desktop OpenGL 3.3 core context.
+    pub fn new(event_loop: &ActiveEventLoop) -> eros::Result<Self> {
         use glutin::config::Api as ConfigApi;
         use glutin::config::ConfigTemplateBuilder;
         use glutin::context::ContextApi;
@@ -1499,18 +1490,23 @@ impl Window {
         // glutin-winit's DisplayBuilder picks a config through a closure
         // that cannot fail, so using it would force a panic on an empty
         // config list.
-        let raw_display = event_loop.display_handle()?.as_raw();
-        let gl_display =
-            Display::new(raw_display, DisplayApiPreference::Egl)?;
+        let display = event_loop.owned_display_handle();
+        let raw_display = display.display_handle()?.as_raw();
+        // SAFETY: `display` outlives `gl_display` locally and `_display` drops
+        // last in `Window`.
+        let gl_display = unsafe {
+            Display::new(raw_display, DisplayApiPreference::Egl)
+        }?;
         // Prefer a config with alpha so the desktop shows through; a machine
         // without one runs opaque.
         let translucent_template = ConfigTemplateBuilder::new()
             .with_api(ConfigApi::OPENGL)
             .with_alpha_size(8)
             .build();
-        let (gl_config, translucent) = if let Some(config) =
-            gl_display.find_configs(translucent_template)?.next()
-        {
+        // SAFETY: `translucent_template` sets no raw window handle.
+        let mut configs =
+            unsafe { gl_display.find_configs(translucent_template) }?;
+        let (gl_config, translucent) = if let Some(config) = configs.next() {
             (config, true)
         } else {
             // The second pass drops the alpha demand. The default
@@ -1520,13 +1516,14 @@ impl Window {
                 .with_api(ConfigApi::OPENGL)
                 .with_alpha_size(0)
                 .build();
-            let config = gl_display.find_configs(plain)?.next().ok_or_else(
-                || {
+            // SAFETY: `plain` sets no raw window handle.
+            let config = unsafe { gl_display.find_configs(plain) }?
+                .next()
+                .ok_or_else(|| {
                     eros::error!(
                         "no desktop OpenGL 3.3 core config on this EGL display"
                     )
-                },
-            )?;
+                })?;
             (config, false)
         };
 
@@ -1549,8 +1546,9 @@ impl Window {
             .with_context_api(ContextApi::OpenGl(Some(Version::new(3, 3))))
             .with_profile(GlProfile::Core)
             .build(Some(raw_window));
+        // SAFETY: `window` owns `raw_window` and outlives the context.
         let not_current =
-            gl_display.create_context(&gl_config, &ctx_attrs)?;
+            unsafe { gl_display.create_context(&gl_config, &ctx_attrs) }?;
 
         let (width, height): (u32, u32) = window.inner_size().into();
         let surface_attrs =
@@ -1562,27 +1560,33 @@ impl Window {
                     eros::error!("window height is zero")
                 })?,
             );
-        let surface = gl_display
-            .create_window_surface(&gl_config, &surface_attrs)?;
+        // SAFETY: `window` owns `raw_window` and outlives `surface`.
+        let surface = unsafe {
+            gl_display.create_window_surface(&gl_config, &surface_attrs)
+        }?;
         let context = not_current.make_current(&surface)?;
         // Non-blocking present; `pre_present_and_swap` requests a Wayland
         // frame callback.
         surface.set_swap_interval(&context, SwapInterval::DontWait)?;
 
-        let gl = Context::from_loader_function(|symbol| {
-            #[expect(
-                clippy::expect_used,
-                reason = "symbol names are static ASCII GL entry points, NUL-free by construction"
-            )]
-            let symbol = CString::new(symbol)
-                .expect("GL proc name without interior NUL");
-            gl_display.get_proc_address(&symbol)
-        });
+        // SAFETY: `context` is current and `gl_display` is alive for lookups.
+        let gl = unsafe {
+            Context::from_loader_function(|symbol| {
+                #[expect(
+                    clippy::expect_used,
+                    reason = "symbol names are static ASCII GL entry points, NUL-free by construction"
+                )]
+                let symbol = CString::new(symbol)
+                    .expect("GL proc name without interior NUL");
+                gl_display.get_proc_address(&symbol)
+            })
+        };
         #[cfg(debug_assertions)]
         let mut gl = gl;
         #[cfg(debug_assertions)]
         if gl.supports_debug() {
-            // SAFETY: the context is current, and the callback only logs.
+            // SAFETY: the context is current, supports debug output, and the
+            // callback only logs.
             unsafe {
                 gl.debug_message_callback(
                     |source, kind, id, severity, message| {
@@ -1599,21 +1603,29 @@ impl Window {
                         );
                     },
                 );
-            }
-            // SAFETY: the context is current and supports debug output.
-            unsafe {
                 gl.enable(glow::DEBUG_OUTPUT);
             }
         }
         let gl = Arc::new(gl);
+        let pages = PageTextures::new(Arc::clone(&gl))?;
         Ok(Self {
-            winit: window,
+            pages,
             gl,
-            surface,
             context,
+            surface,
+            winit: window,
+            _display: display,
             translucent,
             resized_to: (width, height),
         })
+    }
+
+    pub fn pages(&self) -> &PageTextures {
+        &self.pages
+    }
+
+    pub fn pages_mut(&mut self) -> &mut PageTextures {
+        &mut self.pages
     }
 
     pub fn glow(&self) -> Arc<Context> {

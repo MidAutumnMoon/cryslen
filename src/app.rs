@@ -97,7 +97,6 @@ pub fn post(proxy: &EventLoopProxy<WakeEvent>, event: WakeEvent) {
 }
 
 struct Gl {
-    pages: PageTextures,
     limits: ImageLimits,
     egui: EguiGlow,
     // Must drop last: owns the GL context used by the fields above.
@@ -669,7 +668,7 @@ fn adopt_reading(
 ) -> Reading {
     fit.refit();
     if let Some(gl) = gl {
-        gl.pages.clear_all();
+        gl.window.pages_mut().clear_all();
     }
     let mut reading = Reading::new(index);
     let requests = presentation::cold_requests(
@@ -759,7 +758,7 @@ fn present_frame(
     );
     if let (Some(draw), Some(placement)) = (spread, drawn) {
         if let Some(shown) = draw.shown {
-            gl.pages.draw(
+            gl.window.pages().draw(
                 (size.width, size.height),
                 viewport,
                 &draw.layout,
@@ -859,7 +858,7 @@ impl App {
     fn roles(&self, page: usize) -> Roles {
         self.gl
             .as_ref()
-            .map_or_else(Roles::default, |gl| gl.pages.roles(page))
+            .map_or_else(Roles::default, |gl| gl.window.pages().roles(page))
     }
 
     fn role_name(&self, page: Option<usize>) -> &'static str {
@@ -1158,14 +1157,17 @@ impl App {
             if let Some(gl) = gl.as_mut() {
                 // Retention is a performance policy: a dropped role is just a
                 // request on the next frame.
-                gl.pages.retain(|page, role| frame.retains(page, role));
+                gl.window
+                    .pages_mut()
+                    .retain(|page, role| frame.retains(page, role));
             }
             for command in live.reading.sync_playback(playback_targets) {
                 live.book.send(ParentMsg::Playback(command));
             }
             if let Some(gl) = gl.as_mut() {
-                let (deadline, commands) =
-                    live.reading.tick_playback(now, &mut gl.pages);
+                let (deadline, commands) = live
+                    .reading
+                    .tick_playback(now, gl.window.pages_mut());
                 for command in commands {
                     live.book.send(ParentMsg::Playback(command));
                 }
@@ -1185,7 +1187,8 @@ impl App {
         }
 
         let live = self.live()?;
-        let textures = self.gl.as_ref().map(|graphics| &graphics.pages);
+        let textures =
+            self.gl.as_ref().map(|graphics| graphics.window.pages());
         let spread_status = ui::summarize_spread(on_screen, |page| {
             let entry = live.reading.pages.get(&page);
             let info = entry.and_then(|state| state.info).filter(|_| {
@@ -1234,7 +1237,7 @@ impl App {
         else {
             return;
         };
-        if live.reading.drain_deliveries(&mut gl.pages) {
+        if live.reading.drain_deliveries(gl.window.pages_mut()) {
             post(proxy, WakeEvent::Repaint(Duration::ZERO));
         }
     }
@@ -1562,32 +1565,25 @@ impl ApplicationHandler<WakeEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         use egui_system_font_provider::SystemFontProvider;
 
-        // SAFETY: `exiting` drops `self.gl` while the event loop's
-        // display is still alive.
-        let window = match unsafe { Window::new(event_loop) } {
+        let window = match Window::new(event_loop) {
             Ok(window) => window,
             Err(error) => {
                 self.fail(error, event_loop);
                 return;
             }
         };
-        let gl = window.glow();
-        let pages = match PageTextures::new(Arc::clone(&gl)) {
-            Ok(pages) => pages,
-            Err(error) => {
-                self.fail(error, event_loop);
-                return;
-            }
-        };
-        let limits =
-            display_limits(event_loop, &window, pages.max_texture_edge());
+        let limits = display_limits(
+            event_loop,
+            &window,
+            window.pages().max_texture_edge(),
+        );
         // Adopt an already-ready book before egui and system font scanning
         // so page 0 decodes concurrently.
         self.poll_initial_open(limits);
         // `EguiGlow::new` panics if its painter cannot initialize; accepted
         // upstream risk.
         let egui =
-            EguiGlow::new(event_loop, Arc::clone(&gl), None, None, true);
+            EguiGlow::new(event_loop, window.glow(), None, None, true);
         // System fonts cover filename characters the built-in fonts cannot
         // render.
         egui.egui_ctx
@@ -1604,7 +1600,6 @@ impl ApplicationHandler<WakeEvent> for App {
         apply_dark_theme(&egui.egui_ctx, panel_fill);
         window.winit().request_redraw();
         self.gl = Some(Gl {
-            pages,
             limits,
             egui,
             window,
