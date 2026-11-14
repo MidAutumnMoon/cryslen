@@ -264,9 +264,9 @@ mod tests {
     fn sibling_follows_symlinks_and_skips_invalid_entries() {
         use std::os::unix::fs as unix_fs;
 
-        use crate::testkit::TempDir;
+        use tempfile::TempDir;
 
-        let root = TempDir::new("catalog-siblings");
+        let root = TempDir::new().expect("create temp dir");
         let books = root.path().join("books");
         let targets = root.path().join("targets");
         fs::create_dir_all(&books).expect("mkdir books");

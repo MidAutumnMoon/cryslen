@@ -938,9 +938,11 @@ mod tests {
     // 32x16 10-bit 4:0:0 fixture, a black-to-white grayscale gradient.
     #[test]
     fn avif_fixture_decodes() {
-        let page =
-            decode(include_bytes!("../testdata/mono.avif"), "a.avif")
-                .expect("mono avif decodes");
+        let page = decode(
+            include_bytes!("../../tests/fixtures/mono.avif"),
+            "a.avif",
+        )
+        .expect("mono avif decodes");
         assert_eq!(page.format, Format::Avif);
         assert_eq!((page.width, page.height), (32, 16));
         let Pixels::Yuv(yuv) = &page.pixels else {
@@ -961,8 +963,11 @@ mod tests {
     #[test]
     fn jxl_fixtures_decode() {
         // gray: solid halves, gray replicated to r=g=b
-        let gray = decode(include_bytes!("../testdata/gray.jxl"), "a.jxl")
-            .expect("gray jxl decodes");
+        let gray = decode(
+            include_bytes!("../../tests/fixtures/gray.jxl"),
+            "a.jxl",
+        )
+        .expect("gray jxl decodes");
         assert_eq!((gray.width, gray.height), (8, 8));
         assert_eq!(gray.format, Format::Jxl);
         match gray.pixels {
@@ -980,9 +985,11 @@ mod tests {
         }
 
         // alpha: the file's own alpha rides in the fourth byte
-        let alpha =
-            decode(include_bytes!("../testdata/alpha.jxl"), "a.jxl")
-                .expect("alpha jxl decodes");
+        let alpha = decode(
+            include_bytes!("../../tests/fixtures/alpha.jxl"),
+            "a.jxl",
+        )
+        .expect("alpha jxl decodes");
         match alpha.pixels {
             Pixels::Rgba8(bytes) => {
                 assert_eq!(
@@ -1000,8 +1007,11 @@ mod tests {
         // wide: 256x128 pins the row/stride order. Opaque alpha on every
         // pixel proves the decoder wrote all rows of the zero-initialised
         // buffer
-        let wide = decode(include_bytes!("../testdata/wide.jxl"), "a.jxl")
-            .expect("wide jxl decodes");
+        let wide = decode(
+            include_bytes!("../../tests/fixtures/wide.jxl"),
+            "a.jxl",
+        )
+        .expect("wide jxl decodes");
         assert_eq!((wide.width, wide.height), (256, 128));
         let Pixels::Rgba8(wide_rgba) = &wide.pixels else {
             panic!("jxl must decode to rgba")
@@ -1012,9 +1022,11 @@ mod tests {
 
         // animated: the numbered frames paint digits, so the first frame
         // carries non-black pixels
-        let animated =
-            decode(include_bytes!("../testdata/animated.jxl"), "a.jxl")
-                .expect("animated jxl decodes");
+        let animated = decode(
+            include_bytes!("../../tests/fixtures/animated.jxl"),
+            "a.jxl",
+        )
+        .expect("animated jxl decodes");
         assert_eq!((animated.width, animated.height), (256, 256));
         let Pixels::Rgba8(animated_rgba) = &animated.pixels else {
             panic!("jxl must decode to rgba")
@@ -1139,7 +1151,7 @@ mod tests {
         use std::thread;
         use std::time::Duration;
 
-        let fixture = include_bytes!("../testdata/gray.jxl");
+        let fixture = include_bytes!("../../tests/fixtures/gray.jxl");
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             for cut in [1_usize, 2, 8, 35] {

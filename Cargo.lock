@@ -452,6 +452,7 @@ dependencies = [
  "rustix 1.1.6",
  "serde",
  "sevenz-rust2",
+ "tempfile",
  "tracing",
  "xxhash-rust",
  "zip",

@@ -12,17 +12,12 @@
     reason = "an integration test file is already test-only"
 )]
 
-use std::env;
 use std::fs;
 use std::path::Path;
-use std::path::PathBuf;
-use std::process;
 use std::process::Child;
 use std::process::Command;
 use std::process::ExitStatus;
 use std::process::Stdio;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::sync::mpsc::RecvTimeoutError;
 use std::thread;
@@ -40,6 +35,7 @@ use cryslen::protocol::Request;
 use cryslen::protocol::Role;
 use cryslen::protocol::WirePixels;
 use ipc_channel::ipc::IpcOneShotServer;
+use tempfile::TempDir;
 
 /// The page is one solid color, so the decoded pixels prove a real
 /// decode.
@@ -62,36 +58,6 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Grace window so an in-flight `accept` finishes after `Hello::Failed`
 /// lets the child exit.
 const POST_EXIT_GRACE: Duration = Duration::from_secs(1);
-
-static ROOTS: AtomicU64 = AtomicU64::new(0);
-
-/// A scratch root unique within this test process, removed on drop.
-struct TempRoot(PathBuf);
-
-impl TempRoot {
-    fn new() -> Self {
-        let path = env::temp_dir().join(format!(
-            "cryslen-child-{}-{}",
-            process::id(),
-            ROOTS.fetch_add(1, Ordering::Relaxed),
-        ));
-        fs::create_dir_all(&path).expect("create the test's scratch root");
-        Self(path)
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TempRoot {
-    fn drop(&mut self) {
-        // Removal is best-effort; a leaked scratch dir is acceptable.
-        let Ok(()) = fs::remove_dir_all(&self.0) else {
-            return;
-        };
-    }
-}
 
 /// Kills and reaps the child however the test ends, including panics.
 struct ChildGuard(Option<Child>);
@@ -217,7 +183,7 @@ fn child_serves_a_decoded_thumb() {
 
     // `root` outlives the child guard below, so the child is dead before
     // its scratch dirs go away.
-    let root = TempRoot::new();
+    let root = TempDir::new().expect("create the test's scratch root");
     let book = root.path().join("book");
     let store = root.path().join("store");
     fs::create_dir_all(&book).expect("create the book directory");
@@ -304,7 +270,7 @@ fn child_serves_a_decoded_thumb() {
 #[test]
 fn child_reports_open_failure_in_hello() {
     let binary = env!("CARGO_BIN_EXE_cy");
-    let root = TempRoot::new();
+    let root = TempDir::new().expect("create the test's scratch root");
     let missing = root.path().join("missing-book");
     let store = root.path().join("store");
     fs::create_dir_all(&store).expect("create the child's tmpdir");

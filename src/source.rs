@@ -449,11 +449,12 @@ mod tests {
     use crate::fault::BadIndex;
     use crate::fault::PanicFault;
     use crate::testkit;
-    use crate::testkit::TempDir;
 
     use std::cmp::Ordering;
     use std::io::Error as IoError;
     use std::io::Write as _;
+
+    use tempfile::TempDir;
 
     /// LZMA-compressed 7z with two small PNGs, built by 7zz. The crate's
     /// encoder features are trimmed, so the fixture is checked in.
@@ -768,12 +769,29 @@ mod tests {
 
     #[test]
     fn dir_listing_and_read() {
-        let dir = TempDir::new("pagedir");
-        dir.write("c10.png", &testkit::tiny_png(1, 1, [0, 0, 0, 255]));
-        dir.write("c2.png", &testkit::tiny_png(1, 1, [7, 8, 9, 255]));
-        dir.write("c1.png", &testkit::tiny_png(1, 1, [0, 0, 0, 255]));
-        dir.write("cover.PNG", &testkit::tiny_png(1, 1, [0, 0, 0, 255]));
-        dir.write("notes.txt", b"not a page");
+        let dir = TempDir::new().expect("create temp dir");
+        fs::write(
+            dir.path().join("c10.png"),
+            testkit::tiny_png(1, 1, [0, 0, 0, 255]),
+        )
+        .expect("write c10.png");
+        fs::write(
+            dir.path().join("c2.png"),
+            testkit::tiny_png(1, 1, [7, 8, 9, 255]),
+        )
+        .expect("write c2.png");
+        fs::write(
+            dir.path().join("c1.png"),
+            testkit::tiny_png(1, 1, [0, 0, 0, 255]),
+        )
+        .expect("write c1.png");
+        fs::write(
+            dir.path().join("cover.PNG"),
+            testkit::tiny_png(1, 1, [0, 0, 0, 255]),
+        )
+        .expect("write cover.PNG");
+        fs::write(dir.path().join("notes.txt"), b"not a page")
+            .expect("write notes.txt");
         let source = Source::open(dir.path()).expect("dir opens");
         assert_eq!(
             source.names,
@@ -806,13 +824,14 @@ mod tests {
     fn dir_listing_follows_symlinks_and_skips_broken_entries() {
         use std::os::unix::fs as unix_fs;
 
-        let target_dir = TempDir::new("symlink-targets");
+        let target_dir = TempDir::new().expect("create temp dir");
         let target_png = testkit::tiny_png(2, 2, [9, 8, 7, 255]);
-        target_dir.write("real.png", &target_png);
+        fs::write(target_dir.path().join("real.png"), &target_png)
+            .expect("write real.png");
         let nested_dir = target_dir.path().join("subdir");
         fs::create_dir_all(&nested_dir).expect("nested dir creates");
 
-        let book = TempDir::new("symlink-book");
+        let book = TempDir::new().expect("create temp dir");
         unix_fs::symlink(
             target_dir.path().join("real.png"),
             book.path().join("page.png"),
@@ -838,7 +857,7 @@ mod tests {
     fn zip_listing_and_read() {
         use zip::write::SimpleFileOptions;
 
-        let dir = TempDir::new("pagezip");
+        let dir = TempDir::new().expect("create temp dir");
         let zip_path = dir.path().join("book.cbz");
         {
             let file = File::create(&zip_path).unwrap();
@@ -894,7 +913,7 @@ mod tests {
     fn zip_corruption_stays_page_local() {
         use zip::write::SimpleFileOptions;
 
-        let dir = TempDir::new("pagezipbad");
+        let dir = TempDir::new().expect("create temp dir");
         let zip_path = dir.path().join("book.cbz");
         let pages = [
             testkit::tiny_png(2, 2, [1, 0, 0, 255]),
@@ -963,22 +982,24 @@ mod tests {
             missing.downcast_inner_ref::<OpenRefusal>(),
             Some(OpenRefusal::NotFound(_))
         ));
-        let empty_dir = TempDir::new("pageempty");
+        let empty_dir = TempDir::new().expect("create temp dir");
         let empty = Source::open(empty_dir.path())
             .expect_err("an empty directory must refuse");
         assert!(matches!(
             empty.downcast_inner_ref::<OpenRefusal>(),
             Some(OpenRefusal::Empty)
         ));
-        let dir = TempDir::new("pageunsup");
-        dir.write("book.rar", b"not really a rar");
+        let dir = TempDir::new().expect("create temp dir");
+        fs::write(dir.path().join("book.rar"), b"not really a rar")
+            .expect("write book.rar");
         let unsupported = Source::open(&dir.path().join("book.rar"))
             .expect_err("an unsupported extension must refuse");
         assert!(matches!(
             unsupported.downcast_inner_ref::<OpenRefusal>(),
             Some(OpenRefusal::Unsupported(_))
         ));
-        dir.write("plain.txt", b"not a directory");
+        fs::write(dir.path().join("plain.txt"), b"not a directory")
+            .expect("write plain.txt");
         // A path under a regular file reports io.
         let under_file =
             Source::open(&dir.path().join("plain.txt").join("page.png"))
@@ -988,7 +1009,7 @@ mod tests {
 
     #[test]
     fn sibling_books_step_between_their_own_kind() {
-        let parent = TempDir::new("siblings");
+        let parent = TempDir::new().expect("create temp dir");
         let volume = |name: &str| {
             let dir = parent.path().join(name);
             fs::create_dir_all(&dir).expect("volume dir creates");
@@ -1023,7 +1044,7 @@ mod tests {
         );
 
         // Archives step between archives only.
-        let shelf = TempDir::new("siblings-archives");
+        let shelf = TempDir::new().expect("create temp dir");
         let write_cbz = |name: &str| {
             use zip::write::SimpleFileOptions;
 

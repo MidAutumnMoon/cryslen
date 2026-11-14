@@ -1445,13 +1445,13 @@ mod tests {
 
     use image::ImageError;
     use image::codecs::gif::Repeat;
+    use tempfile::TempDir;
 
     use super::*;
     use crate::cache::Store;
     use crate::decode::Pixels;
     use crate::fault::DecodeRefusal;
     use crate::testkit;
-    use crate::testkit::TempDir;
 
     /// Page edge for the tests that check derived and full dimensions:
     /// larger than the thumb edge, smaller than the fit edge, so the
@@ -1616,19 +1616,16 @@ mod tests {
     }
 
     /// A directory of distinct solid pages, `size` pixels square.
-    fn page_dir(
-        tag: &str,
-        count: usize,
-        size: u32,
-    ) -> (TempDir, Arc<Source>) {
-        let dir = TempDir::new(tag);
+    fn page_dir(count: usize, size: u32) -> (TempDir, Arc<Source>) {
+        let dir = TempDir::new().expect("create temp dir");
         for page in 0..count {
             let shade = u8::try_from(page % 256).expect("shade fits");
             let tint = u8::try_from(page >> 8).expect("tint fits");
-            dir.write(
-                &format!("p{page:04}.png"),
-                &testkit::tiny_png(size, size, [shade, tint, 90, 255]),
-            );
+            fs::write(
+                dir.path().join(format!("p{page:04}.png")),
+                testkit::tiny_png(size, size, [shade, tint, 90, 255]),
+            )
+            .expect("write page");
         }
         let source =
             Arc::new(Source::open(dir.path()).expect("temp source opens"));
@@ -1830,7 +1827,7 @@ mod tests {
         let source = Arc::new(
             Source::open(Path::new(SEVENZ_FIXTURE)).expect("7z opens"),
         );
-        let root = TempDir::new("worker-archive-store");
+        let root = TempDir::new().expect("create temp dir");
         let (events, sink) = Updates::new();
         let worker = TestWorker::spawn_at(
             Arc::clone(&source),
@@ -1849,8 +1846,8 @@ mod tests {
 
     #[test]
     fn a_target_is_served_and_persisted() {
-        let (_dir, source) = page_dir("worker-target", 1, BIG);
-        let root = TempDir::new("worker-target-store");
+        let (_dir, source) = page_dir(1, BIG);
+        let root = TempDir::new().expect("create temp dir");
         let (events, sink) = Updates::new();
         let worker = TestWorker::spawn_at(
             Arc::clone(&source),
@@ -1892,8 +1889,8 @@ mod tests {
 
     #[test]
     fn the_tail_waits_for_a_quiet_app() {
-        let (_dir, source) = page_dir("worker-gate", 6, 8);
-        let root = TempDir::new("worker-gate-store");
+        let (_dir, source) = page_dir(6, 8);
+        let root = TempDir::new().expect("create temp dir");
         let _worker = TestWorker::spawn_at(
             Arc::clone(&source),
             Some(0),
@@ -1937,17 +1934,19 @@ mod tests {
 
     #[test]
     fn a_failed_page_notifies_once_and_the_prefetch_advances() {
-        let dir = TempDir::new("worker-fail");
-        dir.write("p000.png", b"not a png at all");
+        let dir = TempDir::new().expect("create temp dir");
+        fs::write(dir.path().join("p000.png"), b"not a png at all")
+            .expect("write corrupt page");
         for page in 1..5_u8 {
-            dir.write(
-                &format!("p{page:03}.png"),
-                &testkit::tiny_png(BIG, BIG, [page, 20, 30, 255]),
-            );
+            fs::write(
+                dir.path().join(format!("p{page:03}.png")),
+                testkit::tiny_png(BIG, BIG, [page, 20, 30, 255]),
+            )
+            .expect("write page");
         }
         let source =
             Arc::new(Source::open(dir.path()).expect("temp source opens"));
-        let root = TempDir::new("worker-fail-store");
+        let root = TempDir::new().expect("create temp dir");
         let (events, sink) = Updates::new();
         let _worker = TestWorker::spawn_at(
             Arc::clone(&source),
@@ -1988,8 +1987,8 @@ mod tests {
 
     #[test]
     fn the_prefetch_warms_the_store_without_delivering() {
-        let (_dir, source) = page_dir("worker-prefetch", 1, BIG);
-        let root = TempDir::new("worker-prefetch-store");
+        let (_dir, source) = page_dir(1, BIG);
+        let root = TempDir::new().expect("create temp dir");
         let (events, sink) = Updates::new();
         let _worker = TestWorker::spawn_at(
             Arc::clone(&source),
@@ -2019,8 +2018,8 @@ mod tests {
 
     #[test]
     fn a_fit_leaving_the_request_set_is_served_again() {
-        let (_dir, source) = page_dir("worker-recover", 1, BIG);
-        let root = TempDir::new("worker-recover-store");
+        let (_dir, source) = page_dir(1, BIG);
+        let root = TempDir::new().expect("create temp dir");
         let (events, sink) = Updates::new();
         let worker = TestWorker::spawn_at(
             Arc::clone(&source),
@@ -2055,8 +2054,8 @@ mod tests {
 
     #[test]
     fn a_full_target_carries_the_page_pixels() {
-        let (_dir, source) = page_dir("worker-full", 1, BIG);
-        let root = TempDir::new("worker-full-store");
+        let (_dir, source) = page_dir(1, BIG);
+        let root = TempDir::new().expect("create temp dir");
         let (events, sink) = Updates::new();
         let worker = TestWorker::spawn_at(
             Arc::clone(&source),
@@ -2081,20 +2080,21 @@ mod tests {
     fn animation_frames_stream_in_order() {
         let colors =
             [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]];
-        let dir = TempDir::new("worker-animation");
-        dir.write(
-            "p000.gif",
-            &testkit::tiny_animated_gif(
+        let dir = TempDir::new().expect("create temp dir");
+        fs::write(
+            dir.path().join("p000.gif"),
+            testkit::tiny_animated_gif(
                 8,
                 8,
                 &colors,
                 50,
                 Repeat::Infinite,
             ),
-        );
+        )
+        .expect("write gif");
         let source =
             Arc::new(Source::open(dir.path()).expect("temp source opens"));
-        let root = TempDir::new("worker-animation-store");
+        let root = TempDir::new().expect("create temp dir");
         let (events, sink) = Updates::new();
         let worker = TestWorker::spawn_at(
             Arc::clone(&source),
@@ -2122,20 +2122,21 @@ mod tests {
     fn a_finite_animation_finishes_after_its_last_pass() {
         let colors =
             [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]];
-        let dir = TempDir::new("worker-animation-finite");
-        dir.write(
-            "p000.gif",
-            &testkit::tiny_animated_gif(
+        let dir = TempDir::new().expect("create temp dir");
+        fs::write(
+            dir.path().join("p000.gif"),
+            testkit::tiny_animated_gif(
                 8,
                 8,
                 &colors,
                 50,
                 Repeat::Finite(0),
             ),
-        );
+        )
+        .expect("write gif");
         let source =
             Arc::new(Source::open(dir.path()).expect("temp source opens"));
-        let root = TempDir::new("worker-animation-finite-store");
+        let root = TempDir::new().expect("create temp dir");
         let (events, sink) = Updates::new();
         let worker = TestWorker::spawn_at(
             Arc::clone(&source),
@@ -2156,8 +2157,8 @@ mod tests {
 
     #[test]
     fn a_warm_store_serves_without_decoding() {
-        let (_dir, source) = page_dir("worker-warm", 1, BIG);
-        let root = TempDir::new("worker-warm-store");
+        let (_dir, source) = page_dir(1, BIG);
+        let root = TempDir::new().expect("create temp dir");
         let store_root = root.path();
 
         // The first session derives and persists both roles.
@@ -2255,8 +2256,8 @@ mod tests {
     fn store_hit_with_known_hash_skips_source_read() {
         const WAIT_TIMEOUT_SECS: u64 = 20;
 
-        let (dir, source) = page_dir("worker-known-hash", 2, BIG);
-        let root = TempDir::new("worker-known-hash-store");
+        let (dir, source) = page_dir(2, BIG);
+        let root = TempDir::new().expect("create temp dir");
         let requested_hash = page_hash(&source, 0);
         let prefetched_hash = page_hash(&source, 1);
         let (events, sink) = Updates::new();
@@ -2317,8 +2318,8 @@ mod tests {
         const SENTINEL_HEIGHT: u32 = 300;
         const SENTINEL_WIDTH: u32 = SENTINEL_HEIGHT * 2;
 
-        let (_dir, source) = page_dir("worker-derive-fit", 1, BIG);
-        let root = TempDir::new("worker-derive-fit-store");
+        let (_dir, source) = page_dir(1, BIG);
+        let root = TempDir::new().expect("create temp dir");
         let hash = page_hash(&source, 0);
         let landscape_fit = decode::decode(
             &testkit::tiny_png(
@@ -2358,14 +2359,15 @@ mod tests {
         const PAGE_WIDTH: u32 = TEST_FIT_EDGE + 40;
         const PAGE_HEIGHT: u32 = 16;
 
-        let dir = TempDir::new("worker-fit-full");
-        dir.write(
-            "p0000.png",
-            &testkit::tiny_png(PAGE_WIDTH, PAGE_HEIGHT, [10, 20, 30, 255]),
-        );
+        let dir = TempDir::new().expect("create temp dir");
+        fs::write(
+            dir.path().join("p0000.png"),
+            testkit::tiny_png(PAGE_WIDTH, PAGE_HEIGHT, [10, 20, 30, 255]),
+        )
+        .expect("write page");
         let source =
             Arc::new(Source::open(dir.path()).expect("temp source opens"));
-        let root = TempDir::new("worker-fit-full-store");
+        let root = TempDir::new().expect("create temp dir");
         let (events, sink) = Updates::new();
         let worker = TestWorker::spawn_at(
             Arc::clone(&source),

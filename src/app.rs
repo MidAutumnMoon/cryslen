@@ -2641,7 +2641,7 @@ fn run(open_path: &Path, land_on: Option<&str>) -> eros::Result<()> {
 )]
 mod argv_tests {
     use super::*;
-    use crate::testkit::TempDir;
+    use tempfile::TempDir;
 
     #[test]
     fn classify_argument_kinds() {
@@ -2650,10 +2650,13 @@ mod argv_tests {
         use std::os::unix::fs as unix_fs;
 
         // classify never reads the content, only the extension.
-        let dir = TempDir::new("parent-arg");
-        dir.write("page.png", b"x");
-        dir.write("book.cbz", b"not really a zip");
-        dir.write("notes.txt", b"not a page");
+        let dir = TempDir::new().expect("create temp dir");
+        fs::write(dir.path().join("page.png"), b"x")
+            .expect("write page.png");
+        fs::write(dir.path().join("book.cbz"), b"not really a zip")
+            .expect("write book.cbz");
+        fs::write(dir.path().join("notes.txt"), b"not a page")
+            .expect("write notes.txt");
         fs::create_dir_all(dir.path().join("sub")).expect("mkdir sub");
         unix_fs::symlink(
             dir.path().join("page.png"),

@@ -1218,9 +1218,10 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    use tempfile::TempDir;
+
     use super::*;
     use crate::browse::Roles;
-    use crate::testkit::TempDir;
 
     const TEST_FIT_EDGE: u32 = 2560;
 
@@ -1374,7 +1375,7 @@ mod tests {
         const WRITER_COUNT: usize = 2;
         const SAVES_PER_WRITER: usize = 20;
 
-        let dir = TempDir::new("preview-concurrent-save");
+        let dir = TempDir::new().expect("create temp dir");
         let root = dir.path();
         let page = rgba_page(8, 8);
         let hash = content_hash(b"same-entry");
@@ -1412,7 +1413,7 @@ mod tests {
 
     #[test]
     fn open_cleans_unlocked_writer_temps() {
-        let dir = TempDir::new("preview-stale-temps");
+        let dir = TempDir::new().expect("create temp dir");
         let root = dir.path().join("cache");
         let page = rgba_page(2, 2);
         let hash = content_hash(b"page-kept");
@@ -1479,7 +1480,7 @@ mod tests {
 
     #[test]
     fn rgba_roundtrip_preserves_the_page() {
-        let dir = TempDir::new("preview-rgba");
+        let dir = TempDir::new().expect("create temp dir");
         let page = rgba_page(3, 2).with_page_dims((9, 6));
         let store = Store::at(dir.path());
         assert!(store.state.is_some());
@@ -1506,7 +1507,7 @@ mod tests {
 
     #[test]
     fn yuv_plane_roundtrip_preserves_the_page() {
-        let dir = TempDir::new("preview-yuv");
+        let dir = TempDir::new().expect("create temp dir");
         let page =
             yuv_page(5, 3, Subsampling::Yuv420).with_page_dims((15, 9));
         let store = Store::at(dir.path());
@@ -1538,7 +1539,7 @@ mod tests {
 
     #[test]
     fn yuv_u8_planes_and_alpha_roundtrip() {
-        let dir = TempDir::new("preview-yuv8");
+        let dir = TempDir::new().expect("create temp dir");
         let page = yuv_page_with(6, 4, Subsampling::Yuv444, 8, true);
         let store = Store::at(dir.path());
         let hash = content_hash(b"page-e");
@@ -1561,7 +1562,7 @@ mod tests {
 
     #[test]
     fn corrupt_entries_are_rejected() {
-        let dir = TempDir::new("preview-corrupt");
+        let dir = TempDir::new().expect("create temp dir");
         let page = rgba_page(2, 2);
         let store = Store::at(dir.path());
         let hash = content_hash(b"page-c");
@@ -1620,8 +1621,9 @@ mod tests {
 
     #[test]
     fn disabled_store_is_a_no_op() {
-        let dir = TempDir::new("preview-disabled");
-        dir.write("not-a-directory", b"x");
+        let dir = TempDir::new().expect("create temp dir");
+        fs::write(dir.path().join("not-a-directory"), b"x")
+            .expect("write marker file");
         let store = Store::at(&dir.path().join("not-a-directory"));
         assert!(store.state.is_none());
         let page = rgba_page(2, 2);
@@ -1835,7 +1837,7 @@ mod tests {
 
     #[test]
     fn prune_drops_the_oldest_first() {
-        let dir = TempDir::new("preview-prune");
+        let dir = TempDir::new().expect("create temp dir");
         let root = dir.path().join("cache");
         let probe_root = dir.path().join("probe");
         let page = rgba_page(4, 4);

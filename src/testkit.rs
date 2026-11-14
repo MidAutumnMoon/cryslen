@@ -1,9 +1,4 @@
-use std::fs;
-use std::path::Path;
-use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
 
 use eros::ErrorUnion;
 use image::Delay;
@@ -124,42 +119,5 @@ pub fn eventually<T>(
             continue;
         }
         panic!("{what}");
-    }
-}
-
-/// Unique temp dir, removed on drop (tests avoid a tempfile dep).
-pub struct TempDir(PathBuf);
-static DIRS: AtomicU64 = AtomicU64::new(0);
-
-impl TempDir {
-    pub fn new(tag: &str) -> Self {
-        use std::env;
-        use std::process;
-
-        let path = env::temp_dir().join(format!(
-            "cryslen-{}-{}-{}",
-            tag,
-            process::id(),
-            DIRS.fetch_add(1, Ordering::Relaxed),
-        ));
-        fs::create_dir_all(&path).expect("create temp dir");
-        Self(path)
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.0
-    }
-
-    pub fn write(&self, name: &str, bytes: &[u8]) {
-        fs::write(self.0.join(name), bytes).expect("write temp file");
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        // A failed removal is a leaked scratch dir, never a test failure.
-        let Ok(()) = fs::remove_dir_all(&self.0) else {
-            return;
-        };
     }
 }
