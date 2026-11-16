@@ -47,8 +47,8 @@ const MAX_THREADS: usize = 8;
     clippy::similar_names,
     reason = "Cb and Cr are the YUV plane names the two locals hold"
 )]
-pub(super) fn decode(bytes: &[u8]) -> eros::Result<Decoded> {
-    let decoder = DecoderGuard::new(bytes)?;
+pub(super) fn decode(bytes: &[u8], max_threads: usize) -> eros::Result<Decoded> {
+    let decoder = DecoderGuard::new(bytes, max_threads)?;
     let frame = decoder.image()?;
 
     let (width, height) = (frame.width, frame.height);
@@ -205,13 +205,8 @@ fn display_transform(frame: &avifImage) -> DisplayTransform {
     clippy::cast_possible_wrap,
     reason = "the thread count is capped at MAX_THREADS, so it fits the C int field"
 )]
-fn threads() -> i32 {
-    use std::num::NonZeroUsize;
-    use std::thread;
-
-    thread::available_parallelism()
-        .map_or(1, NonZeroUsize::get)
-        .min(MAX_THREADS) as i32
+fn clamp_threads(max_threads: usize) -> i32 {
+    max_threads.clamp(1, MAX_THREADS) as i32
 }
 
 fn check(code: avifResult, what: &'static str) -> eros::Result<()> {
@@ -323,7 +318,7 @@ struct DecoderGuard<'bytes> {
 }
 
 impl<'bytes> DecoderGuard<'bytes> {
-    fn new(bytes: &'bytes [u8]) -> eros::Result<Self> {
+    fn new(bytes: &'bytes [u8], max_threads: usize) -> eros::Result<Self> {
         const NO_DIMENSION_LIMIT: u32 = 0;
 
         // SAFETY: allocates an independent decoder instance.
@@ -339,7 +334,7 @@ impl<'bytes> DecoderGuard<'bytes> {
             // SAFETY: `guard.ptr` is newly allocated, non-null, and uniquely
             // owned; the mutable borrow ends before subsequent C calls.
             let decoder = unsafe { &mut *guard.ptr };
-            decoder.maxThreads = threads();
+            decoder.maxThreads = clamp_threads(max_threads);
             // The decoder's pixel cap runs before the pixel decode, so an
             // oversized hostile file fails at parse instead of funding a
             // multi-gigabyte dav1d picture first. Clear libavif's per-axis

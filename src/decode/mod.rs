@@ -17,6 +17,7 @@ use strum::Display;
 mod avif;
 mod image;
 mod jxl;
+mod webp;
 
 /// Construct via [`Decoded::rgba`] / [`Decoded::yuv`], which validate the
 /// pixel extents against the dimensions.
@@ -164,7 +165,7 @@ pub fn admit_dims(
         .ok_or_else(|| MsgError::from_static(bad_dims_reason))
 }
 
-const RGBA_BYTES_PER_PIXEL: usize = 4;
+pub const RGBA_BYTES_PER_PIXEL: usize = 4;
 
 #[derive(Debug, Clone, Copy)]
 pub struct YuvLayout {
@@ -444,6 +445,22 @@ pub fn transform_plane(
     }
 }
 
+pub fn transform_rgba(
+    bytes: Box<[u8]>,
+    dims: (u32, u32),
+    transform: DisplayTransform,
+) -> Box<[u8]> {
+    if transform == DisplayTransform::UPRIGHT || bytes.is_empty() {
+        return bytes;
+    }
+    let (pixels, tail) = bytes.as_chunks::<RGBA_BYTES_PER_PIXEL>();
+    debug_assert!(tail.is_empty(), "rgba buffer must be 4-byte aligned");
+    transform_samples(pixels, dims, transform)
+        .into_vec()
+        .into_flattened()
+        .into_boxed_slice()
+}
+
 /// Mirroring runs before rotation, matching the property order HEIF writers use.
 fn transform_samples<T>(
     samples: &[T],
@@ -484,23 +501,32 @@ where
     out.into_boxed_slice()
 }
 
-/// Decode one page's first raster. `name` is the page filename, used as
-/// the extension fallback. Animated pages stream the rest through
-/// [`open_animation`].
+#[cfg(test)]
 pub fn decode(bytes: &[u8], name: &str) -> eros::Result<Decoded> {
+    const TEST_MAX_THREADS: usize = 2;
+    decode_with_threads(bytes, name, TEST_MAX_THREADS)
+}
+
+/// Decode one page's first raster; animated frames stream through
+/// [`open_animation`]. Internal decoder threads are capped to `max_threads`
+/// where supported.
+pub fn decode_with_threads(
+    bytes: &[u8],
+    name: &str,
+    max_threads: usize,
+) -> eros::Result<Decoded> {
     let Some(format) = sniff(bytes).or_else(|| format_from_name(name))
     else {
         eros::bail!("not an image");
     };
+    let max_threads = max_threads.max(1);
     match format {
-        Format::Avif => avif::decode(bytes),
-        Format::Jxl => jxl::decode(bytes),
-        Format::Jpeg
-        | Format::Png
-        | Format::Gif
-        | Format::Webp
-        | Format::Bmp
-        | Format::Tiff => image::decode(bytes, format),
+        Format::Avif => avif::decode(bytes, max_threads),
+        Format::Jxl => jxl::decode(bytes, max_threads),
+        Format::Webp => webp::decode(bytes, max_threads),
+        Format::Jpeg | Format::Png | Format::Gif | Format::Bmp | Format::Tiff => {
+            image::decode(bytes, format)
+        }
     }
 }
 

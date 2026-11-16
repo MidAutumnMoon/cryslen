@@ -15,10 +15,9 @@ pub(super) fn decode(bytes: &[u8], format: Format) -> eros::Result<Decoded> {
         Format::Jpeg => ImageFormat::Jpeg,
         Format::Png => ImageFormat::Png,
         Format::Gif => ImageFormat::Gif,
-        Format::Webp => ImageFormat::WebP,
         Format::Bmp => ImageFormat::Bmp,
         Format::Tiff => ImageFormat::Tiff,
-        Format::Avif | Format::Jxl => {
+        Format::Avif | Format::Jxl | Format::Webp => {
             eros::bail!("unsupported internal dispatch");
         }
     };

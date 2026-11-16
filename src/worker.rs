@@ -1,5 +1,4 @@
-//! Per-book decode worker (`cy --worker`): serves requests and
-//! playback in the foreground while `cy-prefetch` warms the store.
+//! Per-book decode worker (`cy --worker`): priority worker pool and IPC loop.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -8,6 +7,7 @@ use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::panic;
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
@@ -27,8 +27,6 @@ use parking_lot::Mutex;
 use rustix::process;
 use rustix::process::Pid;
 use rustix::process::Signal;
-use strum::AsRefStr;
-use strum::EnumIs;
 
 use crate::browse;
 use crate::browse::Direction;
@@ -59,8 +57,39 @@ use crate::protocol::PlaybackId;
 use crate::protocol::WireImage;
 use crate::source::Source;
 
-/// Quiet window before prefetch preloads pages beyond the head.
 const IDLE_PRELOAD: Duration = Duration::from_millis(300);
+
+const PREFETCH_AHEAD_PAGES: usize = 64;
+const PREFETCH_BEHIND_PAGES: usize = 16;
+const PREFETCH_HEAD_SPREADS: usize = 8;
+const PREFETCH_AHEAD_RATIO: usize = 2;
+
+const MEMORY_CACHE_CAP_BYTES: usize = 192 * 1024 * 1024;
+
+const MIN_WORKERS: usize = 2;
+const MAX_WORKERS: usize = 6;
+const RESERVED_FOREGROUND_WORKERS: usize = 2;
+const MIN_PREFETCH_WORKERS: usize = 1;
+const PREFETCH_THREADS_PER_PAGE: usize = 1;
+
+fn worker_count() -> usize {
+    thread::available_parallelism()
+        .map_or(MIN_WORKERS, NonZeroUsize::get)
+        .clamp(MIN_WORKERS, MAX_WORKERS)
+}
+
+const fn max_prefetch_workers(workers: usize) -> usize {
+    let available = workers.saturating_sub(RESERVED_FOREGROUND_WORKERS);
+    if available > MIN_PREFETCH_WORKERS {
+        available
+    } else {
+        MIN_PREFETCH_WORKERS
+    }
+}
+
+fn spread_contains(spread: Spread, page: usize) -> bool {
+    spread.first == page || spread.second == Some(page)
+}
 
 enum ChildEvent<'image> {
     Ready {
@@ -131,7 +160,7 @@ enum PlaybackStep {
 }
 
 impl PlaybackStep {
-    fn id(self) -> PlaybackId {
+    const fn id(self) -> PlaybackId {
         match self {
             Self::Start { id, .. } | Self::Next { id } => id,
         }
@@ -172,11 +201,6 @@ impl PlaybackSession {
     }
 }
 
-const PREFETCH_AHEAD_PAGES: usize = 512;
-const PREFETCH_BEHIND_PAGES: usize = 64;
-const PREFETCH_HEAD_SPREADS: usize = 3;
-
-/// Ordered prefetch spreads for one navigation step.
 #[derive(Debug, Clone)]
 struct Prefetch {
     spreads: Vec<Spread>,
@@ -212,20 +236,28 @@ impl Prefetch {
             len,
             behind,
         );
+        let (travel, opposite) = match direction {
+            Direction::Forward => (&increasing, &decreasing),
+            Direction::Backward => (&decreasing, &increasing),
+        };
         let mut spreads =
             Vec::with_capacity(1 + increasing.len() + decreasing.len());
         spreads.push(origin);
-        for distance in 0..increasing.len().max(decreasing.len()) {
-            let (travel, opposite) = match direction {
-                Direction::Forward => {
-                    (increasing.get(distance), decreasing.get(distance))
-                }
-                Direction::Backward => {
-                    (decreasing.get(distance), increasing.get(distance))
-                }
-            };
-            spreads.extend(travel);
-            spreads.extend(opposite);
+        let mut travel_iter = travel.iter().copied();
+        let mut opposite_iter = opposite.iter().copied();
+        loop {
+            let mut pushed = false;
+            for spread in travel_iter.by_ref().take(PREFETCH_AHEAD_RATIO) {
+                spreads.push(spread);
+                pushed = true;
+            }
+            if let Some(spread) = opposite_iter.next() {
+                spreads.push(spread);
+                pushed = true;
+            }
+            if !pushed {
+                break;
+            }
         }
         let head = spreads.len().min(PREFETCH_HEAD_SPREADS);
         Self { spreads, head }
@@ -235,9 +267,21 @@ impl Prefetch {
         &self.spreads
     }
 
-    /// Leading spreads that need a fit image rather than a thumbnail.
+    /// Leading spreads warmed at `Role::Fit` while still.
     fn head(&self) -> &[Spread] {
         self.spreads.get(..self.head).unwrap_or_default()
+    }
+
+    fn in_head(&self, page: usize) -> bool {
+        self.head()
+            .iter()
+            .any(|spread| spread_contains(*spread, page))
+    }
+
+    fn contains(&self, page: usize) -> bool {
+        self.spreads()
+            .iter()
+            .any(|spread| spread_contains(*spread, page))
     }
 }
 
@@ -271,21 +315,72 @@ fn walk_spreads(
     spreads
 }
 
-#[derive(Clone, Copy, Debug)]
-struct PrefetchStep {
-    page: usize,
-    role: Role,
-    preload: bool,
+struct MemoryCache {
+    cap_bytes: usize,
+    entries: HashMap<u128, Arc<Decoded>>,
+    order: VecDeque<u128>,
 }
 
-#[derive(Clone, Copy, AsRefStr, EnumIs)]
-#[strum(serialize_all = "lowercase")]
-enum ServeKind {
+impl MemoryCache {
+    fn new(cap_bytes: usize) -> Self {
+        Self {
+            cap_bytes,
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn total_bytes(&self) -> usize {
+        self.entries
+            .values()
+            .map(|image| image.resident_bytes())
+            .sum()
+    }
+
+    fn get(&mut self, hash: u128) -> Option<Arc<Decoded>> {
+        let image = self.entries.get(&hash).map(Arc::clone)?;
+        self.touch(hash);
+        Some(image)
+    }
+
+    fn insert(&mut self, hash: u128, image: Arc<Decoded>) {
+        if image.resident_bytes() > self.cap_bytes {
+            return;
+        }
+        self.entries.insert(hash, image);
+        self.touch(hash);
+        while self.total_bytes() > self.cap_bytes {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+    }
+
+    fn touch(&mut self, hash: u128) {
+        self.order.retain(|key| *key != hash);
+        self.order.push_back(hash);
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum JobKind {
     Request { requested_at: Instant },
     Prefetch { preload: bool },
 }
 
-impl ServeKind {
+impl JobKind {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Request { .. } => "request",
+            Self::Prefetch { .. } => "prefetch",
+        }
+    }
+
+    const fn is_prefetch(self) -> bool {
+        matches!(self, Self::Prefetch { .. })
+    }
+
     fn report(
         self,
         page: usize,
@@ -314,6 +409,27 @@ impl ServeKind {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PageJob {
+    page: usize,
+    kind: JobKind,
+}
+
+#[derive(Clone, Copy)]
+enum PreloadGate {
+    Idle,
+    Countdown(Instant),
+    Open,
+}
+
+#[derive(Clone, Copy)]
+struct PageState {
+    wanted: Roles,
+    in_head_still: bool,
+    in_prefetch: bool,
+    stored: Roles,
+}
+
 struct BookState {
     page_count: PageCount,
     prefetch: Option<Prefetch>,
@@ -324,18 +440,17 @@ struct BookState {
     /// clear entries, and failed saves stay marked so a refusing store
     /// cannot make prefetch spin.
     stored: HashMap<u128, Roles>,
+    memory_cache: MemoryCache,
     /// Pages whose first failure settled them for the session.
     failed: HashSet<usize>,
     /// Pages whose `Role::Full` derivation failed and must not retry.
     failed_full: HashSet<usize>,
-    /// The request foreground is currently decoding, so prefetch skips it
-    /// even if a new `SetRequests` drops it mid-decode.
-    active_request: Option<Request>,
+    in_flight: HashMap<usize, JobKind>,
     requests: Vec<Request>,
+    requests_at: Instant,
     /// Requests already handed over since they last entered the set.
     served: HashSet<Request>,
-    preload_allowed: bool,
-    activity_sequence: u64,
+    preload: PreloadGate,
     stopped: bool,
 }
 
@@ -347,13 +462,14 @@ impl BookState {
             motion: Motion::Still,
             hashes: HashMap::new(),
             stored: HashMap::new(),
+            memory_cache: MemoryCache::new(MEMORY_CACHE_CAP_BYTES),
             failed: HashSet::new(),
             failed_full: HashSet::new(),
-            active_request: None,
+            in_flight: HashMap::new(),
             requests: Vec::new(),
+            requests_at: Instant::now(),
             served: HashSet::new(),
-            preload_allowed: false,
-            activity_sequence: 0,
+            preload: PreloadGate::Idle,
             stopped: false,
         }
     }
@@ -363,11 +479,10 @@ impl BookState {
         message: ParentMsg,
         playback: &mut PlaybackRunner,
     ) -> bool {
-        // Ignore playback so animation frames keep the preload quiet window.
+        // Ignore playback so animation frames keep the preload quiet
+        // window.
         if !matches!(message, ParentMsg::Playback(_)) {
-            self.preload_allowed = false;
-            self.activity_sequence =
-                self.activity_sequence.wrapping_add(1);
+            self.preload = PreloadGate::Idle;
         }
         match message {
             // Handled on `Shared` before locking `state`.
@@ -398,6 +513,7 @@ impl BookState {
             }
             ParentMsg::SetRequests(requests) => {
                 tracing::debug!(count = requests.len(), "requests");
+                self.requests_at = Instant::now();
                 self.served.retain(|request| requests.contains(request));
                 self.requests = requests;
                 true
@@ -414,15 +530,6 @@ impl BookState {
             || (role == Role::Full && self.failed_full.contains(&page))
     }
 
-    fn take_request(&mut self) -> Option<Request> {
-        let request = *self.requests.iter().find(|request| {
-            !self.served.contains(request)
-                && !self.role_failed(request.page, request.role)
-        })?;
-        self.active_request = Some(request);
-        Some(request)
-    }
-
     fn wants_unserved(&self, page: usize, role: Role) -> bool {
         let request = Request::new(page, role);
         self.requests.contains(&request)
@@ -430,14 +537,70 @@ impl BookState {
             && !self.role_failed(page, role)
     }
 
-    fn is_claimed(&self, page: usize, role: Role) -> bool {
-        let request = Request::new(page, role);
-        self.active_request == Some(request)
-            || (self.requests.contains(&request)
-                && !self.served.contains(&request))
+    fn wanted_roles(&self, page: usize) -> Roles {
+        let mut roles = Roles::default();
+        for role in [Role::Full, Role::Fit, Role::Thumb] {
+            if self.wants_unserved(page, role) {
+                roles.set(role);
+            }
+        }
+        roles
     }
 
-    fn next_prefetch_job(&self) -> Option<(PrefetchStep, Motion)> {
+    fn claim_publish(&mut self, page: usize, role: Role) -> bool {
+        if !self.wants_unserved(page, role) {
+            return false;
+        }
+        self.served.insert(Request::new(page, role));
+        true
+    }
+
+    fn stored_for_hash(&self, hash: u128) -> Roles {
+        self.stored.get(&hash).copied().unwrap_or_default()
+    }
+
+    fn page_state(&self, page: usize, hash: u128) -> PageState {
+        let in_head_still = self.motion == Motion::Still
+            && self
+                .prefetch
+                .as_ref()
+                .is_some_and(|prefetch| prefetch.in_head(page));
+        let in_prefetch = self
+            .prefetch
+            .as_ref()
+            .is_some_and(|prefetch| prefetch.contains(page));
+        PageState {
+            wanted: self.wanted_roles(page),
+            in_head_still,
+            in_prefetch,
+            stored: self.stored_for_hash(hash),
+        }
+    }
+
+    fn in_flight_prefetch(&self) -> usize {
+        self.in_flight
+            .values()
+            .filter(|kind| kind.is_prefetch())
+            .count()
+    }
+
+    fn take_request_page(&mut self) -> Option<PageJob> {
+        let request = *self.requests.iter().find(|request| {
+            !self.served.contains(request)
+                && !self.role_failed(request.page, request.role)
+                && !self.in_flight.contains_key(&request.page)
+        })?;
+        let kind = JobKind::Request {
+            requested_at: self.requests_at,
+        };
+        self.in_flight.insert(request.page, kind);
+        Some(PageJob {
+            page: request.page,
+            kind,
+        })
+    }
+
+    fn next_prefetch_job(&self) -> Option<(usize, Role, bool, Motion)> {
         let prefetch = self.prefetch.as_ref()?;
         let head = prefetch.head();
         for spread in prefetch.spreads() {
@@ -445,43 +608,26 @@ impl BookState {
             for page in
                 [Some(spread.first), spread.second].into_iter().flatten()
             {
-                if self.failed.contains(&page) {
+                if self.failed.contains(&page)
+                    || self.in_flight.contains_key(&page)
+                {
                     continue;
                 }
                 let stored = self
                     .hashes
                     .get(&page)
-                    .and_then(|hash| self.stored.get(hash))
-                    .copied()
-                    .unwrap_or_default();
+                    .map_or_default(|&hash| self.stored_for_hash(hash));
                 if in_head
                     && self.motion == Motion::Still
                     && !stored.contains(Role::Fit)
-                    && !self.is_claimed(page, Role::Fit)
                 {
-                    return Some((
-                        PrefetchStep {
-                            page,
-                            role: Role::Fit,
-                            preload: false,
-                        },
-                        self.motion,
-                    ));
+                    return Some((page, Role::Fit, false, self.motion));
                 }
-                // Let a pending fit decode finish before warming thumb so
-                // thumb can derive from the saved fit without re-decoding.
-                let fit_pending = !stored.contains(Role::Fit)
-                    && self.is_claimed(page, Role::Fit);
-                if !stored.contains(Role::Thumb)
-                    && !fit_pending
-                    && !self.is_claimed(page, Role::Thumb)
-                {
+                if !stored.contains(Role::Thumb) {
                     return Some((
-                        PrefetchStep {
-                            page,
-                            role: Role::Thumb,
-                            preload: !in_head,
-                        },
+                        page,
+                        Role::Thumb,
+                        !in_head,
                         self.motion,
                     ));
                 }
@@ -495,13 +641,14 @@ impl BookState {
     }
 }
 
-struct RequestGuard<'shared, Sink> {
+struct InFlightGuard<'shared, Sink> {
     shared: &'shared Shared<Sink>,
+    page: usize,
 }
 
-impl<Sink> Drop for RequestGuard<'_, Sink> {
+impl<Sink> Drop for InFlightGuard<'_, Sink> {
     fn drop(&mut self) {
-        self.shared.finish_request();
+        self.shared.finish_page_job(self.page);
     }
 }
 
@@ -514,11 +661,9 @@ struct Shared<Sink> {
 }
 
 impl<Sink> Shared<Sink> {
-    fn finish_request(&self) {
-        let mut state = self.state.lock();
-        state.active_request = None;
-        drop(state);
-        self.wake.notify_one();
+    fn finish_page_job(&self, page: usize) {
+        self.state.lock().in_flight.remove(&page);
+        self.wake.notify_all();
     }
 }
 
@@ -537,9 +682,7 @@ where
     }
 
     fn stop(&self) {
-        let mut state = self.state.lock();
-        state.stopped = true;
-        drop(state);
+        self.state.lock().stopped = true;
         self.wake.notify_all();
     }
 
@@ -551,7 +694,6 @@ where
         &self,
         message: ParentMsg,
         playback: &mut PlaybackRunner,
-        requested_at: &mut Instant,
     ) {
         if let ParentMsg::SetLimits(limits) = message {
             match self.limits.set(limits) {
@@ -566,18 +708,15 @@ where
                     "ignoring duplicate limits"
                 ),
             }
-            // Acquire and release `state` before notifying so `prefetch`
-            // cannot observe `None` and park after `notify_one`.
+            // Acquire and release `state` before notifying so idle workers
+            // cannot observe `None` and park after `notify_all`.
             drop(self.state.lock());
-            self.wake.notify_one();
+            self.wake.notify_all();
             return;
         }
-        if matches!(message, ParentMsg::SetRequests(_)) {
-            *requested_at = Instant::now();
-        }
-        let wake_prefetch = self.state.lock().apply(message, playback);
-        if wake_prefetch {
-            self.wake.notify_one();
+        let wake_workers = self.state.lock().apply(message, playback);
+        if wake_workers {
+            self.wake.notify_all();
         }
     }
 
@@ -585,23 +724,16 @@ where
         &self,
         rx: &impl CommandReceiver,
         playback: &mut PlaybackRunner,
-        requested_at: &mut Instant,
     ) -> bool {
         loop {
             match rx.try_recv() {
                 CommandPoll::Message(message) => {
-                    self.apply_message(message, playback, requested_at);
+                    self.apply_message(message, playback);
                 }
                 CommandPoll::Empty => return true,
                 CommandPoll::Disconnected => return false,
             }
         }
-    }
-
-    fn next_request(&self) -> Option<(Request, RequestGuard<'_, Sink>)> {
-        self.limits.get()?;
-        let request = self.state.lock().take_request()?;
-        Some((request, RequestGuard { shared: self }))
     }
 
     fn limits(&self) -> Option<ImageLimits> {
@@ -612,89 +744,111 @@ where
         clippy::significant_drop_tightening,
         reason = "condvar wait loop holds the mutex guard across iterations"
     )]
-    fn next_prefetch(&self) -> Option<PrefetchStep> {
-        let mut preload_wait: Option<(Instant, Instant, u64)> = None;
-        let (step, motion) = {
-            let mut state = self.state.lock();
-            loop {
-                if state.stopped {
-                    return None;
-                }
-                if self.limits.get().is_none() {
-                    preload_wait = None;
-                    self.wake.wait(&mut state);
-                    continue;
-                }
-                let Some((step, motion)) = state.next_prefetch_job()
-                else {
-                    preload_wait = None;
-                    self.wake.wait(&mut state);
-                    continue;
-                };
-                if !step.preload || state.preload_allowed {
-                    break (step, motion);
-                }
-                let sequence = state.activity_sequence;
-                let (started, deadline) = match preload_wait {
-                    Some((started, deadline, wait_sequence))
-                        if wait_sequence == sequence =>
-                    {
-                        (started, deadline)
-                    }
-                    _ => {
-                        let started = Instant::now();
-                        let deadline = started + IDLE_PRELOAD;
-                        preload_wait = Some((started, deadline, sequence));
-                        (started, deadline)
-                    }
-                };
-                let timed_out =
-                    self.wake.wait_until(&mut state, deadline).timed_out();
-                if timed_out
-                    && !state.stopped
-                    && state.activity_sequence == sequence
-                {
-                    state.preload_allowed = true;
-                    tracing::debug!(
-                        waited = ?started.elapsed(),
-                        "preload started"
-                    );
-                }
+    fn next_job(&self, max_prefetch: usize) -> Option<PageJob> {
+        let mut state = self.state.lock();
+        loop {
+            if state.stopped {
+                return None;
             }
-        };
-        tracing::debug!(
-            page = step.page,
-            role = ?step.role,
-            ?motion,
-            preload = step.preload,
-            "prefetch job"
-        );
-        Some(step)
+            if self.limits.get().is_none() {
+                self.wake.wait(&mut state);
+                continue;
+            }
+            if let Some(job) = state.take_request_page() {
+                return Some(job);
+            }
+            if state.in_flight_prefetch() >= max_prefetch {
+                self.wake.wait(&mut state);
+                continue;
+            }
+            let Some((page, role, preload, motion)) =
+                state.next_prefetch_job()
+            else {
+                self.wake.wait(&mut state);
+                continue;
+            };
+            if !preload || matches!(state.preload, PreloadGate::Open) {
+                let kind = JobKind::Prefetch { preload };
+                state.in_flight.insert(page, kind);
+                drop(state);
+                tracing::debug!(
+                    page,
+                    ?role,
+                    ?motion,
+                    preload,
+                    "prefetch job"
+                );
+                return Some(PageJob { page, kind });
+            }
+            // Start the quiet countdown only once active work has drained.
+            if !state.in_flight.is_empty() {
+                self.wake.wait(&mut state);
+                continue;
+            }
+            match state.preload {
+                PreloadGate::Idle => {
+                    let deadline = Instant::now() + IDLE_PRELOAD;
+                    state.preload = PreloadGate::Countdown(deadline);
+                    self.wake.wait_until(&mut state, deadline);
+                }
+                PreloadGate::Countdown(deadline) => {
+                    if Instant::now() >= deadline {
+                        state.preload = PreloadGate::Open;
+                        tracing::debug!(?IDLE_PRELOAD, "preload started");
+                        self.wake.notify_all();
+                    } else {
+                        self.wake.wait_until(&mut state, deadline);
+                    }
+                }
+                PreloadGate::Open => {}
+            }
+        }
     }
 
-    fn hash_of(&self, page: usize) -> Option<u128> {
-        self.state.lock().hashes.get(&page).copied()
+    fn page_state(&self, page: usize, hash: u128) -> PageState {
+        self.state.lock().page_state(page, hash)
     }
 
-    fn insert_hash(&self, page: usize, bytes: &[u8]) -> u128 {
-        let hash = cache::content_hash(bytes);
-        *self.state.lock().hashes.entry(page).or_insert(hash)
+    fn load_memory_fit(&self, hash: u128) -> Option<Arc<Decoded>> {
+        self.state.lock().memory_cache.get(hash)
     }
 
-    fn load_cached(&self, hash: u128, role: Role) -> Option<Decoded> {
+    fn save_memory_fit(&self, hash: u128, image: Arc<Decoded>) {
+        self.state.lock().memory_cache.insert(hash, image);
+    }
+
+    fn resolve_hash(
+        &self,
+        source: &Source,
+        page: usize,
+    ) -> Option<(u128, Option<Arc<[u8]>>)> {
+        let known = self.state.lock().hashes.get(&page).copied();
+        if let Some(known) = known {
+            return Some((known, None));
+        }
+        let bytes = self.read_source(source, page)?;
+        let hash = cache::content_hash(&bytes);
+        let stored = *self.state.lock().hashes.entry(page).or_insert(hash);
+        Some((stored, Some(bytes)))
+    }
+
+    fn load_stored(&self, hash: u128, role: Role) -> Option<Decoded> {
         let limits = self.limits()?;
         let image = self.store.load(hash, role, limits.fit_edge())?;
         self.state.lock().mark_stored(hash, role);
         Some(image)
     }
 
-    fn persist(
+    fn persist_if_missing(
         &self,
         page: usize,
         hash: u128,
         role: Role,
         image: &Decoded,
     ) {
+        if self.state.lock().stored_for_hash(hash).contains(role) {
+            return;
+        }
         let Some(limits) = self.limits() else {
             return;
         };
@@ -745,22 +899,23 @@ where
         }
     }
 
-    fn wants_unserved(&self, page: usize, role: Role) -> bool {
-        self.state.lock().wants_unserved(page, role)
-    }
-
     fn emit(&self, event: ChildEvent<'_>) {
         let sent = self.sink.lock().emit(event);
         if !sent {
-            let mut state = self.state.lock();
-            state.stopped = true;
-            drop(state);
+            self.state.lock().stopped = true;
             self.wake.notify_all();
         }
     }
 
-    fn publish(&self, page: usize, role: Role, image: &Decoded) {
-        self.state.lock().served.insert(Request::new(page, role));
+    fn claim_and_publish(
+        &self,
+        page: usize,
+        role: Role,
+        image: &Decoded,
+    ) -> bool {
+        if !self.state.lock().claim_publish(page, role) {
+            return false;
+        }
         tracing::debug!(
             page,
             ?role,
@@ -769,6 +924,7 @@ where
             "publish"
         );
         self.emit(ChildEvent::Ready { page, role, image });
+        true
     }
 
     fn record_failure(&self, page: usize, error: &dyn fmt::Display) {
@@ -796,10 +952,11 @@ where
         source: &Source,
         page: usize,
         bytes: &[u8],
+        max_threads: usize,
         lane: &str,
     ) -> Option<Decoded> {
         let started = Instant::now();
-        match decode_page(source, page, bytes) {
+        match decode_page(source, page, bytes, max_threads) {
             Ok(native) => {
                 tracing::debug!(
                     page,
@@ -817,179 +974,173 @@ where
     }
 }
 
-fn serve_thumb_from_fit<Sink>(
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FitOrigin {
+    Cache,
+    Decode,
+}
+
+fn finish_fit<Sink>(
     shared: &Shared<Sink>,
-    last_fit: &mut Option<(u128, Decoded)>,
-    page: usize,
+    job: PageJob,
     hash: u128,
-    kind: ServeKind,
+    fit: &Arc<Decoded>,
+    origin: FitOrigin,
+    thumb_done: bool,
     started: Instant,
-) -> bool
-where
+) where
     Sink: EventSink,
 {
-    if last_fit
-        .as_ref()
-        .is_none_or(|(fit_hash, _)| *fit_hash != hash)
+    let page = job.page;
+    let state = shared.page_state(page, hash);
+    if state.wanted.contains(Role::Fit) || state.in_head_still {
+        shared.save_memory_fit(hash, Arc::clone(fit));
+        if state.wanted.contains(Role::Fit) {
+            shared.claim_and_publish(page, Role::Fit, fit);
+        }
+        job.kind.report(
+            page,
+            Role::Fit,
+            origin == FitOrigin::Cache,
+            started.elapsed(),
+        );
+    }
+
+    let need_thumb = state.wanted.contains(Role::Thumb)
+        || (!thumb_done
+            && (state.in_prefetch || state.in_head_still)
+            && !state.stored.contains(Role::Thumb));
+    if need_thumb
+        && let Some(derived) =
+            shared.derive_for(page, Role::Thumb, fit, job.kind.label())
     {
-        let Some(fit) = shared.load_cached(hash, Role::Fit) else {
-            return false;
-        };
-        *last_fit = Some((hash, fit));
+        let thumb = derived.into_owned();
+        if state.wanted.contains(Role::Thumb) {
+            shared.claim_and_publish(page, Role::Thumb, &thumb);
+        }
+        job.kind.report(page, Role::Thumb, false, started.elapsed());
+        shared.persist_if_missing(page, hash, Role::Thumb, &thumb);
     }
-    let Some((_, fit)) = last_fit.as_ref() else {
-        return false;
-    };
-    let Some(thumb) =
-        shared.derive_for(page, Role::Thumb, fit, kind.as_ref())
-    else {
-        return true;
-    };
-    if kind.is_request() {
-        shared.publish(page, Role::Thumb, &thumb);
+
+    // Persist freshly derived `Fit` during tail preload so advancing into
+    // `head` loads from the store without re-decoding.
+    if origin == FitOrigin::Decode {
+        shared.persist_if_missing(page, hash, Role::Fit, fit);
     }
-    kind.report(page, Role::Thumb, false, started.elapsed());
-    shared.persist(page, hash, Role::Thumb, &thumb);
-    true
 }
 
-fn serve_cached<Sink>(
-    shared: &Shared<Sink>,
-    last_fit: &mut Option<(u128, Decoded)>,
-    page: usize,
-    role: Role,
-    hash: u128,
-    kind: ServeKind,
-    started: Instant,
-) -> bool
-where
-    Sink: EventSink,
-{
-    if let Some(image) = shared.load_cached(hash, role) {
-        if kind.is_request() {
-            shared.publish(page, role, &image);
-        }
-        kind.report(page, role, true, started.elapsed());
-        if role == Role::Fit {
-            *last_fit = Some((hash, image));
-        }
-        return true;
-    }
-    role == Role::Thumb
-        && serve_thumb_from_fit(
-            shared, last_fit, page, hash, kind, started,
-        )
-}
-
-fn produce_preview<Sink>(
+fn produce_page<Sink>(
     source: &Source,
     shared: &Shared<Sink>,
-    last_fit: &mut Option<(u128, Decoded)>,
-    page: usize,
-    role: Role,
-    kind: ServeKind,
+    job: PageJob,
+    max_threads: usize,
 ) where
     Sink: EventSink,
 {
     let started = Instant::now();
-    let known_hash = shared.hash_of(page);
-    if let Some(hash) = known_hash
-        && serve_cached(shared, last_fit, page, role, hash, kind, started)
-    {
-        return;
-    }
-
-    let Some(bytes) = shared.read_source(source, page) else {
-        return;
-    };
-    let hash =
-        known_hash.unwrap_or_else(|| shared.insert_hash(page, &bytes));
-    if known_hash.is_none()
-        && serve_cached(shared, last_fit, page, role, hash, kind, started)
-    {
-        return;
-    }
-
-    let Some(native) = shared.decode(source, page, &bytes, kind.as_ref())
+    let page = job.page;
+    let Some((hash, mut source_bytes)) = shared.resolve_hash(source, page)
     else {
         return;
     };
-    let Some(derived) =
-        shared.derive_for(page, role, &native, kind.as_ref())
-    else {
-        return;
-    };
-    if kind.is_request() {
-        shared.publish(page, role, &derived);
-        kind.report(page, role, false, started.elapsed());
-        if role == Role::Fit
-            && shared.wants_unserved(page, Role::Full)
-            && let Some(full) =
-                shared.derive_for(page, Role::Full, &native, kind.as_ref())
-        {
-            shared.publish(page, Role::Full, &full);
-            kind.report(page, Role::Full, false, started.elapsed());
+
+    let initial = shared.page_state(page, hash);
+    let mut thumb_done = false;
+    let mut cached_fit = shared.load_memory_fit(hash);
+
+    // Check stored thumbnails before deriving from a cached `Fit` while
+    // `MemoryCache` is cold so external store entries remain authoritative.
+    let want_or_missing_thumb = initial.wanted.contains(Role::Thumb)
+        || ((initial.in_prefetch || initial.in_head_still)
+            && !initial.stored.contains(Role::Thumb));
+    if cached_fit.is_none()
+        && want_or_missing_thumb
+        && let Some(loaded_thumb) = shared.load_stored(hash, Role::Thumb)
+    {
+        if initial.wanted.contains(Role::Thumb) {
+            shared.claim_and_publish(page, Role::Thumb, &loaded_thumb);
         }
-    } else {
-        kind.report(page, role, false, started.elapsed());
+        job.kind.report(page, Role::Thumb, true, started.elapsed());
+        thumb_done = true;
     }
-    shared.persist(page, hash, role, &derived);
-    if role == Role::Fit {
-        let fit = match derived {
-            Cow::Owned(fit) => fit,
+
+    let want_fit =
+        initial.wanted.contains(Role::Fit) || initial.in_head_still;
+    if cached_fit.is_none()
+        && (want_fit || (want_or_missing_thumb && !thumb_done))
+        && let Some(loaded_fit) = shared.load_stored(hash, Role::Fit)
+    {
+        cached_fit = Some(Arc::new(loaded_fit));
+    }
+
+    if let Some(fit) = cached_fit.as_ref() {
+        finish_fit(
+            shared,
+            job,
+            hash,
+            fit,
+            FitOrigin::Cache,
+            thumb_done,
+            started,
+        );
+    }
+
+    let before_decode = shared.page_state(page, hash);
+    let need_fit_decode = cached_fit.is_none()
+        && (before_decode.wanted.contains(Role::Fit)
+            || before_decode.wanted.contains(Role::Thumb)
+            || before_decode.in_head_still
+            || (before_decode.in_prefetch && !thumb_done));
+    if !before_decode.wanted.contains(Role::Full) && !need_fit_decode {
+        return;
+    }
+
+    let Some(bytes) = source_bytes
+        .take()
+        .or_else(|| shared.read_source(source, page))
+    else {
+        return;
+    };
+    let Some(native) =
+        shared.decode(source, page, &bytes, max_threads, job.kind.label())
+    else {
+        return;
+    };
+
+    let after_decode = shared.page_state(page, hash);
+    if after_decode.wanted.contains(Role::Full)
+        && let Some(full) =
+            shared.derive_for(page, Role::Full, &native, job.kind.label())
+    {
+        shared.claim_and_publish(page, Role::Full, &full);
+        job.kind.report(page, Role::Full, false, started.elapsed());
+    }
+
+    let need_preview = after_decode.wanted.contains(Role::Fit)
+        || after_decode.wanted.contains(Role::Thumb)
+        || after_decode.in_head_still
+        || after_decode.in_prefetch;
+    if cached_fit.is_none() && need_preview {
+        let Some(derived) =
+            shared.derive_for(page, Role::Fit, &native, job.kind.label())
+        else {
+            return;
+        };
+        let owned = match derived {
+            Cow::Owned(derived_fit) => derived_fit,
             Cow::Borrowed(_) => native,
         };
-        *last_fit = Some((hash, fit));
+        let decoded_fit = Arc::new(owned);
+        finish_fit(
+            shared,
+            job,
+            hash,
+            &decoded_fit,
+            FitOrigin::Decode,
+            thumb_done,
+            started,
+        );
     }
-}
-
-fn serve_full<Sink>(
-    source: &Source,
-    shared: &Shared<Sink>,
-    page: usize,
-    requested_at: Instant,
-) where
-    Sink: EventSink,
-{
-    let serve_started = Instant::now();
-    let kind = ServeKind::Request { requested_at };
-    let Some(bytes) = shared.read_source(source, page) else {
-        return;
-    };
-    let Some(native) = shared.decode(source, page, &bytes, kind.as_ref())
-    else {
-        return;
-    };
-    let Some(full) =
-        shared.derive_for(page, Role::Full, &native, kind.as_ref())
-    else {
-        return;
-    };
-    shared.publish(page, Role::Full, &full);
-    kind.report(page, Role::Full, false, serve_started.elapsed());
-}
-
-fn serve_request<Sink>(
-    source: &Source,
-    shared: &Shared<Sink>,
-    last_fit: &mut Option<(u128, Decoded)>,
-    request: Request,
-    requested_at: Instant,
-) where
-    Sink: EventSink,
-{
-    if request.role == Role::Full {
-        serve_full(source, shared, request.page, requested_at);
-        return;
-    }
-    produce_preview(
-        source,
-        shared,
-        last_fit,
-        request.page,
-        request.role,
-        ServeKind::Request { requested_at },
-    );
 }
 
 struct PlaybackRunner {
@@ -1214,22 +1365,32 @@ impl PlaybackRunner {
     }
 }
 
-fn prefetch_loop<Sink>(source: &Source, shared: &Shared<Sink>)
-where
+fn worker_loop<Sink>(
+    source: &Source,
+    shared: &Shared<Sink>,
+    workers: usize,
+) where
     Sink: EventSink,
 {
-    let mut last_fit = None;
-    while let Some(step) = shared.next_prefetch() {
-        produce_preview(
-            source,
+    let max_prefetch = max_prefetch_workers(workers);
+    while let Some(job) = shared.next_job(max_prefetch) {
+        let _guard = InFlightGuard {
             shared,
-            &mut last_fit,
-            step.page,
-            step.role,
-            ServeKind::Prefetch {
-                preload: step.preload,
-            },
-        );
+            page: job.page,
+        };
+        if let JobKind::Request { requested_at } = job.kind {
+            tracing::debug!(
+                page = job.page,
+                waited = ?requested_at.elapsed(),
+                "request"
+            );
+        }
+        let max_threads = if job.kind.is_prefetch() {
+            PREFETCH_THREADS_PER_PAGE
+        } else {
+            workers
+        };
+        produce_page(source, shared, job, max_threads);
     }
 }
 
@@ -1239,42 +1400,33 @@ fn run<Sink>(
     store: Store,
     sink: Sink,
 ) where
-    Sink: EventSink + Send,
+    Sink: EventSink + Send + Sync,
 {
+    let workers = worker_count();
     let shared = Shared::new(source.len(), store, sink);
-    let mut requested_at = Instant::now();
-    let mut last_fit = None;
     let mut playback = PlaybackRunner::new();
 
     thread::scope(|scope| {
-        let spawned = thread::Builder::new()
-            .name("cy-prefetch".into())
-            .spawn_scoped(scope, || prefetch_loop(source, &shared));
-        if let Err(error) = spawned {
-            tracing::warn!(?error, "prefetch thread disabled");
+        for index in 0..workers {
+            let spawned = thread::Builder::new()
+                .name(format!("cy-worker-{index}"))
+                .spawn_scoped(scope, || {
+                    worker_loop(source, &shared, workers);
+                });
+            if let Err(error) = spawned {
+                tracing::warn!(
+                    index,
+                    ?error,
+                    "worker thread spawn failed"
+                );
+            }
         }
 
         loop {
-            if !shared.apply_messages(rx, &mut playback, &mut requested_at)
+            if !shared.apply_messages(rx, &mut playback)
                 || shared.is_stopped()
             {
                 break;
-            }
-            if let Some((request, _guard)) = shared.next_request() {
-                tracing::debug!(
-                    page = request.page,
-                    role = ?request.role,
-                    waited = ?requested_at.elapsed(),
-                    "request"
-                );
-                serve_request(
-                    source,
-                    &shared,
-                    &mut last_fit,
-                    request,
-                    requested_at,
-                );
-                continue;
             }
             if let Some(step) = playback.pop_front() {
                 playback.serve(source, step, &shared);
@@ -1283,11 +1435,7 @@ fn run<Sink>(
             let Some(message) = rx.recv() else {
                 break;
             };
-            shared.apply_message(
-                message,
-                &mut playback,
-                &mut requested_at,
-            );
+            shared.apply_message(message, &mut playback);
         }
         shared.stop();
     });
@@ -1297,6 +1445,7 @@ fn decode_page(
     source: &Source,
     page: usize,
     bytes: &[u8],
+    max_threads: usize,
 ) -> eros::Result<Decoded> {
     let Some(name) = source.name(page) else {
         // `Source::bytes` answers every page under its length, so a name
@@ -1304,7 +1453,7 @@ fn decode_page(
         eros::bail!("no such page");
     };
     match panic::catch_unwind(AssertUnwindSafe(|| {
-        decode::decode(bytes, name)
+        decode::decode_with_threads(bytes, name, max_threads)
     })) {
         Ok(result) => result,
         Err(payload) => eros::bail!(
@@ -1847,7 +1996,8 @@ mod tests {
 
     #[test]
     fn the_tail_waits_for_a_quiet_app() {
-        let (_dir, source) = page_dir(6, 8);
+        let count = PREFETCH_HEAD_SPREADS + 4;
+        let (_dir, source) = page_dir(count, 8);
         let root = TempDir::new().expect("create temp dir");
         let _worker = TestWorker::spawn_at(
             Arc::clone(&source),
@@ -1856,8 +2006,8 @@ mod tests {
             TestSink::discard(),
         );
         let store = Store::at(root.path());
-        // The head is pages 0, 1 and 2; wait until it is fully produced.
-        for page in [0, 1, 2] {
+        // Wait until all head spreads are fully produced.
+        for page in 0..PREFETCH_HEAD_SPREADS {
             testkit::eventually(
                 20,
                 "the head never reached the store",
@@ -1874,11 +2024,15 @@ mod tests {
             );
         }
         let head_done = Instant::now();
-        // Page 3 is beyond the head: it must not start until the app has
-        // been silent for the preload window.
+        // The first page beyond the head must not start until the quiet
+        // window has elapsed after the head finishes.
         testkit::eventually(20, "the tail never preloaded", || {
             store
-                .load(page_hash(&source, 3), Role::Thumb, TEST_FIT_EDGE)
+                .load(
+                    page_hash(&source, PREFETCH_HEAD_SPREADS),
+                    Role::Thumb,
+                    TEST_FIT_EDGE,
+                )
                 .is_some()
                 .then_some(())
         });
@@ -2378,7 +2532,7 @@ mod tests {
         );
         assert_eq!(
             prefetch_starts(&forward),
-            vec![4, 5, 3, 6, 2, 7, 1, 8, 0, 9]
+            vec![4, 5, 6, 3, 7, 8, 2, 9, 1, 0]
         );
         assert!(
             forward
@@ -2395,7 +2549,7 @@ mod tests {
         );
         assert_eq!(
             prefetch_starts(&backward),
-            vec![4, 3, 5, 2, 6, 1, 7, 0, 8, 9]
+            vec![4, 3, 2, 5, 1, 0, 6, 7, 8, 9]
         );
     }
 

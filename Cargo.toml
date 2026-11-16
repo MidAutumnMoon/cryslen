@@ -33,12 +33,13 @@ strum = { version = "0.28", features = ["derive"] }
 eros = { version = "0.8", default-features = false, features = ["backtrace", "location"] }
 fast_image_resize = "6"
 gif = "0.14"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "tiff"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "bmp", "tiff"] }
 indoc = "2"
 parking_lot = "0.13"
 zip = { version = "9", default-features = false, features = ["deflate"] }
 sevenz-rust2 = { version = "0.24", default-features = false, features = ["bzip2"] }
 libavif-sys = { version = "0.18", default-features = false, features = ["codec-dav1d"] }
+libwebp-sys = "0.14"
 jxl = "0.8"
 
 tracing = "0.1"

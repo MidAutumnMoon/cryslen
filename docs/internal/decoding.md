@@ -5,6 +5,7 @@ The ratios here are one laptop's measurements.
 ## Choices
 
 - JPEG and PNG use the `image` crate. JPEG runs through zune-jpeg; its PNG backend measured faster than zune-png on noise-heavy input.
+- WebP uses `libwebp-sys`: opaque lossy pages decode to planar `Yuv420` (BT.601, studio range) for the display shader; other variants decode to RGBA8.
 - AVIF uses libavif with the dav1d codec. The libaom wrapper measured about 3x slower.
 - JXL uses the jxl crate (jxl-rs) with a parallel runner; jxl-oxide measured about 4x slower.
 - AVIF and JXL cost one to two orders more per pixel than JPEG. turbojpeg's scaled decode saves little because entropy decode dominates.

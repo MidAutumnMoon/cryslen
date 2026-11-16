@@ -9,7 +9,7 @@ The parent owns the window, UI, GL, app state, request set, and textures; the ch
 - Open: fork on the event-loop thread so the child's parent-death signal stays bound to it, then finish the handshake off the loop.
 - Archive: list pages immediately, unpack entries into per-page slots in the background, and serve each page as its slot fills. Per-page failures stay page-local; an aborted pass fills empty slots with its error. A directory is ready immediately.
 - Switch: kill the old child, start a new open, and adopt its view when it lands; the app keeps the last frame on screen meanwhile.
-- Child: foreground loop serving requests and playback directly to the parent IPC channel, paired with a `cy-prefetch` thread that warms the store.
+- Child: priority worker pool serving requests and warming caches alongside the IPC and playback loop (`src/worker.rs`).
 - A page fault is text; a book fault is the process.
 - The store, prefetch, and retention are in `docs/internal/cache.md`.
 

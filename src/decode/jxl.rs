@@ -14,10 +14,10 @@ use super::Transfer;
 
 const MAX_THREADS: usize = 16;
 
-pub(super) fn decode(bytes: &[u8]) -> eros::Result<Decoded> {
+pub(super) fn decode(bytes: &[u8], max_threads: usize) -> eros::Result<Decoded> {
     use std::slice;
 
-    let mut runner = Pool(threads());
+    let mut runner = Pool(max_threads.clamp(1, MAX_THREADS));
     // The whole file is in memory, so `NeedMoreInput` means the file is
     // truncated.
     let mut input: &[u8] = bytes;
@@ -86,15 +86,6 @@ pub(super) fn decode(bytes: &[u8]) -> eros::Result<Decoded> {
         Transfer::Srgb,
         rgba.into_boxed_slice(),
     )?)
-}
-
-fn threads() -> usize {
-    use std::num::NonZeroUsize;
-    use std::thread;
-
-    thread::available_parallelism()
-        .map_or(1, NonZeroUsize::get)
-        .min(MAX_THREADS)
 }
 
 /// Scoped-thread runner. A failing task fails the whole run, which is
