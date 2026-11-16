@@ -11,8 +11,6 @@ use image::Rgba;
 use image::RgbaImage;
 use image::codecs::gif::Repeat;
 
-use crate::fault::DecodeRefusal;
-use crate::fault::PageError;
 use crate::source::Source;
 
 fn encode(img: &DynamicImage, format: ImageFormat) -> Vec<u8> {
@@ -77,10 +75,6 @@ pub fn tiny_tiff(width: u32, height: u32, rgb: [u8; 3]) -> Vec<u8> {
     encode(&DynamicImage::ImageRgb8(img), ImageFormat::Tiff)
 }
 
-pub fn failed_page(message: &'static str) -> Arc<PageError> {
-    Arc::new(ErrorUnion::new(DecodeRefusal::Corrupt(message)))
-}
-
 pub fn readable_page(source: &Source, index: usize) -> Arc<[u8]> {
     match source.bytes(index) {
         Ok(bytes) => bytes,
@@ -88,7 +82,7 @@ pub fn readable_page(source: &Source, index: usize) -> Arc<[u8]> {
     }
 }
 
-pub fn unreadable_page(source: &Source, index: usize) -> Arc<PageError> {
+pub fn unreadable_page(source: &Source, index: usize) -> Arc<ErrorUnion> {
     match source.bytes(index) {
         Err(error) => error,
         Ok(_) => panic!("page {index} succeeded"),

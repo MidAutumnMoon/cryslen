@@ -28,7 +28,7 @@ rustix = { version = "1", features = ["process"] }
 serde = { version = "1", features = ["derive"] }
 strum = { version = "0.28", features = ["derive"] }
 
-eros = { version = "0.8", default-features = false, features = ["context", "backtrace", "location"] }
+eros = { version = "0.8", default-features = false, features = ["backtrace", "location"] }
 fast_image_resize = "6"
 gif = "0.14"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "tiff"] }

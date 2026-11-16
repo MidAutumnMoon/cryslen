@@ -296,17 +296,12 @@ impl PageTextures {
             VERTEX_SHADER_SOURCE,
             FRAGMENT_SHADER_SOURCE,
         )?;
-        #[expect(
-            clippy::map_err_ignore,
-            reason = "the dropped conversion error says only that the value is out of range, which the message states"
-        )]
         // SAFETY: MAX_TEXTURE_SIZE is a pure query on the current context.
-        let max_texture_edge = u32::try_from(unsafe {
+        let Ok(max_texture_edge) = u32::try_from(unsafe {
             gl.get_parameter_i32(glow::MAX_TEXTURE_SIZE)
-        })
-        .map_err(|_| {
-            eros::error!("GL MAX_TEXTURE_SIZE is not a positive GLint")
-        })?;
+        }) else {
+            eros::bail!("GL MAX_TEXTURE_SIZE is not a positive GLint");
+        };
         if max_texture_edge < cache::THUMB_EDGE {
             return Err(eros::error!(
                 "GL MAX_TEXTURE_SIZE ({max_texture_edge}) is below THUMB_EDGE ({})",

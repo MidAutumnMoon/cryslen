@@ -1,6 +1,7 @@
 //! The parent's view of a book and the handle to its child process.
 
 use std::env;
+use std::fmt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Child;
@@ -15,6 +16,7 @@ use crossbeam_channel::Receiver;
 use crossbeam_channel::RecvTimeoutError;
 use crossbeam_channel::Sender;
 use crossbeam_channel::TryRecvError;
+use eros::ErrorUnion;
 use ipc_channel::ipc::IpcOneShotServer;
 use ipc_channel::ipc::IpcReceiver;
 use ipc_channel::ipc::IpcSender;
@@ -25,7 +27,6 @@ use crate::browse::PageNames;
 use crate::browse::Role;
 use crate::catalog;
 use crate::catalog::PageName;
-use crate::fault::BookFault;
 use crate::fault::PageFault;
 use crate::protocol::BookInfo;
 use crate::protocol::ChildMsg;
@@ -40,7 +41,7 @@ const OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 /// Wakes the event loop for a completed open or queued child message.
 pub type Wake = Arc<dyn Fn() + Send + Sync + 'static>;
 
-pub type OpenedBook = Result<(BookView, BookProcess), BookFault>;
+pub type OpenedBook = eros::Result<(BookView, BookProcess)>;
 
 /// The parent's complete book state; source, store, and worker live in
 /// the child.
@@ -169,14 +170,17 @@ pub struct BookOpen {
     results: Receiver<OpenedBook>,
 }
 
+fn spawn_error(error: impl fmt::Display) -> ErrorUnion {
+    eros::error!("cannot start the book process: {error}")
+}
+
 impl BookOpen {
     /// Call from a long-lived thread: Linux sends the child's
     /// `PR_SET_PDEATHSIG` when the thread that forked it exits.
-    pub fn start(path: &Path, wake: Wake) -> Result<Self, BookFault> {
-        let (server, server_name) = IpcOneShotServer::<Hello>::new()
-            .map_err(|error| BookFault::Spawn(error.to_string()))?;
-        let binary = env::current_exe()
-            .map_err(|error| BookFault::Spawn(error.to_string()))?;
+    pub fn start(path: &Path, wake: Wake) -> eros::Result<Self> {
+        let (server, server_name) =
+            IpcOneShotServer::<Hello>::new().map_err(spawn_error)?;
+        let binary = env::current_exe().map_err(spawn_error)?;
         let child = Command::new(binary)
             .arg("--worker")
             .arg(&server_name)
@@ -184,7 +188,7 @@ impl BookOpen {
             .stdin(Stdio::null())
             .stderr(Stdio::inherit())
             .spawn()
-            .map_err(|error| BookFault::Spawn(error.to_string()))?;
+            .map_err(spawn_error)?;
         let child = ChildGuard(Some(child));
         let path = path.to_path_buf();
         let (result_sender, results) = crossbeam_channel::bounded(1);
@@ -202,7 +206,7 @@ impl BookOpen {
                     wake();
                 }
             })
-            .map_err(|error| BookFault::Spawn(error.to_string()))?;
+            .map_err(spawn_error)?;
         Ok(Self { results })
     }
 
@@ -210,8 +214,8 @@ impl BookOpen {
         match self.results.try_recv() {
             Ok(opened) => Some(opened),
             Err(TryRecvError::Empty) => None,
-            Err(TryRecvError::Disconnected) => Some(Err(BookFault::Died(
-                String::from("the book open ended without a book"),
+            Err(TryRecvError::Disconnected) => Some(Err(eros::error!(
+                "the book process died: the book open ended without a book"
             ))),
         }
     }
@@ -227,7 +231,7 @@ pub struct Book {
 enum Phase {
     Live(BookProcess),
     Opening(BookOpen),
-    Faulted(BookFault),
+    Faulted(ErrorUnion),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -250,7 +254,7 @@ impl Book {
         &self.view
     }
 
-    pub fn fault(&self) -> Option<&BookFault> {
+    pub fn fault(&self) -> Option<&ErrorUnion> {
         if let Phase::Faulted(fault) = &self.phase {
             Some(fault)
         } else {
@@ -282,7 +286,7 @@ impl Book {
                 BookChange::None
             }
             Err(fault) => {
-                tracing::warn!(?fault, "book open failed");
+                tracing::warn!(%fault, "book open failed");
                 self.phase = Phase::Faulted(fault);
                 BookChange::Faulted
             }
@@ -295,7 +299,9 @@ impl Book {
                 let (updates, died) = process.drain();
                 if let Some(detail) = died {
                     tracing::warn!(%detail, "the book process failed");
-                    self.phase = Phase::Faulted(BookFault::Died(detail));
+                    self.phase = Phase::Faulted(eros::error!(
+                        "the book process died: {detail}"
+                    ));
                     return (updates, BookChange::Faulted);
                 }
                 (updates, BookChange::None)
@@ -311,7 +317,7 @@ impl Book {
                         (Vec::new(), BookChange::Adopted)
                     }
                     Err(fault) => {
-                        tracing::warn!(?fault, "book open failed");
+                        tracing::warn!(%fault, "book open failed");
                         self.phase = Phase::Faulted(fault);
                         (Vec::new(), BookChange::Faulted)
                     }
@@ -337,7 +343,7 @@ fn finish_open(
         .spawn(move || {
             let _sent = accept_tx.send(server.accept());
         })
-        .map_err(|error| BookFault::Spawn(error.to_string()))?;
+        .map_err(spawn_error)?;
     let accepted = match accept_rx.recv_timeout(OPEN_TIMEOUT) {
         Ok(accepted) => accepted,
         Err(RecvTimeoutError::Timeout) => {
@@ -347,18 +353,18 @@ fn finish_open(
             // below instead.
             child.kill();
             wake_accept(server_name, accept_thread);
-            return Err(BookFault::Timeout);
+            eros::bail!("the book process did not answer in time");
         }
         Err(RecvTimeoutError::Disconnected) => {
-            return Err(BookFault::Handshake(String::from(
-                "the book accept thread stopped",
-            )));
+            eros::bail!(
+                "book process handshake failed: the book accept thread stopped"
+            );
         }
     };
     let (_, hello) = match accepted {
         Ok(accepted) => accepted,
         Err(error) => {
-            return Err(BookFault::Handshake(error.to_string()));
+            eros::bail!("book process handshake failed: {error}");
         }
     };
     let (info, messages, commands) = match hello {
@@ -367,7 +373,9 @@ fn finish_open(
             messages,
             commands,
         } => (info, messages, commands),
-        Hello::Failed(detail) => return Err(BookFault::Open(detail)),
+        Hello::Failed(detail) => {
+            eros::bail!("cannot open the book: {detail}");
+        }
     };
     let view = BookView::from_info(path, info);
     let (events, reader) = spawn_reader(messages, wake)?;
@@ -427,12 +435,12 @@ fn kill_and_reap(child: &mut Child) {
 fn spawn_reader(
     child_rx: IpcReceiver<ChildMsg>,
     wake: Wake,
-) -> Result<(Receiver<ProcessEvent>, JoinHandle<()>), BookFault> {
+) -> eros::Result<(Receiver<ProcessEvent>, JoinHandle<()>)> {
     let (event_sender, events) = crossbeam_channel::unbounded();
     let handle = thread::Builder::new()
         .name(String::from("cy-book-reader"))
         .spawn(move || read_events(&child_rx, &event_sender, &*wake))
-        .map_err(|error| BookFault::Spawn(error.to_string()))?;
+        .map_err(spawn_error)?;
     Ok((events, handle))
 }
 
@@ -469,7 +477,7 @@ fn event_from_message(message: ChildMsg) -> BookUpdate {
             }),
             Err(refusal) => BookUpdate::Failed {
                 page,
-                fault: PageFault::new(refusal.to_string()),
+                fault: PageFault::new(refusal.as_str()),
             },
         },
         ChildMsg::Playback(event) => {

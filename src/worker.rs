@@ -7,6 +7,7 @@ use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::ffi::OsString;
+use std::fmt;
 use std::panic;
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
@@ -17,7 +18,6 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
-use eros::ErrorUnion;
 use ipc_channel::TryRecvError as IpcTryRecvError;
 use ipc_channel::ipc;
 use ipc_channel::ipc::IpcReceiver;
@@ -47,11 +47,8 @@ use crate::decode::Animation;
 use crate::decode::Decoded;
 use crate::decode::Frame;
 use crate::decode::Loops;
-use crate::fault::BadIndex;
-use crate::fault::DecodeError;
-use crate::fault::PageError;
+use crate::fault;
 use crate::fault::PageFault;
-use crate::fault::PanicFault;
 use crate::protocol::BookInfo;
 use crate::protocol::ChildMsg;
 use crate::protocol::Hello;
@@ -73,7 +70,7 @@ enum ChildEvent<'image> {
     },
     Failed {
         page: usize,
-        error: &'image Arc<PageError>,
+        error: &'image dyn fmt::Display,
     },
     Playback(PlaybackEvent<&'image Decoded>),
 }
@@ -117,7 +114,7 @@ impl EventSink for IpcSender<ChildMsg> {
             },
             ChildEvent::Failed { page, error } => ChildMsg::Failed {
                 page,
-                fault: PageFault::from(Arc::clone(error)),
+                fault: PageFault::new(error.to_string()),
             },
             ChildEvent::Playback(event) => ChildMsg::Playback(
                 event.map_image(WireImage::from_decoded),
@@ -149,7 +146,7 @@ struct PlaybackSession {
 }
 
 impl PlaybackSession {
-    fn advance(&mut self) -> Result<Option<Frame>, DecodeError> {
+    fn advance(&mut self) -> eros::Result<Option<Frame>> {
         let mut rewound = false;
         loop {
             if let Some(frame) = self.animation.next_frame().transpose()? {
@@ -327,8 +324,8 @@ struct BookState {
     /// clear entries, and failed saves stay marked so a refusing store
     /// cannot make prefetch spin.
     stored: HashMap<u128, Roles>,
-    /// A page's first failure is its verdict for the session.
-    failed: HashMap<usize, Arc<PageError>>,
+    /// Pages whose first failure settled them for the session.
+    failed: HashSet<usize>,
     /// Pages whose `Role::Full` derivation failed and must not retry.
     failed_full: HashSet<usize>,
     /// The request foreground is currently decoding, so prefetch skips it
@@ -350,7 +347,7 @@ impl BookState {
             motion: Motion::Still,
             hashes: HashMap::new(),
             stored: HashMap::new(),
-            failed: HashMap::new(),
+            failed: HashSet::new(),
             failed_full: HashSet::new(),
             active_request: None,
             requests: Vec::new(),
@@ -413,7 +410,7 @@ impl BookState {
     }
 
     fn role_failed(&self, page: usize, role: Role) -> bool {
-        self.failed.contains_key(&page)
+        self.failed.contains(&page)
             || (role == Role::Full && self.failed_full.contains(&page))
     }
 
@@ -448,7 +445,7 @@ impl BookState {
             for page in
                 [Some(spread.first), spread.second].into_iter().flatten()
             {
-                if self.failed.contains_key(&page) {
+                if self.failed.contains(&page) {
                     continue;
                 }
                 let stored = self
@@ -740,8 +737,7 @@ where
                         self.state.lock().failed_full.insert(page);
                     }
                     Role::Thumb | Role::Fit => {
-                        let error = Arc::new(ErrorUnion::new(fault));
-                        self.record_failure(page, &error);
+                        self.record_failure(page, &fault);
                     }
                 }
                 None
@@ -775,17 +771,8 @@ where
         self.emit(ChildEvent::Ready { page, role, image });
     }
 
-    fn record_failure(&self, page: usize, error: &Arc<PageError>) {
-        use std::collections::hash_map::Entry;
-
-        let is_new = match self.state.lock().failed.entry(page) {
-            Entry::Vacant(entry) => {
-                entry.insert(Arc::clone(error));
-                true
-            }
-            Entry::Occupied(_) => false,
-        };
-        if is_new {
+    fn record_failure(&self, page: usize, error: &dyn fmt::Display) {
+        if self.state.lock().failed.insert(page) {
             self.emit(ChildEvent::Failed { page, error });
         }
     }
@@ -1115,15 +1102,11 @@ impl PlaybackRunner {
                 self.fail_playback(id, shared);
             }
             Err(payload) => {
-                let fault = PanicFault::from_payload(
-                    "animation",
-                    payload.as_ref(),
-                );
+                let message = fault::panic_message(payload.as_ref());
                 tracing::warn!(
                     ?id,
                     ?role,
-                    fault = %fault,
-                    "playback open panicked"
+                    "playback open panicked: {message}"
                 );
                 self.fail_playback(id, shared);
             }
@@ -1201,15 +1184,11 @@ impl PlaybackRunner {
                 self.fail_playback(id, shared);
             }
             Err(payload) => {
-                let fault = PanicFault::from_payload(
-                    "animation",
-                    payload.as_ref(),
-                );
+                let message = fault::panic_message(payload.as_ref());
                 tracing::warn!(
                     ?id,
                     ?role,
-                    fault = %fault,
-                    "playback frame panicked"
+                    "playback frame panicked: {message}"
                 );
                 self.fail_playback(id, shared);
             }
@@ -1318,20 +1297,20 @@ fn decode_page(
     source: &Source,
     page: usize,
     bytes: &[u8],
-) -> Result<Decoded, Arc<PageError>> {
+) -> eros::Result<Decoded> {
     let Some(name) = source.name(page) else {
         // `Source::bytes` answers every page under its length, so a name
         // miss is a caller bug.
-        return Err(Arc::new(ErrorUnion::new(BadIndex)));
+        eros::bail!("no such page");
     };
     match panic::catch_unwind(AssertUnwindSafe(|| {
         decode::decode(bytes, name)
     })) {
-        Ok(Ok(decoded)) => Ok(decoded),
-        Ok(Err(error)) => Err(Arc::new(error.widen())),
-        Err(payload) => Err(Arc::new(ErrorUnion::new(
-            PanicFault::from_payload("decoder", payload.as_ref()),
-        ))),
+        Ok(result) => result,
+        Err(payload) => eros::bail!(
+            "decoder panicked: {}",
+            fault::panic_message(payload.as_ref())
+        ),
     }
 }
 
@@ -1435,14 +1414,12 @@ mod tests {
     use std::fs;
     use std::sync::mpsc;
 
-    use image::ImageError;
     use image::codecs::gif::Repeat;
     use tempfile::TempDir;
 
     use super::*;
     use crate::cache::Store;
     use crate::decode::Pixels;
-    use crate::fault::DecodeRefusal;
     use crate::testkit;
 
     /// Page edge for the tests that check derived and full dimensions:
@@ -1464,7 +1441,6 @@ mod tests {
         },
         Failed {
             page: usize,
-            error: Arc<PageError>,
         },
         Playback(PlaybackEvent<Box<Decoded>>),
     }
@@ -1504,10 +1480,7 @@ mod tests {
                     role,
                     image: Box::new(image.clone()),
                 },
-                ChildEvent::Failed { page, error } => Update::Failed {
-                    page,
-                    error: Arc::clone(error),
-                },
+                ChildEvent::Failed { page, .. } => Update::Failed { page },
                 ChildEvent::Playback(playback) => Update::Playback(
                     playback.map_image(|image| Box::new(image.clone())),
                 ),
@@ -1718,20 +1691,19 @@ mod tests {
             })
         }
 
-        fn failure(&self, page: usize) -> Arc<PageError> {
+        fn failure(&self, page: usize) {
             testkit::eventually(20, "page never failed", || {
                 self.drain();
                 let seen = self.seen.lock();
                 seen.iter().find_map(|event| match event {
-                    Update::Failed {
-                        page: failed,
-                        error,
-                    } if *failed == page => Some(Arc::clone(error)),
+                    Update::Failed { page: failed } if *failed == page => {
+                        Some(())
+                    }
                     Update::Ready { .. }
                     | Update::Failed { .. }
                     | Update::Playback(_) => None,
                 })
-            })
+            });
         }
 
         fn delivered(
@@ -1753,14 +1725,8 @@ mod tests {
             self.drain();
             let seen = self.seen.lock();
             seen.iter()
-                .filter_map(|event| match event {
-                    Update::Failed {
-                        page: failed,
-                        error,
-                    } if *failed == page => Some(error),
-                    Update::Ready { .. }
-                    | Update::Failed { .. }
-                    | Update::Playback(_) => None,
+                .filter(|event| {
+                    matches!(event, Update::Failed { page: failed } if *failed == page)
                 })
                 .count()
         }
@@ -1947,12 +1913,7 @@ mod tests {
             sink,
         );
 
-        let error = events.failure(0);
-        assert!(
-            error.downcast_inner_ref::<ImageError>().is_some()
-                || error.downcast_inner_ref::<DecodeRefusal>().is_some(),
-            "page 0 failed as {error}, expected a decode fault"
-        );
+        events.failure(0);
         // The failure leaves the rest of the prefetch running: pages behind it
         // still reach the store.
         let store = Store::at(root.path());

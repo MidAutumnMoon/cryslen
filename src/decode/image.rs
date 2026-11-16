@@ -1,19 +1,10 @@
-use eros::ErrorUnion;
-use eros::IntoUnion as _;
-
-use crate::fault::DecodeError;
-use crate::fault::DecodeRefusal;
-
 use super::Decoded;
 use super::Format;
 use super::Transfer;
 
 /// Decode with a concrete decoder so EXIF orientation is readable, then
 /// apply it.
-pub(super) fn decode(
-    bytes: &[u8],
-    format: Format,
-) -> Result<Decoded, DecodeError> {
+pub(super) fn decode(bytes: &[u8], format: Format) -> eros::Result<Decoded> {
     use image::DynamicImage;
     use image::ImageDecoder as _;
     use image::ImageFormat;
@@ -28,30 +19,27 @@ pub(super) fn decode(
         Format::Bmp => ImageFormat::Bmp,
         Format::Tiff => ImageFormat::Tiff,
         Format::Avif | Format::Jxl => {
-            return Err(ErrorUnion::new(DecodeRefusal::Unsupported(
-                "internal dispatch",
-            )));
+            eros::bail!("unsupported internal dispatch");
         }
     };
     let reader =
         ImageReader::with_format(Cursor::new(bytes), image_format);
-    let mut decoder = reader.into_decoder().union()?;
+    let mut decoder = reader.into_decoder()?;
     // Orientation only swaps w and h, and the cap checks both, so this
     // pre-orientation check catches rotated pages too.
     let (width, height) = decoder.dimensions();
-    super::admit_dims(width, height, "bad dimensions").union()?;
-    let orientation = decoder.orientation().union()?;
-    let mut oriented = DynamicImage::from_decoder(decoder).union()?;
+    super::admit_dims(width, height, "bad dimensions")?;
+    let orientation = decoder.orientation()?;
+    let mut oriented = DynamicImage::from_decoder(decoder)?;
     oriented.apply_orientation(orientation);
     let rgba = oriented.into_rgba8();
-    Decoded::rgba(
+    Ok(Decoded::rgba(
         rgba.width(),
         rgba.height(),
         format,
         Transfer::Srgb,
         rgba.into_raw().into_boxed_slice(),
-    )
-    .union()
+    )?)
 }
 
 #[cfg(test)]

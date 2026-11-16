@@ -9,14 +9,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ::image::Delay;
-use eros::ErrorUnion;
-use eros::IntoUnion as _;
+use eros::MsgError;
 use serde::Deserialize;
 use serde::Serialize;
 use strum::Display;
-
-use crate::fault::DecodeError;
-use crate::fault::DecodeRefusal;
 
 mod avif;
 mod image;
@@ -84,7 +80,7 @@ impl Decoded {
         format: Format,
         transfer: Transfer,
         bytes: Box<[u8]>,
-    ) -> Result<Self, DecodeRefusal> {
+    ) -> Result<Self, MsgError> {
         validate_rgba_extent(width, height, bytes.len())?;
         Ok(Self {
             width,
@@ -102,7 +98,7 @@ impl Decoded {
         format: Format,
         transfer: Transfer,
         yuv: YuvImage,
-    ) -> Result<Self, DecodeRefusal> {
+    ) -> Result<Self, MsgError> {
         let wide = yuv.depth > BYTE_DEPTH;
         let matches_depth =
             |plane: &Plane| matches!(plane, Plane::U16(_)) == wide;
@@ -114,7 +110,7 @@ impl Decoded {
             || (yuv.subsampling != Subsampling::Mono
                 && (!matches_depth(&yuv.cb) || !matches_depth(&yuv.cr)))
         {
-            return Err(DecodeRefusal::Corrupt("yuv plane depth"));
+            return Err(MsgError::from_static("yuv plane depth"));
         }
         validate_yuv_extents(
             (width, height),
@@ -159,25 +155,23 @@ pub fn pixel_count(width: u32, height: u32) -> Option<u32> {
         .filter(|&count| (1..=MAX_PIXELS).contains(&count))
 }
 
-/// Validated [`pixel_count`], mapping failure to
-/// [`DecodeRefusal::Corrupt`].
 pub fn admit_dims(
     width: u32,
     height: u32,
     bad_dims_reason: &'static str,
-) -> Result<u32, DecodeRefusal> {
+) -> Result<u32, MsgError> {
     pixel_count(width, height)
-        .ok_or(DecodeRefusal::Corrupt(bad_dims_reason))
+        .ok_or_else(|| MsgError::from_static(bad_dims_reason))
 }
 
 pub fn validate_rgba_extent(
     width: u32,
     height: u32,
     bytes: usize,
-) -> Result<(), DecodeRefusal> {
+) -> Result<(), MsgError> {
     let pixels = admit_dims(width, height, "bad dimensions")?;
     if bytes != pixels as usize * 4 {
-        return Err(DecodeRefusal::Corrupt("rgba extent"));
+        return Err(MsgError::from_static("rgba extent"));
     }
     Ok(())
 }
@@ -188,13 +182,13 @@ pub fn validate_yuv_extents(
     subsampling: Subsampling,
     [luma_bytes, chroma_blue_bytes, chroma_red_bytes]: [usize; 3],
     alpha_bytes: Option<usize>,
-) -> Result<(), DecodeRefusal> {
+) -> Result<(), MsgError> {
     let (width, height) = dims;
     let luma_pixels = admit_dims(width, height, "bad dimensions")?;
     let bytes_per_sample = match depth {
         1..=BYTE_DEPTH => 1,
         9..=MAX_SAMPLE_DEPTH => size_of::<u16>(),
-        _ => return Err(DecodeRefusal::Corrupt("yuv depth")),
+        _ => return Err(MsgError::from_static("yuv depth")),
     };
     let expected_luma_bytes = luma_pixels as usize * bytes_per_sample;
     let (_, (chroma_width, chroma_height)) =
@@ -209,7 +203,7 @@ pub fn validate_yuv_extents(
             && (chroma_blue_bytes != expected_chroma_bytes
                 || chroma_red_bytes != expected_chroma_bytes))
     {
-        return Err(DecodeRefusal::Corrupt("yuv plane extent"));
+        return Err(MsgError::from_static("yuv plane extent"));
     }
     Ok(())
 }
@@ -447,10 +441,10 @@ where
 /// Decode one page's first raster. `name` is the page filename, used as
 /// the extension fallback. Animated pages stream the rest through
 /// [`open_animation`].
-pub fn decode(bytes: &[u8], name: &str) -> Result<Decoded, DecodeError> {
+pub fn decode(bytes: &[u8], name: &str) -> eros::Result<Decoded> {
     let Some(format) = sniff(bytes).or_else(|| format_from_name(name))
     else {
-        return Err(ErrorUnion::new(DecodeRefusal::NotAnImage));
+        eros::bail!("not an image");
     };
     match format {
         Format::Avif => avif::decode(bytes),
@@ -480,13 +474,13 @@ impl Animation {
     }
 
     /// Restart the pass at frame 0.
-    pub fn rewind(&mut self) -> Result<(), DecodeError> {
+    pub fn rewind(&mut self) -> eros::Result<()> {
         self.frames = Frames::new(Arc::clone(&self.bytes), self.format)?;
         Ok(())
     }
 
     /// `None` means the pass ended.
-    pub fn next_frame(&mut self) -> Option<Result<Frame, DecodeError>> {
+    pub fn next_frame(&mut self) -> Option<eros::Result<Frame>> {
         self.frames.next_frame()
     }
 }
@@ -504,32 +498,30 @@ struct Frames {
 }
 
 impl Frames {
-    fn new(bytes: Arc<[u8]>, format: Format) -> Result<Self, DecodeError> {
+    fn new(bytes: Arc<[u8]>, format: Format) -> eros::Result<Self> {
         use ::image::AnimationDecoder as _;
         use ::image::ImageDecoder as _;
         use ::image::codecs::gif::GifDecoder;
         use std::io::Cursor;
 
         if format != Format::Gif {
-            return Err(ErrorUnion::new(DecodeRefusal::Unsupported(
-                "animation format",
-            )));
+            eros::bail!("unsupported animation format");
         }
-        let decoder = GifDecoder::new(Cursor::new(bytes)).union()?;
+        let decoder = GifDecoder::new(Cursor::new(bytes))?;
         let (width, height) = decoder.dimensions();
-        admit_dims(width, height, "bad dimensions").union()?;
+        admit_dims(width, height, "bad dimensions")?;
         Ok(Self {
             inner: decoder.into_frames(),
             format,
         })
     }
 
-    fn next_frame(&mut self) -> Option<Result<Frame, DecodeError>> {
+    fn next_frame(&mut self) -> Option<eros::Result<Frame>> {
         let frame = match self.inner.next() {
             None => return None,
             Some(Ok(frame)) => frame,
             Some(Err(error)) => {
-                return Some(Err(ErrorUnion::new(error)));
+                return Some(Err(error.into()));
             }
         };
         let delay = delay_duration(frame.delay());
@@ -545,7 +537,7 @@ impl Frames {
                 rgba,
             )
             .map(|image| Frame { image, delay })
-            .union(),
+            .map_err(Into::into),
         )
     }
 }
@@ -555,10 +547,10 @@ impl Frames {
 pub fn open_animation(
     bytes: Arc<[u8]>,
     name: &str,
-) -> Result<Option<Animation>, DecodeError> {
+) -> eros::Result<Option<Animation>> {
     let Some(format) = sniff(&bytes).or_else(|| format_from_name(name))
     else {
-        return Err(ErrorUnion::new(DecodeRefusal::NotAnImage));
+        eros::bail!("not an image");
     };
     if !format.may_animate() {
         return Ok(None);
@@ -705,19 +697,6 @@ mod tests {
     use crate::testkit;
     use ::image::codecs::gif::Repeat;
 
-    /// The refusal a decode returned, for tests that assert on the
-    /// verdict rather than its message.
-    fn refusal(
-        result: Result<Decoded, DecodeError>,
-    ) -> Option<DecodeRefusal> {
-        match result {
-            Ok(_) => None,
-            Err(error) => {
-                error.downcast_inner_ref::<DecodeRefusal>().cloned()
-            }
-        }
-    }
-
     #[test]
     fn format_detection() {
         // sniff: one row per magic
@@ -749,19 +728,10 @@ mod tests {
         assert_eq!(format_from_name("cover.cbz"), None);
         assert_eq!(format_from_name("noext"), None);
 
-        // garbage: no magic and no usable extension is NotAnImage
-        assert_eq!(
-            refusal(decode(b"hello world", "noext")),
-            Some(DecodeRefusal::NotAnImage)
-        );
-        assert_eq!(
-            refusal(decode(b"hello world", "note.txt")),
-            Some(DecodeRefusal::NotAnImage)
-        );
-        assert_eq!(
-            refusal(decode(&[], "x")),
-            Some(DecodeRefusal::NotAnImage)
-        );
+        // garbage: no magic and no usable extension refuses
+        assert!(decode(b"hello world", "noext").is_err());
+        assert!(decode(b"hello world", "note.txt").is_err());
+        assert!(decode(&[], "x").is_err());
     }
 
     #[test]
@@ -776,28 +746,30 @@ mod tests {
             vec![0_u8; 4 * WIDE_EDGE as usize].into_boxed_slice(),
         )
         .expect("tall or wide strip under MAX_PIXELS constructs");
-        assert!(matches!(
+        assert_eq!(
             Decoded::rgba(
                 0,
                 10,
                 Format::Png,
                 Transfer::Srgb,
                 Box::default(),
-            ),
-            Err(DecodeRefusal::Corrupt("bad dimensions"))
-        ));
+            )
+            .err(),
+            Some(MsgError::from_static("bad dimensions"))
+        );
         // Over the pixel-count cap must reject the page before any buffer
         // is sized for it.
-        assert!(matches!(
+        assert_eq!(
             Decoded::rgba(
                 WIDE_EDGE,
                 WIDE_EDGE,
                 Format::Png,
                 Transfer::Srgb,
                 Box::default()
-            ),
-            Err(DecodeRefusal::Corrupt("bad dimensions"))
-        ));
+            )
+            .err(),
+            Some(MsgError::from_static("bad dimensions"))
+        );
     }
 
     #[test]
@@ -841,24 +813,25 @@ mod tests {
         // per-frame byte budget.
         assert_eq!(page.resident_bytes(), 32 * 16 * 2);
         let empty = mono(Plane::U16(Box::new([])), None);
-        assert!(matches!(
-            Decoded::yuv(32, 16, Format::Avif, Transfer::Srgb, empty),
-            Err(DecodeRefusal::Corrupt("yuv plane extent"))
-        ));
+        assert_eq!(
+            Decoded::yuv(32, 16, Format::Avif, Transfer::Srgb, empty).err(),
+            Some(MsgError::from_static("yuv plane extent"))
+        );
         let short_alpha = mono(
             Plane::U16(vec![0; 32 * 16].into_boxed_slice()),
             Some(Plane::U16(vec![0; 5].into_boxed_slice())),
         );
-        assert!(matches!(
+        assert_eq!(
             Decoded::yuv(
                 32,
                 16,
                 Format::Avif,
                 Transfer::Srgb,
                 short_alpha
-            ),
-            Err(DecodeRefusal::Corrupt("yuv plane extent"))
-        ));
+            )
+            .err(),
+            Some(MsgError::from_static("yuv plane extent"))
+        );
         // A 420 image whose chroma planes are stubs: a 4x2 image needs
         // 2x1 chroma samples.
         let undersized = YuvImage {
@@ -871,10 +844,11 @@ mod tests {
             cr: Plane::U8(Box::new([])),
             alpha: None,
         };
-        assert!(matches!(
-            Decoded::yuv(4, 2, Format::Avif, Transfer::Srgb, undersized),
-            Err(DecodeRefusal::Corrupt("yuv plane extent"))
-        ));
+        assert_eq!(
+            Decoded::yuv(4, 2, Format::Avif, Transfer::Srgb, undersized)
+                .err(),
+            Some(MsgError::from_static("yuv plane extent"))
+        );
     }
 
     #[test]
@@ -1158,8 +1132,8 @@ mod tests {
                 .recv_timeout(Duration::from_secs(5))
                 .expect("truncated jxl decode finishes");
             assert!(
-                matches!(refusal(result), Some(DecodeRefusal::Corrupt(_))),
-                "cut {cut} did not fail as corruption"
+                result.is_err(),
+                "cut {cut} did not fail"
             );
         }
     }

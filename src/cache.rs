@@ -11,7 +11,6 @@ use std::borrow::Cow;
 use std::env;
 use std::ffi::OsStr;
 use std::ffi::OsString;
-use std::fmt;
 use std::fs;
 use std::fs::File;
 use std::fs::FileTimes;
@@ -33,10 +32,8 @@ use std::time::Instant;
 use std::time::SystemTime;
 
 use fast_image_resize::FilterType;
-use fast_image_resize::ImageBufferError;
 use fast_image_resize::PixelTrait;
 use fast_image_resize::ResizeAlg;
-use fast_image_resize::ResizeError;
 use fast_image_resize::ResizeOptions;
 use fast_image_resize::Resizer;
 use fast_image_resize::images::TypedImage;
@@ -57,7 +54,6 @@ use crate::decode::Plane;
 use crate::decode::Subsampling;
 use crate::decode::Transfer;
 use crate::decode::YuvImage;
-use crate::fault::DecodeRefusal;
 use crate::fault::TextureFault;
 
 pub const THUMB_EDGE: u32 = 192;
@@ -136,7 +132,7 @@ fn derive_to_edge(
     page: &Decoded,
     edge: u32,
     filter: FilterType,
-) -> Result<Cow<'_, Decoded>, ResampleError> {
+) -> eros::Result<Cow<'_, Decoded>> {
     let page_dims = page.page_dims();
     let dims = (page.width(), page.height());
     let target = fit_dims(dims, edge);
@@ -164,28 +160,11 @@ fn fit_dims(dims: (u32, u32), edge: u32) -> (u32, u32) {
     (scaled(width), scaled(height))
 }
 
-#[derive(Debug)]
-enum ResampleError {
-    Buffer(ImageBufferError),
-    Resize(ResizeError),
-    Extent(DecodeRefusal),
-}
-
-impl fmt::Display for ResampleError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Buffer(error) => write!(f, "{error}"),
-            Self::Resize(error) => write!(f, "{error}"),
-            Self::Extent(error) => write!(f, "{error}"),
-        }
-    }
-}
-
 fn resample_page(
     page: &Decoded,
     target: (u32, u32),
     filter: FilterType,
-) -> Result<Decoded, ResampleError> {
+) -> eros::Result<Decoded> {
     let dims = (page.width(), page.height());
     let mut resizer = Resizer::new();
     match page.pixels() {
@@ -197,14 +176,13 @@ fn resample_page(
                 target,
                 filter,
             )?;
-            Decoded::rgba(
+            Ok(Decoded::rgba(
                 target.0,
                 target.1,
                 page.format(),
                 page.transfer(),
                 pixels.into_flattened().into_boxed_slice(),
-            )
-            .map_err(ResampleError::Extent)
+            )?)
         }
         Pixels::Yuv(yuv) => {
             let ((luma_w, luma_h), (chroma_w, chroma_h)) =
@@ -248,14 +226,13 @@ fn resample_page(
                     None => None,
                 },
             };
-            Decoded::yuv(
+            Ok(Decoded::yuv(
                 target.0,
                 target.1,
                 page.format(),
                 page.transfer(),
                 planes,
-            )
-            .map_err(ResampleError::Extent)
+            )?)
         }
     }
 }
@@ -266,7 +243,7 @@ fn resize_plane(
     source_dims: (u32, u32),
     target_dims: (u32, u32),
     filter: FilterType,
-) -> Result<Plane, ResampleError> {
+) -> eros::Result<Plane> {
     // Equal extents also cover Mono's empty chroma planes, which carry a
     // 1x1 extent without samples.
     if source_dims == target_dims {
@@ -302,39 +279,35 @@ fn resize_typed<S, C, const N: usize>(
     source_dims: (u32, u32),
     target_dims: (u32, u32),
     filter: FilterType,
-) -> Result<Vec<S>, ResampleError>
+) -> eros::Result<Vec<S>>
 where
     S: Default + PartialEq + bytemuck::Pod,
     C: PixelComponent,
     Pixel<S, C, N>: PixelTrait,
 {
-    let count = usize::try_from(
+    let Ok(count) = usize::try_from(
         u64::from(target_dims.0) * u64::from(target_dims.1),
-    )
-    .ok()
-    .ok_or(ResampleError::Buffer(ImageBufferError::InvalidBufferSize))?;
+    ) else {
+        eros::bail!("buffer count overflows usize");
+    };
     let mut out = vec![S::default(); count];
     let source = TypedImageRef::<Pixel<S, C, N>>::from_buffer(
         source_dims.0,
         source_dims.1,
         bytemuck::cast_slice(source),
-    )
-    .map_err(ResampleError::Buffer)?;
+    )?;
     let mut target = TypedImage::<Pixel<S, C, N>>::from_buffer(
         target_dims.0,
         target_dims.1,
         bytemuck::cast_slice_mut(&mut out),
-    )
-    .map_err(ResampleError::Buffer)?;
+    )?;
     // Straight alpha: the renderer premultiplies at draw. Alpha-aware
     // resampling avoids the color bleed at transparent edges but costs a
     // source-sized temporary and about double the time.
     let options = ResizeOptions::new()
         .resize_alg(ResizeAlg::Convolution(filter))
         .use_alpha(false);
-    resizer
-        .resize_typed(&source, &mut target, &options)
-        .map_err(ResampleError::Resize)?;
+    resizer.resize_typed(&source, &mut target, &options)?;
     Ok(out)
 }
 

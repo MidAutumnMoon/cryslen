@@ -20,7 +20,6 @@ use crate::browse::ReadingMode;
 use crate::browse::Spread;
 use crate::catalog::PageName;
 use crate::decode::Format;
-use crate::fault::BookFault;
 use crate::fault::PageFault;
 
 pub struct ReadingStatus {
@@ -38,23 +37,7 @@ pub struct StatusLine<'fault> {
     pub name: PageName,
     /// Whether to show `loading…`.
     pub waiting: bool,
-    pub fault: Option<StatusFault<'fault>>,
-}
-
-/// What the status line blames: a page's own failure (decode, source, or
-/// a texture the GPU refused), or the book's.
-pub enum StatusFault<'fault> {
-    Page(&'fault PageFault),
-    Book(&'fault BookFault),
-}
-
-impl fmt::Display for StatusFault<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Page(fault) => fault.fmt(f),
-            Self::Book(fault) => fault.fmt(f),
-        }
-    }
+    pub fault: Option<&'fault dyn fmt::Display>,
 }
 
 /// The one fault the line shows: the page's own failure first, then the
@@ -62,10 +45,10 @@ impl fmt::Display for StatusFault<'_> {
 /// ordering.
 pub fn fault_to_show<'fault>(
     page: Option<&'fault PageFault>,
-    book: Option<&'fault BookFault>,
-) -> Option<StatusFault<'fault>> {
-    page.map(StatusFault::Page)
-        .or_else(|| book.map(StatusFault::Book))
+    book: Option<&'fault impl fmt::Display>,
+) -> Option<&'fault dyn fmt::Display> {
+    page.map(|fault| fault as &dyn fmt::Display)
+        .or_else(|| book.map(|fault| fault as &dyn fmt::Display))
 }
 
 /// Status-line timers, pure in the clock the caller passes.
@@ -466,20 +449,26 @@ mod tests {
     #[test]
     fn the_line_blames_the_page_before_the_book() {
         let page_fault = PageFault::new("page");
-        let book_fault = BookFault::Timeout;
-        assert!(fault_to_show(None, None).is_none());
-        assert!(matches!(
-            fault_to_show(None, Some(&book_fault)),
-            Some(StatusFault::Book(_))
-        ));
-        assert!(matches!(
-            fault_to_show(Some(&page_fault), None),
-            Some(StatusFault::Page(_))
-        ));
-        assert!(matches!(
-            fault_to_show(Some(&page_fault), Some(&book_fault)),
-            Some(StatusFault::Page(_))
-        ));
+        let book_fault = "the book process did not answer in time";
+        assert!(fault_to_show(None, None::<&&str>).is_none());
+        assert_eq!(
+            fault_to_show(None, Some(&book_fault))
+                .map(ToString::to_string)
+                .as_deref(),
+            Some(book_fault),
+        );
+        assert_eq!(
+            fault_to_show(Some(&page_fault), None::<&&str>)
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("page"),
+        );
+        assert_eq!(
+            fault_to_show(Some(&page_fault), Some(&book_fault))
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("page"),
+        );
     }
 
     fn status() -> StatusLine<'static> {

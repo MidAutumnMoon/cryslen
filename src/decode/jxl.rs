@@ -8,23 +8,13 @@ use jxl::api::JxlPixelFormat;
 use jxl::error::Error as JxlError;
 use jxl::error::Result as JxlResult;
 
-use eros::ErrorUnion;
-use eros::IntoUnion as _;
-
-use crate::fault::DecodeError;
-use crate::fault::DecodeRefusal;
-
 use super::Decoded;
 use super::Format;
 use super::Transfer;
 
 const MAX_THREADS: usize = 16;
 
-fn bad_dimensions() -> DecodeError {
-    ErrorUnion::new(DecodeRefusal::Corrupt("jxl: bad dimensions"))
-}
-
-pub(super) fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
+pub(super) fn decode(bytes: &[u8]) -> eros::Result<Decoded> {
     use std::slice;
 
     let mut runner = Pool(threads());
@@ -34,39 +24,30 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
     let mut decoder = JxlDecoder::new(JxlDecoderOptions::default());
 
     loop {
-        let event = decoder
-            .process(&mut input, None, Some(&mut runner))
-            .union()?;
+        let event = decoder.process(&mut input, None, Some(&mut runner))?;
         if event == Event::BasicInfo {
             break;
         }
         if let Event::NeedMoreInput { size_hint } = event {
             tracing::debug!(size_hint, "truncated jxl header");
-            return Err(ErrorUnion::new(DecodeRefusal::Corrupt(
-                "jxl: truncated header",
-            )));
+            eros::bail!("jxl: truncated header");
         }
         // A fresh decoder emits BasicInfo or NeedMoreInput before all else.
     }
 
-    let info = decoder.basic_info().ok_or_else(|| {
-        ErrorUnion::new(DecodeRefusal::Corrupt("jxl: missing basic info"))
-    })?;
-    #[expect(
-        clippy::map_err_ignore,
-        reason = "the conversion error only says the value does not fit, which the message already states"
-    )]
-    let (width, height) = (
-        u32::try_from(info.size.0).map_err(|_| bad_dimensions())?,
-        u32::try_from(info.size.1).map_err(|_| bad_dimensions())?,
-    );
+    let info = decoder
+        .basic_info()
+        .ok_or_else(|| eros::error!("jxl: missing basic info"))?;
+    let (Ok(width), Ok(height)) =
+        (u32::try_from(info.size.0), u32::try_from(info.size.1))
+    else {
+        eros::bail!("jxl: bad dimensions");
+    };
     let pixel_count =
-        super::admit_dims(width, height, "jxl: bad dimensions").union()?;
+        super::admit_dims(width, height, "jxl: bad dimensions")?;
 
     let extra_channels = info.extra_channels.len();
-    decoder
-        .set_pixel_format(JxlPixelFormat::rgba8(extra_channels))
-        .union()?;
+    decoder.set_pixel_format(JxlPixelFormat::rgba8(extra_channels))?;
 
     let mut rgba = vec![0_u8; pixel_count as usize * 4];
     loop {
@@ -75,14 +56,11 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
             height as usize,
             width as usize * 4,
         );
-        match decoder
-            .process(
-                &mut input,
-                Some(slice::from_mut(&mut output)),
-                Some(&mut runner),
-            )
-            .union()?
-        {
+        match decoder.process(
+            &mut input,
+            Some(slice::from_mut(&mut output)),
+            Some(&mut runner),
+        )? {
             Event::FrameComplete { has_more_frames } => {
                 if has_more_frames {
                     tracing::debug!(
@@ -93,9 +71,7 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
             }
             Event::NeedMoreInput { size_hint } => {
                 tracing::debug!(size_hint, "truncated jxl image");
-                return Err(ErrorUnion::new(DecodeRefusal::Corrupt(
-                    "jxl: truncated image",
-                )));
+                eros::bail!("jxl: truncated image");
             }
             Event::BasicInfo | Event::FrameHeader | Event::Complete => {}
         }
@@ -103,14 +79,13 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
 
     // The crate either converts to sRGB or emits simple PQ values its
     // API does not distinguish, so jxl pages ride the sRGB path.
-    Decoded::rgba(
+    Ok(Decoded::rgba(
         width,
         height,
         Format::Jxl,
         Transfer::Srgb,
         rgba.into_boxed_slice(),
-    )
-    .union()
+    )?)
 }
 
 fn threads() -> usize {

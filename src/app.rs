@@ -55,8 +55,6 @@ use crate::cache::ImageLimits;
 use crate::catalog;
 use crate::catalog::PageName;
 use crate::decode;
-use crate::fault::BookFault;
-use crate::fault::OpenRefusal;
 use crate::fault::PageFault;
 use crate::fault::TextureFault;
 use crate::geometry;
@@ -74,7 +72,6 @@ use crate::render::Window;
 use crate::ui;
 use crate::ui::PageStatus;
 use crate::ui::ReadingStatus;
-use crate::ui::StatusFault;
 use crate::ui::StatusLine;
 use crate::ui::Timers;
 
@@ -621,7 +618,7 @@ enum Session {
     },
     Faulted {
         name: PageName,
-        fault: BookFault,
+        fault: ErrorUnion,
     },
     Reading(Box<LiveBook>),
     Closed,
@@ -806,7 +803,7 @@ impl App {
                 land_on: land_on.map(str::to_owned),
             },
             Err(fault) => {
-                tracing::warn!(?fault, "book open failed");
+                tracing::warn!(%fault, "book open failed");
                 Session::Faulted { name, fault }
             }
         };
@@ -923,7 +920,7 @@ impl App {
                     Session::Reading(Box::new(LiveBook { book, reading }));
             }
             Err(fault) => {
-                tracing::warn!(?fault, "book open failed");
+                tracing::warn!(%fault, "book open failed");
                 self.session = Session::Faulted { name, fault };
             }
         }
@@ -980,7 +977,7 @@ impl App {
                     toast: timers.toasting(),
                     name: name.clone(),
                     waiting: false,
-                    fault: Some(StatusFault::Book(fault)),
+                    fault: Some(fault),
                 };
                 present_frame(gl, fit, last_viewport, size, &status, None)
             }
@@ -2596,7 +2593,7 @@ pub fn main(args: &[OsString]) -> ExitCode {
     }
 }
 
-fn classify(path: &Path) -> Result<Argument, OpenRefusal> {
+fn classify(path: &Path) -> eros::Result<Argument> {
     let normalized = catalog::normalize_path(path);
     let Some(name) = normalized.file_name() else {
         return Ok(Argument::Book(normalized));
@@ -2606,7 +2603,7 @@ fn classify(path: &Path) -> Result<Argument, OpenRefusal> {
     }
     let name = name.to_string_lossy().into_owned();
     if decode::format_from_name(&name).is_none() {
-        return Err(OpenRefusal::Unsupported(normalized));
+        eros::bail!("unsupported source: {}", normalized.display());
     }
     let dir = normalized
         .parent()
@@ -2675,49 +2672,51 @@ mod argv_tests {
         let rows = [
             (
                 dir.path().join("page.png"),
-                Ok(Argument::Image {
+                Argument::Image {
                     dir: dir.path().to_path_buf(),
                     name: String::from("page.png"),
-                }),
+                },
             ),
             (
                 dir.path().join("link.png"),
-                Ok(Argument::Image {
+                Argument::Image {
                     dir: dir.path().to_path_buf(),
                     name: String::from("link.png"),
-                }),
+                },
             ),
             (
                 dir.path().join("book.cbz"),
-                Ok(Argument::Book(dir.path().join("book.cbz"))),
+                Argument::Book(dir.path().join("book.cbz")),
             ),
             (
                 dir.path().to_path_buf(),
-                Ok(Argument::Book(dir.path().to_path_buf())),
+                Argument::Book(dir.path().to_path_buf()),
             ),
             (
                 dir.path().join("link_dir/."),
-                Ok(Argument::Book(dir.path().join("link_dir"))),
+                Argument::Book(dir.path().join("link_dir")),
             ),
             (
                 dir.path().join("broken.png"),
-                Ok(Argument::Book(dir.path().join("broken.png"))),
-            ),
-            (
-                dir.path().join("notes.txt"),
-                Err(OpenRefusal::Unsupported(
-                    dir.path().join("notes.txt"),
-                )),
+                Argument::Book(dir.path().join("broken.png")),
             ),
             (
                 PathBuf::from("."),
-                Ok(Argument::Book(
+                Argument::Book(
                     env::current_dir().expect("current dir"),
-                )),
+                ),
             ),
         ];
         for (path, expected) in rows {
-            assert_eq!(classify(&path), expected, "{}", path.display());
+            assert_eq!(
+                classify(&path).ok(),
+                Some(expected),
+                "{}",
+                path.display()
+            );
         }
+        let unsupported = classify(&dir.path().join("notes.txt"))
+            .expect_err("non-image file must refuse");
+        assert!(unsupported.to_string().contains("unsupported source"));
     }
 }

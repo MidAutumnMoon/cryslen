@@ -5,6 +5,7 @@
     reason = "the wire module is the crate's public vocabulary for the child integration test"
 )]
 
+use eros::MsgError;
 use ipc_channel::ipc::IpcReceiver;
 use ipc_channel::ipc::IpcSender;
 use ipc_channel::ipc::IpcSharedMemory;
@@ -15,7 +16,6 @@ use crate::decode;
 use crate::decode::Decoded;
 use crate::decode::Pixels;
 use crate::decode::Plane;
-use crate::fault::DecodeRefusal;
 
 pub use crate::animation::PlaybackCommand;
 pub use crate::animation::PlaybackEvent;
@@ -98,7 +98,7 @@ impl WireImage {
 
     /// Checks that the pixel buffers match the declared extents, bit
     /// depth, and admission bounds.
-    pub fn validate(&self) -> Result<(), DecodeRefusal> {
+    pub fn validate(&self) -> Result<(), MsgError> {
         match &self.pixels {
             WirePixels::Rgba8(bytes) => decode::validate_rgba_extent(
                 self.width,
@@ -236,10 +236,7 @@ mod tests {
 
         let mut truncated = wire;
         truncated.width = 4;
-        assert!(matches!(
-            truncated.validate(),
-            Err(DecodeRefusal::Corrupt("rgba extent"))
-        ));
+        assert_eq!(truncated.validate(), Err(MsgError::from_static("rgba extent")));
     }
 
     #[test]
@@ -268,16 +265,13 @@ mod tests {
         if let WirePixels::Yuv { depth, .. } = &mut bad_depth.pixels {
             *depth = 0;
         }
-        assert!(matches!(
-            bad_depth.validate(),
-            Err(DecodeRefusal::Corrupt("yuv depth"))
-        ));
+        assert_eq!(bad_depth.validate(), Err(MsgError::from_static("yuv depth")));
 
         let mut bad_dims = wire;
         bad_dims.width = 6;
-        assert!(matches!(
+        assert_eq!(
             bad_dims.validate(),
-            Err(DecodeRefusal::Corrupt("yuv plane extent"))
-        ));
+            Err(MsgError::from_static("yuv plane extent"))
+        );
     }
 }

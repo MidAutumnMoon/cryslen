@@ -30,13 +30,6 @@ use libavif_sys::avifResult;
 use libavif_sys::avifResultToString;
 use std::marker::PhantomData;
 
-use eros::ErrorUnion;
-use eros::IntoUnion as _;
-
-use crate::fault::AvifFault;
-use crate::fault::DecodeError;
-use crate::fault::DecodeRefusal;
-
 use super::Decoded;
 use super::DisplayTransform;
 use super::Format;
@@ -54,7 +47,7 @@ const MAX_THREADS: usize = 8;
     clippy::similar_names,
     reason = "Cb and Cr are the YUV plane names the two locals hold"
 )]
-pub(super) fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
+pub(super) fn decode(bytes: &[u8]) -> eros::Result<Decoded> {
     let decoder = DecoderGuard::new(bytes)?;
     let frame = decoder.image()?;
 
@@ -64,23 +57,15 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
         10 => 10,
         12 => 12,
         16 => 16,
-        _ => {
-            return Err(ErrorUnion::new(DecodeRefusal::Corrupt(
-                "avif: bad depth",
-            )));
-        }
+        _ => eros::bail!("avif: bad depth"),
     };
-    super::admit_dims(width, height, "avif: bad dimensions").union()?;
+    super::admit_dims(width, height, "avif: bad dimensions")?;
     let subsampling = match frame.yuvFormat {
         AVIF_PIXEL_FORMAT_YUV444 => Subsampling::Yuv444,
         AVIF_PIXEL_FORMAT_YUV422 => Subsampling::Yuv422,
         AVIF_PIXEL_FORMAT_YUV420 => Subsampling::Yuv420,
         AVIF_PIXEL_FORMAT_YUV400 => Subsampling::Mono,
-        _ => {
-            return Err(ErrorUnion::new(DecodeRefusal::Unsupported(
-                "avif: pixel format",
-            )));
-        }
+        _ => eros::bail!("avif: unsupported pixel format"),
     };
     let full_range = frame.yuvRange == AVIF_RANGE_FULL;
     let matrix = match u32::from(frame.matrixCoefficients) {
@@ -91,20 +76,14 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
         AVIF_MATRIX_COEFFICIENTS_UNSPECIFIED
         | AVIF_MATRIX_COEFFICIENTS_BT470BG
         | AVIF_MATRIX_COEFFICIENTS_BT601 => Matrix::Bt601,
-        _ => {
-            return Err(ErrorUnion::new(DecodeRefusal::Unsupported(
-                "avif: matrix coefficients",
-            )));
-        }
+        _ => eros::bail!("avif: unsupported matrix coefficients"),
     };
     // HLG has no fixed SDR map; a wrong render is worse than a
     // refused page.
     let transfer = match u32::from(frame.transferCharacteristics) {
         AVIF_TRANSFER_CHARACTERISTICS_SMPTE2084 => Transfer::Pq,
         AVIF_TRANSFER_CHARACTERISTICS_HLG => {
-            return Err(ErrorUnion::new(DecodeRefusal::Unsupported(
-                "avif: HLG transfer",
-            )));
+            eros::bail!("avif: unsupported HLG transfer");
         }
         _ => Transfer::Srgb,
     };
@@ -112,9 +91,7 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
     // A quarter turn makes 4:2:2 subsample vertically instead of
     // horizontally, which no plane geometry in the model expresses.
     if transform.swaps_dims() && subsampling == Subsampling::Yuv422 {
-        return Err(ErrorUnion::new(DecodeRefusal::Unsupported(
-            "avif: rotated 4:2:2",
-        )));
+        eros::bail!("avif: unsupported rotated 4:2:2");
     }
 
     // Mono skips the chroma copy below, so its 1x1 stub dims from
@@ -190,7 +167,7 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
     });
     let (width, height) = transform.out_dims((width, height));
 
-    Decoded::yuv(
+    Ok(Decoded::yuv(
         width,
         height,
         Format::Avif,
@@ -205,8 +182,7 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Decoded, DecodeError> {
             cr: cr_plane,
             alpha: alpha_plane,
         },
-    )
-    .union()
+    )?)
 }
 
 fn display_transform(frame: &avifImage) -> DisplayTransform {
@@ -238,7 +214,7 @@ fn threads() -> i32 {
         .min(MAX_THREADS) as i32
 }
 
-fn check(code: avifResult, what: &'static str) -> Result<(), AvifFault> {
+fn check(code: avifResult, what: &'static str) -> eros::Result<()> {
     use std::ffi::CStr;
 
     if code == AVIF_RESULT_OK {
@@ -249,10 +225,7 @@ fn check(code: avifResult, what: &'static str) -> Result<(), AvifFault> {
     let message_ptr = unsafe { avifResultToString(code) };
     // SAFETY: `message_ptr` points to a static NUL-terminated string.
     let detail = unsafe { CStr::from_ptr(message_ptr) }.to_string_lossy();
-    Err(AvifFault {
-        step: what,
-        detail: detail.into_owned(),
-    })
+    eros::bail!("{what}: {detail}")
 }
 
 /// # Safety
@@ -265,11 +238,9 @@ unsafe fn copy_plane(
     width: u32,
     height: u32,
     depth: u8,
-) -> Result<Plane, DecodeError> {
+) -> eros::Result<Plane> {
     if plane_ptr.is_null() {
-        return Err(ErrorUnion::new(DecodeRefusal::Corrupt(
-            "avif: missing plane",
-        )));
+        eros::bail!("avif: missing plane");
     }
     let width = width as usize;
     let height = height as usize;
@@ -278,9 +249,7 @@ unsafe fn copy_plane(
     let sample_bytes = if wide { size_of::<u16>() } else { 1 };
     let row_bytes = width * sample_bytes;
     if row_stride < row_bytes {
-        return Err(ErrorUnion::new(DecodeRefusal::Corrupt(
-            "avif: bad stride",
-        )));
+        eros::bail!("avif: bad stride");
     }
     if width == 0 || height == 0 {
         return Ok(if wide {
@@ -354,15 +323,13 @@ struct DecoderGuard<'bytes> {
 }
 
 impl<'bytes> DecoderGuard<'bytes> {
-    fn new(bytes: &'bytes [u8]) -> Result<Self, DecodeError> {
+    fn new(bytes: &'bytes [u8]) -> eros::Result<Self> {
         const NO_DIMENSION_LIMIT: u32 = 0;
 
         // SAFETY: allocates an independent decoder instance.
         let ptr = unsafe { avifDecoderCreate() };
         if ptr.is_null() {
-            return Err(ErrorUnion::new(DecodeRefusal::Unsupported(
-                "avif: decoder create",
-            )));
+            eros::bail!("avif: decoder create failed");
         }
         let guard = Self {
             ptr,
@@ -394,24 +361,22 @@ impl<'bytes> DecoderGuard<'bytes> {
         let io = unsafe {
             avifDecoderSetIOMemory(guard.ptr, bytes.as_ptr(), bytes.len())
         };
-        check(io, "avif io").union()?;
+        check(io, "avif io")?;
         // SAFETY: `guard.ptr` is valid with attached input bytes.
         let parsed = unsafe { avifDecoderParse(guard.ptr) };
-        check(parsed, "avif parse").union()?;
+        check(parsed, "avif parse")?;
         // SAFETY: `guard.ptr` parsed cleanly above.
         let next = unsafe { avifDecoderNextImage(guard.ptr) };
-        check(next, "avif image").union()?;
+        check(next, "avif image")?;
         Ok(guard)
     }
 
-    fn image(&self) -> Result<&avifImage, DecodeError> {
+    fn image(&self) -> eros::Result<&avifImage> {
         // SAFETY: `self.ptr` stays live while `self` is borrowed and was
         // decoded in `new`.
         let frame = unsafe { (*self.ptr).image };
         if frame.is_null() {
-            return Err(ErrorUnion::new(DecodeRefusal::Corrupt(
-                "avif: no image",
-            )));
+            eros::bail!("avif: no image");
         }
         // SAFETY: `frame` is non-null and owned by `self.ptr` while `&self`
         // stays live.

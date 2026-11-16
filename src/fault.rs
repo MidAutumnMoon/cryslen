@@ -1,129 +1,20 @@
-//! The fault taxonomy: matchable refusals about input, a page fault as
-//! text, and a book fault with detail. [`PageError`] collects the
-//! page-level errors; an open error owns no page.
+//! Shared fault types: texture limit violations, IPC page fault summaries,
+//! and panic payload formatting.
 
 use std::any::Any;
 use std::error::Error;
 use std::fmt;
-use std::io;
-use std::path::PathBuf;
-use std::sync::Arc;
 
-use eros::ErrorUnion;
-use image::ImageError;
-use jxl::error::Error as JxlError;
 use serde::Deserialize;
 use serde::Serialize;
-use zip::result::ZipError;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OpenRefusal {
-    NotFound(PathBuf),
-    Unsupported(PathBuf),
-    Empty,
-    Duplicate(String),
-    TooBig { unpacked: u64, available: u64 },
+pub fn panic_message(payload: &(dyn Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload")
 }
-
-impl fmt::Display for OpenRefusal {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NotFound(path) => {
-                write!(f, "not found: {}", path.display())
-            }
-            Self::Unsupported(path) => {
-                write!(f, "unsupported source: {}", path.display())
-            }
-            Self::Empty => write!(f, "no image pages found"),
-            Self::Duplicate(name) => {
-                write!(f, "duplicate entry name: {name}")
-            }
-            Self::TooBig {
-                unpacked,
-                available,
-            } => write!(
-                f,
-                "archive too big: {unpacked} bytes claimed, {available} bytes available"
-            ),
-        }
-    }
-}
-
-impl Error for OpenRefusal {}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DecodeRefusal {
-    NotAnImage,
-    Corrupt(&'static str),
-    Unsupported(&'static str),
-}
-
-impl fmt::Display for DecodeRefusal {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NotAnImage => write!(f, "not an image"),
-            Self::Corrupt(what) => write!(f, "corrupt: {what}"),
-            Self::Unsupported(what) => write!(f, "unsupported: {what}"),
-        }
-    }
-}
-
-impl Error for DecodeRefusal {}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AvifFault {
-    pub step: &'static str,
-    pub detail: String,
-}
-
-impl fmt::Display for AvifFault {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.step, self.detail)
-    }
-}
-
-impl Error for AvifFault {}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PanicFault {
-    pub origin: &'static str,
-    pub message: String,
-}
-
-impl fmt::Display for PanicFault {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} panicked: {}", self.origin, self.message)
-    }
-}
-
-impl Error for PanicFault {}
-
-impl PanicFault {
-    pub fn from_payload(
-        origin: &'static str,
-        payload: &(dyn Any + Send),
-    ) -> Self {
-        let message = payload
-            .downcast_ref::<&str>()
-            .map(|text| (*text).to_owned())
-            .or_else(|| payload.downcast_ref::<String>().cloned())
-            .unwrap_or_else(|| String::from("non-string panic payload"));
-        Self { origin, message }
-    }
-}
-
-/// A live source lists at least one page, so every index below its
-/// length has a name; a miss means a caller bug.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BadIndex;
-
-impl fmt::Display for BadIndex {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "no such page")
-    }
-}
-
-impl Error for BadIndex {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextureFault {
@@ -142,25 +33,6 @@ impl fmt::Display for TextureFault {
 }
 
 impl Error for TextureFault {}
-
-pub type PageError = ErrorUnion<(
-    DecodeRefusal,
-    AvifFault,
-    ImageError,
-    JxlError,
-    ZipError,
-    sevenz_rust2::Error,
-    io::Error,
-    PanicFault,
-    BadIndex,
-    TextureFault,
-)>;
-
-pub type OpenError =
-    ErrorUnion<(OpenRefusal, ZipError, sevenz_rust2::Error, io::Error)>;
-
-pub type DecodeError =
-    ErrorUnion<(DecodeRefusal, AvifFault, ImageError, JxlError)>;
 
 /// A page's failure as text; the error types stay in the child.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -182,72 +54,20 @@ impl fmt::Display for PageFault {
     }
 }
 
-impl From<PageError> for PageFault {
-    fn from(error: PageError) -> Self {
-        Self::new(error.to_string())
-    }
-}
-
-impl From<Arc<PageError>> for PageFault {
-    fn from(error: Arc<PageError>) -> Self {
-        Self::new(error.to_string())
-    }
-}
-
 impl From<TextureFault> for PageFault {
     fn from(error: TextureFault) -> Self {
         Self::new(error.to_string())
     }
 }
 
-/// Why a book could not be opened or kept open.
-#[derive(Debug)]
-pub enum BookFault {
-    Spawn(String),
-    Handshake(String),
-    Open(String),
-    Timeout,
-    Died(String),
-}
-
-impl fmt::Display for BookFault {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Spawn(detail) => {
-                write!(f, "cannot start the book process: {detail}")
-            }
-            Self::Handshake(detail) => {
-                write!(f, "book process handshake failed: {detail}")
-            }
-            Self::Open(detail) => {
-                write!(f, "cannot open the book: {detail}")
-            }
-            Self::Timeout => {
-                write!(f, "the book process did not answer in time")
-            }
-            Self::Died(detail) => {
-                write!(f, "the book process died: {detail}")
-            }
-        }
-    }
-}
-
-impl Error for BookFault {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn panic_fault_reads_payload_kinds() {
-        let string =
-            PanicFault::from_payload("decoder", &String::from("boom"));
-        assert_eq!(string.message, "boom");
-
-        let text = PanicFault::from_payload("unpack", &"static boom");
-        assert_eq!(text.message, "static boom");
-
-        let other = PanicFault::from_payload("unpack", &7_u8);
-        assert_eq!(other.message, "non-string panic payload");
+    fn panic_message_reads_payload_kinds() {
+        assert_eq!(panic_message(&String::from("boom")), "boom");
+        assert_eq!(panic_message(&"static boom"), "static boom");
+        assert_eq!(panic_message(&7_u8), "non-string panic payload");
     }
 }

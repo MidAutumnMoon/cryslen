@@ -16,7 +16,6 @@ use std::time::Duration;
 use std::time::Instant;
 
 use eros::ErrorUnion;
-use eros::IntoUnion as _;
 use parking_lot::Condvar;
 use parking_lot::Mutex;
 
@@ -25,13 +24,9 @@ use crate::browse::PageNames;
 use crate::catalog;
 use crate::catalog::ArchiveKind;
 use crate::decode;
-use crate::fault::BadIndex;
-use crate::fault::OpenError;
-use crate::fault::OpenRefusal;
-use crate::fault::PageError;
-use crate::fault::PanicFault;
+use crate::fault;
 
-type PageRead = Result<Arc<[u8]>, Arc<PageError>>;
+type PageRead = Result<Arc<[u8]>, Arc<ErrorUnion>>;
 
 #[derive(Debug)]
 struct ArchiveSlots {
@@ -53,7 +48,7 @@ impl ArchiveSlots {
             match slots.get(index) {
                 Some(Some(page)) => return page.clone(),
                 Some(None) => self.ready.wait(&mut slots),
-                None => return Err(Arc::new(ErrorUnion::new(BadIndex))),
+                None => return Err(Arc::new(eros::error!("no such page"))),
             }
         }
     }
@@ -68,10 +63,10 @@ impl ArchiveSlots {
         self.ready.notify_all();
     }
 
-    fn finish(&self, verdict: Result<(), Arc<PageError>>) {
+    fn finish(&self, verdict: Result<(), Arc<ErrorUnion>>) {
         let fallback = verdict
             .err()
-            .unwrap_or_else(|| Arc::new(ErrorUnion::new(BadIndex)));
+            .unwrap_or_else(|| Arc::new(eros::error!("missing archive entry")));
         {
             let mut slots = self.slots.lock();
             for slot in &mut *slots {
@@ -97,15 +92,13 @@ pub struct Source {
 }
 
 impl Source {
-    pub fn open(path: &Path) -> Result<Self, OpenError> {
+    pub fn open(path: &Path) -> eros::Result<Self> {
         let metadata = match fs::metadata(path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == ErrorKind::NotFound => {
-                return Err(ErrorUnion::new(OpenRefusal::NotFound(
-                    path.to_path_buf(),
-                )));
+                eros::bail!("not found: {}", path.display());
             }
-            Err(error) => return Err(ErrorUnion::new(error)),
+            Err(error) => return Err(error.into()),
         };
         if metadata.is_dir() {
             return Self::open_dir(path);
@@ -113,15 +106,12 @@ impl Source {
         match catalog::archive_kind(path) {
             Some(ArchiveKind::Zip) => Self::open_zip(path),
             Some(ArchiveKind::SevenZip) => Self::open_sevenzip(path),
-            None => Err(ErrorUnion::new(OpenRefusal::Unsupported(
-                path.to_path_buf(),
-            ))),
+            None => eros::bail!("unsupported source: {}", path.display()),
         }
     }
 
-    fn open_dir(dir: &Path) -> Result<Self, OpenError> {
-        let mut names: Vec<String> = fs::read_dir(dir)
-            .union()?
+    fn open_dir(dir: &Path) -> eros::Result<Self> {
+        let mut names: Vec<String> = fs::read_dir(dir)?
             .filter_map(Result::ok)
             .filter_map(|entry| {
                 let name = entry.file_name().into_string().ok()?;
@@ -135,18 +125,15 @@ impl Source {
 
     /// Listing reads the central directory, so a damaged local header fails
     /// only that member when materialization reaches it.
-    fn open_zip(path: &Path) -> Result<Self, OpenError> {
-        let zip = zip::ZipArchive::new(BufReader::new(
-            File::open(path).union()?,
-        ))
-        .union()?;
+    fn open_zip(path: &Path) -> eros::Result<Self> {
+        let zip = zip::ZipArchive::new(BufReader::new(File::open(path)?))?;
         let mut listed: Vec<(String, u64)> = Vec::new();
         for entry_index in 0..zip.len() {
-            let entry = zip.by_index_data(entry_index).union()?;
+            let entry = zip.by_index_data(entry_index)?;
             if entry.is_dir() {
                 continue;
             }
-            let name = entry.name().union()?.into_owned();
+            let name = entry.name()?.into_owned();
             if decode::format_from_name(&name).is_some() {
                 listed.push((name, entry.size()));
             }
@@ -158,12 +145,11 @@ impl Source {
 
     /// No password: a 7z with encrypted headers fails to open, and the
     /// first encrypted block ends the pass.
-    fn open_sevenzip(path: &Path) -> Result<Self, OpenError> {
+    fn open_sevenzip(path: &Path) -> eros::Result<Self> {
         let archive = sevenz_rust2::ArchiveReader::open(
             path,
             sevenz_rust2::Password::empty(),
-        )
-        .union()?;
+        )?;
         let listed: Vec<(String, u64)> = archive
             .archive()
             .files
@@ -181,9 +167,9 @@ impl Source {
 
     fn archive_from_listing(
         listed: Vec<(String, u64)>,
-    ) -> Result<(Self, Arc<ArchiveSlots>), OpenError> {
-        let (names, unpacked) = validated_listing(listed).union()?;
-        guard_memory(unpacked, mem_available_bytes()).union()?;
+    ) -> eros::Result<(Self, Arc<ArchiveSlots>)> {
+        let (names, unpacked) = validated_listing(listed)?;
+        guard_memory(unpacked, mem_available_bytes())?;
         let slots = Arc::new(ArchiveSlots::new(names.len()));
         let source =
             Self::from_names(Backend::Archive(Arc::clone(&slots)), names)?;
@@ -193,9 +179,9 @@ impl Source {
     fn from_names(
         backend: Backend,
         names: Vec<String>,
-    ) -> Result<Self, OpenError> {
+    ) -> eros::Result<Self> {
         let Some(names) = PageNames::new(names) else {
-            return Err(ErrorUnion::new(OpenRefusal::Empty));
+            eros::bail!("no image pages found");
         };
         Ok(Self { names, backend })
     }
@@ -219,12 +205,12 @@ impl Source {
     /// page's slot is filled.
     pub fn bytes(&self, index: usize) -> PageRead {
         let Some(name) = self.names.get(index) else {
-            return Err(Arc::new(ErrorUnion::new(BadIndex)));
+            return Err(Arc::new(eros::error!("no such page")));
         };
         match &self.backend {
             Backend::Directory(dir) => match fs::read(dir.join(name)) {
                 Ok(bytes) => Ok(bytes.into()),
-                Err(error) => Err(Arc::new(ErrorUnion::new(error))),
+                Err(error) => Err(Arc::new(error.into())),
             },
             Backend::Archive(slots) => slots.get(index),
         }
@@ -252,7 +238,7 @@ fn sort_page_names(names: &mut [String]) {
 
 fn validated_listing(
     listed: Vec<(String, u64)>,
-) -> Result<(Vec<String>, u64), OpenRefusal> {
+) -> eros::Result<(Vec<String>, u64)> {
     // Header sizes are claims; saturating addition keeps the sum within
     // the guard even for a liar archive.
     let unpacked_bytes: u64 = listed
@@ -263,7 +249,7 @@ fn validated_listing(
         listed.into_iter().map(|(name, _)| name).collect();
     sort_page_names(&mut names);
     if let Some(name) = duplicate_name(&names) {
-        return Err(OpenRefusal::Duplicate(name));
+        eros::bail!("duplicate entry name: {name}");
     }
     Ok((names, unpacked_bytes))
 }
@@ -273,7 +259,7 @@ fn validated_listing(
 /// an independent entry discards the rest.
 fn read_member(
     member: &mut (impl Read + ?Sized),
-) -> Result<Arc<[u8]>, PageError> {
+) -> eros::Result<Arc<[u8]>> {
     let started = Instant::now();
     let mut bytes = Vec::new();
     match member.read_to_end(&mut bytes) {
@@ -295,7 +281,7 @@ fn read_member(
                 reason = "only the drain's side effect matters; its result is irrelevant"
             )]
             let _ = member.read_to_end(&mut bytes);
-            Err(ErrorUnion::new(error))
+            Err(error.into())
         }
     }
 }
@@ -310,7 +296,7 @@ fn spawn_zip_materialize(
         for (index, name) in names.iter().enumerate() {
             let page = match zip.by_name(name) {
                 Ok(mut entry) => read_member(&mut entry).map_err(Arc::new),
-                Err(error) => Err(Arc::new(ErrorUnion::new(error))),
+                Err(error) => Err(Arc::new(error.into())),
             };
             slots.fill(index, page);
         }
@@ -322,7 +308,7 @@ fn spawn_zip_materialize(
 /// immediately; a failed spawn answers every page with the spawn error.
 fn spawn_materialize(
     slots: &Arc<ArchiveSlots>,
-    body: impl FnOnce(&ArchiveSlots) -> Result<(), PageError> + Send + 'static,
+    body: impl FnOnce(&ArchiveSlots) -> eros::Result<()> + Send + 'static,
 ) {
     use std::panic;
     use std::panic::AssertUnwindSafe;
@@ -341,8 +327,9 @@ fn spawn_materialize(
                     tracing::warn!(?reason, "unpack pass ended early");
                     Err(Arc::new(reason))
                 }
-                Err(payload) => Err(Arc::new(ErrorUnion::new(
-                    PanicFault::from_payload("unpack", payload.as_ref()),
+                Err(payload) => Err(Arc::new(eros::error!(
+                    "unpack panicked: {}",
+                    fault::panic_message(payload.as_ref())
                 ))),
             };
             tracing::debug!(
@@ -354,7 +341,7 @@ fn spawn_materialize(
         });
     if let Err(error) = spawned {
         tracing::warn!(?error, "could not start the unpack thread");
-        let error: Arc<PageError> = Arc::new(ErrorUnion::new(error));
+        let error: Arc<ErrorUnion> = Arc::new(error.into());
         slots.finish(Err(error));
     }
 }
@@ -372,27 +359,26 @@ fn spawn_sevenzip_materialize(
         .map(|(index, name)| (name.clone(), index))
         .collect();
     spawn_materialize(slots, move |slots| {
-        reader
-            .for_each_entries(|entry, data| {
-                let page_index = (!entry.is_directory())
-                    .then(|| by_name.get(&entry.name).copied())
-                    .flatten();
-                match page_index {
-                    Some(index) => {
-                        slots.fill(
-                            index,
-                            read_member(data).map_err(Arc::new),
-                        );
-                    }
-                    None => {
-                        // A solid block yields its later members only
-                        // after this one is consumed, so non-pages are drained.
-                        io::copy(data, &mut io::sink())?;
-                    }
+        reader.for_each_entries(|entry, data| {
+            let page_index = (!entry.is_directory())
+                .then(|| by_name.get(&entry.name).copied())
+                .flatten();
+            match page_index {
+                Some(index) => {
+                    slots.fill(
+                        index,
+                        read_member(data).map_err(Arc::new),
+                    );
                 }
-                Ok(true)
-            })
-            .map_err(ErrorUnion::new)
+                None => {
+                    // A solid block yields its later members only
+                    // after this one is consumed, so non-pages are drained.
+                    io::copy(data, &mut io::sink())?;
+                }
+            }
+            Ok(true)
+        })?;
+        Ok(())
     });
 }
 
@@ -415,18 +401,14 @@ fn mem_available_bytes() -> Option<u64> {
 /// the system also live in `MemAvailable`.
 const MEM_RESERVE_BYTES: u64 = 1024 * 1024 * 1024;
 
-fn guard_memory(
-    unpacked: u64,
-    available: Option<u64>,
-) -> Result<(), OpenRefusal> {
+fn guard_memory(unpacked: u64, available: Option<u64>) -> eros::Result<()> {
     match available {
         Some(available)
             if unpacked > available.saturating_sub(MEM_RESERVE_BYTES) =>
         {
-            Err(OpenRefusal::TooBig {
-                unpacked,
-                available,
-            })
+            eros::bail!(
+                "archive too big: {unpacked} bytes claimed, {available} bytes available"
+            );
         }
         _ => Ok(()),
     }
@@ -446,8 +428,6 @@ mod tests {
     use crate::catalog::PageName;
     use crate::decode;
     use crate::decode::Format;
-    use crate::fault::BadIndex;
-    use crate::fault::PanicFault;
     use crate::testkit;
 
     use std::cmp::Ordering;
@@ -470,11 +450,15 @@ mod tests {
         "/tests/fixtures/mixed_pages.7z"
     );
 
+    fn failed_page(message: &'static str) -> Arc<ErrorUnion> {
+        Arc::new(ErrorUnion::new(eros::MsgError::from_static(message)))
+    }
+
     #[test]
     fn a_failed_pass_answers_only_unfilled_pages() {
         let good: Arc<[u8]> = Arc::from(&b"a"[..]);
-        let bad = testkit::failed_page("bad page");
-        let fatal = testkit::failed_page("stream broke");
+        let bad = failed_page("bad page");
+        let fatal = failed_page("stream broke");
         let slots = ArchiveSlots::new(3);
         slots.fill(0, Ok(Arc::clone(&good)));
         slots.fill(1, Err(Arc::clone(&bad)));
@@ -489,14 +473,12 @@ mod tests {
             matches!(slots.get(2), Err(error) if Arc::ptr_eq(&error, &fatal))
         );
 
-        // A whole pass that missed a page reports `BadIndex`.
+        // A whole pass that missed a page rejects unfilled slots.
         let whole = ArchiveSlots::new(2);
         whole.fill(0, Ok(Arc::clone(&good)));
         whole.finish(Ok(()));
-        assert!(matches!(
-            whole.get(1),
-            Err(error) if error.downcast_inner_ref::<BadIndex>().is_some()
-        ));
+        let missed = whole.get(1).expect_err("missed slot must fail");
+        assert!(missed.to_string().contains("missing archive entry"));
     }
 
     #[test]
@@ -641,13 +623,7 @@ mod tests {
 
     #[test]
     fn memory_guard() {
-        assert!(matches!(
-            guard_memory(100, Some(50)),
-            Err(OpenRefusal::TooBig {
-                unpacked: 100,
-                available: 50
-            })
-        ));
+        assert!(guard_memory(100, Some(50)).is_err());
         guard_memory(50, Some(MEM_RESERVE_BYTES + 100)).unwrap();
         guard_memory(u64::MAX, None).unwrap();
         // The guard keeps a reserve free: an archive that would leave
@@ -655,13 +631,13 @@ mod tests {
         let available = 4 * 1024 * 1024 * 1024;
         guard_memory(available - MEM_RESERVE_BYTES, Some(available))
             .unwrap();
-        let Err(OpenRefusal::TooBig { unpacked, .. }) = guard_memory(
-            available - MEM_RESERVE_BYTES + 1,
-            Some(available),
-        ) else {
-            panic!("an archive eating the reserve must refuse");
-        };
-        assert_eq!(unpacked, available - MEM_RESERVE_BYTES + 1);
+        assert!(
+            guard_memory(
+                available - MEM_RESERVE_BYTES + 1,
+                Some(available),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -675,10 +651,7 @@ mod tests {
         let Err(error) = slots.get(1) else {
             panic!("the unfilled page takes the panic verdict");
         };
-        let fault = error
-            .downcast_inner_ref::<PanicFault>()
-            .expect("a panic settles as a PanicFault");
-        assert!(fault.message.contains("boom"));
+        assert!(error.to_string().contains("boom"));
     }
 
     #[test]
@@ -712,12 +685,9 @@ mod tests {
             validated_listing(listed).expect("liar names still list");
         assert_eq!(names, ["a.png", "b.png"]);
         assert_eq!(unpacked, u64::MAX);
-        let Err(OpenRefusal::TooBig { unpacked, .. }) =
-            guard_memory(unpacked, Some(4 * 1024 * 1024 * 1024))
-        else {
-            panic!("liar sizes must refuse against the guard");
-        };
-        assert_eq!(unpacked, u64::MAX);
+        assert!(
+            guard_memory(unpacked, Some(4 * 1024 * 1024 * 1024)).is_err()
+        );
     }
 
     #[test]
@@ -727,10 +697,9 @@ mod tests {
             ("a.png".to_owned(), 8),
             ("a.png".to_owned(), 8),
         ];
-        assert_eq!(
-            validated_listing(listed).expect_err("duplicates must refuse"),
-            OpenRefusal::Duplicate(String::from("a.png"))
-        );
+        let error =
+            validated_listing(listed).expect_err("duplicates must refuse");
+        assert!(error.to_string().contains("a.png"));
     }
 
     #[test]
@@ -978,26 +947,17 @@ mod tests {
     fn open_errors() {
         let missing = Source::open(Path::new("/nonexistent-cryslen-dir"))
             .expect_err("a missing path must refuse");
-        assert!(matches!(
-            missing.downcast_inner_ref::<OpenRefusal>(),
-            Some(OpenRefusal::NotFound(_))
-        ));
+        assert!(missing.to_string().contains("not found"));
         let empty_dir = TempDir::new().expect("create temp dir");
         let empty = Source::open(empty_dir.path())
             .expect_err("an empty directory must refuse");
-        assert!(matches!(
-            empty.downcast_inner_ref::<OpenRefusal>(),
-            Some(OpenRefusal::Empty)
-        ));
+        assert!(empty.to_string().contains("no image pages found"));
         let dir = TempDir::new().expect("create temp dir");
         fs::write(dir.path().join("book.rar"), b"not really a rar")
             .expect("write book.rar");
         let unsupported = Source::open(&dir.path().join("book.rar"))
             .expect_err("an unsupported extension must refuse");
-        assert!(matches!(
-            unsupported.downcast_inner_ref::<OpenRefusal>(),
-            Some(OpenRefusal::Unsupported(_))
-        ));
+        assert!(unsupported.to_string().contains("unsupported source"));
         fs::write(dir.path().join("plain.txt"), b"not a directory")
             .expect("write plain.txt");
         // A path under a regular file reports io.
