@@ -13,6 +13,7 @@ use eros::ErrorUnion;
 use eros::IntoUnion as _;
 use serde::Deserialize;
 use serde::Serialize;
+use strum::Display;
 
 use crate::fault::DecodeError;
 use crate::fault::DecodeRefusal;
@@ -227,7 +228,10 @@ pub enum Pixels {
     /// Planar YUV, converted to RGB in the renderer's shader.
     Yuv(YuvImage),
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Display,
+)]
+#[strum(serialize_all = "lowercase")]
 pub enum Format {
     Jpeg,
     Png,
@@ -240,20 +244,6 @@ pub enum Format {
 }
 
 impl Format {
-    #[must_use]
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Jpeg => "jpeg",
-            Self::Png => "png",
-            Self::Gif => "gif",
-            Self::Webp => "webp",
-            Self::Bmp => "bmp",
-            Self::Tiff => "tiff",
-            Self::Avif => "avif",
-            Self::Jxl => "jxl",
-        }
-    }
-
     /// Whether the parent may request playback.
     #[must_use]
     pub fn may_animate(self) -> bool {
@@ -575,7 +565,7 @@ pub fn open_animation(
     }
     let loops = gif_loops(&bytes);
     let frames = Frames::new(Arc::clone(&bytes), format)?;
-    tracing::debug!(format = format.label(), ?loops, "animation opened");
+    tracing::debug!(%format, ?loops, "animation opened");
     Ok(Some(Animation {
         bytes,
         format,

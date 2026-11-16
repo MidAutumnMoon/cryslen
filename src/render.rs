@@ -24,6 +24,8 @@ use glutin::context::PossiblyCurrentContext;
 use glutin::surface::Surface;
 use glutin::surface::WindowSurface;
 use indoc::indoc;
+use strum::EnumCount as _;
+use strum::VariantArray as _;
 
 use winit::dpi::PhysicalSize;
 use winit::event_loop::ActiveEventLoop;
@@ -268,7 +270,6 @@ fn role_slot_mut(
     &mut slots[role.index()]
 }
 
-/// The largest resident role; slots are in ascending [`Role::ALL`] order.
 fn best_texture(
     slots: &[Option<PageTexture>; Role::COUNT],
 ) -> Option<&PageTexture> {
@@ -386,7 +387,7 @@ impl PageTextures {
             return Roles::default();
         };
         let mut roles = Roles::default();
-        for (slot, role) in slots.iter().zip(Role::ALL) {
+        for (slot, &role) in slots.iter().zip(Role::VARIANTS) {
             if slot.is_some() {
                 roles.set(role);
             }
@@ -406,10 +407,9 @@ impl PageTextures {
             .is_some_and(|slots| slots.iter().any(Option::is_some))
     }
 
-    /// Drop every texture whose page and role `keep` rejects.
     pub fn retain(&mut self, keep: impl Fn(usize, Role) -> bool) {
         self.pages.retain(|&page, slots| {
-            for (slot, role) in slots.iter_mut().zip(Role::ALL) {
+            for (slot, &role) in slots.iter_mut().zip(Role::VARIANTS) {
                 if slot.is_some() && !keep(page, role) {
                     *slot = None;
                 }
@@ -847,7 +847,6 @@ fn label_entry(
     if !gl.supports_debug() {
         return;
     }
-    let role = role.name();
     match &page_texture.layout {
         PixelLayout::Rgba { texture, .. } => label(
             gl,

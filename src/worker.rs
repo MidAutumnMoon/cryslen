@@ -27,6 +27,8 @@ use parking_lot::Mutex;
 use rustix::process;
 use rustix::process::Pid;
 use rustix::process::Signal;
+use strum::AsRefStr;
+use strum::EnumIs;
 
 use crate::browse;
 use crate::browse::Direction;
@@ -279,24 +281,14 @@ struct PrefetchStep {
     preload: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, AsRefStr, EnumIs)]
+#[strum(serialize_all = "lowercase")]
 enum ServeKind {
     Request { requested_at: Instant },
     Prefetch { preload: bool },
 }
 
 impl ServeKind {
-    const fn lane(self) -> &'static str {
-        match self {
-            Self::Request { .. } => "request",
-            Self::Prefetch { .. } => "prefetch",
-        }
-    }
-
-    const fn is_request(self) -> bool {
-        matches!(self, Self::Request { .. })
-    }
-
     fn report(
         self,
         page: usize,
@@ -862,7 +854,7 @@ where
         return false;
     };
     let Some(thumb) =
-        shared.derive_for(page, Role::Thumb, fit, kind.lane())
+        shared.derive_for(page, Role::Thumb, fit, kind.as_ref())
     else {
         return true;
     };
@@ -931,12 +923,12 @@ fn produce_preview<Sink>(
         return;
     }
 
-    let Some(native) = shared.decode(source, page, &bytes, kind.lane())
+    let Some(native) = shared.decode(source, page, &bytes, kind.as_ref())
     else {
         return;
     };
     let Some(derived) =
-        shared.derive_for(page, role, &native, kind.lane())
+        shared.derive_for(page, role, &native, kind.as_ref())
     else {
         return;
     };
@@ -946,7 +938,7 @@ fn produce_preview<Sink>(
         if role == Role::Fit
             && shared.wants_unserved(page, Role::Full)
             && let Some(full) =
-                shared.derive_for(page, Role::Full, &native, kind.lane())
+                shared.derive_for(page, Role::Full, &native, kind.as_ref())
         {
             shared.publish(page, Role::Full, &full);
             kind.report(page, Role::Full, false, started.elapsed());
@@ -977,12 +969,12 @@ fn serve_full<Sink>(
     let Some(bytes) = shared.read_source(source, page) else {
         return;
     };
-    let Some(native) = shared.decode(source, page, &bytes, kind.lane())
+    let Some(native) = shared.decode(source, page, &bytes, kind.as_ref())
     else {
         return;
     };
     let Some(full) =
-        shared.derive_for(page, Role::Full, &native, kind.lane())
+        shared.derive_for(page, Role::Full, &native, kind.as_ref())
     else {
         return;
     };

@@ -26,6 +26,7 @@ crossbeam-channel = "0.5"
 ipc-channel = "0.23"
 rustix = { version = "1", features = ["process"] }
 serde = { version = "1", features = ["derive"] }
+strum = { version = "0.28", features = ["derive"] }
 
 eros = { version = "0.8", default-features = false, features = ["context", "backtrace", "location"] }
 fast_image_resize = "6"

@@ -863,7 +863,7 @@ impl App {
         let Some(page) = page else {
             return "empty";
         };
-        self.roles(page).best().map_or("none", Role::name)
+        self.roles(page).best().map_or("none", Into::into)
     }
 
     fn is_fullscreen(&self) -> bool {
@@ -2445,6 +2445,8 @@ impl Action {
 
 #[cfg(test)]
 mod input_tests {
+    use strum::VariantArray as _;
+
     use super::*;
 
     #[test]
@@ -2518,20 +2520,16 @@ mod input_tests {
         let one_shot = [
             Action::Quit,
             Action::Escape,
-            Action::SelectMode(ReadingMode::Normal),
-            Action::SelectMode(ReadingMode::Manga),
-            Action::SelectMode(ReadingMode::Comic),
             Action::ToggleFullscreen,
             Action::ResetView,
-            Action::SelectFit(FitMode::Page),
-            Action::SelectFit(FitMode::Width),
-            Action::SelectFit(FitMode::Height),
-            Action::SelectFit(FitMode::Actual),
             Action::First,
             Action::Last,
             Action::NextBook,
             Action::PrevBook,
-        ];
+        ]
+        .into_iter()
+        .chain(ReadingMode::VARIANTS.iter().copied().map(Action::SelectMode))
+        .chain(FitMode::VARIANTS.iter().copied().map(Action::SelectFit));
         for action in one_shot {
             assert!(!action.repeats(), "{action:?} is one-shot");
         }

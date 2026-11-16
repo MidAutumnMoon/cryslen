@@ -1,6 +1,8 @@
 //! Geometry: the placement of a composed spread in the viewport, fit
 //! modes, zoom, and pan. Pure data, no GL.
 
+use strum::VariantArray;
+
 /// Where pages live: the window area left after egui chrome, in physical
 /// px, anchored at the window's top-left.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -44,7 +46,7 @@ impl Default for Placement {
 }
 
 /// How a spread fits the viewport when the view is not user-placed.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, VariantArray)]
 pub enum FitMode {
     #[default]
     Page,
@@ -433,13 +435,7 @@ mod tests {
         assert_eq!(actual.scale, 1.0);
         assert!((actual.offset.0 + 750.0).abs() < 1e-6);
         assert!((actual.offset.1 + 250.0).abs() < 1e-6);
-        // Degenerate totals stay inert in every mode.
-        for mode in [
-            FitMode::Page,
-            FitMode::Width,
-            FitMode::Height,
-            FitMode::Actual,
-        ] {
+        for &mode in FitMode::VARIANTS {
             assert_eq!(
                 fit_as(mode, (0.0, 100.0), viewport),
                 Placement {

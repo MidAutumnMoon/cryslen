@@ -13,6 +13,7 @@ use egui::Style;
 use egui::TextFormat;
 use egui::Ui;
 use egui::text::LayoutJob;
+use strum::VariantArray as _;
 
 use crate::browse::PageInfo;
 use crate::browse::ReadingMode;
@@ -312,13 +313,12 @@ fn page_jump_text(
     job
 }
 
-/// The mode group plus a showing toast to its left. The Sides right
-/// side lays out right-to-left, so the display order iterates in
+/// `egui::Sides` lays out the right side right-to-left, so iterate in
 /// reverse.
 fn right_end(ui: &mut Ui, status: &StatusLine<'_>) {
     use egui::RichText;
 
-    for (mode_index, &mode) in ReadingMode::ALL.iter().enumerate().rev() {
+    for (mode_index, &mode) in ReadingMode::VARIANTS.iter().enumerate().rev() {
         let text = RichText::new(group_label(mode)).monospace();
         let text = if mode == status.mode {
             text.color(mode_color(mode)).strong()
@@ -336,7 +336,7 @@ fn right_end(ui: &mut Ui, status: &StatusLine<'_>) {
 }
 
 fn group_label(mode: ReadingMode) -> String {
-    format!("{} ({})", mode.label(), mode.shortcut())
+    format!("{mode} ({})", mode.shortcut())
 }
 
 fn mode_color(mode: ReadingMode) -> Color32 {
@@ -391,7 +391,7 @@ fn line(style: &Style, status: &StatusLine<'_>) -> LayoutJob {
             let dims_text = if facts.claimed == Some(facts.info.format) {
                 format!("{width}x{height}")
             } else {
-                format!("{} {width}x{height}", facts.info.format.label())
+                format!("{} {width}x{height}", facts.info.format)
             };
             section(&mut job, &dims_text, plain);
         }

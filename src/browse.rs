@@ -7,6 +7,10 @@ use std::ops::Deref;
 
 use serde::Deserialize;
 use serde::Serialize;
+use strum::Display;
+use strum::EnumCount;
+use strum::IntoStaticStr;
+use strum::VariantArray;
 
 use crate::decode::Format;
 
@@ -74,8 +78,17 @@ impl Serialize for PageNames {
     }
 }
 
-/// Page pairing and reading direction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Deserialize,
+    Serialize,
+    Display,
+    VariantArray,
+)]
 pub enum ReadingMode {
     Normal,
     Manga,
@@ -83,8 +96,6 @@ pub enum ReadingMode {
 }
 
 impl ReadingMode {
-    pub const ALL: [Self; 3] = [Self::Normal, Self::Manga, Self::Comic];
-
     #[must_use]
     pub fn pairs(self) -> bool {
         matches!(self, Self::Manga | Self::Comic)
@@ -93,15 +104,6 @@ impl ReadingMode {
     #[must_use]
     pub fn rtl(self) -> bool {
         self == Self::Manga
-    }
-
-    #[must_use]
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Normal => "Normal",
-            Self::Manga => "Manga",
-            Self::Comic => "Comic",
-        }
     }
 
     #[must_use]
@@ -161,8 +163,9 @@ pub fn seating<T>(
     }
 }
 
-/// Reading direction of a turn.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, VariantArray,
+)]
 pub enum Direction {
     Forward,
     Backward,
@@ -176,38 +179,36 @@ pub enum Motion {
     Skimming,
 }
 
-/// A page image: a thumb for skims, a fit image for settled reading, or
-/// the page's own pixels for zoom. Only the first two enter the store.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+/// Ascending size; array storage keyed by [`Self::index`] follows this
+/// order.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Deserialize,
+    Serialize,
+    Display,
+    EnumCount,
+    IntoStaticStr,
+    VariantArray,
+)]
 #[repr(usize)]
 pub enum Role {
+    #[strum(serialize = "thumb")]
     Thumb,
+    #[strum(serialize = "view")]
     Fit,
+    #[strum(serialize = "native")]
     Full,
 }
 
 impl Role {
-    pub const COUNT: usize = 3;
-    /// Ascending size; array storage keyed by [`Self::index`] follows this
-    /// order.
-    pub const ALL: [Self; Self::COUNT] =
-        [Self::Thumb, Self::Fit, Self::Full];
-
-    /// Slot index for role-keyed arrays.
     #[must_use]
     pub const fn index(self) -> usize {
         self as usize
-    }
-
-    /// The role's stable name (`Fit` uses `view` in the store; full images
-    /// bypass the store).
-    #[must_use]
-    pub fn name(self) -> &'static str {
-        match self {
-            Self::Thumb => "thumb",
-            Self::Fit => "view",
-            Self::Full => "native",
-        }
     }
 }
 
@@ -219,8 +220,8 @@ const _: () = {
     let mut index = 0;
     while index < Role::COUNT {
         assert!(
-            Role::ALL[index].index() == index,
-            "Role::ALL order must match Role::index"
+            Role::VARIANTS[index].index() == index,
+            "Role::VARIANTS order must match Role::index"
         );
         index += 1;
     }
@@ -273,11 +274,12 @@ impl Roles {
         self.contains(Role::Fit) || self.contains(Role::Full)
     }
 
-    /// The largest role present: full, then fit, then thumb.
+    /// The largest role present.
     #[must_use]
     pub fn best(self) -> Option<Role> {
-        Role::ALL
-            .into_iter()
+        Role::VARIANTS
+            .iter()
+            .copied()
             .rev()
             .find(|role| self.contains(*role))
     }
@@ -486,7 +488,7 @@ mod tests {
                 second: Some(2)
             }
         );
-        for &mode in &ReadingMode::ALL {
+        for &mode in ReadingMode::VARIANTS {
             for len in 1_usize..=10 {
                 for page in 0..=(len + 2) {
                     let clamped = page.min(len - 1);
@@ -523,11 +525,9 @@ mod tests {
     #[test]
     fn advance_steps_between_spread_starts() {
         for len in [1_usize, 2, 3, 6, 9, 10] {
-            for &mode in &ReadingMode::ALL {
+            for &mode in ReadingMode::VARIANTS {
                 for page in 0..=len {
-                    for &direction in
-                        &[Direction::Backward, Direction::Forward]
-                    {
+                    for &direction in Direction::VARIANTS {
                         let stepped =
                             advance(page, direction, mode, pages(len));
                         assert_eq!(
@@ -635,7 +635,7 @@ mod tests {
     #[test]
     fn first_and_last_spreads() {
         // Single page: both ends are the cover.
-        for mode in ReadingMode::ALL {
+        for &mode in ReadingMode::VARIANTS {
             assert_eq!(last_spread(mode, pages(1)), 0);
         }
         // Pairs: the final spread starts on the last odd page.
@@ -646,7 +646,7 @@ mod tests {
         // Normal: the last page.
         assert_eq!(last_spread(ReadingMode::Normal, pages(10)), 9);
         for len in 1_usize..=12 {
-            for &mode in &ReadingMode::ALL {
+            for &mode in ReadingMode::VARIANTS {
                 let last = last_spread(mode, pages(len));
                 assert_eq!(
                     spread_for(last, mode, pages(len)).first,

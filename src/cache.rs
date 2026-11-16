@@ -684,13 +684,11 @@ fn is_digits(text: &str) -> bool {
     !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
 }
 
-/// Create the store's directories, refusing a root that is not a plain
-/// directory. A symlinked root could move the cache outside the intended
-/// tree, so it disables the store instead.
+/// Refuse symlinks so the store stays inside `root`.
 fn prepare(root: &Path) -> Option<(PathBuf, PathBuf)> {
     make_dir(root)?;
-    let thumb = root.join("thumb");
-    let view = root.join("view");
+    let thumb = root.join(<&str>::from(Role::Thumb));
+    let view = root.join(<&str>::from(Role::Fit));
     make_dir(&thumb)?;
     make_dir(&view)?;
     Some((thumb, view))
