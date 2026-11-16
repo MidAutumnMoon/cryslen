@@ -44,7 +44,7 @@ use crate::geometry;
 use crate::geometry::Placement;
 use crate::geometry::SpreadLayout;
 use crate::geometry::Viewport;
-use crate::protocol::WireImage;
+use crate::protocol::ValidatedImage;
 use crate::protocol::WirePixels;
 
 // The quad is a fixed -1..1 strip generated from gl_VertexID; uniforms
@@ -304,12 +304,12 @@ impl PageTextures {
         &mut self,
         page: usize,
         role: Role,
-        image: &WireImage,
+        image: &ValidatedImage,
     ) -> Result<(), TextureFault> {
         if self.has(page, role) {
             return Ok(());
         }
-        let dims = (image.width, image.height);
+        let dims = (image.width(), image.height());
         check_texture_dims(dims, self.max_texture_edge)?;
         let texture = upload_page_texture(Arc::clone(&self.gl), image);
         label_entry(&self.gl, page, role, &texture);
@@ -322,9 +322,9 @@ impl PageTextures {
         &mut self,
         page: usize,
         role: Role,
-        image: &WireImage,
+        image: &ValidatedImage,
     ) -> Result<(), TextureFault> {
-        let dims = (image.width, image.height);
+        let dims = (image.width(), image.height());
         check_texture_dims(dims, self.max_texture_edge)?;
         if let Some(PageTexture {
             layout:
@@ -339,8 +339,8 @@ impl PageTextures {
             .get(&page)
             .and_then(|slots| slots[role].as_ref())
             && *present_dims == dims
-            && *transfer == image.transfer
-            && let WirePixels::Rgba8(bytes) = &image.pixels
+            && *transfer == image.transfer()
+            && let WirePixels::Rgba8(bytes) = image.pixels()
         {
             update_rgba(&self.gl, *texture, bytes, dims);
             return Ok(());
@@ -892,7 +892,7 @@ fn magnification_filter(
 /// has none.
 fn needs_dither(transfer: Transfer, plane_depth: Option<u8>) -> bool {
     transfer == Transfer::Pq
-        || plane_depth.is_some_and(|depth| depth > BYTE_DEPTH)
+        || plane_depth.is_some_and(|depth| depth > decode::BYTE_DEPTH)
 }
 
 /// Create a texture with mipmapped minification and the requested
@@ -1046,20 +1046,21 @@ fn upload_plane(
 )]
 fn upload_page_texture(
     gl: Arc<Context>,
-    image: &WireImage,
+    image: &ValidatedImage,
 ) -> PageTexture {
-    let dims = (image.width, image.height);
-    let magnification_filter = magnification_filter(dims, image.page_dims);
-    let page_uv_per_pixel = page_uv_per_pixel(image.page_dims);
-    match &image.pixels {
+    let dims = (image.width(), image.height());
+    let page_dims = image.page_dims();
+    let magnification_filter = magnification_filter(dims, page_dims);
+    let page_uv_per_pixel = page_uv_per_pixel(page_dims);
+    match image.pixels() {
         WirePixels::Rgba8(rgba_bytes) => {
             let texture =
                 upload_rgba(&gl, rgba_bytes, dims, magnification_filter);
             PageTexture {
                 gl,
                 page_uv_per_pixel,
-                transfer: image.transfer,
-                needs_dither: needs_dither(image.transfer, None),
+                transfer: image.transfer(),
+                needs_dither: needs_dither(image.transfer(), None),
                 layout: PixelLayout::Rgba { texture, dims },
             }
         }
@@ -1073,44 +1074,10 @@ fn upload_page_texture(
             cr,
             alpha,
         } => {
+            let depth = *depth;
             let ((luma_w, luma_h), (chroma_w, chroma_h)) =
                 decode::plane_dims(dims, *subsampling);
-            let wide = *depth > BYTE_DEPTH;
-            let depth = (*depth).clamp(MIN_PLANE_DEPTH, MAX_PLANE_DEPTH);
-            let assert_plane_bytes =
-                |plane: &[u8], want_samples: usize, plane_name: &str| {
-                    let want_bytes = want_samples
-                        * if wide { size_of::<u16>() } else { 1 };
-                    assert_eq!(
-                        plane.len(),
-                        want_bytes,
-                        "{plane_name} plane bytes"
-                    );
-                };
-            assert_plane_bytes(
-                luma,
-                luma_w as usize * luma_h as usize,
-                "luma",
-            );
-            if *subsampling != Subsampling::Mono {
-                assert_plane_bytes(
-                    cb,
-                    chroma_w as usize * chroma_h as usize,
-                    "cb",
-                );
-                assert_plane_bytes(
-                    cr,
-                    chroma_w as usize * chroma_h as usize,
-                    "cr",
-                );
-            }
-            if let Some(alpha) = alpha.as_ref() {
-                assert_plane_bytes(
-                    alpha,
-                    dims.0 as usize * dims.1 as usize,
-                    "alpha",
-                );
-            }
+            let wide = depth > decode::BYTE_DEPTH;
             let luma_texture = upload_plane(
                 &gl,
                 luma,
@@ -1162,15 +1129,15 @@ fn upload_page_texture(
             PageTexture {
                 gl,
                 page_uv_per_pixel,
-                transfer: image.transfer,
-                needs_dither: needs_dither(image.transfer, Some(depth)),
+                transfer: image.transfer(),
+                needs_dither: needs_dither(image.transfer(), Some(depth)),
                 layout: PixelLayout::Yuv {
                     luma: luma_texture,
                     cb: cb_texture,
                     cr: cr_texture,
                     alpha: alpha_texture,
                     chroma_uv_per_pixel: chroma_uv_per_pixel(
-                        image.page_dims,
+                        page_dims,
                         *subsampling,
                     ),
                     color_conversion: page_color_conversion(
@@ -1210,10 +1177,10 @@ fn upload_constant_plane(
     depth: u8,
     sample_code: u32,
 ) -> Texture {
-    if depth > BYTE_DEPTH {
+    if depth > decode::BYTE_DEPTH {
         #[expect(
             clippy::cast_possible_truncation,
-            reason = "callers clamp depth to MAX_PLANE_DEPTH, so sample_code fits u16"
+            reason = "depth stays within decode::MAX_SAMPLE_DEPTH, so sample_code fits u16"
         )]
         let wide = sample_code as u16;
         #[expect(
@@ -1230,7 +1197,7 @@ fn upload_constant_plane(
     } else {
         #[expect(
             clippy::cast_possible_truncation,
-            reason = "depths up to BYTE_DEPTH keep codes within u8"
+            reason = "depths up to decode::BYTE_DEPTH keep codes within u8"
         )]
         upload_plane(
             gl,
@@ -1260,22 +1227,18 @@ fn transfer_code(transfer: Transfer) -> i32 {
     reason = "the depth mask 2^depth - 1 is at most 65535, exact in f32"
 )]
 fn depth_normalization(depth: u8, wide: bool) -> f32 {
+    debug_assert!(
+        (1..=decode::MAX_SAMPLE_DEPTH).contains(&depth),
+        "YUV bit depth out of range"
+    );
     if !wide {
         return 1.0;
     }
-    R16_STORAGE_MAX
-        / ((1_u32 << depth.clamp(MIN_PLANE_DEPTH, MAX_PLANE_DEPTH)) - 1)
-            as f32
+    R16_STORAGE_MAX / ((1_u32 << depth) - 1) as f32
 }
 
 const R16_STORAGE_MAX: f32 = 65535.0;
 const R8_STORAGE_MAX: f32 = 255.0;
-
-/// 8-bit storage; wider planes use `R16` and need depth normalization.
-const BYTE_DEPTH: u8 = 8;
-
-const MIN_PLANE_DEPTH: u8 = 1;
-const MAX_PLANE_DEPTH: u8 = 16;
 
 /// YUV storage-code quantization: anchor codes, sample-to-RGB scales,
 /// and capacity. Limited range scales the BT studio swing by 2^(depth-8).
@@ -1332,7 +1295,10 @@ fn page_color_conversion(
     color_matrix: Matrix,
     wide: bool,
 ) -> ColorConversion {
-    let depth = depth.clamp(MIN_PLANE_DEPTH, MAX_PLANE_DEPTH);
+    debug_assert!(
+        (1..=decode::MAX_SAMPLE_DEPTH).contains(&depth),
+        "YUV bit depth out of range"
+    );
     let quantization = code_quantization(depth, full_range, wide);
     let normalization = depth_normalization(depth, wide);
     let (
@@ -1722,7 +1688,7 @@ mod tests {
                     Subsampling::Yuv444,
                     full_range,
                     Matrix::Bt601,
-                    depth > BYTE_DEPTH,
+                    depth > decode::BYTE_DEPTH,
                 );
                 let (black, white, neutral, storage_max) =
                     code_quantization_codes(depth, full_range);

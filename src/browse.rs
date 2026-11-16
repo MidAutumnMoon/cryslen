@@ -83,6 +83,7 @@ impl Serialize for PageNames {
     Debug,
     Clone,
     Copy,
+    Default,
     PartialEq,
     Eq,
     Deserialize,
@@ -91,6 +92,7 @@ impl Serialize for PageNames {
     VariantArray,
 )]
 pub enum ReadingMode {
+    #[default]
     Normal,
     Manga,
     Comic,

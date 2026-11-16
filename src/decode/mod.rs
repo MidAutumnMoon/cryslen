@@ -145,7 +145,7 @@ impl Decoded {
 /// 8-bit storage; deeper planes store one `u16` per sample.
 pub const BYTE_DEPTH: u8 = 8;
 
-const MAX_SAMPLE_DEPTH: u8 = 16;
+pub const MAX_SAMPLE_DEPTH: u8 = 16;
 
 /// Pixel count of `(width, height)` when non-empty and within
 /// [`MAX_PIXELS`].

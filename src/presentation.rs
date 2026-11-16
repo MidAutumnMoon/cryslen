@@ -1,8 +1,6 @@
 //! Frame planning: the spread the screen shows and the roles the frame
 //! keeps or asks for. Pure: no clocks, GL, or IO.
 
-use std::collections::BTreeMap;
-
 use crate::browse;
 use crate::browse::Direction;
 use crate::browse::Motion;
@@ -25,17 +23,16 @@ pub struct FrameInput {
     pub direction: Direction,
     pub len: PageCount,
     pub limits: ImageLimits,
-    pub measurable: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PageSummary {
     pub info: Option<PageInfo>,
     pub faulted: bool,
+    pub roles: Roles,
 }
 
 pub struct Frame {
-    shown: Option<Spread>,
     demand: Spread,
     requests: Vec<Request>,
     retention: Retention,
@@ -50,18 +47,6 @@ struct Retention {
 }
 
 impl Frame {
-    #[must_use]
-    pub fn shown(&self) -> Option<Spread> {
-        self.shown
-    }
-
-    /// The spread the frame treats as on screen: the shown one, or the
-    /// target while nothing is presentable.
-    #[must_use]
-    pub fn on_screen(&self) -> Spread {
-        self.retention.on_screen
-    }
-
     #[must_use]
     pub fn demand(&self) -> Spread {
         self.demand
@@ -102,20 +87,18 @@ impl Retention {
     }
 }
 
-pub fn build_frame<P>(
+/// Pass `None` for `on_screen_scale` before the viewport has a size; full
+/// requests start once placement computes a scale.
+pub fn build_frame(
     input: &FrameInput,
-    pages: &BTreeMap<usize, P>,
-    summary: impl Fn(&P) -> PageSummary,
-    roles: impl Fn(usize) -> Roles,
-    scale_for: impl Fn(Spread) -> f32,
+    on_screen: Spread,
+    on_screen_scale: Option<f32>,
+    page_state: impl Fn(usize) -> PageSummary,
 ) -> Frame {
-    let page = |index: usize| pages.get(&index).map_or_default(&summary);
-    let shown = choose_presented(input, pages, &summary, &roles);
-    let on_screen = shown.unwrap_or(input.target);
     let playback = if input.motion == Motion::Still {
         on_screen.seats(input.mode).map(|seat| {
             let candidate = seat?;
-            let entry = page(candidate);
+            let entry = page_state(candidate);
             if entry.faulted {
                 return None;
             }
@@ -123,7 +106,7 @@ pub fn build_frame<P>(
             if !info.format.may_animate() {
                 return None;
             }
-            let role = roles(candidate).best()?;
+            let role = entry.roles.best()?;
             (role != Role::Thumb).then_some((candidate, role))
         })
     } else {
@@ -137,24 +120,16 @@ pub fn build_frame<P>(
         input.mode,
         input.len,
     );
-    let on_screen_scale = scale_for(on_screen);
     let requests = request_roles(
         demand,
         on_screen,
         input.mode,
         input.motion == Motion::Still,
-        // Full images key off the on-screen spread, not the demand spread.
-        |candidate| {
-            input.measurable
-                && page(candidate).info.is_some_and(|entry| {
-                    full_wanted(on_screen_scale, entry.dims, input.limits)
-                })
-        },
-        &roles,
-        |candidate| page(candidate).faulted,
+        on_screen_scale,
+        input.limits,
+        &page_state,
     );
     Frame {
-        shown,
         demand,
         requests,
         retention: Retention {
@@ -167,18 +142,15 @@ pub fn build_frame<P>(
     }
 }
 
-/// Requests for a spread with no textures, before the frame can measure
-/// placement.
+/// Initial `Fit` requests before textures or placement exist.
+#[must_use]
 pub fn cold_requests(spread: Spread, mode: ReadingMode) -> Vec<Request> {
-    request_roles(
-        spread,
-        spread,
-        mode,
-        true,
-        |_| false,
-        |_| Roles::default(),
-        |_| false,
-    )
+    spread
+        .seats(mode)
+        .into_iter()
+        .flatten()
+        .map(|page| Request::new(page, Role::Fit))
+        .collect()
 }
 
 #[expect(
@@ -222,24 +194,29 @@ fn request_roles(
     on_screen: Spread,
     mode: ReadingMode,
     still: bool,
-    upscaled: impl Fn(usize) -> bool,
-    roles: impl Fn(usize) -> Roles,
-    faulted: impl Fn(usize) -> bool,
+    on_screen_scale: Option<f32>,
+    limits: ImageLimits,
+    page_state: impl Fn(usize) -> PageSummary,
 ) -> Vec<Request> {
     let mut requests = Vec::new();
     for spread in [demand, on_screen] {
         for page in spread.seats(mode).into_iter().flatten() {
-            if faulted(page) {
+            let entry = page_state(page);
+            if entry.faulted {
                 continue;
             }
-            let resident = roles(page);
+            let resident = entry.roles;
             if still {
                 if !resident.has_settled_image() {
                     push_request(&mut requests, page, Role::Fit);
                 }
                 if on_screen.contains(page)
-                    && upscaled(page)
                     && !resident.contains(Role::Full)
+                    && on_screen_scale.is_some_and(|scale| {
+                        entry.info.is_some_and(|info| {
+                            full_wanted(scale, info.dims, limits)
+                        })
+                    })
                 {
                     push_request(&mut requests, page, Role::Full);
                 }
@@ -274,26 +251,25 @@ fn fit_kept(
         || start.abs_diff(target.first) <= FIT_KEEP_SPREADS
 }
 
-/// The target spread once every page is presentable; otherwise the
-/// nearest presentable start between the shown and target spreads, so
-/// a skim advances monotonically; otherwise the shown spread.
-fn choose_presented<P>(
+/// Returns `input.target` once presentable, else the nearest presentable
+/// start in `loaded_pages` between `input.shown` and `input.target`
+/// (monotonic skim), else `input.shown`.
+pub fn choose_presented(
     input: &FrameInput,
-    pages: &BTreeMap<usize, P>,
-    summary: impl Fn(&P) -> PageSummary,
-    roles: impl Fn(usize) -> Roles,
+    loaded_pages: impl IntoIterator<Item = usize>,
+    page_state: impl Fn(usize) -> PageSummary,
 ) -> Option<Spread> {
     let forward = input.direction == Direction::Forward;
     let skimming = input.motion == Motion::Skimming;
     let shown = input.shown.map(|entry| entry.spread);
     let can_show = |candidate: usize| {
-        let entry = pages.get(&candidate).map_or_default(&summary);
+        let entry = page_state(candidate);
         entry.faulted
             || (entry.info.is_some()
                 && if skimming {
-                    roles(candidate).any()
+                    entry.roles.any()
                 } else {
-                    roles(candidate).has_settled_image()
+                    entry.roles.has_settled_image()
                 })
     };
     let presentable = |spread: Spread| {
@@ -302,22 +278,23 @@ fn choose_presented<P>(
     if presentable(input.target) {
         return Some(input.target);
     }
-    let (low, high) = shown.map_or((0, usize::MAX), |shown| {
+    let (low, high) = shown.map_or((0, usize::MAX), |previous| {
         (
-            shown.first.min(input.target.first),
-            shown.first.max(input.target.first),
+            previous.first.min(input.target.first),
+            previous.first.max(input.target.first),
         )
     });
     let mut best: Option<Spread> = None;
-    for (&page, entry) in pages.range(low..=high.saturating_add(1)) {
-        if summary(entry).info.is_none() {
+    for page in loaded_pages {
+        // A paired spread starting at `high` may be visited via its second seat.
+        if page < low || page > high.saturating_add(1) {
+            continue;
+        }
+        if page_state(page).info.is_none() {
             continue;
         }
         let spread = browse::spread_for(page, input.mode, input.len);
-        if spread.first < low
-            || spread.first > high
-            || !presentable(spread)
-        {
+        if spread.first < low || spread.first > high || !presentable(spread) {
             continue;
         }
         let distance = spread.first.abs_diff(input.target.first);
@@ -355,10 +332,17 @@ mod tests {
         ImageLimits::new(FIT_EDGE, MAX_TEXTURE_EDGE)
     }
 
-    fn ready_page(info: PageInfo) -> PageSummary {
+    fn roles_with(role: Role) -> Roles {
+        let mut roles = Roles::default();
+        roles.set(role);
+        roles
+    }
+
+    fn ready_page(info: PageInfo, roles: Roles) -> PageSummary {
         PageSummary {
             info: Some(info),
             faulted: false,
+            roles,
         }
     }
 
@@ -381,7 +365,6 @@ mod tests {
     #[test]
     fn retention_keeps_fit_images_within_the_role_bounds() {
         let len = PageCount::new(20).expect("the test book is not empty");
-        let pages: BTreeMap<usize, PageSummary> = BTreeMap::new();
         let frame = build_frame(
             &FrameInput {
                 target: Spread::lone(10),
@@ -394,12 +377,10 @@ mod tests {
                 direction: Direction::Forward,
                 len,
                 limits: test_limits(),
-                measurable: false,
             },
-            &pages,
-            |summary| *summary,
-            |_| Roles::default(),
-            |_| 1.0,
+            Spread::lone(10),
+            None,
+            |_| PageSummary::default(),
         );
         assert!(frame.retains(10, Role::Full));
         assert!(!frame.retains(12, Role::Full));
@@ -415,30 +396,27 @@ mod tests {
             dims: (4000, 6000),
             format: Format::Png,
         };
-        let pages: BTreeMap<usize, PageSummary> = [1, 2]
-            .into_iter()
-            .map(|page| (page, ready_page(entry)))
-            .collect();
-        let frame = build_frame(
-            &FrameInput {
-                target: Spread::lone(2),
-                shown: Some(ShownSpread {
-                    mode: ReadingMode::Normal,
-                    spread: Spread::lone(1),
-                }),
+        let input = FrameInput {
+            target: Spread::lone(2),
+            shown: Some(ShownSpread {
                 mode: ReadingMode::Normal,
-                motion: Motion::Still,
-                direction: Direction::Forward,
-                len,
-                limits: test_limits(),
-                measurable: true,
-            },
-            &pages,
-            |summary| *summary,
-            |_| Roles::default(),
-            |spread| if spread.first == 1 { 1.0 } else { 0.1 },
-        );
-        assert_eq!(frame.on_screen(), Spread::lone(1));
+                spread: Spread::lone(1),
+            }),
+            mode: ReadingMode::Normal,
+            motion: Motion::Still,
+            direction: Direction::Forward,
+            len,
+            limits: test_limits(),
+        };
+        let page_state = |page| PageSummary {
+            info: [1, 2].contains(&page).then_some(entry),
+            ..Default::default()
+        };
+        let on_screen = choose_presented(&input, [1, 2], page_state)
+            .unwrap_or(input.target);
+        assert_eq!(on_screen, Spread::lone(1));
+        let scale = if on_screen.first == 1 { 1.0 } else { 0.1 };
+        let frame = build_frame(&input, on_screen, Some(scale), page_state);
         assert!(
             frame.requests.contains(&Request::new(1, Role::Full)),
             "the on-screen page asks for its full image at the on-screen scale"
@@ -457,17 +435,20 @@ mod tests {
             dims: (2, 2),
             format: Format::Png,
         };
-        let pages: BTreeMap<usize, PageSummary> = [0, 2, 4, 8]
-            .into_iter()
-            .map(|page| (page, ready_page(entry)))
-            .collect();
-        let fit_on = |fit_pages: &'static [usize]| {
+        let known_pages = [0, 2, 4, 8];
+        let state = |fit_pages: &'static [usize]| {
             move |page: usize| {
-                let mut roles = Roles::default();
-                if fit_pages.contains(&page) {
-                    roles.set(Role::Fit);
+                let info = known_pages.contains(&page).then_some(entry);
+                let roles = if fit_pages.contains(&page) {
+                    roles_with(Role::Fit)
+                } else {
+                    Roles::default()
+                };
+                PageSummary {
+                    info,
+                    faulted: false,
+                    roles,
                 }
-                roles
             }
         };
         let input = |target, shown: Option<Spread>| FrameInput {
@@ -478,7 +459,6 @@ mod tests {
             direction: Direction::Forward,
             len,
             limits: test_limits(),
-            measurable: false,
         };
         let lone = Spread::lone;
 
@@ -486,9 +466,8 @@ mod tests {
         assert_eq!(
             choose_presented(
                 &input(lone(4), Some(lone(0))),
-                &pages,
-                |summary| *summary,
-                fit_on(&[0, 2, 4])
+                known_pages,
+                state(&[0, 2, 4]),
             ),
             Some(lone(4))
         );
@@ -497,9 +476,8 @@ mod tests {
         assert_eq!(
             choose_presented(
                 &input(lone(9), Some(lone(0))),
-                &pages,
-                |summary| *summary,
-                fit_on(&[0, 2, 4])
+                known_pages,
+                state(&[0, 2, 4]),
             ),
             Some(lone(4))
         );
@@ -507,9 +485,8 @@ mod tests {
         assert_eq!(
             choose_presented(
                 &input(lone(9), Some(lone(2))),
-                &pages,
-                |summary| *summary,
-                fit_on(&[0])
+                known_pages,
+                state(&[0]),
             ),
             Some(lone(2))
         );
@@ -517,20 +494,14 @@ mod tests {
         assert_eq!(
             choose_presented(
                 &input(lone(5), None),
-                &pages,
-                |summary| *summary,
-                fit_on(&[0, 2, 4])
+                known_pages,
+                state(&[0, 2, 4]),
             ),
             Some(lone(4))
         );
         // A cold start presents only decoded spreads.
         assert_eq!(
-            choose_presented(
-                &input(lone(5), None),
-                &pages,
-                |summary| *summary,
-                |_| Roles::default()
-            ),
+            choose_presented(&input(lone(5), None), known_pages, state(&[])),
             None
         );
     }
@@ -543,10 +514,6 @@ mod tests {
             dims: (2, 2),
             format: Format::Png,
         };
-        let mut pages: BTreeMap<usize, PageSummary> = [0, 2]
-            .into_iter()
-            .map(|page| (page, ready_page(entry)))
-            .collect();
         let pair = Spread {
             first: 1,
             second: Some(2),
@@ -563,35 +530,29 @@ mod tests {
             direction: Direction::Forward,
             len,
             limits: test_limits(),
-            measurable: false,
         };
-        let fit_on = |fit_pages: &'static [usize]| {
+        let state = |info_pages: &'static [usize], fit_pages: &'static [usize]| {
             move |page: usize| {
-                let mut roles = Roles::default();
-                if fit_pages.contains(&page) {
-                    roles.set(Role::Fit);
+                let info = info_pages.contains(&page).then_some(entry);
+                let roles = if fit_pages.contains(&page) {
+                    roles_with(Role::Fit)
+                } else {
+                    Roles::default()
+                };
+                PageSummary {
+                    info,
+                    faulted: false,
+                    roles,
                 }
-                roles
             }
         };
 
         assert_eq!(
-            choose_presented(
-                &input,
-                &pages,
-                |summary| *summary,
-                fit_on(&[2])
-            ),
+            choose_presented(&input, [0, 2], state(&[0, 2], &[2])),
             Some(shown)
         );
-        pages.insert(1, ready_page(entry));
         assert_eq!(
-            choose_presented(
-                &input,
-                &pages,
-                |summary| *summary,
-                fit_on(&[1, 2])
-            ),
+            choose_presented(&input, [0, 1, 2], state(&[0, 1, 2], &[1, 2])),
             Some(pair)
         );
     }
@@ -615,27 +576,23 @@ mod tests {
     #[test]
     fn skim_demands_the_next_spread() {
         let len = PageCount::new(40).expect("the test book is not empty");
-        let pages: BTreeMap<usize, PageSummary> = BTreeMap::new();
-        let frame = build_frame(
-            &FrameInput {
-                target: Spread::lone(20),
-                shown: Some(ShownSpread {
-                    mode: ReadingMode::Normal,
-                    spread: Spread::lone(2),
-                }),
+        let input = FrameInput {
+            target: Spread::lone(20),
+            shown: Some(ShownSpread {
                 mode: ReadingMode::Normal,
-                motion: Motion::Skimming,
-                direction: Direction::Forward,
-                len,
-                limits: test_limits(),
-                measurable: true,
-            },
-            &pages,
-            |summary| *summary,
-            |_| Roles::default(),
-            |_| 1.0,
-        );
-        assert_eq!(frame.shown, Some(Spread::lone(2)));
+                spread: Spread::lone(2),
+            }),
+            mode: ReadingMode::Normal,
+            motion: Motion::Skimming,
+            direction: Direction::Forward,
+            len,
+            limits: test_limits(),
+        };
+        let on_screen = choose_presented(&input, [], |_| PageSummary::default())
+            .unwrap_or(input.target);
+        assert_eq!(on_screen, Spread::lone(2));
+        let frame =
+            build_frame(&input, on_screen, Some(1.0), |_| PageSummary::default());
         assert_eq!(frame.demand, Spread::lone(3));
         assert_ne!(frame.demand, Spread::lone(20));
     }
@@ -651,27 +608,19 @@ mod tests {
             dims: (2, 2),
             format: Format::Png,
         };
-        let pages: BTreeMap<usize, PageSummary> = BTreeMap::from([
-            (4, ready_page(gif_page)),
-            (6, ready_page(gif_page)),
-            (8, ready_page(still_image)),
-            (
-                10,
-                PageSummary {
+        let page_state = |page: usize| {
+            let role = if page == 6 { Role::Thumb } else { Role::Fit };
+            let roles = roles_with(role);
+            match page {
+                4 | 6 | 12 => ready_page(gif_page, roles),
+                8 => ready_page(still_image, roles),
+                10 => PageSummary {
                     info: Some(gif_page),
                     faulted: true,
+                    roles,
                 },
-            ),
-            (12, ready_page(gif_page)),
-        ]);
-        let roles = |page: usize| {
-            let mut page_roles = Roles::default();
-            page_roles.set(if page == 6 {
-                Role::Thumb
-            } else {
-                Role::Fit
-            });
-            page_roles
+                _ => PageSummary::default(),
+            }
         };
         let frame_at = |page: usize, motion: Motion| {
             build_frame(
@@ -686,12 +635,10 @@ mod tests {
                     direction: Direction::Forward,
                     len,
                     limits: test_limits(),
-                    measurable: false,
                 },
-                &pages,
-                |summary| *summary,
-                roles,
-                |_| 1.0,
+                Spread::lone(page),
+                None,
+                page_state,
             )
         };
 
@@ -733,7 +680,6 @@ mod tests {
             dims: (4000, 6000),
             format: Format::Png,
         };
-        let pages = BTreeMap::from([(2, ready_page(entry))]);
         let frame = build_frame(
             &FrameInput {
                 target: Spread::lone(2),
@@ -746,18 +692,16 @@ mod tests {
                 direction: Direction::Forward,
                 len,
                 limits: test_limits(),
-                measurable: true,
             },
-            &pages,
-            |summary| *summary,
+            Spread::lone(2),
+            Some(1.0),
             |page| {
-                let mut roles = Roles::default();
                 if page == 2 {
-                    roles.set(Role::Thumb);
+                    ready_page(entry, roles_with(Role::Thumb))
+                } else {
+                    PageSummary::default()
                 }
-                roles
             },
-            |_| 1.0,
         );
         assert_eq!(
             frame.into_requests(),
@@ -772,7 +716,6 @@ mod tests {
             dims: (800, 600),
             format: Format::Png,
         };
-        let pages = BTreeMap::from([(4, ready_page(entry))]);
         let frame = build_frame(
             &FrameInput {
                 target: Spread::lone(6),
@@ -785,18 +728,16 @@ mod tests {
                 direction: Direction::Forward,
                 len,
                 limits: test_limits(),
-                measurable: true,
             },
-            &pages,
-            |summary| *summary,
+            Spread::lone(4),
+            Some(1.0),
             |page| {
-                let mut roles = Roles::default();
                 if page == 4 {
-                    roles.set(Role::Fit);
+                    ready_page(entry, roles_with(Role::Fit))
+                } else {
+                    PageSummary::default()
                 }
-                roles
             },
-            |_| 1.0,
         );
         assert_eq!(
             frame.into_requests(),

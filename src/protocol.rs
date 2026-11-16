@@ -69,6 +69,48 @@ pub struct WireImage {
     pub pixels: WirePixels,
 }
 
+/// Wire image whose extents, bit depth, and plane byte lengths passed validation.
+#[derive(Debug, Clone)]
+pub struct ValidatedImage(WireImage);
+
+impl ValidatedImage {
+    #[must_use]
+    pub fn width(&self) -> u32 {
+        self.0.width
+    }
+
+    #[must_use]
+    pub fn height(&self) -> u32 {
+        self.0.height
+    }
+
+    #[must_use]
+    pub fn format(&self) -> Format {
+        self.0.format
+    }
+
+    #[must_use]
+    pub fn transfer(&self) -> Transfer {
+        self.0.transfer
+    }
+
+    #[must_use]
+    pub fn page_dims(&self) -> (u32, u32) {
+        self.0.page_dims
+    }
+
+    #[must_use]
+    pub fn pixels(&self) -> &WirePixels {
+        &self.0.pixels
+    }
+
+    /// Bytes held across all shared-memory pixel planes.
+    #[must_use]
+    pub fn resident_bytes(&self) -> usize {
+        self.0.resident_bytes()
+    }
+}
+
 impl WireImage {
     pub fn from_decoded(image: &Decoded) -> Self {
         let pixels = match image.pixels() {
@@ -98,13 +140,13 @@ impl WireImage {
 
     /// Checks that the pixel buffers match the declared extents, bit
     /// depth, and admission bounds.
-    pub fn validate(&self) -> Result<(), MsgError> {
+    pub fn validate(self) -> Result<ValidatedImage, MsgError> {
         match &self.pixels {
             WirePixels::Rgba8(bytes) => decode::validate_rgba_extent(
                 self.width,
                 self.height,
                 bytes.len(),
-            ),
+            )?,
             WirePixels::Yuv {
                 depth,
                 subsampling,
@@ -119,8 +161,9 @@ impl WireImage {
                 *subsampling,
                 [luma.len(), cb.len(), cr.len()],
                 alpha.as_ref().map(|plane| plane.len()),
-            ),
+            )?,
         }
+        Ok(ValidatedImage(self))
     }
 
     /// Bytes held across all shared-memory pixel planes.
@@ -232,11 +275,17 @@ mod tests {
             "the wire keeps the pixels",
         );
         assert_eq!(wire.resident_bytes(), pixels.len());
-        wire.validate().expect("valid rgba wire image validates");
+        let mut truncated = wire.clone();
+        let validated = wire.validate().expect("valid rgba wire image validates");
+        assert_eq!(validated.resident_bytes(), pixels.len());
 
-        let mut truncated = wire;
         truncated.width = 4;
-        assert_eq!(truncated.validate(), Err(MsgError::from_static("rgba extent")));
+        assert_eq!(
+            truncated
+                .validate()
+                .expect_err("truncated rgba image is rejected"),
+            MsgError::from_static("rgba extent")
+        );
     }
 
     #[test]
@@ -259,19 +308,26 @@ mod tests {
                 .expect("valid yuv page");
         let wire = WireImage::from_decoded(&decoded);
         assert_eq!(wire.resident_bytes(), (8 + 2 + 2) * 2);
+        let mut bad_depth = wire.clone();
+        let mut bad_dims = wire.clone();
         wire.validate().expect("valid yuv wire image validates");
 
-        let mut bad_depth = wire.clone();
         if let WirePixels::Yuv { depth, .. } = &mut bad_depth.pixels {
             *depth = 0;
         }
-        assert_eq!(bad_depth.validate(), Err(MsgError::from_static("yuv depth")));
+        assert_eq!(
+            bad_depth
+                .validate()
+                .expect_err("out-of-range depth is rejected"),
+            MsgError::from_static("yuv depth")
+        );
 
-        let mut bad_dims = wire;
         bad_dims.width = 6;
         assert_eq!(
-            bad_dims.validate(),
-            Err(MsgError::from_static("yuv plane extent"))
+            bad_dims
+                .validate()
+                .expect_err("mismatched plane width is rejected"),
+            MsgError::from_static("yuv plane extent")
         );
     }
 }

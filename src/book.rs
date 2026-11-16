@@ -32,6 +32,7 @@ use crate::protocol::BookInfo;
 use crate::protocol::ChildMsg;
 use crate::protocol::Hello;
 use crate::protocol::ParentMsg;
+use crate::protocol::ValidatedImage;
 use crate::protocol::WireImage;
 
 /// A child that has not answered by now is wedged; the parent reports a
@@ -102,17 +103,15 @@ impl BookView {
     }
 }
 
-/// One image delivered by the child: the page, its role, and the pixels
-/// the parent uploads.
 pub struct Delivery {
     pub page: usize,
     pub role: Role,
-    pub image: Box<WireImage>,
+    pub image: Box<ValidatedImage>,
 }
 
 pub enum BookUpdate {
     Ready(Delivery),
-    Playback(PlaybackEvent<Box<WireImage>>),
+    Playback(PlaybackEvent<Box<ValidatedImage>>),
     Failed { page: usize, fault: PageFault },
 }
 
@@ -122,7 +121,7 @@ enum ProcessEvent {
 }
 
 pub struct BookProcess {
-    child: ChildGuard,
+    child: Option<Child>,
     to_child: IpcSender<ParentMsg>,
     events: Receiver<ProcessEvent>,
     reader: Option<JoinHandle<()>>,
@@ -136,7 +135,7 @@ impl BookProcess {
         }
     }
 
-    fn drain(&self) -> (Vec<BookUpdate>, Option<String>) {
+    pub fn drain(&self) -> (Vec<BookUpdate>, Option<String>) {
         let mut updates = Vec::new();
         let mut died = None;
         for event in self.events.try_iter() {
@@ -148,10 +147,10 @@ impl BookProcess {
         (updates, died)
     }
 
-    /// Kill and reap the child, then join its reader. Idempotent, so both
-    /// an explicit switch and `Drop` can rely on it.
     pub fn kill(&mut self) {
-        self.child.kill();
+        if let Some(mut child) = self.child.take() {
+            kill_and_reap(&mut child);
+        }
         if let Some(reader) = self.reader.take()
             && reader.join().is_err()
         {
@@ -221,113 +220,6 @@ impl BookOpen {
     }
 }
 
-/// Keeps [`BookView`] alive across switches and faults.
-pub struct Book {
-    view: BookView,
-    phase: Phase,
-    wake: Wake,
-}
-
-enum Phase {
-    Live(BookProcess),
-    Opening(BookOpen),
-    Faulted(ErrorUnion),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BookChange {
-    None,
-    Adopted,
-    Faulted,
-}
-
-impl Book {
-    pub fn new(view: BookView, process: BookProcess, wake: Wake) -> Self {
-        Self {
-            view,
-            phase: Phase::Live(process),
-            wake,
-        }
-    }
-
-    pub fn view(&self) -> &BookView {
-        &self.view
-    }
-
-    pub fn fault(&self) -> Option<&ErrorUnion> {
-        if let Phase::Faulted(fault) = &self.phase {
-            Some(fault)
-        } else {
-            None
-        }
-    }
-
-    pub fn send(&self, message: ParentMsg) {
-        if let Phase::Live(process) = &self.phase {
-            process.send(message);
-        }
-    }
-
-    /// Opens a sibling book (`true` advances forward); no-op while opening.
-    pub fn switch(&mut self, forward: bool) -> BookChange {
-        if matches!(self.phase, Phase::Opening(_)) {
-            return BookChange::None;
-        }
-        let Some(path) = self.view.sibling(forward) else {
-            return BookChange::None;
-        };
-        if let Phase::Live(process) = &mut self.phase {
-            process.kill();
-        }
-        tracing::debug!(path = %path.display(), "book switch");
-        match BookOpen::start(&path, Arc::clone(&self.wake)) {
-            Ok(open) => {
-                self.phase = Phase::Opening(open);
-                BookChange::None
-            }
-            Err(fault) => {
-                tracing::warn!(%fault, "book open failed");
-                self.phase = Phase::Faulted(fault);
-                BookChange::Faulted
-            }
-        }
-    }
-
-    pub fn poll(&mut self) -> (Vec<BookUpdate>, BookChange) {
-        match &mut self.phase {
-            Phase::Live(process) => {
-                let (updates, died) = process.drain();
-                if let Some(detail) = died {
-                    tracing::warn!(%detail, "the book process failed");
-                    self.phase = Phase::Faulted(eros::error!(
-                        "the book process died: {detail}"
-                    ));
-                    return (updates, BookChange::Faulted);
-                }
-                (updates, BookChange::None)
-            }
-            Phase::Opening(open) => {
-                let Some(opened) = open.try_take() else {
-                    return (Vec::new(), BookChange::None);
-                };
-                match opened {
-                    Ok((view, process)) => {
-                        self.view = view;
-                        self.phase = Phase::Live(process);
-                        (Vec::new(), BookChange::Adopted)
-                    }
-                    Err(fault) => {
-                        tracing::warn!(%fault, "book open failed");
-                        self.phase = Phase::Faulted(fault);
-                        (Vec::new(), BookChange::Faulted)
-                    }
-                }
-            }
-            Phase::Faulted(_) => (Vec::new(), BookChange::None),
-        }
-    }
-}
-
 /// Runs `accept(2)` on `cy-book-accept` under `OPEN_TIMEOUT` because a
 /// never-connecting child leaves `accept(2)` blocked forever.
 fn finish_open(
@@ -380,7 +272,7 @@ fn finish_open(
     let view = BookView::from_info(path, info);
     let (events, reader) = spawn_reader(messages, wake)?;
     let process = BookProcess {
-        child: child.release(),
+        child: child.take(),
         to_child: commands,
         events,
         reader: Some(reader),
@@ -406,8 +298,8 @@ fn wake_accept(server_name: &str, accept_thread: JoinHandle<()>) {
 struct ChildGuard(Option<Child>);
 
 impl ChildGuard {
-    fn release(mut self) -> Self {
-        Self(self.0.take())
+    fn take(&mut self) -> Option<Child> {
+        self.0.take()
     }
 
     fn kill(&mut self) {
@@ -470,7 +362,7 @@ fn read_events(
 fn event_from_message(message: ChildMsg) -> BookUpdate {
     match message {
         ChildMsg::Ready { page, role, image } => match image.validate() {
-            Ok(()) => BookUpdate::Ready(Delivery {
+            Ok(image) => BookUpdate::Ready(Delivery {
                 page,
                 role,
                 image: Box::new(image),
@@ -489,14 +381,13 @@ fn event_from_message(message: ChildMsg) -> BookUpdate {
     }
 }
 
-/// A malformed frame answers `Failed`.
 fn validated_event(
     event: PlaybackEvent<WireImage>,
-) -> PlaybackEvent<Box<WireImage>> {
+) -> PlaybackEvent<Box<ValidatedImage>> {
     match event {
         PlaybackEvent::Frame { id, delay, image } => {
             match image.validate() {
-                Ok(()) => PlaybackEvent::Frame {
+                Ok(image) => PlaybackEvent::Frame {
                     id,
                     delay,
                     image: Box::new(image),
