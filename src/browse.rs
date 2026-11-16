@@ -5,10 +5,11 @@
 use std::num::NonZeroUsize;
 use std::ops::Deref;
 
+use enum_map::Enum;
+use enum_map::EnumMap;
 use serde::Deserialize;
 use serde::Serialize;
 use strum::Display;
-use strum::EnumCount;
 use strum::IntoStaticStr;
 use strum::VariantArray;
 
@@ -179,8 +180,7 @@ pub enum Motion {
     Skimming,
 }
 
-/// Ascending size; array storage keyed by [`Self::index`] follows this
-/// order.
+/// Page image resolution tier.
 #[derive(
     Debug,
     Clone,
@@ -191,11 +191,9 @@ pub enum Motion {
     Deserialize,
     Serialize,
     Display,
-    EnumCount,
+    Enum,
     IntoStaticStr,
-    VariantArray,
 )]
-#[repr(usize)]
 pub enum Role {
     #[strum(serialize = "thumb")]
     Thumb,
@@ -205,67 +203,29 @@ pub enum Role {
     Full,
 }
 
-impl Role {
-    #[must_use]
-    pub const fn index(self) -> usize {
-        self as usize
-    }
-}
-
-#[expect(
-    clippy::indexing_slicing,
-    reason = "the loop bound keeps the index in range"
-)]
-const _: () = {
-    let mut index = 0;
-    while index < Role::COUNT {
-        assert!(
-            Role::VARIANTS[index].index() == index,
-            "Role::VARIANTS order must match Role::index"
-        );
-        index += 1;
-    }
-};
-
 /// The roles present for one page.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Roles {
-    present: [bool; Role::COUNT],
+    present: EnumMap<Role, bool>,
 }
 
 impl Roles {
-    #[expect(
-        clippy::indexing_slicing,
-        reason = "Role::index is bounded by Role::COUNT"
-    )]
-    fn slot(self, role: Role) -> bool {
-        self.present[role.index()]
-    }
-
-    #[expect(
-        clippy::indexing_slicing,
-        reason = "Role::index is bounded by Role::COUNT"
-    )]
-    fn slot_mut(&mut self, role: Role) -> &mut bool {
-        &mut self.present[role.index()]
-    }
-
     pub fn set(&mut self, role: Role) {
-        *self.slot_mut(role) = true;
+        self.present[role] = true;
     }
 
     pub fn clear(&mut self, role: Role) {
-        *self.slot_mut(role) = false;
+        self.present[role] = false;
     }
 
     #[must_use]
     pub fn contains(self, role: Role) -> bool {
-        self.slot(role)
+        self.present[role]
     }
 
     #[must_use]
     pub fn any(self) -> bool {
-        self.present.iter().any(|present| *present)
+        self.present.values().any(|present| *present)
     }
 
     /// A fit or full image can fill a still seat.
@@ -277,11 +237,9 @@ impl Roles {
     /// The largest role present.
     #[must_use]
     pub fn best(self) -> Option<Role> {
-        Role::VARIANTS
-            .iter()
-            .copied()
-            .rev()
-            .find(|role| self.contains(*role))
+        [Role::Full, Role::Fit, Role::Thumb]
+            .into_iter()
+            .find(|&role| self.contains(role))
     }
 }
 
@@ -655,5 +613,35 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn roles_prefer_the_largest_role() {
+        let mut roles = Roles::default();
+        roles.set(Role::Thumb);
+        assert_eq!(roles.best(), Some(Role::Thumb));
+        assert!(roles.contains(Role::Thumb));
+        assert!(roles.any());
+        assert!(!roles.has_settled_image());
+
+        roles.set(Role::Fit);
+        assert_eq!(roles.best(), Some(Role::Fit));
+        assert!(roles.has_settled_image());
+
+        roles.set(Role::Full);
+        assert_eq!(roles.best(), Some(Role::Full));
+
+        roles.clear(Role::Full);
+        assert_eq!(roles.best(), Some(Role::Fit));
+        assert!(!roles.contains(Role::Full));
+
+        roles.clear(Role::Fit);
+        assert_eq!(roles.best(), Some(Role::Thumb));
+        assert!(!roles.has_settled_image());
+        assert!(roles.any());
+
+        roles.clear(Role::Thumb);
+        assert_eq!(roles.best(), None);
+        assert!(!roles.any());
     }
 }

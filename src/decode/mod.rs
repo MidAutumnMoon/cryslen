@@ -164,16 +164,72 @@ pub fn admit_dims(
         .ok_or_else(|| MsgError::from_static(bad_dims_reason))
 }
 
+const RGBA_BYTES_PER_PIXEL: usize = 4;
+
+#[derive(Debug, Clone, Copy)]
+pub struct YuvLayout {
+    pub luma_samples: usize,
+    pub chroma_samples: usize,
+    pub is_u16: bool,
+}
+
+impl YuvLayout {
+    #[must_use]
+    pub fn sample_bytes(self) -> usize {
+        if self.is_u16 { size_of::<u16>() } else { 1 }
+    }
+
+    #[must_use]
+    pub fn total_bytes(self, has_alpha: bool) -> Option<usize> {
+        let alpha = if has_alpha { self.luma_samples } else { 0 };
+        self.luma_samples
+            .checked_add(self.chroma_samples)?
+            .checked_add(self.chroma_samples)?
+            .checked_add(alpha)?
+            .checked_mul(self.sample_bytes())
+    }
+}
+
+pub fn rgba_byte_len(width: u32, height: u32) -> Result<usize, MsgError> {
+    let pixels = admit_dims(width, height, "bad dimensions")?;
+    (pixels as usize)
+        .checked_mul(RGBA_BYTES_PER_PIXEL)
+        .ok_or_else(|| MsgError::from_static("bad dimensions"))
+}
+
 pub fn validate_rgba_extent(
     width: u32,
     height: u32,
     bytes: usize,
 ) -> Result<(), MsgError> {
-    let pixels = admit_dims(width, height, "bad dimensions")?;
-    if bytes != pixels as usize * 4 {
+    if bytes != rgba_byte_len(width, height)? {
         return Err(MsgError::from_static("rgba extent"));
     }
     Ok(())
+}
+
+pub fn yuv_layout(
+    dims: (u32, u32),
+    depth: u8,
+    subsampling: Subsampling,
+) -> Result<YuvLayout, MsgError> {
+    let luma_samples = admit_dims(dims.0, dims.1, "bad dimensions")? as usize;
+    let is_u16 = match depth {
+        1..=BYTE_DEPTH => false,
+        9..=MAX_SAMPLE_DEPTH => true,
+        _ => return Err(MsgError::from_static("yuv depth")),
+    };
+    let (_, (chroma_w, chroma_h)) = plane_dims(dims, subsampling);
+    let chroma_samples = if subsampling == Subsampling::Mono {
+        0
+    } else {
+        admit_dims(chroma_w, chroma_h, "bad dimensions")? as usize
+    };
+    Ok(YuvLayout {
+        luma_samples,
+        chroma_samples,
+        is_u16,
+    })
 }
 
 pub fn validate_yuv_extents(
@@ -183,20 +239,10 @@ pub fn validate_yuv_extents(
     [luma_bytes, chroma_blue_bytes, chroma_red_bytes]: [usize; 3],
     alpha_bytes: Option<usize>,
 ) -> Result<(), MsgError> {
-    let (width, height) = dims;
-    let luma_pixels = admit_dims(width, height, "bad dimensions")?;
-    let bytes_per_sample = match depth {
-        1..=BYTE_DEPTH => 1,
-        9..=MAX_SAMPLE_DEPTH => size_of::<u16>(),
-        _ => return Err(MsgError::from_static("yuv depth")),
-    };
-    let expected_luma_bytes = luma_pixels as usize * bytes_per_sample;
-    let (_, (chroma_width, chroma_height)) =
-        plane_dims((width, height), subsampling);
-    let expected_chroma_bytes =
-        admit_dims(chroma_width, chroma_height, "bad dimensions")?
-            as usize
-            * bytes_per_sample;
+    let layout = yuv_layout(dims, depth, subsampling)?;
+    let sample_bytes = layout.sample_bytes();
+    let expected_luma_bytes = layout.luma_samples * sample_bytes;
+    let expected_chroma_bytes = layout.chroma_samples * sample_bytes;
     if luma_bytes != expected_luma_bytes
         || alpha_bytes.is_some_and(|len| len != expected_luma_bytes)
         || (subsampling != Subsampling::Mono

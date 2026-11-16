@@ -20,12 +20,11 @@ use egui_glow::glow::Texture;
 use egui_glow::glow::UniformLocation;
 use egui_glow::glow::VertexArray;
 use egui_winit::winit;
+use enum_map::EnumMap;
 use glutin::context::PossiblyCurrentContext;
 use glutin::surface::Surface;
 use glutin::surface::WindowSurface;
 use indoc::indoc;
-use strum::EnumCount as _;
-use strum::VariantArray as _;
 
 use winit::dpi::PhysicalSize;
 use winit::event_loop::ActiveEventLoop;
@@ -156,7 +155,7 @@ const SEAT_UV_TOLERANCE: f32 = 1e-3;
 pub struct PageTextures {
     gl: Arc<Context>,
     pipeline: Pipeline,
-    pages: HashMap<usize, [Option<PageTexture>; Role::COUNT]>,
+    pages: HashMap<usize, EnumMap<Role, Option<PageTexture>>>,
     max_texture_edge: u32,
 }
 
@@ -248,32 +247,12 @@ struct ColorConversion {
     offset: [f32; 3],
 }
 
-#[expect(
-    clippy::indexing_slicing,
-    reason = "Role::index is bounded by Role::COUNT"
-)]
-fn role_slot(
-    slots: &[Option<PageTexture>; Role::COUNT],
-    role: Role,
-) -> Option<&PageTexture> {
-    slots[role.index()].as_ref()
-}
-
-#[expect(
-    clippy::indexing_slicing,
-    reason = "Role::index is bounded by Role::COUNT"
-)]
-fn role_slot_mut(
-    slots: &mut [Option<PageTexture>; Role::COUNT],
-    role: Role,
-) -> &mut Option<PageTexture> {
-    &mut slots[role.index()]
-}
-
 fn best_texture(
-    slots: &[Option<PageTexture>; Role::COUNT],
+    slots: &EnumMap<Role, Option<PageTexture>>,
 ) -> Option<&PageTexture> {
-    slots.iter().rev().find_map(Option::as_ref)
+    [Role::Full, Role::Fit, Role::Thumb]
+        .into_iter()
+        .find_map(|role| slots[role].as_ref())
 }
 
 /// Refuse a page over `MAX_TEXTURE_SIZE` before upload; an oversized
@@ -334,8 +313,7 @@ impl PageTextures {
         check_texture_dims(dims, self.max_texture_edge)?;
         let texture = upload_page_texture(Arc::clone(&self.gl), image);
         label_entry(&self.gl, page, role, &texture);
-        *role_slot_mut(self.pages.entry(page).or_default(), role) =
-            Some(texture);
+        self.pages.entry(page).or_default()[role] = Some(texture);
         Ok(())
     }
 
@@ -359,7 +337,7 @@ impl PageTextures {
         }) = self
             .pages
             .get(&page)
-            .and_then(|slots| role_slot(slots, role))
+            .and_then(|slots| slots[role].as_ref())
             && *present_dims == dims
             && *transfer == image.transfer
             && let WirePixels::Rgba8(bytes) = &image.pixels
@@ -368,8 +346,8 @@ impl PageTextures {
             return Ok(());
         }
         let empty = self.pages.get_mut(&page).is_some_and(|slots| {
-            *role_slot_mut(slots, role) = None;
-            slots.iter().all(Option::is_none)
+            slots[role] = None;
+            slots.values().all(Option::is_none)
         });
         if empty {
             self.pages.remove(&page);
@@ -382,7 +360,7 @@ impl PageTextures {
             return Roles::default();
         };
         let mut roles = Roles::default();
-        for (slot, &role) in slots.iter().zip(Role::VARIANTS) {
+        for (role, slot) in slots {
             if slot.is_some() {
                 roles.set(role);
             }
@@ -393,23 +371,23 @@ impl PageTextures {
     fn has(&self, page: usize, role: Role) -> bool {
         self.pages
             .get(&page)
-            .is_some_and(|slots| role_slot(slots, role).is_some())
+            .is_some_and(|slots| slots[role].is_some())
     }
 
     pub fn has_any(&self, page: usize) -> bool {
         self.pages
             .get(&page)
-            .is_some_and(|slots| slots.iter().any(Option::is_some))
+            .is_some_and(|slots| slots.values().any(Option::is_some))
     }
 
     pub fn retain(&mut self, keep: impl Fn(usize, Role) -> bool) {
         self.pages.retain(|&page, slots| {
-            for (slot, &role) in slots.iter_mut().zip(Role::VARIANTS) {
+            for (role, slot) in slots.iter_mut() {
                 if slot.is_some() && !keep(page, role) {
                     *slot = None;
                 }
             }
-            slots.iter().any(Option::is_some)
+            slots.values().any(Option::is_some)
         });
     }
 

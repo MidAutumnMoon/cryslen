@@ -379,7 +379,7 @@ impl Store {
             let _ = file.set_times(
                 FileTimes::new().set_modified(SystemTime::now()),
             );
-            read_stored(file, role, target.edge)
+            read_stored(file, target.edge)
         });
         tracing::debug!(
             ?role,
@@ -407,7 +407,6 @@ impl Store {
             target.namespace,
             hash,
             page,
-            role,
             target.edge,
         ) else {
             return SaveResult::default();
@@ -762,121 +761,104 @@ fn write_atomic(
 }
 
 const MAGIC: [u8; 4] = *b"CYPV";
-const VERSION: u16 = 2;
+const VERSION: u16 = 3;
+const PREFIX_BYTES: usize = MAGIC.len() + size_of::<u16>() + size_of::<u8>();
+const MAX_META_BYTES: usize = u8::MAX as usize;
 
-const PIXEL_RGBA: u8 = 0;
-const PIXEL_YUV: u8 = 1;
+#[derive(Deserialize, Serialize)]
+struct CacheMeta {
+    target_edge: u32,
+    page_dims: (u32, u32),
+    width: u32,
+    height: u32,
+    format: Format,
+    transfer: Transfer,
+    pixels: PixelMeta,
+}
 
-const PLANE_U8: u8 = 0;
-const PLANE_U16: u8 = 1;
+#[derive(Deserialize, Serialize)]
+enum PixelMeta {
+    Rgba8,
+    Yuv {
+        depth: u8,
+        subsampling: Subsampling,
+        full_range: bool,
+        matrix: Matrix,
+        has_alpha: bool,
+    },
+}
 
-/// Alpha reuses the plane tag byte, so absence needs its own value.
-const ALPHA_ABSENT: u8 = 0;
-const ALPHA_U8: u8 = 1;
-const ALPHA_U16: u8 = 2;
+impl CacheMeta {
+    fn from_page(page: &Decoded, target_edge: u32) -> Self {
+        let pixels = match page.pixels() {
+            Pixels::Rgba8(_) => PixelMeta::Rgba8,
+            Pixels::Yuv(yuv) => PixelMeta::Yuv {
+                depth: yuv.depth,
+                subsampling: yuv.subsampling,
+                full_range: yuv.full_range,
+                matrix: yuv.matrix,
+                has_alpha: yuv.alpha.is_some(),
+            },
+        };
+        Self {
+            target_edge,
+            page_dims: page.page_dims(),
+            width: page.width(),
+            height: page.height(),
+            format: page.format(),
+            transfer: page.transfer(),
+            pixels,
+        }
+    }
+}
+
+fn encode_header(meta: &CacheMeta) -> io::Result<Vec<u8>> {
+    let mut meta_buf = [0_u8; MAX_META_BYTES];
+    let encoded =
+        postcard::to_slice(meta, &mut meta_buf).map_err(io::Error::other)?;
+    let Ok(meta_len) = u8::try_from(encoded.len()) else {
+        return Err(io::Error::other(format!(
+            "cache metadata exceeds {MAX_META_BYTES} bytes"
+        )));
+    };
+    let mut header = Vec::with_capacity(PREFIX_BYTES + encoded.len());
+    header.extend_from_slice(&MAGIC);
+    header.extend_from_slice(&VERSION.to_le_bytes());
+    header.push(meta_len);
+    header.extend_from_slice(encoded);
+    Ok(header)
+}
 
 fn write_encoded_atomic(
     namespace: &Namespace,
     hash: u128,
     page: &Decoded,
-    role: Role,
     target_edge: u32,
 ) -> io::Result<u64> {
+    let header = encode_header(&CacheMeta::from_page(page, target_edge))?;
     match page.pixels() {
         Pixels::Rgba8(bytes) => {
-            let header = header_bytes(
-                page,
-                role,
-                target_edge,
-                encode_len(bytes.len()),
-            );
             let mut slices = [IoSlice::new(&header), IoSlice::new(bytes)];
             write_atomic(namespace, hash, &mut slices)
         }
         Pixels::Yuv(yuv) => {
-            // Header + 3 YUV (prefix, plane) pairs + optional alpha (prefix, plane).
-            const YUV_MAX_SLICES: usize = 1 + 3 * 2 + 2;
-            let header = header_bytes(
-                page,
-                role,
-                target_edge,
-                [
-                    yuv.depth,
-                    subsampling_tag(yuv.subsampling),
-                    u8::from(yuv.full_range),
-                    matrix_tag(yuv.matrix),
-                ],
-            );
-            let yuv_planes = [&yuv.luma, &yuv.cb, &yuv.cr];
-            let prefixes = yuv_planes
-                .map(|plane| plane_prefix(plane, PLANE_U8, PLANE_U16));
-            let plane_bytes = yuv_planes.map(little_endian_plane_bytes);
-            let alpha_pair = yuv.alpha.as_ref().map(|alpha| {
-                (
-                    plane_prefix(alpha, ALPHA_U8, ALPHA_U16),
-                    little_endian_plane_bytes(alpha),
-                )
-            });
-            let absent = [ALPHA_ABSENT];
+            // Header + 3 YUV planes + optional alpha plane.
+            const YUV_MAX_SLICES: usize = 1 + 3 + 1;
+            let luma = little_endian_plane_bytes(&yuv.luma);
+            let cb = little_endian_plane_bytes(&yuv.cb);
+            let cr = little_endian_plane_bytes(&yuv.cr);
+            let alpha = yuv.alpha.as_ref().map(little_endian_plane_bytes);
             let mut slices = Vec::with_capacity(YUV_MAX_SLICES);
             slices.push(IoSlice::new(&header));
-            for (prefix, bytes) in prefixes.iter().zip(&plane_bytes) {
-                slices.push(IoSlice::new(prefix));
-                slices.push(IoSlice::new(bytes));
-            }
-            if let Some((alpha_prefix, alpha_bytes)) = &alpha_pair {
-                slices.push(IoSlice::new(alpha_prefix));
-                slices.push(IoSlice::new(alpha_bytes));
-            } else {
-                slices.push(IoSlice::new(&absent));
+            slices.push(IoSlice::new(&luma));
+            slices.push(IoSlice::new(&cb));
+            slices.push(IoSlice::new(&cr));
+            if let Some(alpha) = &alpha {
+                slices.push(IoSlice::new(alpha));
             }
             write_atomic(namespace, hash, &mut slices)
         }
     }
-}
-
-fn header_bytes(
-    page: &Decoded,
-    role: Role,
-    target_edge: u32,
-    trailer: [u8; 4],
-) -> Vec<u8> {
-    // Magic (4), version (2), role, pixel, 5 u32 fields, format, transfer, trailer (4).
-    const HEADER_BYTES: usize = 4 + 2 + 1 + 1 + 5 * 4 + 1 + 1 + 4;
-    let pixel = match page.pixels() {
-        Pixels::Rgba8(_) => PIXEL_RGBA,
-        Pixels::Yuv(_) => PIXEL_YUV,
-    };
-    let mut out = Vec::with_capacity(HEADER_BYTES);
-    out.extend_from_slice(&MAGIC);
-    out.extend_from_slice(&VERSION.to_le_bytes());
-    out.push(role_tag(role));
-    out.push(pixel);
-    out.extend_from_slice(&target_edge.to_le_bytes());
-    out.extend_from_slice(&page.page_dims().0.to_le_bytes());
-    out.extend_from_slice(&page.page_dims().1.to_le_bytes());
-    out.extend_from_slice(&page.width().to_le_bytes());
-    out.extend_from_slice(&page.height().to_le_bytes());
-    out.push(format_tag(page.format()));
-    out.push(transfer_tag(page.transfer()));
-    out.extend_from_slice(&trailer);
-    debug_assert_eq!(
-        out.len(),
-        HEADER_BYTES,
-        "header byte count must match reserved capacity"
-    );
-    out
-}
-
-fn plane_prefix(plane: &Plane, u8_tag: u8, u16_tag: u8) -> [u8; 5] {
-    let (tag, bytes) = match plane {
-        Plane::U8(bytes) => (u8_tag, bytes.len()),
-        Plane::U16(words) => (u16_tag, words.len() * size_of::<u16>()),
-    };
-    let mut prefix = [tag, 0, 0, 0, 0];
-    let (_, len_bytes) = prefix.split_at_mut(1);
-    len_bytes.copy_from_slice(&encode_len(bytes));
-    prefix
 }
 
 fn little_endian_plane_bytes(plane: &Plane) -> Cow<'_, [u8]> {
@@ -897,286 +879,131 @@ fn little_endian_plane_bytes(plane: &Plane) -> Cow<'_, [u8]> {
     }
 }
 
-fn encode_len(value: usize) -> [u8; 4] {
-    u32::try_from(value).unwrap_or(u32::MAX).to_le_bytes()
-}
-
-fn role_tag(role: Role) -> u8 {
-    match role {
-        Role::Thumb => 0,
-        Role::Fit => 1,
-        Role::Full => 2,
-    }
-}
-
-fn format_tag(format: Format) -> u8 {
-    match format {
-        Format::Jpeg => 0,
-        Format::Png => 1,
-        Format::Gif => 2,
-        Format::Webp => 3,
-        Format::Bmp => 4,
-        Format::Tiff => 5,
-        Format::Avif => 6,
-        Format::Jxl => 7,
-    }
-}
-
-fn format_from_tag(tag: u8) -> Option<Format> {
-    Some(match tag {
-        0 => Format::Jpeg,
-        1 => Format::Png,
-        2 => Format::Gif,
-        3 => Format::Webp,
-        4 => Format::Bmp,
-        5 => Format::Tiff,
-        6 => Format::Avif,
-        7 => Format::Jxl,
-        _ => return None,
-    })
-}
-
-fn transfer_tag(transfer: Transfer) -> u8 {
-    match transfer {
-        Transfer::Srgb => 0,
-        Transfer::Pq => 1,
-    }
-}
-
-fn transfer_from_tag(tag: u8) -> Option<Transfer> {
-    Some(match tag {
-        0 => Transfer::Srgb,
-        1 => Transfer::Pq,
-        _ => return None,
-    })
-}
-
-fn subsampling_tag(subsampling: Subsampling) -> u8 {
-    match subsampling {
-        Subsampling::Mono => 0,
-        Subsampling::Yuv420 => 1,
-        Subsampling::Yuv422 => 2,
-        Subsampling::Yuv444 => 3,
-    }
-}
-
-fn subsampling_from_tag(tag: u8) -> Option<Subsampling> {
-    Some(match tag {
-        0 => Subsampling::Mono,
-        1 => Subsampling::Yuv420,
-        2 => Subsampling::Yuv422,
-        3 => Subsampling::Yuv444,
-        _ => return None,
-    })
-}
-
-fn matrix_tag(matrix: Matrix) -> u8 {
-    match matrix {
-        Matrix::Bt601 => 0,
-        Matrix::Bt709 => 1,
-        Matrix::Bt2020 => 2,
-        Matrix::Identity => 3,
-    }
-}
-
-fn matrix_from_tag(tag: u8) -> Option<Matrix> {
-    Some(match tag {
-        0 => Matrix::Bt601,
-        1 => Matrix::Bt709,
-        2 => Matrix::Bt2020,
-        3 => Matrix::Identity,
-        _ => return None,
-    })
-}
-
-/// Header and payload reader over an open cache file. Every read is
-/// charged against the file's length, so a damaged header cannot make the
-/// loader allocate memory the file does not hold.
-struct Reader {
-    file: File,
-    remaining: u64,
-}
-
-impl Reader {
-    fn new(file: File) -> Option<Self> {
-        let remaining = file.metadata().ok()?.len();
-        Some(Self { file, remaining })
-    }
-
-    fn at_end(&self) -> bool {
-        self.remaining == 0
-    }
-
-    fn array<const N: usize>(&mut self) -> Option<[u8; N]> {
-        let mut buffer = [0_u8; N];
-        self.read_into(&mut buffer)?;
-        Some(buffer)
-    }
-
-    fn read_into(&mut self, target: &mut [u8]) -> Option<()> {
-        let needed = u64::try_from(target.len()).ok()?;
-        if needed > self.remaining {
-            return None;
-        }
-        self.remaining -= needed;
-        self.file.read_exact(target).ok()
-    }
-
-    fn bytes(&mut self, len: usize) -> Option<Vec<u8>> {
-        let mut buffer = vec![0_u8; len];
-        self.read_into(&mut buffer)?;
-        Some(buffer)
-    }
-
-    fn u8(&mut self) -> Option<u8> {
-        Some(u8::from_le_bytes(self.array()?))
-    }
-
-    fn u16(&mut self) -> Option<u16> {
-        Some(u16::from_le_bytes(self.array()?))
-    }
-
-    fn u32(&mut self) -> Option<u32> {
-        Some(u32::from_le_bytes(self.array()?))
-    }
-}
-
-fn read_stored(
-    file: File,
-    role: Role,
-    target_edge: u32,
-) -> Option<Decoded> {
-    let mut reader = Reader::new(file)?;
-    if reader.array::<4>()? != MAGIC
-        || reader.u16()? != VERSION
-        || reader.u8()? != role_tag(role)
-    {
+fn read_stored(mut file: File, target_edge: u32) -> Option<Decoded> {
+    let file_len = file.metadata().ok()?.len();
+    if file_len < u64::try_from(PREFIX_BYTES).ok()? {
         return None;
     }
-    let pixel = reader.u8()?;
-    if reader.u32()? != target_edge {
+    let mut prefix = [0_u8; PREFIX_BYTES];
+    file.read_exact(&mut prefix).ok()?;
+    let (magic, rest) = prefix.split_first_chunk::<{ MAGIC.len() }>()?;
+    let (version, rest) = rest.split_first_chunk::<{ size_of::<u16>() }>()?;
+    let &[meta_len] = rest else {
         return None;
-    }
-    let page_dims = (reader.u32()?, reader.u32()?);
-    let image = (reader.u32()?, reader.u32()?);
-    let format = format_from_tag(reader.u8()?)?;
-    let transfer = transfer_from_tag(reader.u8()?)?;
-    sample_count(page_dims)?;
-    let page = match pixel {
-        PIXEL_RGBA => read_rgba(&mut reader, image, format, transfer)?,
-        PIXEL_YUV => read_yuv(&mut reader, image, format, transfer)?,
-        _ => return None,
     };
-    if !reader.at_end() {
+    if *magic != MAGIC || *version != VERSION.to_le_bytes() {
         return None;
     }
-    Some(page.with_page_dims(page_dims))
+    let meta_len = usize::from(meta_len);
+    if meta_len == 0 {
+        return None;
+    }
+    let header_len = u64::try_from(PREFIX_BYTES + meta_len).ok()?;
+    let payload_len = file_len.checked_sub(header_len)?;
+    let mut meta_buf = [0_u8; MAX_META_BYTES];
+    let meta_bytes = meta_buf.get_mut(..meta_len)?;
+    file.read_exact(meta_bytes).ok()?;
+    let meta: CacheMeta = postcard::from_bytes(meta_bytes).ok()?;
+    if meta.target_edge != target_edge {
+        return None;
+    }
+    decode::pixel_count(meta.page_dims.0, meta.page_dims.1)?;
+    let page = match meta.pixels {
+        PixelMeta::Rgba8 => read_rgba(&mut file, payload_len, &meta)?,
+        PixelMeta::Yuv {
+            depth,
+            subsampling,
+            full_range,
+            matrix,
+            has_alpha,
+        } => {
+            let layout = decode::yuv_layout(
+                (meta.width, meta.height),
+                depth,
+                subsampling,
+            )
+            .ok()?;
+            let expected_bytes = layout.total_bytes(has_alpha)?;
+            if u64::try_from(expected_bytes).ok()? != payload_len {
+                return None;
+            }
+            let luma =
+                read_plane(&mut file, layout.luma_samples, layout.is_u16)?;
+            let cb =
+                read_plane(&mut file, layout.chroma_samples, layout.is_u16)?;
+            let cr =
+                read_plane(&mut file, layout.chroma_samples, layout.is_u16)?;
+            let alpha = if has_alpha {
+                Some(read_plane(
+                    &mut file,
+                    layout.luma_samples,
+                    layout.is_u16,
+                )?)
+            } else {
+                None
+            };
+            Decoded::yuv(
+                meta.width,
+                meta.height,
+                meta.format,
+                meta.transfer,
+                YuvImage {
+                    depth,
+                    subsampling,
+                    full_range,
+                    matrix,
+                    luma,
+                    cb,
+                    cr,
+                    alpha,
+                },
+            )
+            .ok()?
+        }
+    };
+    Some(page.with_page_dims(meta.page_dims))
 }
 
 fn read_rgba(
-    reader: &mut Reader,
-    image: (u32, u32),
-    format: Format,
-    transfer: Transfer,
+    file: &mut File,
+    payload_len: u64,
+    meta: &CacheMeta,
 ) -> Option<Decoded> {
-    let want = sample_count(image)?.checked_mul(4)?;
-    if usize::try_from(reader.u32()?).ok()? != want {
+    let expected_bytes =
+        decode::rgba_byte_len(meta.width, meta.height).ok()?;
+    if u64::try_from(expected_bytes).ok()? != payload_len {
         return None;
     }
-    let bytes = reader.bytes(want)?.into_boxed_slice();
-    Decoded::rgba(image.0, image.1, format, transfer, bytes).ok()
+    let mut bytes = vec![0_u8; expected_bytes];
+    file.read_exact(&mut bytes).ok()?;
+    Decoded::rgba(
+        meta.width,
+        meta.height,
+        meta.format,
+        meta.transfer,
+        bytes.into_boxed_slice(),
+    )
+    .ok()
 }
 
-fn read_yuv(
-    reader: &mut Reader,
-    image: (u32, u32),
-    format: Format,
-    transfer: Transfer,
-) -> Option<Decoded> {
-    let depth = reader.u8()?;
-    let subsampling = subsampling_from_tag(reader.u8()?)?;
-    let full_range = match reader.u8()? {
-        0 => false,
-        1 => true,
-        _ => return None,
-    };
-    let matrix = matrix_from_tag(reader.u8()?)?;
-    let ((luma_w, luma_h), (chroma_w, chroma_h)) =
-        decode::plane_dims(image, subsampling);
-    let luma = read_plane(reader, sample_count((luma_w, luma_h))?)?;
-    let chroma = if subsampling == Subsampling::Mono {
-        0
-    } else {
-        sample_count((chroma_w, chroma_h))?
-    };
-    let cb = read_plane(reader, chroma)?;
-    let cr = read_plane(reader, chroma)?;
-    let alpha = match reader.u8()? {
-        ALPHA_ABSENT => None,
-        tag => {
-            let tag = alpha_plane_tag(tag)?;
-            let wanted = sample_count((luma_w, luma_h))?;
-            Some(read_plane_tag(reader, tag, wanted)?)
-        }
-    };
-    let yuv = YuvImage {
-        depth,
-        subsampling,
-        full_range,
-        matrix,
-        luma,
-        cb,
-        cr,
-        alpha,
-    };
-    Decoded::yuv(image.0, image.1, format, transfer, yuv).ok()
-}
-
-fn alpha_plane_tag(tag: u8) -> Option<u8> {
-    Some(match tag {
-        ALPHA_U8 => PLANE_U8,
-        ALPHA_U16 => PLANE_U16,
-        _ => return None,
-    })
-}
-
-fn read_plane(reader: &mut Reader, samples: usize) -> Option<Plane> {
-    let tag = reader.u8()?;
-    read_plane_tag(reader, tag, samples)
-}
-
-fn read_plane_tag(
-    reader: &mut Reader,
-    tag: u8,
+fn read_plane(
+    file: &mut File,
     samples: usize,
+    is_u16: bool,
 ) -> Option<Plane> {
-    let want = match tag {
-        PLANE_U8 => samples,
-        PLANE_U16 => samples.checked_mul(size_of::<u16>())?,
-        _ => return None,
-    };
-    if usize::try_from(reader.u32()?).ok()? != want {
-        return None;
+    if !is_u16 {
+        let mut bytes = vec![0_u8; samples];
+        file.read_exact(&mut bytes).ok()?;
+        return Some(Plane::U8(bytes.into_boxed_slice()));
     }
-    if tag == PLANE_U8 {
-        let mut bytes = vec![0_u8; want];
-        reader.read_into(&mut bytes)?;
-        Some(Plane::U8(bytes.into_boxed_slice()))
-    } else {
-        let mut words = vec![0_u16; samples];
-        reader.read_into(bytemuck::cast_slice_mut(&mut words))?;
-        if cfg!(not(target_endian = "little")) {
-            for word in &mut words {
-                *word = u16::from_le(*word);
-            }
+    let mut words = vec![0_u16; samples];
+    file.read_exact(bytemuck::cast_slice_mut(&mut words)).ok()?;
+    if cfg!(not(target_endian = "little")) {
+        for word in &mut words {
+            *word = u16::from_le(*word);
         }
-        Some(Plane::U16(words.into_boxed_slice()))
     }
-}
-
-fn sample_count(dims: (u32, u32)) -> Option<usize> {
-    let count = decode::pixel_count(dims.0, dims.1)?;
-    usize::try_from(count).ok()
+    Some(Plane::U16(words.into_boxed_slice()))
 }
 
 #[cfg(test)]
@@ -1192,7 +1019,6 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::browse::Roles;
 
     const TEST_FIT_EDGE: u32 = 2560;
 
@@ -1533,6 +1359,9 @@ mod tests {
 
     #[test]
     fn corrupt_entries_are_rejected() {
+        const VERSION_START: usize = MAGIC.len();
+        const VERSION_END: usize = VERSION_START + size_of::<u16>();
+
         let dir = TempDir::new().expect("create temp dir");
         let page = rgba_page(2, 2);
         let store = Store::at(dir.path());
@@ -1553,27 +1382,37 @@ mod tests {
         assert!(store.load(hash, Role::Thumb, TEST_FIT_EDGE).is_none());
 
         let mut bad_version = good.clone();
-        if let Some(field) = bad_version.get_mut(4..6) {
+        if let Some(field) = bad_version.get_mut(VERSION_START..VERSION_END) {
             field.copy_from_slice(&(VERSION + 1).to_le_bytes());
         }
         fs::write(&path, &bad_version).expect("write version");
         assert!(store.load(hash, Role::Thumb, TEST_FIT_EDGE).is_none());
 
-        // The target edge sits between the pixel tag and the page dims;
-        // a different edge is a different role.
-        let mut bad_edge = good.clone();
-        if let Some(field) = bad_edge.get_mut(8..12) {
-            field.copy_from_slice(&(THUMB_EDGE + 1).to_le_bytes());
+        for meta_len in [0_u8, u8::MAX] {
+            let mut bad_meta_len = good.clone();
+            if let Some(byte) = bad_meta_len.get_mut(VERSION_END) {
+                *byte = meta_len;
+            }
+            fs::write(&path, &bad_meta_len).expect("write meta length");
+            assert!(store.load(hash, Role::Thumb, TEST_FIT_EDGE).is_none());
         }
-        fs::write(&path, &bad_edge).expect("write edge");
+
+        // Different target edge on disk misses cleanly even with matching pixels.
+        let mut wrong_edge =
+            encode_header(&CacheMeta::from_page(&page, THUMB_EDGE + 1))
+                .expect("encode wrong-edge header");
+        wrong_edge.extend_from_slice(&rgba_bytes(&page));
+        fs::write(&path, &wrong_edge).expect("write wrong-edge entry");
         assert!(store.load(hash, Role::Thumb, TEST_FIT_EDGE).is_none());
 
-        // The RGBA payload length sits right after the 30 header bytes.
-        let mut bad_length = good.clone();
-        if let Some(field) = bad_length.get_mut(30..34) {
-            field.copy_from_slice(&1_u32.to_le_bytes());
-        }
-        fs::write(&path, &bad_length).expect("write length");
+        // Admissible dims whose byte size exceeds the file reject against
+        // file length before allocating.
+        let mut forged_dims = CacheMeta::from_page(&page, THUMB_EDGE);
+        forged_dims.width = 4_096;
+        forged_dims.height = 4_096;
+        let oversized =
+            encode_header(&forged_dims).expect("encode oversized header");
+        fs::write(&path, &oversized).expect("write oversized entry");
         assert!(store.load(hash, Role::Thumb, TEST_FIT_EDGE).is_none());
 
         let mut truncated = good.clone();
@@ -1873,35 +1712,5 @@ mod tests {
             (500, 100)
         );
         assert_eq!(full_clamped.page_dims(), (1000, 200));
-    }
-
-    #[test]
-    fn roles_prefer_the_largest_role() {
-        let mut roles = Roles::default();
-        roles.set(Role::Thumb);
-        assert_eq!(roles.best(), Some(Role::Thumb));
-        assert!(roles.contains(Role::Thumb));
-        assert!(roles.any());
-        assert!(!roles.has_settled_image());
-
-        roles.set(Role::Fit);
-        assert_eq!(roles.best(), Some(Role::Fit));
-        assert!(roles.has_settled_image());
-
-        roles.set(Role::Full);
-        assert_eq!(roles.best(), Some(Role::Full));
-
-        roles.clear(Role::Full);
-        assert_eq!(roles.best(), Some(Role::Fit));
-        assert!(!roles.contains(Role::Full));
-
-        roles.clear(Role::Fit);
-        assert_eq!(roles.best(), Some(Role::Thumb));
-        assert!(!roles.has_settled_image());
-        assert!(roles.any());
-
-        roles.clear(Role::Thumb);
-        assert_eq!(roles.best(), None);
-        assert!(!roles.any());
     }
 }
