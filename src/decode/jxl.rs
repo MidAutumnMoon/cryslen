@@ -1,4 +1,7 @@
 use jxl::api::Event;
+use jxl::api::ExtraChannel;
+use jxl::api::JxlColorType;
+use jxl::api::JxlDataFormat;
 use jxl::api::JxlDecoder;
 use jxl::api::JxlDecoderOptions;
 use jxl::api::JxlOutputBuffer;
@@ -10,7 +13,11 @@ use jxl::error::Result as JxlResult;
 
 use super::Decoded;
 use super::Format;
+use super::Matrix;
+use super::Plane;
+use super::Subsampling;
 use super::Transfer;
+use super::YuvImage;
 
 const MAX_THREADS: usize = 16;
 
@@ -47,15 +54,34 @@ pub(super) fn decode(bytes: &[u8], max_threads: usize) -> eros::Result<Decoded> 
         super::admit_dims(width, height, "jxl: bad dimensions")?;
 
     let extra_channels = info.extra_channels.len();
-    decoder.set_pixel_format(JxlPixelFormat::rgba8(extra_channels))?;
+    let has_alpha = info
+        .extra_channels
+        .iter()
+        .any(|channel| channel.ec_type == ExtraChannel::Alpha);
+    // `BasicInfo` seeds `current_pixel_format()` with the source color type.
+    let mono = !has_alpha
+        && decoder
+            .current_pixel_format()
+            .is_some_and(|format| format.color_type.is_grayscale());
+    let pixel_format = if mono {
+        JxlPixelFormat {
+            color_type: JxlColorType::Grayscale,
+            color_data_format: Some(JxlDataFormat::U8 {
+                bit_depth: super::BYTE_DEPTH,
+            }),
+            extra_channel_format: vec![None; extra_channels],
+        }
+    } else {
+        JxlPixelFormat::rgba8(extra_channels)
+    };
+    let samples_per_pixel = pixel_format.color_type.samples_per_pixel();
+    let stride = width as usize * samples_per_pixel;
+    decoder.set_pixel_format(pixel_format)?;
 
-    let mut rgba = vec![0_u8; pixel_count as usize * 4];
+    let mut pixels = vec![0_u8; pixel_count as usize * samples_per_pixel];
     loop {
-        let mut output = JxlOutputBuffer::new(
-            &mut rgba,
-            height as usize,
-            width as usize * 4,
-        );
+        let mut output =
+            JxlOutputBuffer::new(&mut pixels, height as usize, stride);
         match decoder.process(
             &mut input,
             Some(slice::from_mut(&mut output)),
@@ -79,19 +105,31 @@ pub(super) fn decode(bytes: &[u8], max_threads: usize) -> eros::Result<Decoded> 
 
     // The crate either converts to sRGB or emits simple PQ values its
     // API does not distinguish, so jxl pages ride the sRGB path.
-    Ok(Decoded::rgba(
-        width,
-        height,
-        Format::Jxl,
-        Transfer::Srgb,
-        rgba.into_boxed_slice(),
-    )?)
+    Ok(if mono {
+        let yuv = YuvImage {
+            depth: super::BYTE_DEPTH,
+            subsampling: Subsampling::Mono,
+            full_range: true,
+            matrix: Matrix::Identity,
+            luma: Plane::U8(pixels.into_boxed_slice()),
+            cb: Plane::U8(Box::new([])),
+            cr: Plane::U8(Box::new([])),
+            alpha: None,
+        };
+        Decoded::yuv(width, height, Format::Jxl, Transfer::Srgb, yuv)?
+    } else {
+        Decoded::rgba(
+            width,
+            height,
+            Format::Jxl,
+            Transfer::Srgb,
+            pixels.into_boxed_slice(),
+        )?
+    })
 }
 
 /// Scoped-thread runner. A failing task fails the whole run, which is
 /// how the crate's driver expects a broken codestream to be reported.
-/// The driver invokes this only with two or more threads, so no
-/// sequential path is needed.
 struct Pool(usize);
 
 impl JxlParallelRunner for Pool {
@@ -104,6 +142,12 @@ impl JxlParallelRunner for Pool {
         use std::thread;
 
         let thread_count = self.0.min(num);
+        if thread_count <= 1 {
+            for task_index in 0..num {
+                fun(task_index)?;
+            }
+            return Ok(());
+        }
         let chunk = num.div_ceil(thread_count);
         let failure: OnceLock<JxlError> = OnceLock::new();
         thread::scope(|scope| {

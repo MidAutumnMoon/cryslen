@@ -998,7 +998,7 @@ mod tests {
     // 5_frames_numbered_jxli.jxl from jxl 0.8.0's tests/testdata.
     #[test]
     fn jxl_fixtures_decode() {
-        // gray: solid halves, gray replicated to r=g=b
+        // gray: solid halves
         let gray = decode(
             include_bytes!("../../tests/fixtures/gray.jxl"),
             "a.jxl",
@@ -1007,17 +1007,19 @@ mod tests {
         assert_eq!((gray.width, gray.height), (8, 8));
         assert_eq!(gray.format, Format::Jxl);
         match gray.pixels {
-            Pixels::Rgba8(bytes) => {
-                assert_eq!(
-                    bytes.get(..4),
-                    Some(&[0x20, 0x20, 0x20, 0xFF][..])
-                );
-                assert_eq!(
-                    bytes.get(128..132),
-                    Some(&[0xE0, 0xE0, 0xE0, 0xFF][..])
-                );
+            Pixels::Yuv(yuv) => {
+                assert_eq!(yuv.depth, 8);
+                assert_eq!(yuv.subsampling, Subsampling::Mono);
+                assert!(yuv.full_range);
+                assert_eq!(yuv.matrix, Matrix::Identity);
+                assert!(yuv.alpha.is_none());
+                let Plane::U8(luma) = yuv.luma else {
+                    panic!("8-bit mono jxl must use U8 luma");
+                };
+                assert_eq!(luma.first().copied(), Some(0x20));
+                assert_eq!(luma.get(32).copied(), Some(0xE0));
             }
-            Pixels::Yuv(_) => panic!("jxl must decode to rgba"),
+            Pixels::Rgba8(_) => panic!("opaque gray jxl must decode to mono"),
         }
 
         // alpha: the file's own alpha rides in the fourth byte

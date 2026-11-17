@@ -306,6 +306,29 @@ impl ReadingPosition {
         self.target = target;
     }
 
+    pub fn turn(
+        &mut self,
+        direction: Direction,
+        mode: ReadingMode,
+        len: PageCount,
+        motion: Motion,
+    ) -> bool {
+        let next = advance(self.target, direction, mode, len);
+        if motion == Motion::Skimming {
+            let Some(shown) = self.shown else {
+                return false;
+            };
+            // Keep skims within one spread of what is on screen.
+            let shown_start = spread_for(shown.spread.first, mode, len).first;
+            let target_start = spread_for(self.target, mode, len).first;
+            if target_start != shown_start && next != shown_start {
+                return false;
+            }
+        }
+        self.target = next;
+        true
+    }
+
     pub fn record_shown(
         &mut self,
         mode: ReadingMode,
@@ -645,5 +668,51 @@ mod tests {
         roles.clear(Role::Thumb);
         assert_eq!(roles.best(), None);
         assert!(!roles.any());
+    }
+
+    #[test]
+    fn skimming_turn_waits_for_shown_when_one_spread_ahead() {
+        let len = pages(10);
+        let mode = ReadingMode::Manga;
+
+        let mut position = ReadingPosition::new(1);
+        assert!(!position.turn(
+            Direction::Forward,
+            mode,
+            len,
+            Motion::Skimming
+        ));
+        assert_eq!(position.target(), 1);
+        assert!(position.turn(
+            Direction::Forward,
+            mode,
+            len,
+            Motion::Still
+        ));
+        assert_eq!(position.target(), 3);
+
+        position.record_shown(mode, Some(spread_for(3, mode, len)));
+        assert!(position.turn(
+            Direction::Forward,
+            mode,
+            len,
+            Motion::Skimming
+        ));
+        assert_eq!(position.target(), 5);
+        assert!(!position.turn(
+            Direction::Forward,
+            mode,
+            len,
+            Motion::Skimming
+        ));
+        assert_eq!(position.target(), 5);
+
+        assert!(position.turn(
+            Direction::Backward,
+            mode,
+            len,
+            Motion::Skimming
+        ));
+        assert_eq!(position.target(), 3);
     }
 }

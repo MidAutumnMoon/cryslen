@@ -13,7 +13,7 @@ The ratios here are one laptop's measurements.
 ## JXL
 
 - Supply a parallel runner; the default path is single-threaded and several times slower. Scoped threads are the runner model.
-- Decode into RGBA with an extra alpha channel; the crate interleaves channels and fills opaque alpha.
+- Decode opaque grayscale into 1-byte planar `Mono` (`Matrix::Identity`, full range); decode color or alpha pages into RGBA (`jxl` interleaves extra alpha and fills opaque alpha).
 - The whole file is in memory, so a request for more input means truncation: report a corrupt page.
 
 ## AVIF

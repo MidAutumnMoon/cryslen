@@ -66,25 +66,22 @@ const PREFETCH_AHEAD_RATIO: usize = 2;
 
 const MEMORY_CACHE_CAP_BYTES: usize = 192 * 1024 * 1024;
 
+const DEFAULT_CPU_THREADS: usize = 2;
 const MIN_WORKERS: usize = 2;
 const MAX_WORKERS: usize = 6;
 const RESERVED_FOREGROUND_WORKERS: usize = 2;
 const MIN_PREFETCH_WORKERS: usize = 1;
-const PREFETCH_THREADS_PER_PAGE: usize = 1;
+const MAX_PREFETCH_WORKERS: usize = 2;
 
-fn worker_count() -> usize {
+fn available_parallelism() -> usize {
     thread::available_parallelism()
-        .map_or(MIN_WORKERS, NonZeroUsize::get)
-        .clamp(MIN_WORKERS, MAX_WORKERS)
+        .map_or(DEFAULT_CPU_THREADS, NonZeroUsize::get)
 }
 
-const fn max_prefetch_workers(workers: usize) -> usize {
-    let available = workers.saturating_sub(RESERVED_FOREGROUND_WORKERS);
-    if available > MIN_PREFETCH_WORKERS {
-        available
-    } else {
-        MIN_PREFETCH_WORKERS
-    }
+fn max_prefetch_workers(workers: usize) -> usize {
+    workers
+        .saturating_sub(RESERVED_FOREGROUND_WORKERS)
+        .clamp(MIN_PREFETCH_WORKERS, MAX_PREFETCH_WORKERS)
 }
 
 fn spread_contains(spread: Spread, page: usize) -> bool {
@@ -1368,28 +1365,30 @@ impl PlaybackRunner {
 fn worker_loop<Sink>(
     source: &Source,
     shared: &Shared<Sink>,
-    workers: usize,
+    max_prefetch: usize,
+    cpu_threads: usize,
 ) where
     Sink: EventSink,
 {
-    let max_prefetch = max_prefetch_workers(workers);
+    let prefetch_threads = cpu_threads.div_ceil(max_prefetch);
     while let Some(job) = shared.next_job(max_prefetch) {
         let _guard = InFlightGuard {
             shared,
             page: job.page,
         };
+        let max_threads = if job.kind.is_prefetch() {
+            prefetch_threads
+        } else {
+            cpu_threads
+        };
         if let JobKind::Request { requested_at } = job.kind {
             tracing::debug!(
                 page = job.page,
+                threads = max_threads,
                 waited = ?requested_at.elapsed(),
                 "request"
             );
         }
-        let max_threads = if job.kind.is_prefetch() {
-            PREFETCH_THREADS_PER_PAGE
-        } else {
-            workers
-        };
         produce_page(source, shared, job, max_threads);
     }
 }
@@ -1402,7 +1401,9 @@ fn run<Sink>(
 ) where
     Sink: EventSink + Send + Sync,
 {
-    let workers = worker_count();
+    let cpu_threads = available_parallelism();
+    let workers = cpu_threads.clamp(MIN_WORKERS, MAX_WORKERS);
+    let max_prefetch = max_prefetch_workers(workers);
     let shared = Shared::new(source.len(), store, sink);
     let mut playback = PlaybackRunner::new();
 
@@ -1411,7 +1412,7 @@ fn run<Sink>(
             let spawned = thread::Builder::new()
                 .name(format!("cy-worker-{index}"))
                 .spawn_scoped(scope, || {
-                    worker_loop(source, &shared, workers);
+                    worker_loop(source, &shared, max_prefetch, cpu_threads);
                 });
             if let Err(error) = spawned {
                 tracing::warn!(

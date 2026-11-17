@@ -1142,14 +1142,15 @@ impl App {
                 let Some(current) = self.book.current_mut() else {
                     return;
                 };
-                let next = browse::advance(
-                    current.reading.position.target(),
+                let motion = current.reading.motion;
+                if current.reading.position.turn(
                     direction,
                     mode,
                     current.book.len(),
-                );
-                current.reading.position.set_target(next);
-                self.after_page_change(direction);
+                    motion,
+                ) {
+                    self.after_page_change(direction);
+                }
             }
         }
     }
