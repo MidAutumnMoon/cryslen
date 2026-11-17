@@ -774,7 +774,12 @@ fn present_frame(
 
     let drawn = spread.as_ref().map(|draw| {
         if jump.is_none()
-            && apply_page_input(&mut view.fit, &page_surface, draw.size, viewport)
+            && apply_page_input(
+                &mut view.fit,
+                &page_surface,
+                draw.size,
+                viewport,
+            )
         {
             gl.window.winit().request_redraw();
         }
@@ -827,7 +832,9 @@ impl App {
             Arc::new(move || post(&proxy, WakeEvent::Wake))
         };
         let mut app = Self {
-            book: BookSlot::Initial(catalog::opening_name(open_path, land_on)),
+            book: BookSlot::Initial(catalog::opening_name(
+                open_path, land_on,
+            )),
             child: ChildProcess::Stopped,
             gl: None,
             fatal_error: None,
@@ -905,15 +912,16 @@ impl App {
                             .map_or_else(browse::first_spread, |entry| {
                                 book.landing(entry)
                             });
-                        self.book = BookSlot::Loaded(Box::new(adopt_book(
-                            &mut self.view.fit,
-                            self.gl.as_mut(),
-                            limits,
-                            self.view.mode,
-                            book,
-                            &process,
-                            index,
-                        )));
+                        self.book =
+                            BookSlot::Loaded(Box::new(adopt_book(
+                                &mut self.view.fit,
+                                self.gl.as_mut(),
+                                limits,
+                                self.view.mode,
+                                book,
+                                &process,
+                                index,
+                            )));
                         self.child = ChildProcess::Live(process);
                     }
                     Err(fault) => {
@@ -969,7 +977,12 @@ impl App {
         };
         match book {
             BookSlot::Initial(name) => {
-                tick_timers(&mut view.timers, proxy, now, child.is_opening());
+                tick_timers(
+                    &mut view.timers,
+                    proxy,
+                    now,
+                    child.is_opening(),
+                );
                 let status = StatusLine {
                     reading: None,
                     mode: view.mode,
@@ -983,7 +996,9 @@ impl App {
                 present_frame(gl, view, size, &status, None)
             }
             BookSlot::Loaded(current) => {
-                present_reading(current, child, gl, view, size, now, proxy)?;
+                present_reading(
+                    current, child, gl, view, size, now, proxy,
+                )?;
                 let total = frame_started.elapsed();
                 if total >= Duration::from_millis(50) {
                     tracing::info!(
@@ -1068,7 +1083,8 @@ impl App {
                         // The new pairing is a different coordinate system;
                         // commit the shown spread before switching.
                         let from = current.reading.position.target();
-                        if current.reading.position.commit_shown(previous) {
+                        if current.reading.position.commit_shown(previous)
+                        {
                             tracing::debug!(
                                 from,
                                 to = current.reading.position.target(),
@@ -1118,13 +1134,11 @@ impl App {
                 if self.child.is_opening() {
                     return;
                 }
-                let Some(path) =
-                    self.book.current().and_then(|current| {
-                        current
-                            .book
-                            .sibling(matches!(action, Action::NextBook))
-                    })
-                else {
+                let Some(path) = self.book.current().and_then(|current| {
+                    current
+                        .book
+                        .sibling(matches!(action, Action::NextBook))
+                }) else {
                     return;
                 };
                 tracing::debug!(path = %path.display(), "book switch");
@@ -1202,7 +1216,8 @@ impl App {
                 return;
             };
             let page_count = current.book.len().get();
-            let Some(digits) = current.reading.jump_digits.as_deref() else {
+            let Some(digits) = current.reading.jump_digits.as_deref()
+            else {
                 return;
             };
             if digits.is_empty() {
@@ -1238,9 +1253,12 @@ impl App {
         };
         let len = current.book.len();
         let target_start = browse::spread_for(index, mode, len).first;
-        let current_start =
-            browse::spread_for(current.reading.position.target(), mode, len)
-                .first;
+        let current_start = browse::spread_for(
+            current.reading.position.target(),
+            mode,
+            len,
+        )
+        .first;
         if target_start == current_start {
             return;
         }
@@ -1335,7 +1353,8 @@ fn present_reading(
                 let state = pages.get(&page);
                 PageSummary {
                     info: state.and_then(|entry| entry.info),
-                    faulted: state.is_some_and(|entry| entry.fault.is_some()),
+                    faulted: state
+                        .is_some_and(|entry| entry.fault.is_some()),
                     roles: textures.roles(page),
                 }
             },
@@ -1344,7 +1363,9 @@ fn present_reading(
         let changed = shown != previous_shown;
         if changed {
             let seats = shown.map(|spread| {
-                spread.seats(view.mode).map(|seat| role_name(textures, seat))
+                spread
+                    .seats(view.mode)
+                    .map(|seat| role_name(textures, seat))
             });
             let took = current
                 .reading
@@ -1387,20 +1408,27 @@ fn present_reading(
     let frame = {
         let pages = &current.reading.pages;
         let textures = gl.window.pages();
-        presentation::build_frame(&input, on_screen, on_screen_scale, |page| {
-            let state = pages.get(&page);
-            PageSummary {
-                info: state.and_then(|entry| entry.info),
-                faulted: state.is_some_and(|entry| entry.fault.is_some()),
-                roles: textures.roles(page),
-            }
-        })
+        presentation::build_frame(
+            &input,
+            on_screen,
+            on_screen_scale,
+            |page| {
+                let state = pages.get(&page);
+                PageSummary {
+                    info: state.and_then(|entry| entry.info),
+                    faulted: state
+                        .is_some_and(|entry| entry.fault.is_some()),
+                    roles: textures.roles(page),
+                }
+            },
+        )
     };
 
     if current.reading.motion == Motion::Still && shown != Some(target) {
         let since = *current.reading.hold_since.get_or_insert(now);
         let waited = now.saturating_duration_since(since);
-        if !current.reading.hold_logged && waited >= Duration::from_millis(250)
+        if !current.reading.hold_logged
+            && waited >= Duration::from_millis(250)
         {
             current.reading.hold_logged = true;
             tracing::info!(
@@ -1629,7 +1657,8 @@ impl ApplicationHandler<WakeEvent> for App {
                             && !self.modifiers.super_key()
                             && key.text.as_deref() == Some(":")
                         {
-                            if let Some(current) = self.book.current_mut() {
+                            if let Some(current) = self.book.current_mut()
+                            {
                                 current.reading.jump_digits =
                                     Some(String::new());
                                 self.request_redraw();
@@ -1843,7 +1872,8 @@ mod tests {
             &self,
             image: &ValidatedImage,
         ) -> Result<(), TextureFault> {
-            if image.width() > self.max_edge || image.height() > self.max_edge
+            if image.width() > self.max_edge
+                || image.height() > self.max_edge
             {
                 return Err(TextureFault {
                     dims: (image.width(), image.height()),
@@ -2456,7 +2486,12 @@ mod input_tests {
             Action::PrevBook,
         ]
         .into_iter()
-        .chain(ReadingMode::VARIANTS.iter().copied().map(Action::SelectMode))
+        .chain(
+            ReadingMode::VARIANTS
+                .iter()
+                .copied()
+                .map(Action::SelectMode),
+        )
         .chain(FitMode::VARIANTS.iter().copied().map(Action::SelectFit));
         for action in one_shot {
             assert!(!action.repeats(), "{action:?} is one-shot");
@@ -2633,9 +2668,7 @@ mod argv_tests {
             ),
             (
                 PathBuf::from("."),
-                Argument::Book(
-                    env::current_dir().expect("current dir"),
-                ),
+                Argument::Book(env::current_dir().expect("current dir")),
             ),
         ];
         for (path, expected) in rows {

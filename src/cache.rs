@@ -762,7 +762,8 @@ fn write_atomic(
 
 const MAGIC: [u8; 4] = *b"CYPV";
 const VERSION: u16 = 3;
-const PREFIX_BYTES: usize = MAGIC.len() + size_of::<u16>() + size_of::<u8>();
+const PREFIX_BYTES: usize =
+    MAGIC.len() + size_of::<u16>() + size_of::<u8>();
 const MAX_META_BYTES: usize = u8::MAX as usize;
 
 #[derive(Deserialize, Serialize)]
@@ -814,8 +815,8 @@ impl CacheMeta {
 
 fn encode_header(meta: &CacheMeta) -> io::Result<Vec<u8>> {
     let mut meta_buf = [0_u8; MAX_META_BYTES];
-    let encoded =
-        postcard::to_slice(meta, &mut meta_buf).map_err(io::Error::other)?;
+    let encoded = postcard::to_slice(meta, &mut meta_buf)
+        .map_err(io::Error::other)?;
     let Ok(meta_len) = u8::try_from(encoded.len()) else {
         return Err(io::Error::other(format!(
             "cache metadata exceeds {MAX_META_BYTES} bytes"
@@ -887,7 +888,8 @@ fn read_stored(mut file: File, target_edge: u32) -> Option<Decoded> {
     let mut prefix = [0_u8; PREFIX_BYTES];
     file.read_exact(&mut prefix).ok()?;
     let (magic, rest) = prefix.split_first_chunk::<{ MAGIC.len() }>()?;
-    let (version, rest) = rest.split_first_chunk::<{ size_of::<u16>() }>()?;
+    let (version, rest) =
+        rest.split_first_chunk::<{ size_of::<u16>() }>()?;
     let &[meta_len] = rest else {
         return None;
     };
@@ -929,10 +931,16 @@ fn read_stored(mut file: File, target_edge: u32) -> Option<Decoded> {
             }
             let luma =
                 read_plane(&mut file, layout.luma_samples, layout.is_u16)?;
-            let cb =
-                read_plane(&mut file, layout.chroma_samples, layout.is_u16)?;
-            let cr =
-                read_plane(&mut file, layout.chroma_samples, layout.is_u16)?;
+            let cb = read_plane(
+                &mut file,
+                layout.chroma_samples,
+                layout.is_u16,
+            )?;
+            let cr = read_plane(
+                &mut file,
+                layout.chroma_samples,
+                layout.is_u16,
+            )?;
             let alpha = if has_alpha {
                 Some(read_plane(
                     &mut file,
@@ -1382,7 +1390,9 @@ mod tests {
         assert!(store.load(hash, Role::Thumb, TEST_FIT_EDGE).is_none());
 
         let mut bad_version = good.clone();
-        if let Some(field) = bad_version.get_mut(VERSION_START..VERSION_END) {
+        if let Some(field) =
+            bad_version.get_mut(VERSION_START..VERSION_END)
+        {
             field.copy_from_slice(&(VERSION + 1).to_le_bytes());
         }
         fs::write(&path, &bad_version).expect("write version");
@@ -1394,7 +1404,9 @@ mod tests {
                 *byte = meta_len;
             }
             fs::write(&path, &bad_meta_len).expect("write meta length");
-            assert!(store.load(hash, Role::Thumb, TEST_FIT_EDGE).is_none());
+            assert!(
+                store.load(hash, Role::Thumb, TEST_FIT_EDGE).is_none()
+            );
         }
 
         // Different target edge on disk misses cleanly even with matching pixels.

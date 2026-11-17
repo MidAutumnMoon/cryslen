@@ -1412,7 +1412,12 @@ fn run<Sink>(
             let spawned = thread::Builder::new()
                 .name(format!("cy-worker-{index}"))
                 .spawn_scoped(scope, || {
-                    worker_loop(source, &shared, max_prefetch, cpu_threads);
+                    worker_loop(
+                        source,
+                        &shared,
+                        max_prefetch,
+                        cpu_threads,
+                    );
                 });
             if let Err(error) = spawned {
                 tracing::warn!(

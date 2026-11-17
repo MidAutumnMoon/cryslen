@@ -276,7 +276,8 @@ mod tests {
         );
         assert_eq!(wire.resident_bytes(), pixels.len());
         let mut truncated = wire.clone();
-        let validated = wire.validate().expect("valid rgba wire image validates");
+        let validated =
+            wire.validate().expect("valid rgba wire image validates");
         assert_eq!(validated.resident_bytes(), pixels.len());
 
         truncated.width = 4;

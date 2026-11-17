@@ -294,7 +294,10 @@ pub fn choose_presented(
             continue;
         }
         let spread = browse::spread_for(page, input.mode, input.len);
-        if spread.first < low || spread.first > high || !presentable(spread) {
+        if spread.first < low
+            || spread.first > high
+            || !presentable(spread)
+        {
             continue;
         }
         let distance = spread.first.abs_diff(input.target.first);
@@ -416,7 +419,8 @@ mod tests {
             .unwrap_or(input.target);
         assert_eq!(on_screen, Spread::lone(1));
         let scale = if on_screen.first == 1 { 1.0 } else { 0.1 };
-        let frame = build_frame(&input, on_screen, Some(scale), page_state);
+        let frame =
+            build_frame(&input, on_screen, Some(scale), page_state);
         assert!(
             frame.requests.contains(&Request::new(1, Role::Full)),
             "the on-screen page asks for its full image at the on-screen scale"
@@ -501,7 +505,11 @@ mod tests {
         );
         // A cold start presents only decoded spreads.
         assert_eq!(
-            choose_presented(&input(lone(5), None), known_pages, state(&[])),
+            choose_presented(
+                &input(lone(5), None),
+                known_pages,
+                state(&[])
+            ),
             None
         );
     }
@@ -531,7 +539,8 @@ mod tests {
             len,
             limits: test_limits(),
         };
-        let state = |info_pages: &'static [usize], fit_pages: &'static [usize]| {
+        let state = |info_pages: &'static [usize],
+                     fit_pages: &'static [usize]| {
             move |page: usize| {
                 let info = info_pages.contains(&page).then_some(entry);
                 let roles = if fit_pages.contains(&page) {
@@ -552,7 +561,11 @@ mod tests {
             Some(shown)
         );
         assert_eq!(
-            choose_presented(&input, [0, 1, 2], state(&[0, 1, 2], &[1, 2])),
+            choose_presented(
+                &input,
+                [0, 1, 2],
+                state(&[0, 1, 2], &[1, 2])
+            ),
             Some(pair)
         );
     }
@@ -588,11 +601,13 @@ mod tests {
             len,
             limits: test_limits(),
         };
-        let on_screen = choose_presented(&input, [], |_| PageSummary::default())
-            .unwrap_or(input.target);
+        let on_screen =
+            choose_presented(&input, [], |_| PageSummary::default())
+                .unwrap_or(input.target);
         assert_eq!(on_screen, Spread::lone(2));
-        let frame =
-            build_frame(&input, on_screen, Some(1.0), |_| PageSummary::default());
+        let frame = build_frame(&input, on_screen, Some(1.0), |_| {
+            PageSummary::default()
+        });
         assert_eq!(frame.demand, Spread::lone(3));
         assert_ne!(frame.demand, Spread::lone(20));
     }

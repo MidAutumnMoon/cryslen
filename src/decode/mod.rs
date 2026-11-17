@@ -214,7 +214,8 @@ pub fn yuv_layout(
     depth: u8,
     subsampling: Subsampling,
 ) -> Result<YuvLayout, MsgError> {
-    let luma_samples = admit_dims(dims.0, dims.1, "bad dimensions")? as usize;
+    let luma_samples =
+        admit_dims(dims.0, dims.1, "bad dimensions")? as usize;
     let is_u16 = match depth {
         1..=BYTE_DEPTH => false,
         9..=MAX_SAMPLE_DEPTH => true,
@@ -270,7 +271,14 @@ pub enum Pixels {
     Yuv(YuvImage),
 }
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Display,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Deserialize,
+    Serialize,
+    Display
 )]
 #[strum(serialize_all = "lowercase")]
 pub enum Format {
@@ -524,9 +532,11 @@ pub fn decode_with_threads(
         Format::Avif => avif::decode(bytes, max_threads),
         Format::Jxl => jxl::decode(bytes, max_threads),
         Format::Webp => webp::decode(bytes, max_threads),
-        Format::Jpeg | Format::Png | Format::Gif | Format::Bmp | Format::Tiff => {
-            image::decode(bytes, format)
-        }
+        Format::Jpeg
+        | Format::Png
+        | Format::Gif
+        | Format::Bmp
+        | Format::Tiff => image::decode(bytes, format),
     }
 }
 
@@ -886,7 +896,8 @@ mod tests {
         assert_eq!(page.resident_bytes(), 32 * 16 * 2);
         let empty = mono(Plane::U16(Box::new([])), None);
         assert_eq!(
-            Decoded::yuv(32, 16, Format::Avif, Transfer::Srgb, empty).err(),
+            Decoded::yuv(32, 16, Format::Avif, Transfer::Srgb, empty)
+                .err(),
             Some(MsgError::from_static("yuv plane extent"))
         );
         let short_alpha = mono(
@@ -1019,7 +1030,9 @@ mod tests {
                 assert_eq!(luma.first().copied(), Some(0x20));
                 assert_eq!(luma.get(32).copied(), Some(0xE0));
             }
-            Pixels::Rgba8(_) => panic!("opaque gray jxl must decode to mono"),
+            Pixels::Rgba8(_) => {
+                panic!("opaque gray jxl must decode to mono")
+            }
         }
 
         // alpha: the file's own alpha rides in the fourth byte
@@ -1205,10 +1218,7 @@ mod tests {
             let (cut, result) = rx
                 .recv_timeout(Duration::from_secs(5))
                 .expect("truncated jxl decode finishes");
-            assert!(
-                result.is_err(),
-                "cut {cut} did not fail"
-            );
+            assert!(result.is_err(), "cut {cut} did not fail");
         }
     }
 }

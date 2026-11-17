@@ -89,7 +89,7 @@ impl Serialize for PageNames {
     Deserialize,
     Serialize,
     Display,
-    VariantArray,
+    VariantArray
 )]
 pub enum ReadingMode {
     #[default]
@@ -167,7 +167,14 @@ pub fn seating<T>(
 }
 
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, VariantArray,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Deserialize,
+    Serialize,
+    VariantArray
 )]
 pub enum Direction {
     Forward,
@@ -194,7 +201,7 @@ pub enum Motion {
     Serialize,
     Display,
     Enum,
-    IntoStaticStr,
+    IntoStaticStr
 )]
 pub enum Role {
     #[strum(serialize = "thumb")]
@@ -319,7 +326,8 @@ impl ReadingPosition {
                 return false;
             };
             // Keep skims within one spread of what is on screen.
-            let shown_start = spread_for(shown.spread.first, mode, len).first;
+            let shown_start =
+                spread_for(shown.spread.first, mode, len).first;
             let target_start = spread_for(self.target, mode, len).first;
             if target_start != shown_start && next != shown_start {
                 return false;

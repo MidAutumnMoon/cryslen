@@ -301,7 +301,9 @@ fn page_jump_text(
 fn right_end(ui: &mut Ui, status: &StatusLine<'_>) {
     use egui::RichText;
 
-    for (mode_index, &mode) in ReadingMode::VARIANTS.iter().enumerate().rev() {
+    for (mode_index, &mode) in
+        ReadingMode::VARIANTS.iter().enumerate().rev()
+    {
         let text = RichText::new(group_label(mode)).monospace();
         let text = if mode == status.mode {
             text.color(mode_color(mode)).strong()

@@ -48,7 +48,9 @@ impl ArchiveSlots {
             match slots.get(index) {
                 Some(Some(page)) => return page.clone(),
                 Some(None) => self.ready.wait(&mut slots),
-                None => return Err(Arc::new(eros::error!("no such page"))),
+                None => {
+                    return Err(Arc::new(eros::error!("no such page")));
+                }
             }
         }
     }
@@ -64,9 +66,9 @@ impl ArchiveSlots {
     }
 
     fn finish(&self, verdict: Result<(), Arc<ErrorUnion>>) {
-        let fallback = verdict
-            .err()
-            .unwrap_or_else(|| Arc::new(eros::error!("missing archive entry")));
+        let fallback = verdict.err().unwrap_or_else(|| {
+            Arc::new(eros::error!("missing archive entry"))
+        });
         {
             let mut slots = self.slots.lock();
             for slot in &mut *slots {
@@ -365,10 +367,7 @@ fn spawn_sevenzip_materialize(
                 .flatten();
             match page_index {
                 Some(index) => {
-                    slots.fill(
-                        index,
-                        read_member(data).map_err(Arc::new),
-                    );
+                    slots.fill(index, read_member(data).map_err(Arc::new));
                 }
                 None => {
                     // A solid block yields its later members only
@@ -401,7 +400,10 @@ fn mem_available_bytes() -> Option<u64> {
 /// the system also live in `MemAvailable`.
 const MEM_RESERVE_BYTES: u64 = 1024 * 1024 * 1024;
 
-fn guard_memory(unpacked: u64, available: Option<u64>) -> eros::Result<()> {
+fn guard_memory(
+    unpacked: u64,
+    available: Option<u64>,
+) -> eros::Result<()> {
     match available {
         Some(available)
             if unpacked > available.saturating_sub(MEM_RESERVE_BYTES) =>

@@ -334,10 +334,8 @@ impl PageTextures {
                 },
             transfer,
             ..
-        }) = self
-            .pages
-            .get(&page)
-            .and_then(|slots| slots[role].as_ref())
+        }) =
+            self.pages.get(&page).and_then(|slots| slots[role].as_ref())
             && *present_dims == dims
             && *transfer == image.transfer()
             && let WirePixels::Rgba8(bytes) = image.pixels()

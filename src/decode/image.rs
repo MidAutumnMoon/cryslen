@@ -4,7 +4,10 @@ use super::Transfer;
 
 /// Decode with a concrete decoder so EXIF orientation is readable, then
 /// apply it.
-pub(super) fn decode(bytes: &[u8], format: Format) -> eros::Result<Decoded> {
+pub(super) fn decode(
+    bytes: &[u8],
+    format: Format,
+) -> eros::Result<Decoded> {
     use image::DynamicImage;
     use image::ImageDecoder as _;
     use image::ImageFormat;

@@ -21,7 +21,10 @@ use super::YuvImage;
 
 const MAX_THREADS: usize = 16;
 
-pub(super) fn decode(bytes: &[u8], max_threads: usize) -> eros::Result<Decoded> {
+pub(super) fn decode(
+    bytes: &[u8],
+    max_threads: usize,
+) -> eros::Result<Decoded> {
     use std::slice;
 
     let mut runner = Pool(max_threads.clamp(1, MAX_THREADS));
@@ -31,7 +34,8 @@ pub(super) fn decode(bytes: &[u8], max_threads: usize) -> eros::Result<Decoded> 
     let mut decoder = JxlDecoder::new(JxlDecoderOptions::default());
 
     loop {
-        let event = decoder.process(&mut input, None, Some(&mut runner))?;
+        let event =
+            decoder.process(&mut input, None, Some(&mut runner))?;
         if event == Event::BasicInfo {
             break;
         }

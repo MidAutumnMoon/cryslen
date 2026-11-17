@@ -47,7 +47,10 @@ const MAX_THREADS: usize = 8;
     clippy::similar_names,
     reason = "Cb and Cr are the YUV plane names the two locals hold"
 )]
-pub(super) fn decode(bytes: &[u8], max_threads: usize) -> eros::Result<Decoded> {
+pub(super) fn decode(
+    bytes: &[u8],
+    max_threads: usize,
+) -> eros::Result<Decoded> {
     let decoder = DecoderGuard::new(bytes, max_threads)?;
     let frame = decoder.image()?;
 
