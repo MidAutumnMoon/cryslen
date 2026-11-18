@@ -10,14 +10,6 @@ cryslen is an image viewer, authored by MidAutumnMoon and licensed under GPL-3.0
 - Make breaking changes. Trace, find, redesign, from top to bottom.
 - Challenge existing designs.
 
-## Fitting New Code
-
-- Recover the domain truth before choosing a shape: valid states, natural owner, boundaries, and relevant failure or resource constraints.
-- Give each fact one authoritative home. Prefer representations and APIs that enforce invariants over comments or caller discipline.
-- Read the surrounding code first. Extend an abstraction only when the new behavior shares its policy and ownership; otherwise reshape proportionally instead of adding special cases, parallel paths, or copied logic.
-- Keep dependencies and data flow explicit. Do not recover required context from ambient state or reconstruct information discarded earlier.
-- Design for real pressures, not hypothetical reuse. Preserve existing behavior unless a change is requested; consolidate experiments before landing.
-
 ## Repo conventions
 
 - Nix devShell: Run cargo commands in `nix develop` devShell. Otherwise build will break.
