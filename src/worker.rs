@@ -31,30 +31,28 @@ use rustix::process::Signal;
 use crate::browse;
 use crate::browse::Direction;
 use crate::browse::Motion;
-use crate::browse::PageCount;
 use crate::browse::ReadingMode;
 use crate::browse::Request;
 use crate::browse::Role;
 use crate::browse::Roles;
 use crate::browse::Spread;
 use crate::cache;
-use crate::cache::ImageLimits;
 use crate::cache::Store;
 use crate::decode;
 use crate::decode::Animation;
 use crate::decode::Decoded;
 use crate::decode::Frame;
 use crate::decode::Loops;
-use crate::fault;
-use crate::fault::PageFault;
 use crate::protocol::BookInfo;
 use crate::protocol::ChildMsg;
 use crate::protocol::Hello;
+use crate::protocol::ImageLimits;
 use crate::protocol::ParentMsg;
 use crate::protocol::PlaybackCommand;
 use crate::protocol::PlaybackEvent;
 use crate::protocol::PlaybackId;
 use crate::protocol::WireImage;
+use crate::source;
 use crate::source::Source;
 
 const IDLE_PRELOAD: Duration = Duration::from_millis(300);
@@ -82,72 +80,6 @@ fn max_prefetch_workers(workers: usize) -> usize {
     workers
         .saturating_sub(RESERVED_FOREGROUND_WORKERS)
         .clamp(MIN_PREFETCH_WORKERS, MAX_PREFETCH_WORKERS)
-}
-
-fn spread_contains(spread: Spread, page: usize) -> bool {
-    spread.first == page || spread.second == Some(page)
-}
-
-enum ChildEvent<'image> {
-    Ready {
-        page: usize,
-        role: Role,
-        image: &'image Decoded,
-    },
-    Failed {
-        page: usize,
-        error: &'image dyn fmt::Display,
-    },
-    Playback(PlaybackEvent<&'image Decoded>),
-}
-
-enum CommandPoll {
-    Message(ParentMsg),
-    Empty,
-    Disconnected,
-}
-
-trait CommandReceiver {
-    fn try_recv(&self) -> CommandPoll;
-    fn recv(&self) -> Option<ParentMsg>;
-}
-
-impl CommandReceiver for IpcReceiver<ParentMsg> {
-    fn try_recv(&self) -> CommandPoll {
-        match Self::try_recv(self) {
-            Ok(message) => CommandPoll::Message(message),
-            Err(IpcTryRecvError::Empty) => CommandPoll::Empty,
-            Err(IpcTryRecvError::IpcError(_)) => CommandPoll::Disconnected,
-        }
-    }
-
-    fn recv(&self) -> Option<ParentMsg> {
-        Self::recv(self).ok()
-    }
-}
-
-trait EventSink {
-    fn emit(&self, event: ChildEvent<'_>) -> bool;
-}
-
-impl EventSink for IpcSender<ChildMsg> {
-    fn emit(&self, event: ChildEvent<'_>) -> bool {
-        let message = match event {
-            ChildEvent::Ready { page, role, image } => ChildMsg::Ready {
-                page,
-                role,
-                image: WireImage::from_decoded(image),
-            },
-            ChildEvent::Failed { page, error } => ChildMsg::Failed {
-                page,
-                fault: PageFault::new(error.to_string()),
-            },
-            ChildEvent::Playback(event) => ChildMsg::Playback(
-                event.map_image(WireImage::from_decoded),
-            ),
-        };
-        self.send(message).is_ok()
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -209,7 +141,7 @@ impl Prefetch {
         origin: Spread,
         direction: Direction,
         mode: ReadingMode,
-        len: PageCount,
+        len: NonZeroUsize,
     ) -> Self {
         let (ahead, behind) = match direction {
             Direction::Forward => {
@@ -270,15 +202,11 @@ impl Prefetch {
     }
 
     fn in_head(&self, page: usize) -> bool {
-        self.head()
-            .iter()
-            .any(|spread| spread_contains(*spread, page))
+        self.head().iter().any(|spread| spread.contains(page))
     }
 
     fn contains(&self, page: usize) -> bool {
-        self.spreads()
-            .iter()
-            .any(|spread| spread_contains(*spread, page))
+        self.spreads().iter().any(|spread| spread.contains(page))
     }
 }
 
@@ -286,7 +214,7 @@ fn walk_spreads(
     start: usize,
     direction: Direction,
     mode: ReadingMode,
-    len: PageCount,
+    len: NonZeroUsize,
     limit: usize,
 ) -> Vec<Spread> {
     let mut spreads = Vec::new();
@@ -428,7 +356,7 @@ struct PageState {
 }
 
 struct BookState {
-    page_count: PageCount,
+    page_count: NonZeroUsize,
     prefetch: Option<Prefetch>,
     motion: Motion,
     /// Content hash of each page's bytes, computed once per session.
@@ -452,7 +380,7 @@ struct BookState {
 }
 
 impl BookState {
-    fn new(page_count: PageCount) -> Self {
+    fn new(page_count: NonZeroUsize) -> Self {
         Self {
             page_count,
             prefetch: None,
@@ -471,64 +399,13 @@ impl BookState {
         }
     }
 
-    fn apply(
-        &mut self,
-        message: ParentMsg,
-        playback: &mut PlaybackRunner,
-    ) -> bool {
-        // Ignore playback so animation frames keep the preload quiet
-        // window.
-        if !matches!(message, ParentMsg::Playback(_)) {
-            self.preload = PreloadGate::Idle;
-        }
-        match message {
-            // Handled on `Shared` before locking `state`.
-            ParentMsg::SetLimits(_) => false,
-            ParentMsg::SetView {
-                page,
-                mode,
-                direction,
-            } => {
-                let prefetch = Prefetch::build(
-                    browse::spread_for(page, mode, self.page_count),
-                    direction,
-                    mode,
-                    self.page_count,
-                );
-                tracing::debug!(
-                    origin = ?prefetch.spreads().first(),
-                    motion = ?self.motion,
-                    "prefetch set"
-                );
-                self.prefetch = Some(prefetch);
-                true
-            }
-            ParentMsg::SetMotion(motion) => {
-                tracing::debug!(?motion, "motion");
-                self.motion = motion;
-                true
-            }
-            ParentMsg::SetRequests(requests) => {
-                tracing::debug!(count = requests.len(), "requests");
-                self.requests_at = Instant::now();
-                self.served.retain(|request| requests.contains(request));
-                self.requests = requests;
-                true
-            }
-            ParentMsg::Playback(command) => {
-                playback.apply(command);
-                false
-            }
-        }
-    }
-
     fn role_failed(&self, page: usize, role: Role) -> bool {
         self.failed.contains(&page)
             || (role == Role::Full && self.failed_full.contains(&page))
     }
 
     fn wants_unserved(&self, page: usize, role: Role) -> bool {
-        let request = Request::new(page, role);
+        let request = Request { page, role };
         self.requests.contains(&request)
             && !self.served.contains(&request)
             && !self.role_failed(page, role)
@@ -548,7 +425,7 @@ impl BookState {
         if !self.wants_unserved(page, role) {
             return false;
         }
-        self.served.insert(Request::new(page, role));
+        self.served.insert(Request { page, role });
         true
     }
 
@@ -599,9 +476,8 @@ impl BookState {
 
     fn next_prefetch_job(&self) -> Option<(usize, Role, bool, Motion)> {
         let prefetch = self.prefetch.as_ref()?;
-        let head = prefetch.head();
-        for spread in prefetch.spreads() {
-            let in_head = head.contains(spread);
+        for (index, spread) in prefetch.spreads().iter().enumerate() {
+            let in_head = index < prefetch.head;
             for page in
                 [Some(spread.first), spread.second].into_iter().flatten()
             {
@@ -638,44 +514,43 @@ impl BookState {
     }
 }
 
-struct InFlightGuard<'shared, Sink> {
-    shared: &'shared Shared<Sink>,
+struct InFlightGuard<'shared> {
+    shared: &'shared Shared,
     page: usize,
 }
 
-impl<Sink> Drop for InFlightGuard<'_, Sink> {
+impl Drop for InFlightGuard<'_> {
     fn drop(&mut self) {
         self.shared.finish_page_job(self.page);
     }
 }
 
-struct Shared<Sink> {
+struct Shared {
     store: Store,
     limits: OnceLock<ImageLimits>,
     state: Mutex<BookState>,
     wake: Condvar,
-    sink: Mutex<Sink>,
+    to_parent: Mutex<IpcSender<ChildMsg>>,
 }
 
-impl<Sink> Shared<Sink> {
-    fn finish_page_job(&self, page: usize) {
-        self.state.lock().in_flight.remove(&page);
-        self.wake.notify_all();
-    }
-}
-
-impl<Sink> Shared<Sink>
-where
-    Sink: EventSink,
-{
-    fn new(page_count: PageCount, store: Store, sink: Sink) -> Self {
+impl Shared {
+    fn new(
+        page_count: NonZeroUsize,
+        store: Store,
+        to_parent: IpcSender<ChildMsg>,
+    ) -> Self {
         Self {
             store,
             limits: OnceLock::new(),
             state: Mutex::new(BookState::new(page_count)),
             wake: Condvar::new(),
-            sink: Mutex::new(sink),
+            to_parent: Mutex::new(to_parent),
         }
+    }
+
+    fn finish_page_job(&self, page: usize) {
+        self.state.lock().in_flight.remove(&page);
+        self.wake.notify_all();
     }
 
     fn stop(&self) {
@@ -692,43 +567,81 @@ where
         message: ParentMsg,
         playback: &mut PlaybackRunner,
     ) {
-        if let ParentMsg::SetLimits(limits) = message {
-            match self.limits.set(limits) {
-                Ok(()) => tracing::debug!(
-                    fit_edge = limits.fit_edge(),
-                    max_texture_edge = limits.max_texture_edge(),
-                    "limits set"
-                ),
-                Err(existing) => tracing::debug!(
-                    fit_edge = existing.fit_edge(),
-                    max_texture_edge = existing.max_texture_edge(),
-                    "ignoring duplicate limits"
-                ),
+        match message {
+            ParentMsg::SetLimits(limits) => {
+                match self.limits.set(limits) {
+                    Ok(()) => tracing::debug!(
+                        fit_edge = limits.fit_edge(),
+                        max_texture_edge = limits.max_texture_edge(),
+                        "limits set"
+                    ),
+                    Err(existing) => tracing::debug!(
+                        fit_edge = existing.fit_edge(),
+                        max_texture_edge = existing.max_texture_edge(),
+                        "ignoring duplicate limits"
+                    ),
+                }
+                // Acquire and release `state` before notifying so idle workers
+                // cannot observe `None` and park after `notify_all`.
+                drop(self.state.lock());
+                self.wake.notify_all();
             }
-            // Acquire and release `state` before notifying so idle workers
-            // cannot observe `None` and park after `notify_all`.
-            drop(self.state.lock());
-            self.wake.notify_all();
-            return;
-        }
-        let wake_workers = self.state.lock().apply(message, playback);
-        if wake_workers {
-            self.wake.notify_all();
+            // Ignore playback so animation frames keep the preload quiet
+            // window and avoid locking `state`.
+            ParentMsg::Playback(command) => playback.apply(command),
+            ParentMsg::SetView {
+                page,
+                mode,
+                direction,
+            } => {
+                let mut state = self.state.lock();
+                state.preload = PreloadGate::Idle;
+                let prefetch = Prefetch::build(
+                    browse::spread_for(page, mode, state.page_count),
+                    direction,
+                    mode,
+                    state.page_count,
+                );
+                tracing::debug!(
+                    origin = ?prefetch.spreads().first(),
+                    motion = ?state.motion,
+                    "prefetch set"
+                );
+                state.prefetch = Some(prefetch);
+                drop(state);
+                self.wake.notify_all();
+            }
+            ParentMsg::SetMotion(motion) => {
+                let mut state = self.state.lock();
+                state.preload = PreloadGate::Idle;
+                tracing::debug!(?motion, "motion");
+                state.motion = motion;
+                drop(state);
+                self.wake.notify_all();
+            }
+            ParentMsg::SetRequests(requests) => {
+                let mut state = self.state.lock();
+                state.preload = PreloadGate::Idle;
+                tracing::debug!(count = requests.len(), "requests");
+                state.requests_at = Instant::now();
+                state.served.retain(|request| requests.contains(request));
+                state.requests = requests;
+                drop(state);
+                self.wake.notify_all();
+            }
         }
     }
 
     fn apply_messages(
         &self,
-        rx: &impl CommandReceiver,
+        commands: &IpcReceiver<ParentMsg>,
         playback: &mut PlaybackRunner,
     ) -> bool {
         loop {
-            match rx.try_recv() {
-                CommandPoll::Message(message) => {
-                    self.apply_message(message, playback);
-                }
-                CommandPoll::Empty => return true,
-                CommandPoll::Disconnected => return false,
+            match commands.try_recv() {
+                Ok(message) => self.apply_message(message, playback),
+                Err(IpcTryRecvError::Empty) => return true,
+                Err(IpcTryRecvError::IpcError(_)) => return false,
             }
         }
     }
@@ -849,14 +762,17 @@ where
         let Some(limits) = self.limits() else {
             return;
         };
-        let saved = self.store.save(hash, role, image, limits.fit_edge());
-        if !saved.persisted {
+        let evicted =
+            self.store.save(hash, role, image, limits.fit_edge());
+        if evicted.is_none() {
             tracing::debug!(page, ?role, "preview not persisted");
         }
         let mut state = self.state.lock();
-        for (evicted_role, evicted_hash) in saved.evicted {
-            if let Some(roles) = state.stored.get_mut(&evicted_hash) {
-                roles.clear(evicted_role);
+        if let Some(evicted) = evicted {
+            for evicted_hash in evicted {
+                if let Some(roles) = state.stored.get_mut(&evicted_hash) {
+                    roles.clear(role);
+                }
             }
         }
         state.mark_stored(hash, role);
@@ -896,8 +812,8 @@ where
         }
     }
 
-    fn emit(&self, event: ChildEvent<'_>) {
-        let sent = self.sink.lock().emit(event);
+    fn emit(&self, message: ChildMsg) {
+        let sent = self.to_parent.lock().send(message).is_ok();
         if !sent {
             self.state.lock().stopped = true;
             self.wake.notify_all();
@@ -920,13 +836,20 @@ where
             height = image.height(),
             "publish"
         );
-        self.emit(ChildEvent::Ready { page, role, image });
+        self.emit(ChildMsg::Ready {
+            page,
+            role,
+            image: WireImage::from_decoded(image),
+        });
         true
     }
 
     fn record_failure(&self, page: usize, error: &dyn fmt::Display) {
         if self.state.lock().failed.insert(page) {
-            self.emit(ChildEvent::Failed { page, error });
+            self.emit(ChildMsg::Failed {
+                page,
+                fault: error.to_string(),
+            });
         }
     }
 
@@ -977,17 +900,15 @@ enum FitOrigin {
     Decode,
 }
 
-fn finish_fit<Sink>(
-    shared: &Shared<Sink>,
+fn finish_fit(
+    shared: &Shared,
     job: PageJob,
     hash: u128,
     fit: &Arc<Decoded>,
     origin: FitOrigin,
     thumb_done: bool,
     started: Instant,
-) where
-    Sink: EventSink,
-{
+) {
     let page = job.page;
     let state = shared.page_state(page, hash);
     if state.wanted.contains(Role::Fit) || state.in_head_still {
@@ -1026,14 +947,12 @@ fn finish_fit<Sink>(
     }
 }
 
-fn produce_page<Sink>(
+fn produce_page(
     source: &Source,
-    shared: &Shared<Sink>,
+    shared: &Shared,
     job: PageJob,
     max_threads: usize,
-) where
-    Sink: EventSink,
-{
+) {
     let started = Instant::now();
     let page = job.page;
     let Some((hash, mut source_bytes)) = shared.resolve_hash(source, page)
@@ -1179,14 +1098,12 @@ impl PlaybackRunner {
         self.steps.pop_front()
     }
 
-    fn serve<Sink>(
+    fn serve(
         &mut self,
         source: &Source,
         step: PlaybackStep,
-        shared: &Shared<Sink>,
-    ) where
-        Sink: EventSink,
-    {
+        shared: &Shared,
+    ) {
         match step {
             PlaybackStep::Start { id, role } => {
                 self.start_playback(source, id, role, shared);
@@ -1195,15 +1112,13 @@ impl PlaybackRunner {
         }
     }
 
-    fn start_playback<Sink>(
+    fn start_playback(
         &mut self,
         source: &Source,
         id: PlaybackId,
         role: Role,
-        shared: &Shared<Sink>,
-    ) where
-        Sink: EventSink,
-    {
+        shared: &Shared,
+    ) {
         let page = id.page;
         let bytes = match source.bytes(page) {
             Ok(bytes) => bytes,
@@ -1250,7 +1165,7 @@ impl PlaybackRunner {
                 self.fail_playback(id, shared);
             }
             Err(payload) => {
-                let message = fault::panic_message(payload.as_ref());
+                let message = source::panic_message(payload.as_ref());
                 tracing::warn!(
                     ?id,
                     ?role,
@@ -1261,13 +1176,7 @@ impl PlaybackRunner {
         }
     }
 
-    fn next_playback<Sink>(
-        &mut self,
-        id: PlaybackId,
-        shared: &Shared<Sink>,
-    ) where
-        Sink: EventSink,
-    {
+    fn next_playback(&mut self, id: PlaybackId, shared: &Shared) {
         let page = id.page;
         let Some(session) = self.playing_pages.get_mut(&page) else {
             tracing::debug!(?id, "playback frame without a session");
@@ -1309,18 +1218,18 @@ impl PlaybackRunner {
                     height = image.height(),
                     "playback frame"
                 );
-                shared.emit(ChildEvent::Playback(PlaybackEvent::Frame {
+                shared.emit(ChildMsg::Playback(PlaybackEvent::Frame {
                     id,
                     delay: frame.delay,
-                    image: &image,
+                    image: WireImage::from_decoded(&image),
                 }));
             }
             Ok(Ok(None)) => {
                 tracing::debug!(?id, ?role, "playback finished");
                 self.playing_pages.remove(&page);
-                shared.emit(ChildEvent::Playback(
-                    PlaybackEvent::Finished { id },
-                ));
+                shared.emit(ChildMsg::Playback(PlaybackEvent::Finished {
+                    id,
+                }));
             }
             Ok(Err(error)) => {
                 tracing::warn!(
@@ -1332,7 +1241,7 @@ impl PlaybackRunner {
                 self.fail_playback(id, shared);
             }
             Err(payload) => {
-                let message = fault::panic_message(payload.as_ref());
+                let message = source::panic_message(payload.as_ref());
                 tracing::warn!(
                     ?id,
                     ?role,
@@ -1343,13 +1252,7 @@ impl PlaybackRunner {
         }
     }
 
-    fn fail_playback<Sink>(
-        &mut self,
-        id: PlaybackId,
-        shared: &Shared<Sink>,
-    ) where
-        Sink: EventSink,
-    {
+    fn fail_playback(&mut self, id: PlaybackId, shared: &Shared) {
         if self
             .playing_pages
             .get(&id.page)
@@ -1358,18 +1261,16 @@ impl PlaybackRunner {
             self.playing_pages.remove(&id.page);
         }
         self.steps.retain(|step| step.id() != id);
-        shared.emit(ChildEvent::Playback(PlaybackEvent::Failed { id }));
+        shared.emit(ChildMsg::Playback(PlaybackEvent::Failed { id }));
     }
 }
 
-fn worker_loop<Sink>(
+fn worker_loop(
     source: &Source,
-    shared: &Shared<Sink>,
+    shared: &Shared,
     max_prefetch: usize,
     cpu_threads: usize,
-) where
-    Sink: EventSink,
-{
+) {
     let prefetch_threads = cpu_threads.div_ceil(max_prefetch);
     while let Some(job) = shared.next_job(max_prefetch) {
         let _guard = InFlightGuard {
@@ -1393,18 +1294,16 @@ fn worker_loop<Sink>(
     }
 }
 
-fn run<Sink>(
+fn run(
     source: &Source,
-    rx: &impl CommandReceiver,
+    commands: &IpcReceiver<ParentMsg>,
     store: Store,
-    sink: Sink,
-) where
-    Sink: EventSink + Send + Sync,
-{
+    to_parent: IpcSender<ChildMsg>,
+) {
     let cpu_threads = available_parallelism();
     let workers = cpu_threads.clamp(MIN_WORKERS, MAX_WORKERS);
     let max_prefetch = max_prefetch_workers(workers);
-    let shared = Shared::new(source.len(), store, sink);
+    let shared = Shared::new(source.len(), store, to_parent);
     let mut playback = PlaybackRunner::new();
 
     thread::scope(|scope| {
@@ -1429,7 +1328,7 @@ fn run<Sink>(
         }
 
         loop {
-            if !shared.apply_messages(rx, &mut playback)
+            if !shared.apply_messages(commands, &mut playback)
                 || shared.is_stopped()
             {
                 break;
@@ -1438,7 +1337,7 @@ fn run<Sink>(
                 playback.serve(source, step, &shared);
                 continue;
             }
-            let Some(message) = rx.recv() else {
+            let Ok(message) = commands.recv() else {
                 break;
             };
             shared.apply_message(message, &mut playback);
@@ -1464,7 +1363,7 @@ fn decode_page(
         Ok(result) => result,
         Err(payload) => eros::bail!(
             "decoder panicked: {}",
-            fault::panic_message(payload.as_ref())
+            source::panic_message(payload.as_ref())
         ),
     }
 }
@@ -1567,14 +1466,14 @@ fn parse(args: &[OsString]) -> Option<(&OsStr, &Path)> {
 )]
 mod tests {
     use std::fs;
-    use std::sync::mpsc;
 
     use image::codecs::gif::Repeat;
     use tempfile::TempDir;
 
     use super::*;
     use crate::cache::Store;
-    use crate::decode::Pixels;
+    use crate::protocol::THUMB_EDGE;
+    use crate::protocol::WirePixels;
     use crate::testkit;
 
     /// Page edge for the tests that check derived and full dimensions:
@@ -1588,70 +1487,10 @@ mod tests {
         ImageLimits::new(TEST_FIT_EDGE, MAX_TEXTURE_EDGE)
     }
 
-    enum Update {
-        Ready {
-            page: usize,
-            role: Role,
-            image: Box<Decoded>,
-        },
-        Failed {
-            page: usize,
-        },
-        Playback(PlaybackEvent<Box<Decoded>>),
-    }
-
-    impl CommandReceiver for mpsc::Receiver<ParentMsg> {
-        fn try_recv(&self) -> CommandPoll {
-            match Self::try_recv(self) {
-                Ok(message) => CommandPoll::Message(message),
-                Err(mpsc::TryRecvError::Empty) => CommandPoll::Empty,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    CommandPoll::Disconnected
-                }
-            }
-        }
-
-        fn recv(&self) -> Option<ParentMsg> {
-            Self::recv(self).ok()
-        }
-    }
-
-    struct TestSink(Option<mpsc::Sender<Update>>);
-
-    impl TestSink {
-        const fn discard() -> Self {
-            Self(None)
-        }
-    }
-
-    impl EventSink for TestSink {
-        fn emit(&self, event: ChildEvent<'_>) -> bool {
-            let Some(tx) = &self.0 else {
-                return true;
-            };
-            let update = match event {
-                ChildEvent::Ready { page, role, image } => Update::Ready {
-                    page,
-                    role,
-                    image: Box::new(image.clone()),
-                },
-                ChildEvent::Failed { page, .. } => Update::Failed { page },
-                ChildEvent::Playback(playback) => Update::Playback(
-                    playback.map_image(|image| Box::new(image.clone())),
-                ),
-            };
-            // A dropped receiver means the test already ended; keep the
-            // worker alive until commands close.
-            let Ok(()) = tx.send(update) else {
-                return true;
-            };
-            true
-        }
-    }
-
     struct TestWorker {
-        tx: Option<mpsc::Sender<ParentMsg>>,
-        handle: Option<thread::JoinHandle<()>>,
+        to_worker: Option<IpcSender<ParentMsg>>,
+        worker: Option<thread::JoinHandle<()>>,
+        drain: Option<thread::JoinHandle<()>>,
     }
 
     impl TestWorker {
@@ -1659,32 +1498,51 @@ mod tests {
             source: Arc<Source>,
             initial_view: Option<usize>,
             store_root: &Path,
-            sink: TestSink,
+            to_parent: Option<IpcSender<ChildMsg>>,
         ) -> Self {
-            let (tx, rx) = mpsc::channel();
+            let (to_worker, commands) =
+                ipc::channel::<ParentMsg>().expect("parent test channel");
+            let (to_parent, drain) = to_parent.map_or_else(
+                || {
+                    let (event_sender, event_receiver) =
+                        ipc::channel::<ChildMsg>()
+                            .expect("child test channel");
+                    let drain = thread::Builder::new()
+                        .name("test-worker-drain".into())
+                        .spawn(
+                            move || {
+                                while event_receiver.recv().is_ok() {}
+                            },
+                        )
+                        .expect("drain thread spawns");
+                    (event_sender, Some(drain))
+                },
+                |sender| (sender, None),
+            );
             let store = Store::at(store_root);
-            let handle = thread::Builder::new()
+            let worker = thread::Builder::new()
                 .name("test-worker".into())
                 .spawn(move || {
-                    run(&source, &rx, store, sink);
+                    run(&source, &commands, store, to_parent);
                 })
                 .expect("test worker thread spawns");
-            let worker = Self {
-                tx: Some(tx),
-                handle: Some(handle),
+            let handle = Self {
+                to_worker: Some(to_worker),
+                worker: Some(worker),
+                drain,
             };
-            worker.send(ParentMsg::SetLimits(test_limits()));
+            handle.send(ParentMsg::SetLimits(test_limits()));
             if let Some(page) = initial_view {
-                worker.set_view(page);
+                handle.set_view(page);
             }
-            worker
+            handle
         }
 
         fn send(&self, message: ParentMsg) {
-            let Some(tx) = &self.tx else {
+            let Some(to_worker) = &self.to_worker else {
                 return;
             };
-            let Ok(()) = tx.send(message) else {
+            let Ok(()) = to_worker.send(message) else {
                 return;
             };
         }
@@ -1708,11 +1566,16 @@ mod tests {
 
     impl Drop for TestWorker {
         fn drop(&mut self) {
-            drop(self.tx.take());
-            if let Some(handle) = self.handle.take()
-                && handle.join().is_err()
+            drop(self.to_worker.take());
+            if let Some(worker) = self.worker.take()
+                && worker.join().is_err()
             {
                 tracing::warn!("test worker panicked");
+            }
+            if let Some(drain) = self.drain.take()
+                && drain.join().is_err()
+            {
+                tracing::warn!("test drain thread panicked");
             }
         }
     }
@@ -1760,12 +1623,12 @@ mod tests {
         }
     }
 
-    fn long_edge(image: &Decoded) -> u32 {
-        image.width().max(image.height())
+    fn long_edge(image: &WireImage) -> u32 {
+        image.meta.width.max(image.meta.height)
     }
 
-    fn first_pixel(image: &Decoded) -> [u8; 4] {
-        let Pixels::Rgba8(bytes) = image.pixels() else {
+    fn first_pixel(image: &WireImage) -> [u8; 4] {
+        let WirePixels::Rgba8(bytes) = &image.pixels else {
             panic!("a gif frame decodes to rgba");
         };
         let mut pixel = [0; 4];
@@ -1805,22 +1668,23 @@ mod tests {
     /// The events the worker delivered, kept so several assertions can
     /// read the same stream.
     struct Updates {
-        rx: mpsc::Receiver<Update>,
-        seen: Mutex<Vec<Update>>,
+        messages: IpcReceiver<ChildMsg>,
+        seen: Mutex<Vec<ChildMsg>>,
     }
 
     impl Updates {
-        fn new() -> (Self, TestSink) {
-            let (tx, rx) = mpsc::channel();
+        fn new() -> (Self, IpcSender<ChildMsg>) {
+            let (sender, messages) =
+                ipc::channel().expect("child test channel");
             let events = Self {
-                rx,
+                messages,
                 seen: Mutex::new(Vec::new()),
             };
-            (events, TestSink(Some(tx)))
+            (events, sender)
         }
 
         fn drain(&self) {
-            while let Ok(event) = self.rx.try_recv() {
+            while let Ok(event) = self.messages.try_recv() {
                 self.seen.lock().push(event);
             }
         }
@@ -1829,19 +1693,19 @@ mod tests {
             &self,
             what: &str,
             want: impl Fn(usize, Role) -> bool,
-        ) -> Decoded {
+        ) -> WireImage {
             testkit::eventually(20, what, || {
                 self.drain();
                 let seen = self.seen.lock();
                 seen.iter().find_map(|event| match event {
-                    Update::Ready { page, role, image }
+                    ChildMsg::Ready { page, role, image }
                         if want(*page, *role) =>
                     {
-                        Some((**image).clone())
+                        Some(image.clone())
                     }
-                    Update::Ready { .. }
-                    | Update::Failed { .. }
-                    | Update::Playback(_) => None,
+                    ChildMsg::Ready { .. }
+                    | ChildMsg::Failed { .. }
+                    | ChildMsg::Playback(_) => None,
                 })
             })
         }
@@ -1851,12 +1715,14 @@ mod tests {
                 self.drain();
                 let seen = self.seen.lock();
                 seen.iter().find_map(|event| match event {
-                    Update::Failed { page: failed } if *failed == page => {
+                    ChildMsg::Failed { page: failed, .. }
+                        if *failed == page =>
+                    {
                         Some(())
                     }
-                    Update::Ready { .. }
-                    | Update::Failed { .. }
-                    | Update::Playback(_) => None,
+                    ChildMsg::Ready { .. }
+                    | ChildMsg::Failed { .. }
+                    | ChildMsg::Playback(_) => None,
                 })
             });
         }
@@ -1870,7 +1736,7 @@ mod tests {
             let seen = self.seen.lock();
             seen.iter()
                 .filter(|event| {
-                    matches!(event, Update::Ready { page: delivered, role, .. }
+                    matches!(event, ChildMsg::Ready { page: delivered, role, .. }
                         if *delivered == page && want(*role))
                 })
                 .count()
@@ -1881,7 +1747,7 @@ mod tests {
             let seen = self.seen.lock();
             seen.iter()
                 .filter(|event| {
-                    matches!(event, Update::Failed { page: failed } if *failed == page)
+                    matches!(event, ChildMsg::Failed { page: failed, .. } if *failed == page)
                 })
                 .count()
         }
@@ -1892,22 +1758,22 @@ mod tests {
             &self,
             page: usize,
             offset: usize,
-        ) -> (Duration, Decoded) {
+        ) -> (Duration, WireImage) {
             testkit::eventually(20, "no animation frame", || {
                 self.drain();
                 let seen = self.seen.lock();
                 seen.iter()
                     .filter_map(|event| match event {
-                        Update::Playback(PlaybackEvent::Frame {
+                        ChildMsg::Playback(PlaybackEvent::Frame {
                             id,
                             delay,
                             image,
                         }) if id.page == page => {
-                            Some((*delay, (**image).clone()))
+                            Some((*delay, image.clone()))
                         }
-                        Update::Ready { .. }
-                        | Update::Failed { .. }
-                        | Update::Playback(_) => None,
+                        ChildMsg::Ready { .. }
+                        | ChildMsg::Failed { .. }
+                        | ChildMsg::Playback(_) => None,
                     })
                     .nth(offset)
             })
@@ -1921,7 +1787,7 @@ mod tests {
                     .any(|event| {
                         matches!(
                             event,
-                            Update::Playback(PlaybackEvent::Finished {
+                            ChildMsg::Playback(PlaybackEvent::Finished {
                                 id,
                             }) if id.page == page
                         )
@@ -1941,12 +1807,12 @@ mod tests {
             Source::open(Path::new(SEVENZ_FIXTURE)).expect("7z opens"),
         );
         let root = TempDir::new().expect("create temp dir");
-        let (events, sink) = Updates::new();
+        let (events, to_parent) = Updates::new();
         let worker = TestWorker::spawn_at(
             Arc::clone(&source),
             Some(0),
             root.path(),
-            sink,
+            Some(to_parent),
         );
 
         worker.set_requests(vec![request_thumb(0)]);
@@ -1954,19 +1820,19 @@ mod tests {
             .ready("the archive page never served", |page, role| {
                 page == 0 && is_thumb(role)
             });
-        assert_eq!((thumb.width(), thumb.height()), (40, 30));
+        assert_eq!((thumb.meta.width, thumb.meta.height), (40, 30));
     }
 
     #[test]
     fn a_target_is_served_and_persisted() {
         let (_dir, source) = page_dir(1, BIG);
         let root = TempDir::new().expect("create temp dir");
-        let (events, sink) = Updates::new();
+        let (events, to_parent) = Updates::new();
         let worker = TestWorker::spawn_at(
             Arc::clone(&source),
             Some(0),
             root.path(),
-            sink,
+            Some(to_parent),
         );
 
         worker.set_requests(vec![request_fit(0), request_thumb(0)]);
@@ -1978,7 +1844,7 @@ mod tests {
             "the target never delivered a fit image",
             |page, role| page == 0 && is_fit(role),
         );
-        assert_eq!(long_edge(&thumb), cache::THUMB_EDGE);
+        assert_eq!(long_edge(&thumb), THUMB_EDGE);
         assert_eq!(
             long_edge(&view),
             TEST_FIT_EDGE.min(BIG),
@@ -2009,7 +1875,7 @@ mod tests {
             Arc::clone(&source),
             Some(0),
             root.path(),
-            TestSink::discard(),
+            None,
         );
         let store = Store::at(root.path());
         // Wait until all head spreads are fully produced.
@@ -2065,12 +1931,12 @@ mod tests {
         let source =
             Arc::new(Source::open(dir.path()).expect("temp source opens"));
         let root = TempDir::new().expect("create temp dir");
-        let (events, sink) = Updates::new();
+        let (events, to_parent) = Updates::new();
         let _worker = TestWorker::spawn_at(
             Arc::clone(&source),
             Some(0),
             root.path(),
-            sink,
+            Some(to_parent),
         );
 
         events.failure(0);
@@ -2102,12 +1968,12 @@ mod tests {
     fn the_prefetch_warms_the_store_without_delivering() {
         let (_dir, source) = page_dir(1, BIG);
         let root = TempDir::new().expect("create temp dir");
-        let (events, sink) = Updates::new();
+        let (events, to_parent) = Updates::new();
         let _worker = TestWorker::spawn_at(
             Arc::clone(&source),
             Some(0),
             root.path(),
-            sink,
+            Some(to_parent),
         );
 
         let store = Store::at(root.path());
@@ -2133,12 +1999,12 @@ mod tests {
     fn a_fit_leaving_the_request_set_is_served_again() {
         let (_dir, source) = page_dir(1, BIG);
         let root = TempDir::new().expect("create temp dir");
-        let (events, sink) = Updates::new();
+        let (events, to_parent) = Updates::new();
         let worker = TestWorker::spawn_at(
             Arc::clone(&source),
             Some(0),
             root.path(),
-            sink,
+            Some(to_parent),
         );
 
         worker.set_requests(vec![request_fit(0)]);
@@ -2169,12 +2035,12 @@ mod tests {
     fn a_full_target_carries_the_page_pixels() {
         let (_dir, source) = page_dir(1, BIG);
         let root = TempDir::new().expect("create temp dir");
-        let (events, sink) = Updates::new();
+        let (events, to_parent) = Updates::new();
         let worker = TestWorker::spawn_at(
             Arc::clone(&source),
             Some(0),
             root.path(),
-            sink,
+            Some(to_parent),
         );
 
         worker.set_requests(vec![request_full(0)]);
@@ -2183,7 +2049,7 @@ mod tests {
                 page == 0 && role == Role::Full
             });
         assert_eq!(
-            (image.width(), image.height()),
+            (image.meta.width, image.meta.height),
             (BIG, BIG),
             "full must carry the page's own pixels"
         );
@@ -2208,12 +2074,12 @@ mod tests {
         let source =
             Arc::new(Source::open(dir.path()).expect("temp source opens"));
         let root = TempDir::new().expect("create temp dir");
-        let (events, sink) = Updates::new();
+        let (events, to_parent) = Updates::new();
         let worker = TestWorker::spawn_at(
             Arc::clone(&source),
             Some(0),
             root.path(),
-            sink,
+            Some(to_parent),
         );
 
         start_playback(&worker, 0, Role::Fit, 9);
@@ -2221,7 +2087,7 @@ mod tests {
             next_frame(&worker, 0, 9);
             let (delay, image) = events.frame(0, offset);
             assert_eq!(delay, Duration::from_millis(50));
-            assert_eq!((image.width(), image.height()), (8, 8));
+            assert_eq!((image.meta.width, image.meta.height), (8, 8));
             assert_eq!(first_pixel(&image), color);
         }
         // The fourth frame crosses the pass boundary and repeats the
@@ -2250,12 +2116,12 @@ mod tests {
         let source =
             Arc::new(Source::open(dir.path()).expect("temp source opens"));
         let root = TempDir::new().expect("create temp dir");
-        let (events, sink) = Updates::new();
+        let (events, to_parent) = Updates::new();
         let worker = TestWorker::spawn_at(
             Arc::clone(&source),
             Some(0),
             root.path(),
-            sink,
+            Some(to_parent),
         );
 
         start_playback(&worker, 0, Role::Fit, 3);
@@ -2275,12 +2141,12 @@ mod tests {
         let store_root = root.path();
 
         // The first session derives and persists both roles.
-        let (first, sink) = Updates::new();
+        let (first, first_to_parent) = Updates::new();
         let worker = TestWorker::spawn_at(
             Arc::clone(&source),
             Some(0),
             store_root,
-            sink,
+            Some(first_to_parent),
         );
         worker.set_requests(vec![request_thumb(0), request_fit(0)]);
         let thumb = first.ready(
@@ -2291,7 +2157,7 @@ mod tests {
             "the first session never delivered a fit image",
             |page, role| page == 0 && is_fit(role),
         );
-        assert_eq!(long_edge(&thumb), cache::THUMB_EDGE);
+        assert_eq!(long_edge(&thumb), THUMB_EDGE);
         assert_eq!(
             long_edge(&view),
             TEST_FIT_EDGE.min(BIG),
@@ -2321,22 +2187,22 @@ mod tests {
         assert!(
             store
                 .save(hash, Role::Thumb, &sentinel, TEST_FIT_EDGE)
-                .persisted
+                .is_some()
         );
         assert!(
             store
                 .save(hash, Role::Fit, &sentinel, TEST_FIT_EDGE)
-                .persisted
+                .is_some()
         );
         drop(store);
 
         // A second worker on the same root loads the cached roles.
-        let (second, sink_second) = Updates::new();
+        let (second, second_to_parent) = Updates::new();
         let warm = TestWorker::spawn_at(
             Arc::clone(&source),
             Some(0),
             store_root,
-            sink_second,
+            Some(second_to_parent),
         );
         warm.set_requests(vec![request_thumb(0), request_fit(0)]);
         let warm_thumb = second.ready(
@@ -2348,12 +2214,12 @@ mod tests {
             |page, role| page == 0 && is_fit(role),
         );
         assert_eq!(
-            (warm_thumb.width(), warm_thumb.height()),
+            (warm_thumb.meta.width, warm_thumb.meta.height),
             (7, 7),
             "the thumb missed the warm store"
         );
         assert_eq!(
-            (warm_view.width(), warm_view.height()),
+            (warm_view.meta.width, warm_view.meta.height),
             (7, 7),
             "the fit image missed the warm store"
         );
@@ -2373,12 +2239,12 @@ mod tests {
         let root = TempDir::new().expect("create temp dir");
         let requested_hash = page_hash(&source, 0);
         let prefetched_hash = page_hash(&source, 1);
-        let (events, sink) = Updates::new();
+        let (events, to_parent) = Updates::new();
         let worker = TestWorker::spawn_at(
             Arc::clone(&source),
             Some(0),
             root.path(),
-            sink,
+            Some(to_parent),
         );
 
         worker.set_requests(vec![request_fit(0)]);
@@ -2447,24 +2313,24 @@ mod tests {
         assert!(
             store
                 .save(hash, Role::Fit, &landscape_fit, TEST_FIT_EDGE)
-                .persisted
+                .is_some()
         );
         drop(store);
 
-        let (events, sink) = Updates::new();
+        let (events, to_parent) = Updates::new();
         let worker = TestWorker::spawn_at(
             Arc::clone(&source),
             None,
             root.path(),
-            sink,
+            Some(to_parent),
         );
         worker.set_requests(vec![request_thumb(0)]);
         let thumb = events
             .ready("derived thumb never arrived", |page, role| {
                 page == 0 && is_thumb(role)
             });
-        assert_eq!(thumb.width(), cache::THUMB_EDGE);
-        assert_eq!(thumb.height() * 2, thumb.width());
+        assert_eq!(thumb.meta.width, THUMB_EDGE);
+        assert_eq!(thumb.meta.height * 2, thumb.meta.width);
     }
 
     #[test]
@@ -2481,12 +2347,12 @@ mod tests {
         let source =
             Arc::new(Source::open(dir.path()).expect("temp source opens"));
         let root = TempDir::new().expect("create temp dir");
-        let (events, sink) = Updates::new();
+        let (events, to_parent) = Updates::new();
         let worker = TestWorker::spawn_at(
             Arc::clone(&source),
             None,
             root.path(),
-            sink,
+            Some(to_parent),
         );
 
         worker.set_requests(vec![
@@ -2504,18 +2370,18 @@ mod tests {
             page == 0 && role == Role::Full
         });
         assert_eq!(
-            (fit.width(), fit.height()),
+            (fit.meta.width, fit.meta.height),
             (TEST_FIT_EDGE, PAGE_HEIGHT)
         );
         assert_eq!(
-            (full.width(), full.height()),
+            (full.meta.width, full.meta.height),
             (PAGE_WIDTH, PAGE_HEIGHT)
         );
         assert_eq!(events.delivered(0, |role| role == Role::Full), 1);
     }
 
-    fn page_count(count: usize) -> PageCount {
-        PageCount::new(count).expect("test book is non-empty")
+    fn page_count(count: usize) -> NonZeroUsize {
+        NonZeroUsize::new(count).expect("test book is non-empty")
     }
 
     fn prefetch_starts(prefetch: &Prefetch) -> Vec<usize> {

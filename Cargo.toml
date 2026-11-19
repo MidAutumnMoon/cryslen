@@ -90,8 +90,9 @@ correctness = { level = "deny", priority = -1 }
 blanket_clippy_restriction_lints = "allow"
 
 # The debug/status wire vocabulary is closed and matched exhaustively
-# inside the crate; exhaustive public enums buy nothing here.
+# inside the crate; exhaustive public enums and structs buy nothing here.
 exhaustive_enums = "allow"
+exhaustive_structs = "allow"
 
 # Too annoying!
 cognitive_complexity = "allow"

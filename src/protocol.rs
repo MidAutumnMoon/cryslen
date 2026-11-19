@@ -5,6 +5,11 @@
     reason = "the wire module is the crate's public vocabulary for the child integration test"
 )]
 
+use std::error::Error;
+use std::fmt;
+use std::ops::Deref;
+use std::time::Duration;
+
 use eros::MsgError;
 use ipc_channel::ipc::IpcReceiver;
 use ipc_channel::ipc::IpcSender;
@@ -17,25 +22,101 @@ use crate::decode::Decoded;
 use crate::decode::Pixels;
 use crate::decode::Plane;
 
-pub use crate::animation::PlaybackCommand;
-pub use crate::animation::PlaybackEvent;
-pub use crate::animation::PlaybackId;
 pub use crate::browse::Direction;
 pub use crate::browse::Motion;
 pub use crate::browse::PageNames;
 pub use crate::browse::ReadingMode;
 pub use crate::browse::Request;
 pub use crate::browse::Role;
-pub use crate::cache::ImageLimits;
 pub use crate::decode::Format;
+pub use crate::decode::ImageMeta;
 pub use crate::decode::Matrix;
 pub use crate::decode::Subsampling;
 pub use crate::decode::Transfer;
-pub use crate::fault::PageFault;
+pub use crate::decode::YuvSpec;
+
+pub const THUMB_EDGE: u32 = 192;
+
+/// Session-wide target edges clamped into the display and GPU ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ImageLimits {
+    fit_edge: u32,
+    max_texture_edge: u32,
+}
+
+impl ImageLimits {
+    /// Clamps `max_texture_edge >= THUMB_EDGE` and `fit_edge` into
+    /// `[THUMB_EDGE, max_texture_edge]`.
+    pub fn new(fit_edge: u32, max_texture_edge: u32) -> Self {
+        let max_texture_edge = max_texture_edge.max(THUMB_EDGE);
+        Self {
+            fit_edge: fit_edge.clamp(THUMB_EDGE, max_texture_edge),
+            max_texture_edge,
+        }
+    }
+
+    pub fn fit_edge(self) -> u32 {
+        self.fit_edge
+    }
+
+    pub fn max_texture_edge(self) -> u32 {
+        self.max_texture_edge
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TextureFault {
+    pub dims: (u32, u32),
+    pub max_edge: u32,
+}
+
+impl fmt::Display for TextureFault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}x{} exceeds this GPU's {}-texel texture edge limit",
+            self.dims.0, self.dims.1, self.max_edge
+        )
+    }
+}
+
+impl Error for TextureFault {}
+
+/// `generation` changes on every restart, so a stopped session's frames
+/// cannot reach the new one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PlaybackId {
+    pub page: usize,
+    pub generation: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub enum PlaybackCommand {
+    /// Open the page's stream and fix its role.
+    Start { id: PlaybackId, role: Role },
+    /// Produce the next frame. A pass boundary is invisible to the parent.
+    Next { id: PlaybackId },
+    /// Drop the session. The child answers nothing.
+    Stop { id: PlaybackId },
+}
+
+/// One child answer about a session. Frames arrive in order.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub enum PlaybackEvent<Image> {
+    /// One composited frame, already sized for the session's role.
+    Frame {
+        id: PlaybackId,
+        delay: Duration,
+        image: Image,
+    },
+    /// Every allowed pass has been played.
+    Finished { id: PlaybackId },
+    /// Playback failed. The page stays valid.
+    Failed { id: PlaybackId },
+}
 
 /// What a freshly opened child knows about its book.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[non_exhaustive]
 pub struct BookInfo {
     pub names: PageNames,
     pub archive: bool,
@@ -46,10 +127,7 @@ pub struct BookInfo {
 pub enum WirePixels {
     Rgba8(IpcSharedMemory),
     Yuv {
-        depth: u8,
-        subsampling: Subsampling,
-        full_range: bool,
-        matrix: Matrix,
+        spec: YuvSpec,
         luma: IpcSharedMemory,
         cb: IpcSharedMemory,
         cr: IpcSharedMemory,
@@ -59,13 +137,8 @@ pub enum WirePixels {
 
 /// A decoded image in the shape the parent's renderer uploads.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[non_exhaustive]
 pub struct WireImage {
-    pub width: u32,
-    pub height: u32,
-    pub format: Format,
-    pub transfer: Transfer,
-    pub page_dims: (u32, u32),
+    pub meta: ImageMeta,
     pub pixels: WirePixels,
 }
 
@@ -73,41 +146,11 @@ pub struct WireImage {
 #[derive(Debug, Clone)]
 pub struct ValidatedImage(WireImage);
 
-impl ValidatedImage {
-    #[must_use]
-    pub fn width(&self) -> u32 {
-        self.0.width
-    }
+impl Deref for ValidatedImage {
+    type Target = WireImage;
 
-    #[must_use]
-    pub fn height(&self) -> u32 {
-        self.0.height
-    }
-
-    #[must_use]
-    pub fn format(&self) -> Format {
-        self.0.format
-    }
-
-    #[must_use]
-    pub fn transfer(&self) -> Transfer {
-        self.0.transfer
-    }
-
-    #[must_use]
-    pub fn page_dims(&self) -> (u32, u32) {
-        self.0.page_dims
-    }
-
-    #[must_use]
-    pub fn pixels(&self) -> &WirePixels {
-        &self.0.pixels
-    }
-
-    /// Bytes held across all shared-memory pixel planes.
-    #[must_use]
-    pub fn resident_bytes(&self) -> usize {
-        self.0.resident_bytes()
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
 
@@ -118,10 +161,7 @@ impl WireImage {
                 WirePixels::Rgba8(IpcSharedMemory::from_bytes(bytes))
             }
             Pixels::Yuv(yuv) => WirePixels::Yuv {
-                depth: yuv.depth,
-                subsampling: yuv.subsampling,
-                full_range: yuv.full_range,
-                matrix: yuv.matrix,
+                spec: yuv.spec,
                 luma: shared_plane(&yuv.luma),
                 cb: shared_plane(&yuv.cb),
                 cr: shared_plane(&yuv.cr),
@@ -129,11 +169,7 @@ impl WireImage {
             },
         };
         Self {
-            width: image.width(),
-            height: image.height(),
-            format: image.format(),
-            transfer: image.transfer(),
-            page_dims: image.page_dims(),
+            meta: image.meta(),
             pixels,
         }
     }
@@ -143,22 +179,20 @@ impl WireImage {
     pub fn validate(self) -> Result<ValidatedImage, MsgError> {
         match &self.pixels {
             WirePixels::Rgba8(bytes) => decode::validate_rgba_extent(
-                self.width,
-                self.height,
+                self.meta.width,
+                self.meta.height,
                 bytes.len(),
             )?,
             WirePixels::Yuv {
-                depth,
-                subsampling,
+                spec,
                 luma,
                 cb,
                 cr,
                 alpha,
-                ..
             } => decode::validate_yuv_extents(
-                (self.width, self.height),
-                *depth,
-                *subsampling,
+                (self.meta.width, self.meta.height),
+                spec.depth,
+                spec.subsampling,
                 [luma.len(), cb.len(), cr.len()],
                 alpha.as_ref().map(|plane| plane.len()),
             )?,
@@ -213,7 +247,7 @@ pub enum ChildMsg {
     },
     Failed {
         page: usize,
-        fault: PageFault,
+        fault: String,
     },
     Playback(PlaybackEvent<WireImage>),
 }
@@ -256,13 +290,17 @@ mod tests {
 
         let wire = WireImage::from_decoded(&decoded);
         assert_eq!(
-            (wire.width, wire.height),
+            (wire.meta.width, wire.meta.height),
             (3, 2),
             "the wire keeps the pixel extents",
         );
-        assert_eq!(wire.format, Format::Png, "the wire keeps the format");
         assert_eq!(
-            wire.page_dims,
+            wire.meta.format,
+            Format::Png,
+            "the wire keeps the format"
+        );
+        assert_eq!(
+            wire.meta.page_dims,
             (3, 2),
             "the wire keeps the page dimensions",
         );
@@ -280,7 +318,7 @@ mod tests {
             wire.validate().expect("valid rgba wire image validates");
         assert_eq!(validated.resident_bytes(), pixels.len());
 
-        truncated.width = 4;
+        truncated.meta.width = 4;
         assert_eq!(
             truncated
                 .validate()
@@ -295,10 +333,12 @@ mod tests {
         use crate::decode::YuvImage;
 
         let yuv = YuvImage {
-            depth: 10,
-            subsampling: Subsampling::Yuv420,
-            full_range: false,
-            matrix: Matrix::Bt709,
+            spec: YuvSpec {
+                depth: 10,
+                subsampling: Subsampling::Yuv420,
+                full_range: false,
+                matrix: Matrix::Bt709,
+            },
             luma: Plane::U16(vec![512_u16; 4 * 2].into_boxed_slice()),
             cb: Plane::U16(vec![512_u16; 2].into_boxed_slice()),
             cr: Plane::U16(vec![512_u16; 2].into_boxed_slice()),
@@ -313,8 +353,8 @@ mod tests {
         let mut bad_dims = wire.clone();
         wire.validate().expect("valid yuv wire image validates");
 
-        if let WirePixels::Yuv { depth, .. } = &mut bad_depth.pixels {
-            *depth = 0;
+        if let WirePixels::Yuv { spec, .. } = &mut bad_depth.pixels {
+            spec.depth = 0;
         }
         assert_eq!(
             bad_depth
@@ -323,7 +363,7 @@ mod tests {
             MsgError::from_static("yuv depth")
         );
 
-        bad_dims.width = 6;
+        bad_dims.meta.width = 6;
         assert_eq!(
             bad_dims
                 .validate()

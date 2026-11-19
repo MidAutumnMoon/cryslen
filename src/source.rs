@@ -2,6 +2,7 @@
 //! Archives unpack progressively into per-page slots on a background
 //! thread; [`Source::bytes`] waits on the requested page's slot.
 
+use std::any::Any;
 use std::collections::HashMap;
 use std::fs;
 use std::fs::File;
@@ -9,6 +10,7 @@ use std::io;
 use std::io::BufReader;
 use std::io::ErrorKind;
 use std::io::Read;
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -19,12 +21,18 @@ use eros::ErrorUnion;
 use parking_lot::Condvar;
 use parking_lot::Mutex;
 
-use crate::browse::PageCount;
 use crate::browse::PageNames;
 use crate::catalog;
 use crate::catalog::ArchiveKind;
 use crate::decode;
-use crate::fault;
+
+pub fn panic_message(payload: &(dyn Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload")
+}
 
 type PageRead = Result<Arc<[u8]>, Arc<ErrorUnion>>;
 
@@ -188,7 +196,7 @@ impl Source {
         Ok(Self { names, backend })
     }
 
-    pub fn len(&self) -> PageCount {
+    pub fn len(&self) -> NonZeroUsize {
         self.names.count()
     }
 
@@ -331,7 +339,7 @@ fn spawn_materialize(
                 }
                 Err(payload) => Err(Arc::new(eros::error!(
                     "unpack panicked: {}",
-                    fault::panic_message(payload.as_ref())
+                    panic_message(payload.as_ref())
                 ))),
             };
             tracing::debug!(
@@ -454,6 +462,13 @@ mod tests {
 
     fn failed_page(message: &'static str) -> Arc<ErrorUnion> {
         Arc::new(ErrorUnion::new(eros::MsgError::from_static(message)))
+    }
+
+    #[test]
+    fn panic_message_reads_payload_kinds() {
+        assert_eq!(panic_message(&String::from("boom")), "boom");
+        assert_eq!(panic_message(&"static boom"), "static boom");
+        assert_eq!(panic_message(&7_u8), "non-string panic payload");
     }
 
     #[test]

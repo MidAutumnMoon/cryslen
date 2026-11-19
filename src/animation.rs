@@ -1,15 +1,11 @@
-//! Playback vocabulary and the parent's frame pipeline: no IO, GL, or
-//! decode. The child owns the decoder cursor and the loop policy; this
-//! decides when a delivered frame is due.
+//! Parent-side frame timing; the child owns the decoder cursor and loop policy.
 
 use std::collections::VecDeque;
 use std::time::Duration;
 use std::time::Instant;
 
-use serde::Deserialize;
-use serde::Serialize;
-
 use crate::browse::Role;
+use crate::protocol::PlaybackId;
 
 /// Below this a GIF delay is a stuck frame.
 const MIN_FRAME_DELAY: Duration = Duration::from_millis(20);
@@ -18,67 +14,9 @@ const FALLBACK_FRAME_DELAY: Duration = Duration::from_millis(100);
 
 const LOOKAHEAD: usize = 2;
 
-/// `generation` changes on every restart, so a stopped session's frames
-/// cannot reach the new one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[non_exhaustive]
-pub struct PlaybackId {
-    pub page: usize,
-    pub generation: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-pub enum PlaybackCommand {
-    /// Open the page's stream and fix its role.
-    Start { id: PlaybackId, role: Role },
-    /// Produce the next frame. A pass boundary is invisible to the parent.
-    Next { id: PlaybackId },
-    /// Drop the session. The child answers nothing.
-    Stop { id: PlaybackId },
-}
-
-/// One child answer about a session. Frames arrive in order.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[non_exhaustive]
-pub enum PlaybackEvent<Image> {
-    /// One composited frame, already sized for the session's role.
-    Frame {
-        id: PlaybackId,
-        delay: Duration,
-        image: Image,
-    },
-    /// Every allowed pass has been played.
-    Finished { id: PlaybackId },
-    /// Playback failed. The page stays valid.
-    Failed { id: PlaybackId },
-}
-
-impl<Image> PlaybackEvent<Image> {
-    #[must_use]
-    pub fn map_image<Next>(
-        self,
-        map: impl FnOnce(Image) -> Next,
-    ) -> PlaybackEvent<Next> {
-        match self {
-            Self::Frame { id, delay, image } => PlaybackEvent::Frame {
-                id,
-                delay,
-                image: map(image),
-            },
-            Self::Finished { id } => PlaybackEvent::Finished { id },
-            Self::Failed { id } => PlaybackEvent::Failed { id },
-        }
-    }
-}
-
 struct BufferedFrame<Image> {
     image: Image,
     delay: Duration,
-}
-
-struct ShownFrame {
-    delay: Duration,
-    shown_at: Instant,
 }
 
 #[derive(Clone, Copy)]
@@ -93,7 +31,7 @@ pub struct Player<Image> {
     role: Role,
     buffered: VecDeque<BufferedFrame<Image>>,
     request: RequestState,
-    shown: Option<ShownFrame>,
+    next_due: Option<Instant>,
     finished: bool,
 }
 
@@ -110,7 +48,7 @@ impl<Image> Player<Image> {
             role,
             buffered: VecDeque::new(),
             request: RequestState::Queued,
-            shown: None,
+            next_due: None,
             finished: false,
         }
     }
@@ -166,11 +104,10 @@ impl<Image> Player<Image> {
         if self.finished && self.buffered.is_empty() {
             return Due::Idle;
         }
-        if let Some(shown) = &self.shown {
-            let due = shown.shown_at + shown.delay;
-            if now < due {
-                return Due::Wait(due - now);
-            }
+        if let Some(due) = self.next_due
+            && now < due
+        {
+            return Due::Wait(due - now);
         }
         if let Some(frame) = self.buffered.pop_front() {
             return self.show(frame, now);
@@ -183,10 +120,7 @@ impl<Image> Player<Image> {
         frame: BufferedFrame<Image>,
         now: Instant,
     ) -> Due<Image> {
-        self.shown = Some(ShownFrame {
-            delay: frame.delay,
-            shown_at: now,
-        });
+        self.next_due = Some(now + frame.delay);
         self.replenish();
         Due::Show {
             image: frame.image,

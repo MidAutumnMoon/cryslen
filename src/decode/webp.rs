@@ -35,6 +35,7 @@ use super::Plane;
 use super::Subsampling;
 use super::Transfer;
 use super::YuvImage;
+use super::YuvSpec;
 
 /// `features.format` value for lossy VP8 bitstreams (`decode.h`).
 const WEBP_FORMAT_LOSSY: i32 = 1;
@@ -165,10 +166,12 @@ fn decode_yuv(
         Format::Webp,
         Transfer::Srgb,
         YuvImage {
-            depth: super::BYTE_DEPTH,
-            subsampling: Subsampling::Yuv420,
-            full_range: false,
-            matrix: Matrix::Bt601,
+            spec: YuvSpec {
+                depth: super::BYTE_DEPTH,
+                subsampling: Subsampling::Yuv420,
+                full_range: false,
+                matrix: Matrix::Bt601,
+            },
             luma: luma_plane,
             cb: chroma_blue,
             cr: chroma_red,
@@ -736,10 +739,10 @@ mod tests {
         let Pixels::Yuv(yuv) = decoded_lossy.pixels() else {
             panic!("opaque lossy webp must decode to yuv");
         };
-        assert_eq!(yuv.subsampling, Subsampling::Yuv420);
-        assert_eq!(yuv.matrix, Matrix::Bt601);
-        assert!(!yuv.full_range);
-        assert_eq!(yuv.depth, 8);
+        assert_eq!(yuv.spec.subsampling, Subsampling::Yuv420);
+        assert_eq!(yuv.spec.matrix, Matrix::Bt601);
+        assert!(!yuv.spec.full_range);
+        assert_eq!(yuv.spec.depth, 8);
         assert!(yuv.alpha.is_none());
 
         let lossless =

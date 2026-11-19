@@ -38,6 +38,7 @@ use super::Plane;
 use super::Subsampling;
 use super::Transfer;
 use super::YuvImage;
+use super::YuvSpec;
 
 /// dav1d parallelism saturates quickly on stills, so the thread count
 /// is capped.
@@ -176,10 +177,12 @@ pub(super) fn decode(
         Format::Avif,
         transfer,
         YuvImage {
-            depth,
-            subsampling,
-            full_range,
-            matrix,
+            spec: YuvSpec {
+                depth,
+                subsampling,
+                full_range,
+                matrix,
+            },
             luma: luma_plane,
             cb: cb_plane,
             cr: cr_plane,

@@ -19,18 +19,33 @@ mod image;
 mod jxl;
 mod webp;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub struct ImageMeta {
+    /// Decoded dimensions of this representation; may be downsampled from `page_dims`.
+    pub width: u32,
+    pub height: u32,
+    /// Original unscaled page dimensions.
+    pub page_dims: (u32, u32),
+    pub format: Format,
+    /// Sample encoding the renderer must undo before the framebuffer.
+    pub transfer: Transfer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub struct YuvSpec {
+    pub depth: u8,
+    pub subsampling: Subsampling,
+    /// Limited (video) or full (JPEG) range quantization.
+    pub full_range: bool,
+    pub matrix: Matrix,
+}
+
 /// Construct via [`Decoded::rgba`] / [`Decoded::yuv`], which validate the
 /// pixel extents against the dimensions.
 #[derive(Clone)]
 pub struct Decoded {
-    /// This representation's pixel dimensions, not the page's.
-    width: u32,
-    height: u32,
+    meta: ImageMeta,
     pixels: Pixels,
-    /// Sample encoding the renderer must undo before the framebuffer.
-    transfer: Transfer,
-    format: Format,
-    page_dims: (u32, u32),
 }
 
 /// Sample encoding. SDR pages are sRGB-class gamma, passed through to the
@@ -43,12 +58,16 @@ pub enum Transfer {
 }
 
 impl Decoded {
+    pub fn meta(&self) -> ImageMeta {
+        self.meta
+    }
+
     pub fn width(&self) -> u32 {
-        self.width
+        self.meta.width
     }
 
     pub fn height(&self) -> u32 {
-        self.height
+        self.meta.height
     }
 
     pub fn pixels(&self) -> &Pixels {
@@ -56,22 +75,22 @@ impl Decoded {
     }
 
     pub fn transfer(&self) -> Transfer {
-        self.transfer
+        self.meta.transfer
     }
 
     pub fn format(&self) -> Format {
-        self.format
+        self.meta.format
     }
 
     /// The page's dimensions, however far this representation is
     /// downsampled.
     pub fn page_dims(&self) -> (u32, u32) {
-        self.page_dims
+        self.meta.page_dims
     }
 
     #[must_use]
     pub fn with_page_dims(mut self, page_dims: (u32, u32)) -> Self {
-        self.page_dims = page_dims;
+        self.meta.page_dims = page_dims;
         self
     }
 
@@ -84,12 +103,14 @@ impl Decoded {
     ) -> Result<Self, MsgError> {
         validate_rgba_extent(width, height, bytes.len())?;
         Ok(Self {
-            width,
-            height,
+            meta: ImageMeta {
+                width,
+                height,
+                page_dims: (width, height),
+                format,
+                transfer,
+            },
             pixels: Pixels::Rgba8(bytes),
-            transfer,
-            format,
-            page_dims: (width, height),
         })
     }
 
@@ -100,7 +121,7 @@ impl Decoded {
         transfer: Transfer,
         yuv: YuvImage,
     ) -> Result<Self, MsgError> {
-        let wide = yuv.depth > BYTE_DEPTH;
+        let wide = yuv.spec.depth > BYTE_DEPTH;
         let matches_depth =
             |plane: &Plane| matches!(plane, Plane::U16(_)) == wide;
         if !matches_depth(&yuv.luma)
@@ -108,25 +129,27 @@ impl Decoded {
                 .alpha
                 .as_ref()
                 .is_some_and(|alpha| !matches_depth(alpha))
-            || (yuv.subsampling != Subsampling::Mono
+            || (yuv.spec.subsampling != Subsampling::Mono
                 && (!matches_depth(&yuv.cb) || !matches_depth(&yuv.cr)))
         {
             return Err(MsgError::from_static("yuv plane depth"));
         }
         validate_yuv_extents(
             (width, height),
-            yuv.depth,
-            yuv.subsampling,
+            yuv.spec.depth,
+            yuv.spec.subsampling,
             [yuv.luma.byte_len(), yuv.cb.byte_len(), yuv.cr.byte_len()],
             yuv.alpha.as_ref().map(Plane::byte_len),
         )?;
         Ok(Self {
-            width,
-            height,
+            meta: ImageMeta {
+                width,
+                height,
+                page_dims: (width, height),
+                format,
+                transfer,
+            },
             pixels: Pixels::Yuv(yuv),
-            transfer,
-            format,
-            page_dims: (width, height),
         })
     }
 
@@ -139,10 +162,12 @@ impl Decoded {
         luma: Plane,
     ) -> Result<Self, MsgError> {
         let yuv = YuvImage {
-            depth,
-            subsampling: Subsampling::Mono,
-            full_range: true,
-            matrix: Matrix::Identity,
+            spec: YuvSpec {
+                depth,
+                subsampling: Subsampling::Mono,
+                full_range: true,
+                matrix: Matrix::Identity,
+            },
             luma,
             cb: Plane::U8(Box::new([])),
             cr: Plane::U8(Box::new([])),
@@ -329,15 +354,11 @@ pub enum Loops {
 }
 
 /// 8-bit planes are one byte per sample; deeper planes are `u16` with
-/// `depth` significant bits. Mono carries luma only; alpha, when present,
+/// `spec.depth` significant bits. Mono carries luma only; alpha, when present,
 /// is a luma-sized full-range plane.
 #[derive(Clone)]
 pub struct YuvImage {
-    pub depth: u8,
-    pub subsampling: Subsampling,
-    /// Limited (video) or full (JPEG) range quantization.
-    pub full_range: bool,
-    pub matrix: Matrix,
+    pub spec: YuvSpec,
     pub luma: Plane,
     pub cb: Plane,
     pub cr: Plane,
@@ -381,13 +402,6 @@ pub enum Plane {
 }
 
 impl Plane {
-    pub fn sample_count(&self) -> usize {
-        match self {
-            Self::U8(bytes) => bytes.len(),
-            Self::U16(words) => words.len(),
-        }
-    }
-
     pub fn byte_len(&self) -> usize {
         match self {
             Self::U8(bytes) => bytes.len(),
@@ -565,9 +579,8 @@ pub fn decode_with_threads(
 /// no seek.
 pub struct Animation {
     bytes: Arc<[u8]>,
-    format: Format,
     loops: Loops,
-    frames: Frames,
+    frames: ::image::Frames<'static>,
 }
 
 impl Animation {
@@ -578,49 +591,13 @@ impl Animation {
 
     /// Restart the pass at frame 0.
     pub fn rewind(&mut self) -> eros::Result<()> {
-        self.frames = Frames::new(Arc::clone(&self.bytes), self.format)?;
+        self.frames = open_gif_frames(Arc::clone(&self.bytes))?;
         Ok(())
     }
 
     /// `None` means the pass ended.
     pub fn next_frame(&mut self) -> Option<eros::Result<Frame>> {
-        self.frames.next_frame()
-    }
-}
-
-/// One composited animation frame at the page canvas size.
-#[derive(Clone)]
-pub struct Frame {
-    pub image: Decoded,
-    pub delay: Duration,
-}
-
-struct Frames {
-    inner: ::image::Frames<'static>,
-    format: Format,
-}
-
-impl Frames {
-    fn new(bytes: Arc<[u8]>, format: Format) -> eros::Result<Self> {
-        use ::image::AnimationDecoder as _;
-        use ::image::ImageDecoder as _;
-        use ::image::codecs::gif::GifDecoder;
-        use std::io::Cursor;
-
-        if format != Format::Gif {
-            eros::bail!("unsupported animation format");
-        }
-        let decoder = GifDecoder::new(Cursor::new(bytes))?;
-        let (width, height) = decoder.dimensions();
-        admit_dims(width, height, "bad dimensions")?;
-        Ok(Self {
-            inner: decoder.into_frames(),
-            format,
-        })
-    }
-
-    fn next_frame(&mut self) -> Option<eros::Result<Frame>> {
-        let frame = match self.inner.next() {
+        let frame = match self.frames.next() {
             None => return None,
             Some(Ok(frame)) => frame,
             Some(Err(error)) => {
@@ -635,7 +612,7 @@ impl Frames {
             Decoded::rgba(
                 width,
                 height,
-                self.format,
+                Format::Gif,
                 Transfer::Srgb,
                 rgba,
             )
@@ -643,6 +620,27 @@ impl Frames {
             .map_err(Into::into),
         )
     }
+}
+
+/// One composited animation frame at the page canvas size.
+#[derive(Clone)]
+pub struct Frame {
+    pub image: Decoded,
+    pub delay: Duration,
+}
+
+fn open_gif_frames(
+    bytes: Arc<[u8]>,
+) -> eros::Result<::image::Frames<'static>> {
+    use ::image::AnimationDecoder as _;
+    use ::image::ImageDecoder as _;
+    use ::image::codecs::gif::GifDecoder;
+    use std::io::Cursor;
+
+    let decoder = GifDecoder::new(Cursor::new(bytes))?;
+    let (width, height) = decoder.dimensions();
+    admit_dims(width, height, "bad dimensions")?;
+    Ok(decoder.into_frames())
 }
 
 /// `Ok(None)` means the format has no animation path; a still GIF
@@ -659,11 +657,10 @@ pub fn open_animation(
         return Ok(None);
     }
     let loops = gif_loops(&bytes);
-    let frames = Frames::new(Arc::clone(&bytes), format)?;
+    let frames = open_gif_frames(Arc::clone(&bytes))?;
     tracing::debug!(%format, ?loops, "animation opened");
     Ok(Some(Animation {
         bytes,
-        format,
         loops,
         frames,
     }))
@@ -898,10 +895,12 @@ mod tests {
         // a well-sized mono page constructs; an empty luma plane does not;
         // a short alpha plane does not either
         let mono = |luma: Plane, alpha: Option<Plane>| YuvImage {
-            depth: 10,
-            subsampling: Subsampling::Mono,
-            full_range: true,
-            matrix: Matrix::Bt601,
+            spec: YuvSpec {
+                depth: 10,
+                subsampling: Subsampling::Mono,
+                full_range: true,
+                matrix: Matrix::Bt601,
+            },
             luma,
             cb: Plane::U8(Box::new([])),
             cr: Plane::U8(Box::new([])),
@@ -939,10 +938,12 @@ mod tests {
         // A 420 image whose chroma planes are stubs: a 4x2 image needs
         // 2x1 chroma samples.
         let undersized = YuvImage {
-            depth: 8,
-            subsampling: Subsampling::Yuv420,
-            full_range: true,
-            matrix: Matrix::Bt601,
+            spec: YuvSpec {
+                depth: 8,
+                subsampling: Subsampling::Yuv420,
+                full_range: true,
+                matrix: Matrix::Bt601,
+            },
             luma: Plane::U8(vec![0; 4 * 2].into_boxed_slice()),
             cb: Plane::U8(Box::new([])),
             cr: Plane::U8(Box::new([])),
@@ -1011,12 +1012,12 @@ mod tests {
             "a.avif",
         )
         .expect("mono avif decodes");
-        assert_eq!(page.format, Format::Avif);
-        assert_eq!((page.width, page.height), (32, 16));
+        assert_eq!(page.format(), Format::Avif);
+        assert_eq!((page.width(), page.height()), (32, 16));
         let Pixels::Yuv(yuv) = &page.pixels else {
             panic!("avif must decode to yuv planes")
         };
-        assert_eq!(yuv.subsampling, Subsampling::Mono);
+        assert_eq!(yuv.spec.subsampling, Subsampling::Mono);
         let Plane::U16(luma) = &yuv.luma else {
             panic!("10-bit luma must be u16 samples")
         };
@@ -1036,14 +1037,14 @@ mod tests {
             "a.jxl",
         )
         .expect("gray jxl decodes");
-        assert_eq!((gray.width, gray.height), (8, 8));
-        assert_eq!(gray.format, Format::Jxl);
+        assert_eq!((gray.width(), gray.height()), (8, 8));
+        assert_eq!(gray.format(), Format::Jxl);
         match gray.pixels {
             Pixels::Yuv(yuv) => {
-                assert_eq!(yuv.depth, 8);
-                assert_eq!(yuv.subsampling, Subsampling::Mono);
-                assert!(yuv.full_range);
-                assert_eq!(yuv.matrix, Matrix::Identity);
+                assert_eq!(yuv.spec.depth, 8);
+                assert_eq!(yuv.spec.subsampling, Subsampling::Mono);
+                assert!(yuv.spec.full_range);
+                assert_eq!(yuv.spec.matrix, Matrix::Identity);
                 assert!(yuv.alpha.is_none());
                 let Plane::U8(luma) = yuv.luma else {
                     panic!("8-bit mono jxl must use U8 luma");
@@ -1084,7 +1085,7 @@ mod tests {
             "a.jxl",
         )
         .expect("wide jxl decodes");
-        assert_eq!((wide.width, wide.height), (256, 128));
+        assert_eq!((wide.width(), wide.height()), (256, 128));
         let Pixels::Rgba8(wide_rgba) = &wide.pixels else {
             panic!("jxl must decode to rgba")
         };
@@ -1099,7 +1100,7 @@ mod tests {
             "a.jxl",
         )
         .expect("animated jxl decodes");
-        assert_eq!((animated.width, animated.height), (256, 256));
+        assert_eq!((animated.width(), animated.height()), (256, 256));
         let Pixels::Rgba8(animated_rgba) = &animated.pixels else {
             panic!("jxl must decode to rgba")
         };

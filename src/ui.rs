@@ -1,7 +1,5 @@
 //! Status bar, page interaction surface, and prompt rendering.
 
-use std::fmt;
-use std::iter;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -15,17 +13,17 @@ use egui::Ui;
 use egui::text::LayoutJob;
 use strum::VariantArray as _;
 
-use crate::browse::PageInfo;
 use crate::browse::ReadingMode;
 use crate::browse::Spread;
 use crate::catalog::PageName;
 use crate::decode::Format;
-use crate::fault::PageFault;
 
 pub struct ReadingStatus {
     pub page_count: usize,
     pub spread: Spread,
-    pub page: Option<PageStatus>,
+    pub page_dims: Option<(u32, u32)>,
+    /// Set only when the decoded format differs from the filename extension.
+    pub actual_format: Option<Format>,
     /// Placement scale, screen px per image px.
     pub zoom: f32,
 }
@@ -37,18 +35,7 @@ pub struct StatusLine<'fault> {
     pub name: PageName,
     /// Whether to show `loading…`.
     pub waiting: bool,
-    pub fault: Option<&'fault dyn fmt::Display>,
-}
-
-/// The one fault the line shows: the page's own failure first, then the
-/// book's. Each layer's cell keeps its own retention; this is only the
-/// ordering.
-pub fn fault_to_show<'fault>(
-    page: Option<&'fault PageFault>,
-    book: Option<&'fault impl fmt::Display>,
-) -> Option<&'fault dyn fmt::Display> {
-    page.map(|fault| fault as &dyn fmt::Display)
-        .or_else(|| book.map(|fault| fault as &dyn fmt::Display))
+    pub fault: Option<&'fault str>,
 }
 
 /// Status-line timers, pure in the clock the caller passes.
@@ -101,61 +88,6 @@ impl Timers {
     pub fn toasting(&self) -> bool {
         self.toast_since.is_some()
     }
-}
-
-/// The status line's view of one spread, in page order.
-pub struct SpreadStatus<'fault> {
-    pub waiting: bool,
-    pub fault: Option<&'fault PageFault>,
-    pub page: Option<(usize, PageInfo)>,
-    /// The page the line names: the failed one if any page failed, else
-    /// the first decoded page, else the spread's first page.
-    pub named_page: usize,
-}
-
-pub fn summarize_spread<'fault>(
-    spread: Spread,
-    state: impl Fn(usize) -> (Option<PageInfo>, Option<&'fault PageFault>),
-) -> SpreadStatus<'fault> {
-    let mut has_info = false;
-    let mut has_fault = false;
-    let mut failure: Option<(usize, &'fault PageFault)> = None;
-    let mut facts = None;
-    let mut first_decoded = None;
-    for page in iter::once(spread.first).chain(spread.second) {
-        let (info, fault) = state(page);
-        has_info |= info.is_some();
-        has_fault |= fault.is_some();
-        if failure.is_some() {
-            continue;
-        }
-        if let Some(fault) = fault {
-            failure = Some((page, fault));
-            continue;
-        }
-        if let Some(info) = info {
-            first_decoded.get_or_insert(page);
-            facts.get_or_insert((page, info));
-        }
-    }
-    let (named_page, fault) = match failure {
-        Some((page, fault)) => (page, Some(fault)),
-        None => (first_decoded.unwrap_or(spread.first), None),
-    };
-    SpreadStatus {
-        waiting: !has_info && !has_fault,
-        fault,
-        page: facts,
-        named_page,
-    }
-}
-
-pub struct PageStatus {
-    /// The page's own dims and decoded format.
-    pub info: PageInfo,
-    /// Format the filename's extension claims. Listed pages always
-    /// carry one.
-    pub claimed: Option<Format>,
 }
 
 pub fn show(
@@ -370,14 +302,12 @@ fn line(style: &Style, status: &StatusLine<'_>) -> LayoutJob {
     section(&mut job, &status.name.file, NAME_COLOR);
 
     if let Some(reading) = &status.reading {
-        if let Some(facts) = &reading.page {
+        if let Some((width, height)) = reading.page_dims {
             section(&mut job, " · ", plain);
-            let (width, height) = facts.info.dims;
-            let dims_text = if facts.claimed == Some(facts.info.format) {
-                format!("{width}x{height}")
-            } else {
-                format!("{} {width}x{height}", facts.info.format)
-            };
+            let dims_text = reading.actual_format.map_or_else(
+                || format!("{width}x{height}"),
+                |format| format!("{format} {width}x{height}"),
+            );
             section(&mut job, &dims_text, plain);
         }
         section(
@@ -389,7 +319,7 @@ fn line(style: &Style, status: &StatusLine<'_>) -> LayoutJob {
     if status.waiting {
         section(&mut job, " · loading…", plain);
     }
-    if let Some(fault) = &status.fault {
+    if let Some(fault) = status.fault {
         section(&mut job, &format!(" · {fault}"), plain);
     }
     job
@@ -448,31 +378,6 @@ mod tests {
         assert!(!timers.toasting());
     }
 
-    #[test]
-    fn the_line_blames_the_page_before_the_book() {
-        let page_fault = PageFault::new("page");
-        let book_fault = "the book process did not answer in time";
-        assert!(fault_to_show(None, None::<&&str>).is_none());
-        assert_eq!(
-            fault_to_show(None, Some(&book_fault))
-                .map(ToString::to_string)
-                .as_deref(),
-            Some(book_fault),
-        );
-        assert_eq!(
-            fault_to_show(Some(&page_fault), None::<&&str>)
-                .map(ToString::to_string)
-                .as_deref(),
-            Some("page"),
-        );
-        assert_eq!(
-            fault_to_show(Some(&page_fault), Some(&book_fault))
-                .map(ToString::to_string)
-                .as_deref(),
-            Some("page"),
-        );
-    }
-
     fn status() -> StatusLine<'static> {
         StatusLine {
             reading: Some(ReadingStatus {
@@ -483,13 +388,8 @@ mod tests {
                 },
                 // The name claims png and the page decodes as jxl, so the
                 // format label prefixes the dims.
-                page: Some(PageStatus {
-                    info: PageInfo {
-                        dims: (6000, 4000),
-                        format: Format::Jxl,
-                    },
-                    claimed: Some(Format::Png),
-                }),
+                page_dims: Some((6000, 4000)),
+                actual_format: Some(Format::Jxl),
                 zoom: 0.866,
             }),
             mode: ReadingMode::Manga,

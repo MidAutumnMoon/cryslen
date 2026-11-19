@@ -108,7 +108,7 @@ pub fn layout(dims: [Option<(u32, u32)>; 2]) -> SpreadLayout {
 /// Placement of one fit mode, centered on both axes. `Page` fits both
 /// axes, `Width` and `Height` fill their axis, `Actual` maps one image px
 /// to one screen px. Degenerate inputs are inert.
-pub fn fit_as(
+fn fit_as(
     mode: FitMode,
     total: (f32, f32),
     viewport: Viewport,
@@ -142,7 +142,7 @@ const MAX_SCALE: f32 = 40.0;
 
 /// Zoom by `factor`, anchoring the point under `cursor`; clamps to
 /// [`MIN_SCALE`]..=[`MAX_SCALE`] with the applied factor.
-pub fn zoom_at(
+fn zoom_at(
     mut placement: Placement,
     cursor: (f32, f32),
     factor: f32,
@@ -157,7 +157,7 @@ pub fn zoom_at(
     placement
 }
 
-pub fn pan(placement: Placement, delta: (f32, f32)) -> Placement {
+fn pan(placement: Placement, delta: (f32, f32)) -> Placement {
     Placement {
         scale: placement.scale,
         offset: (
@@ -173,7 +173,7 @@ const EDGE_KEEP_PX: f32 = 64.0;
 
 /// Clamp pan so the spread cannot be lost. An axis where the scaled
 /// spread fits the viewport is pinned to the centered position.
-pub fn clamp(
+fn clamp(
     placement: Placement,
     total: (f32, f32),
     viewport: Viewport,

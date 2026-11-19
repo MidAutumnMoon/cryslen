@@ -1,7 +1,3 @@
-//! The reading model shared by parent, child, and renderer: page counts,
-//! pairing, direction, roles, requests, position, and spread arithmetic.
-//! Pure: no clocks, IO, or GL.
-
 use std::num::NonZeroUsize;
 use std::ops::Deref;
 
@@ -13,37 +9,21 @@ use strum::Display;
 use strum::IntoStaticStr;
 use strum::VariantArray;
 
-use crate::decode::Format;
-
-/// A live book's page count. Sources never return an empty page list.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PageCount(NonZeroUsize);
-
-impl PageCount {
-    pub fn new(count: usize) -> Option<Self> {
-        NonZeroUsize::new(count).map(Self)
-    }
-
-    pub fn get(self) -> usize {
-        self.0.get()
-    }
-}
-
 /// Non-empty page names in reading order.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(try_from = "Vec<String>")]
 pub struct PageNames {
     names: Vec<String>,
-    count: PageCount,
+    count: NonZeroUsize,
 }
 
 impl PageNames {
     pub fn new(names: Vec<String>) -> Option<Self> {
-        let count = PageCount::new(names.len())?;
+        let count = NonZeroUsize::new(names.len())?;
         Some(Self { names, count })
     }
 
-    pub fn count(&self) -> PageCount {
+    pub fn count(&self) -> NonZeroUsize {
         self.count
     }
 }
@@ -144,25 +124,17 @@ impl Spread {
         }
     }
 
+    /// Seat order as `[left, right]` under `mode`.
     pub fn seats(&self, mode: ReadingMode) -> [Option<usize>; 2] {
-        seating(self.first, self.second, mode)
+        if mode.rtl() {
+            [self.second, Some(self.first)]
+        } else {
+            [Some(self.first), self.second]
+        }
     }
 
     pub fn contains(&self, page: usize) -> bool {
         self.first == page || self.second == Some(page)
-    }
-}
-
-/// Seat order as `[left, right]` under `mode`.
-pub fn seating<T>(
-    first: T,
-    second: Option<T>,
-    mode: ReadingMode,
-) -> [Option<T>; 2] {
-    if mode.rtl() {
-        [second, Some(first)]
-    } else {
-        [Some(first), second]
     }
 }
 
@@ -255,113 +227,17 @@ impl Roles {
 /// One missing role. The app sends the whole set and the child sends no
 /// acknowledgement: a request leaving the set means the app got it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
-#[non_exhaustive]
 pub struct Request {
     pub page: usize,
     pub role: Role,
 }
 
-impl Request {
-    #[must_use]
-    pub fn new(page: usize, role: Role) -> Self {
-        Self { page, role }
-    }
-}
-
-/// The page's own dims and format, independent of stored representations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PageInfo {
-    pub dims: (u32, u32),
-    pub format: Format,
-}
-
-/// A spread as shown, with the mode it was drawn under. A mode switch
-/// makes an older pairing uncommittable.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ShownSpread {
-    pub mode: ReadingMode,
-    pub spread: Spread,
-}
-
-/// The target page and the last spread shown.
-pub struct ReadingPosition {
-    target: usize,
-    shown: Option<ShownSpread>,
-}
-
-impl ReadingPosition {
-    pub fn new(target: usize) -> Self {
-        Self {
-            target,
-            shown: None,
-        }
-    }
-
-    pub fn target(&self) -> usize {
-        self.target
-    }
-
-    pub fn shown(&self) -> Option<Spread> {
-        self.shown.map(|shown| shown.spread)
-    }
-
-    pub fn shown_with_mode(&self) -> Option<ShownSpread> {
-        self.shown
-    }
-
-    pub fn set_target(&mut self, target: usize) {
-        self.target = target;
-    }
-
-    pub fn turn(
-        &mut self,
-        direction: Direction,
-        mode: ReadingMode,
-        len: PageCount,
-        motion: Motion,
-    ) -> bool {
-        let next = advance(self.target, direction, mode, len);
-        if motion == Motion::Skimming {
-            let Some(shown) = self.shown else {
-                return false;
-            };
-            // Keep skims within one spread of what is on screen.
-            let shown_start =
-                spread_for(shown.spread.first, mode, len).first;
-            let target_start = spread_for(self.target, mode, len).first;
-            if target_start != shown_start && next != shown_start {
-                return false;
-            }
-        }
-        self.target = next;
-        true
-    }
-
-    pub fn record_shown(
-        &mut self,
-        mode: ReadingMode,
-        shown: Option<Spread>,
-    ) {
-        self.shown = shown.map(|spread| ShownSpread { mode, spread });
-    }
-
-    pub fn commit_shown(&mut self, mode: ReadingMode) -> bool {
-        let Some(shown) = self.shown else {
-            return false;
-        };
-        if shown.mode != mode || shown.spread.first == self.target {
-            return false;
-        }
-        self.target = shown.spread.first;
-        true
-    }
-}
 /// Spread containing `index` under `mode`, clamped to the book. An
 /// odd tail shows one page (`second: None`).
 pub fn spread_for(
     index: usize,
     mode: ReadingMode,
-    len: PageCount,
+    len: NonZeroUsize,
 ) -> Spread {
     let len = len.get();
     let index = index.min(len - 1);
@@ -384,7 +260,7 @@ pub fn advance(
     current: usize,
     direction: Direction,
     mode: ReadingMode,
-    len: PageCount,
+    len: NonZeroUsize,
 ) -> usize {
     let forward = direction == Direction::Forward;
     let len = len.get();
@@ -407,33 +283,6 @@ pub fn advance(
     spread_start(next)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ModeSwitch {
-    pub index: usize,
-    pub pairing_changed: bool,
-}
-
-/// Where a switch from `old` to `new` lands. A pairing change moves
-/// to the new spread's start. A direction-only change keeps the page.
-pub fn switch_mode(
-    old: ReadingMode,
-    new: ReadingMode,
-    index: usize,
-    len: PageCount,
-) -> ModeSwitch {
-    if old.pairs() == new.pairs() {
-        ModeSwitch {
-            index,
-            pairing_changed: false,
-        }
-    } else {
-        ModeSwitch {
-            index: spread_for(index, new, len).first,
-            pairing_changed: true,
-        }
-    }
-}
-
 fn spread_number(page: usize) -> usize {
     page.div_ceil(2)
 }
@@ -446,11 +295,7 @@ fn spread_count(len: usize) -> usize {
     1 + (len - 1).div_ceil(2)
 }
 
-pub fn first_spread() -> usize {
-    0
-}
-
-pub fn last_spread(mode: ReadingMode, len: PageCount) -> usize {
+pub fn last_spread(mode: ReadingMode, len: NonZeroUsize) -> usize {
     if !mode.pairs() {
         return len.get() - 1;
     }
@@ -465,8 +310,8 @@ pub fn last_spread(mode: ReadingMode, len: PageCount) -> usize {
 mod tests {
     use super::*;
 
-    fn pages(count: usize) -> PageCount {
-        PageCount::new(count).expect("test book is non-empty")
+    fn pages(count: usize) -> NonZeroUsize {
+        NonZeroUsize::new(count).expect("test book is non-empty")
     }
 
     #[test]
@@ -556,58 +401,6 @@ mod tests {
     }
 
     #[test]
-    fn mode_switch_relands_only_on_pairing_change() {
-        assert_eq!(
-            switch_mode(
-                ReadingMode::Normal,
-                ReadingMode::Manga,
-                2,
-                pages(10)
-            ),
-            ModeSwitch {
-                index: 1,
-                pairing_changed: true
-            }
-        );
-        assert_eq!(
-            switch_mode(
-                ReadingMode::Normal,
-                ReadingMode::Comic,
-                0,
-                pages(10)
-            ),
-            ModeSwitch {
-                index: 0,
-                pairing_changed: true
-            }
-        );
-        assert_eq!(
-            switch_mode(
-                ReadingMode::Manga,
-                ReadingMode::Comic,
-                5,
-                pages(10)
-            ),
-            ModeSwitch {
-                index: 5,
-                pairing_changed: false
-            }
-        );
-        assert_eq!(
-            switch_mode(
-                ReadingMode::Manga,
-                ReadingMode::Manga,
-                5,
-                pages(10)
-            ),
-            ModeSwitch {
-                index: 5,
-                pairing_changed: false
-            }
-        );
-    }
-
-    #[test]
     fn seats_follow_reading_direction() {
         let spread = Spread {
             first: 1,
@@ -676,51 +469,5 @@ mod tests {
         roles.clear(Role::Thumb);
         assert_eq!(roles.best(), None);
         assert!(!roles.any());
-    }
-
-    #[test]
-    fn skimming_turn_waits_for_shown_when_one_spread_ahead() {
-        let len = pages(10);
-        let mode = ReadingMode::Manga;
-
-        let mut position = ReadingPosition::new(1);
-        assert!(!position.turn(
-            Direction::Forward,
-            mode,
-            len,
-            Motion::Skimming
-        ));
-        assert_eq!(position.target(), 1);
-        assert!(position.turn(
-            Direction::Forward,
-            mode,
-            len,
-            Motion::Still
-        ));
-        assert_eq!(position.target(), 3);
-
-        position.record_shown(mode, Some(spread_for(3, mode, len)));
-        assert!(position.turn(
-            Direction::Forward,
-            mode,
-            len,
-            Motion::Skimming
-        ));
-        assert_eq!(position.target(), 5);
-        assert!(!position.turn(
-            Direction::Forward,
-            mode,
-            len,
-            Motion::Skimming
-        ));
-        assert_eq!(position.target(), 5);
-
-        assert!(position.turn(
-            Direction::Backward,
-            mode,
-            len,
-            Motion::Skimming
-        ));
-        assert_eq!(position.target(), 3);
     }
 }

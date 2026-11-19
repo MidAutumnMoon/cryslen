@@ -37,37 +37,36 @@ pub fn is_archive(path: &Path) -> bool {
     archive_kind(path).is_some()
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum DirTarget {
-    File,
-    Dir,
-}
-
-fn entry_target(entry: &DirEntry) -> Option<DirTarget> {
-    let file_type = entry.file_type().ok()?;
+fn entry_is(entry: &DirEntry, want_dir: bool) -> bool {
+    let Ok(file_type) = entry.file_type() else {
+        return false;
+    };
     #[expect(
         clippy::filetype_is_file,
         reason = "fast path for regular files; symlinks and unknown types fall through to fs::metadata"
     )]
     if file_type.is_file() {
-        return Some(DirTarget::File);
+        return !want_dir;
     }
     if file_type.is_dir() {
-        return Some(DirTarget::Dir);
+        return want_dir;
     }
-    let metadata = fs::metadata(entry.path()).ok()?;
-    if metadata.is_dir() {
-        Some(DirTarget::Dir)
-    } else if metadata.is_file() {
-        Some(DirTarget::File)
-    } else {
-        None
-    }
+    fs::metadata(entry.path()).is_ok_and(|metadata| {
+        if want_dir {
+            metadata.is_dir()
+        } else {
+            metadata.is_file()
+        }
+    })
 }
 
 /// Whether `entry` resolves to a regular file, following symlinks.
 pub fn entry_is_file(entry: &DirEntry) -> bool {
-    entry_target(entry) == Some(DirTarget::File)
+    entry_is(entry, false)
+}
+
+fn entry_is_dir(entry: &DirEntry) -> bool {
+    entry_is(entry, true)
 }
 
 /// Resolve relative paths against the working directory and strip `.` components, preserving symlinks.
@@ -98,7 +97,7 @@ pub fn sibling(
                     is_archive(Path::new(&entry.file_name()))
                         && entry_is_file(entry)
                 } else {
-                    entry_target(entry) == Some(DirTarget::Dir)
+                    entry_is_dir(entry)
                 }
             })
             .map(|entry| {

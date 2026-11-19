@@ -221,7 +221,10 @@ fn child_serves_a_decoded_thumb() {
         })
         .expect("send SetView");
     commands
-        .send(ParentMsg::SetRequests(vec![Request::new(0, Role::Thumb)]))
+        .send(ParentMsg::SetRequests(vec![Request {
+            page: 0,
+            role: Role::Thumb,
+        }]))
         .expect("send SetRequests");
 
     let image = match messages.try_recv_timeout(STEP_TIMEOUT) {
@@ -237,17 +240,17 @@ fn child_serves_a_decoded_thumb() {
     };
 
     assert_eq!(
-        (image.width, image.height),
+        (image.meta.width, image.meta.height),
         (PAGE_EDGE, PAGE_EDGE),
         "the thumb is the page's own size",
     );
     assert_eq!(
-        image.page_dims,
+        image.meta.page_dims,
         (PAGE_EDGE, PAGE_EDGE),
         "the thumb reports the page's dimensions",
     );
     assert_eq!(
-        image.format,
+        image.meta.format,
         Format::Png,
         "the child preserved the page's format",
     );

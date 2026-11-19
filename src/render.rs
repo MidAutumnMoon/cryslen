@@ -37,17 +37,17 @@ use winit::window::Window as WinitWindow;
 
 use crate::browse::Role;
 use crate::browse::Roles;
-use crate::cache;
 use crate::decode;
 use crate::decode::Matrix;
 use crate::decode::Subsampling;
 use crate::decode::Transfer;
-use crate::fault::TextureFault;
 use crate::geometry;
 use crate::geometry::PageRect;
 use crate::geometry::Placement;
 use crate::geometry::SpreadLayout;
 use crate::geometry::Viewport;
+use crate::protocol::THUMB_EDGE;
+use crate::protocol::TextureFault;
 use crate::protocol::ValidatedImage;
 use crate::protocol::WirePixels;
 
@@ -408,16 +408,6 @@ struct HorizontalCommon {
     transfer_code: UniformLocation,
 }
 
-struct VerticalUniforms {
-    quad: QuadUniforms,
-    visible_origin_x: UniformLocation,
-    visible_width: UniformLocation,
-    source_y_start: UniformLocation,
-    source_y_end: UniformLocation,
-    source_per_screen_y: UniformLocation,
-    dither: UniformLocation,
-}
-
 struct HorizontalMonoProgram {
     common: HorizontalCommon,
     luma_gain_offset: UniformLocation,
@@ -431,7 +421,13 @@ struct HorizontalColorProgram {
 
 struct VerticalProgram {
     objects: ProgramObjects,
-    uniforms: VerticalUniforms,
+    quad: QuadUniforms,
+    visible_origin_x: UniformLocation,
+    visible_width: UniformLocation,
+    source_y_start: UniformLocation,
+    source_y_end: UniformLocation,
+    source_per_screen_y: UniformLocation,
+    dither: UniformLocation,
 }
 
 struct EwaResampler {
@@ -665,10 +661,9 @@ impl PageTextures {
         }) else {
             eros::bail!("GL MAX_TEXTURE_SIZE is not a positive GLint");
         };
-        if max_texture_edge < cache::THUMB_EDGE {
+        if max_texture_edge < THUMB_EDGE {
             return Err(eros::error!(
-                "GL MAX_TEXTURE_SIZE ({max_texture_edge}) is below THUMB_EDGE ({})",
-                cache::THUMB_EDGE
+                "GL MAX_TEXTURE_SIZE ({max_texture_edge}) is below THUMB_EDGE ({THUMB_EDGE})",
             ));
         }
         // SAFETY: Context is current (module invariant).
@@ -713,7 +708,7 @@ impl PageTextures {
         if self.has(page, role) {
             return Ok(());
         }
-        let dims = (image.width(), image.height());
+        let dims = (image.meta.width, image.meta.height);
         check_texture_dims(dims, self.max_texture_edge)?;
         let texture = upload_page_texture(Arc::clone(&self.gl), image);
         label_entry(&self.gl, page, role, &texture);
@@ -728,7 +723,7 @@ impl PageTextures {
         role: Role,
         image: &ValidatedImage,
     ) -> Result<(), TextureFault> {
-        let dims = (image.width(), image.height());
+        let dims = (image.meta.width, image.meta.height);
         check_texture_dims(dims, self.max_texture_edge)?;
         if let Some(PageTexture {
             dims: present_dims,
@@ -738,8 +733,8 @@ impl PageTextures {
         }) =
             self.pages.get(&page).and_then(|slots| slots[role].as_ref())
             && *present_dims == dims
-            && *transfer == image.transfer()
-            && let WirePixels::Rgba8(bytes) = image.pixels()
+            && *transfer == image.meta.transfer
+            && let WirePixels::Rgba8(bytes) = &image.pixels
         {
             update_rgba(&self.gl, *texture, bytes, dims);
             return Ok(());
@@ -1481,7 +1476,7 @@ fn create_vertical_program(
     )?;
     let location =
         |name: &str| uniform_location(&objects.gl, objects.program, name);
-    let uniforms = VerticalUniforms {
+    Ok(VerticalProgram {
         quad: QuadUniforms::lookup(&objects.gl, objects.program),
         visible_origin_x: location("u_visible_origin_x"),
         visible_width: location("u_visible_width"),
@@ -1489,8 +1484,8 @@ fn create_vertical_program(
         source_y_end: location("u_source_y_end"),
         source_per_screen_y: location("u_source_per_screen_y"),
         dither: location("u_dither"),
-    };
-    Ok(VerticalProgram { objects, uniforms })
+        objects,
+    })
 }
 
 impl EwaResampler {
@@ -1804,29 +1799,29 @@ impl EwaResampler {
         // SAFETY: Context is current (module invariant) and default FBO is restored.
         unsafe {
             self.gl.use_program(Some(vertical.objects.program));
-            vertical.uniforms.quad.bind(&self.gl, target.window, seat);
+            vertical.quad.bind(&self.gl, target.window, seat);
             self.gl.uniform_1_i32(
-                Some(&vertical.uniforms.visible_origin_x),
+                Some(&vertical.visible_origin_x),
                 slice.visible_origin.0,
             );
             self.gl.uniform_1_i32(
-                Some(&vertical.uniforms.visible_width),
+                Some(&vertical.visible_width),
                 gl_int(slice.visible_size.0),
             );
             self.gl.uniform_1_i32(
-                Some(&vertical.uniforms.source_y_start),
+                Some(&vertical.source_y_start),
                 gl_int(slice.source_y_range.0),
             );
             self.gl.uniform_1_i32(
-                Some(&vertical.uniforms.source_y_end),
+                Some(&vertical.source_y_end),
                 gl_int(slice.source_y_range.1),
             );
             self.gl.uniform_1_f32(
-                Some(&vertical.uniforms.source_per_screen_y),
+                Some(&vertical.source_per_screen_y),
                 slice.source_per_screen.1,
             );
             self.gl.uniform_1_i32(
-                Some(&vertical.uniforms.dither),
+                Some(&vertical.dither),
                 i32::from(page_texture.needs_dither),
             );
             for (&unit, &texture) in
@@ -2301,10 +2296,10 @@ fn upload_page_texture(
     gl: Arc<Context>,
     image: &ValidatedImage,
 ) -> PageTexture {
-    let dims = (image.width(), image.height());
-    let page_dims = image.page_dims();
+    let dims = (image.meta.width, image.meta.height);
+    let page_dims = image.meta.page_dims;
     let magnification_filter = magnification_filter(dims, page_dims);
-    match image.pixels() {
+    match &image.pixels {
         WirePixels::Rgba8(rgba_bytes) => {
             let texture =
                 upload_rgba(&gl, rgba_bytes, dims, magnification_filter);
@@ -2312,24 +2307,21 @@ fn upload_page_texture(
                 gl,
                 dims,
                 page_dims,
-                transfer: image.transfer(),
-                needs_dither: needs_dither(image.transfer(), None),
+                transfer: image.meta.transfer,
+                needs_dither: needs_dither(image.meta.transfer, None),
                 layout: PixelLayout::Rgba { texture },
             }
         }
         WirePixels::Yuv {
-            depth,
-            subsampling,
-            full_range,
-            matrix,
+            spec,
             luma,
             cb,
             cr,
             alpha,
         } => {
-            let depth = *depth;
+            let depth = spec.depth;
             let ((luma_w, luma_h), (chroma_w, chroma_h)) =
-                decode::plane_dims(dims, *subsampling);
+                decode::plane_dims(dims, spec.subsampling);
             let wide = depth > decode::BYTE_DEPTH;
             let luma_texture = upload_plane(
                 &gl,
@@ -2340,12 +2332,12 @@ fn upload_page_texture(
             );
             let color_conversion = page_color_conversion(
                 depth,
-                *subsampling,
-                *full_range,
-                *matrix,
+                spec.subsampling,
+                spec.full_range,
+                spec.matrix,
                 wide,
             );
-            let layout = if *subsampling == Subsampling::Mono
+            let layout = if spec.subsampling == Subsampling::Mono
                 && alpha.is_none()
             {
                 PixelLayout::Mono {
@@ -2354,7 +2346,7 @@ fn upload_page_texture(
                     offset: color_conversion.offset[0],
                 }
             } else {
-                let (cb_texture, cr_texture) = if *subsampling
+                let (cb_texture, cr_texture) = if spec.subsampling
                     == Subsampling::Mono
                 {
                     // `color_conversion` zeroes columns 1 and 2.
@@ -2402,7 +2394,7 @@ fn upload_page_texture(
                     },
                 );
                 let chroma_px = geometry::px_f32((chroma_w, chroma_h));
-                let ratio = subsampling.chroma_ratio();
+                let ratio = spec.subsampling.chroma_ratio();
                 PixelLayout::Yuv(YuvTexture {
                     luma: luma_texture,
                     cb: cb_texture,
@@ -2420,8 +2412,11 @@ fn upload_page_texture(
                 gl,
                 dims,
                 page_dims,
-                transfer: image.transfer(),
-                needs_dither: needs_dither(image.transfer(), Some(depth)),
+                transfer: image.meta.transfer,
+                needs_dither: needs_dither(
+                    image.meta.transfer,
+                    Some(depth),
+                ),
                 layout,
             }
         }
@@ -2496,54 +2491,13 @@ fn depth_normalization(depth: u8, wide: bool) -> f32 {
 const R16_STORAGE_MAX: f32 = 65535.0;
 const R8_STORAGE_MAX: f32 = 255.0;
 
-/// YUV storage-code quantization: anchor codes, sample-to-RGB scales,
-/// and capacity. Limited range scales the BT studio swing by 2^(depth-8).
-struct CodeQuantization {
-    luma_black: f32,
-    chroma_neutral: f32,
-    luma_scale: f32,
-    chroma_scale: f32,
-    storage_max: f32,
-}
-
+/// Fold storage samples to gamma RGB: depth normalization, quantization,
+/// and the KR/KB matrix (or GBR permutation). The offset is the matrix
+/// times the anchor codes.
 #[expect(
     clippy::cast_precision_loss,
     reason = "codes and scales stay below 65536, exact in f32"
 )]
-fn code_quantization(
-    depth: u8,
-    full_range: bool,
-    wide: bool,
-) -> CodeQuantization {
-    let max_code = (1_u32 << depth) - 1;
-    let storage_max = if wide {
-        R16_STORAGE_MAX
-    } else {
-        R8_STORAGE_MAX
-    };
-    if full_range {
-        CodeQuantization {
-            luma_black: 0.0,
-            chroma_neutral: (1_u32 << (depth - 1)) as f32,
-            luma_scale: 1.0,
-            chroma_scale: 1.0,
-            storage_max,
-        }
-    } else {
-        let swing = u32::from(depth.saturating_sub(8));
-        CodeQuantization {
-            luma_black: (16 << swing) as f32,
-            chroma_neutral: (128 << swing) as f32,
-            luma_scale: max_code as f32 / (219 << swing) as f32,
-            chroma_scale: max_code as f32 / (224 << swing) as f32,
-            storage_max,
-        }
-    }
-}
-
-/// Fold storage samples to gamma RGB: depth normalization, quantization,
-/// and the KR/KB matrix (or GBR permutation). The offset is the matrix
-/// times the anchor codes.
 fn page_color_conversion(
     depth: u8,
     subsampling: Subsampling,
@@ -2551,11 +2505,40 @@ fn page_color_conversion(
     color_matrix: Matrix,
     wide: bool,
 ) -> ColorConversion {
+    const STUDIO_LUMA_BLACK_8BIT: u32 = 16;
+    const STUDIO_CHROMA_NEUTRAL_8BIT: u32 = 128;
+    const STUDIO_LUMA_SWING_8BIT: u32 = 219;
+    const STUDIO_CHROMA_SWING_8BIT: u32 = 224;
+
     debug_assert!(
         (1..=decode::MAX_SAMPLE_DEPTH).contains(&depth),
         "YUV bit depth out of range"
     );
-    let quantization = code_quantization(depth, full_range, wide);
+    let max_code = (1_u32 << depth) - 1;
+    let storage_max = if wide {
+        R16_STORAGE_MAX
+    } else {
+        R8_STORAGE_MAX
+    };
+    let (
+        range_luma_black,
+        range_chroma_neutral,
+        range_luma_scale,
+        range_chroma_scale,
+    ) = if full_range {
+        (0.0, (1_u32 << (depth - 1)) as f32, 1.0, 1.0)
+    } else {
+        let extra_bits =
+            u32::from(depth.saturating_sub(decode::BYTE_DEPTH));
+        (
+            (STUDIO_LUMA_BLACK_8BIT << extra_bits) as f32,
+            (STUDIO_CHROMA_NEUTRAL_8BIT << extra_bits) as f32,
+            max_code as f32
+                / (STUDIO_LUMA_SWING_8BIT << extra_bits) as f32,
+            max_code as f32
+                / (STUDIO_CHROMA_SWING_8BIT << extra_bits) as f32,
+        )
+    };
     let normalization = depth_normalization(depth, wide);
     let (
         base_matrix,
@@ -2566,9 +2549,9 @@ fn page_color_conversion(
     ) = if subsampling == Subsampling::Mono {
         (
             [1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-            quantization.luma_scale,
+            range_luma_scale,
             0.0,
-            quantization.luma_black,
+            range_luma_black,
             0.0,
         )
     } else if color_matrix == Matrix::Identity {
@@ -2577,18 +2560,18 @@ fn page_color_conversion(
         // anchor every axis at luma black.
         (
             [0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0],
-            quantization.luma_scale,
-            quantization.luma_scale,
-            quantization.luma_black,
-            quantization.luma_black,
+            range_luma_scale,
+            range_luma_scale,
+            range_luma_black,
+            range_luma_black,
         )
     } else {
         (
             yuv_to_rgb_matrix(color_matrix),
-            quantization.luma_scale,
-            quantization.chroma_scale,
-            quantization.luma_black,
-            quantization.chroma_neutral,
+            range_luma_scale,
+            range_chroma_scale,
+            range_luma_black,
+            range_chroma_neutral,
         )
     };
     let mut matrix = base_matrix;
@@ -2605,9 +2588,9 @@ fn page_color_conversion(
         }
     }
     let anchors = [
-        luma_black / quantization.storage_max,
-        chroma_neutral / quantization.storage_max,
-        chroma_neutral / quantization.storage_max,
+        luma_black / storage_max,
+        chroma_neutral / storage_max,
+        chroma_neutral / storage_max,
     ];
     let mut offset = [0.0_f32; 3];
     for (matrix_column, anchor) in

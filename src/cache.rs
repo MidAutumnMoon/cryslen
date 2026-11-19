@@ -47,45 +47,17 @@ use xxhash_rust::xxh3::xxh3_128;
 use crate::browse::Role;
 use crate::decode;
 use crate::decode::Decoded;
-use crate::decode::Format;
-use crate::decode::Matrix;
+use crate::decode::ImageMeta;
 use crate::decode::Pixels;
 use crate::decode::Plane;
-use crate::decode::Subsampling;
-use crate::decode::Transfer;
 use crate::decode::YuvImage;
-use crate::fault::TextureFault;
+use crate::decode::YuvSpec;
+use crate::protocol::ImageLimits;
+use crate::protocol::THUMB_EDGE;
+use crate::protocol::TextureFault;
 
-pub const THUMB_EDGE: u32 = 192;
 pub const THUMB_CAP_BYTES: u64 = 512 * 1024 * 1024;
 pub const FIT_CAP_BYTES: u64 = 3 * 512 * 1024 * 1024;
-
-/// Session-wide target edges clamped into the display and GPU ceiling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-pub struct ImageLimits {
-    fit_edge: u32,
-    max_texture_edge: u32,
-}
-
-impl ImageLimits {
-    /// Clamps `max_texture_edge >= THUMB_EDGE` and `fit_edge` into
-    /// `[THUMB_EDGE, max_texture_edge]`.
-    pub fn new(fit_edge: u32, max_texture_edge: u32) -> Self {
-        let max_texture_edge = max_texture_edge.max(THUMB_EDGE);
-        Self {
-            fit_edge: fit_edge.clamp(THUMB_EDGE, max_texture_edge),
-            max_texture_edge,
-        }
-    }
-
-    pub fn fit_edge(self) -> u32 {
-        self.fit_edge
-    }
-
-    pub fn max_texture_edge(self) -> u32 {
-        self.max_texture_edge
-    }
-}
 
 fn derivation(role: Role, limits: ImageLimits) -> (u32, FilterType) {
     match role {
@@ -186,14 +158,11 @@ fn resample_page(
         }
         Pixels::Yuv(yuv) => {
             let ((luma_w, luma_h), (chroma_w, chroma_h)) =
-                decode::plane_dims(dims, yuv.subsampling);
+                decode::plane_dims(dims, yuv.spec.subsampling);
             let (_, (target_w, target_h)) =
-                decode::plane_dims(target, yuv.subsampling);
+                decode::plane_dims(target, yuv.spec.subsampling);
             let planes = YuvImage {
-                depth: yuv.depth,
-                subsampling: yuv.subsampling,
-                full_range: yuv.full_range,
-                matrix: yuv.matrix,
+                spec: yuv.spec,
                 luma: resize_plane(
                     &mut resizer,
                     &yuv.luma,
@@ -322,15 +291,6 @@ struct State {
     view: Namespace,
 }
 
-/// What a save did: whether the entry reached the store, and the
-/// entries its prune removed (oldest first), so a caller that tracks the
-/// store's contents can keep its ledger current.
-#[derive(Debug, Default)]
-pub struct SaveResult {
-    pub persisted: bool,
-    pub evicted: Vec<(Role, u128)>,
-}
-
 /// One role namespace: a directory of entries with its own byte cap.
 struct Namespace {
     dir: PathBuf,
@@ -369,18 +329,20 @@ impl Store {
         fit_edge: u32,
     ) -> Option<Decoded> {
         let started = Instant::now();
-        let loaded = self.role_target(role, fit_edge).and_then(|target| {
-            let file = File::open(target.namespace.path(hash)).ok()?;
-            #[expect(
-                clippy::let_underscore_must_use,
-                clippy::let_underscore_untyped,
-                reason = "the recency touch is advisory; its failure changes nothing"
-            )]
-            let _ = file.set_times(
-                FileTimes::new().set_modified(SystemTime::now()),
-            );
-            read_stored(file, target.edge)
-        });
+        let loaded = self.role_target(role, fit_edge).and_then(
+            |(namespace, edge)| {
+                let file = File::open(namespace.path(hash)).ok()?;
+                #[expect(
+                    clippy::let_underscore_must_use,
+                    clippy::let_underscore_untyped,
+                    reason = "the recency touch is advisory; its failure changes nothing"
+                )]
+                let _ = file.set_times(
+                    FileTimes::new().set_modified(SystemTime::now()),
+                );
+                read_stored(file, edge)
+            },
+        );
         tracing::debug!(
             ?role,
             hit = loaded.is_some(),
@@ -390,75 +352,41 @@ impl Store {
         loaded
     }
 
-    /// Store `page` under `hash`, replacing the same key. Crossing the
-    /// namespace's cap prunes it; the result names the removed entries.
+    /// Returns pruned hashes on save, or `None` if disabled, uncached, or writing fails.
     pub fn save(
         &self,
         hash: u128,
         role: Role,
         page: &Decoded,
         fit_edge: u32,
-    ) -> SaveResult {
-        let Some(target) = self.role_target(role, fit_edge) else {
-            return SaveResult::default();
-        };
+    ) -> Option<Vec<u128>> {
+        let (namespace, edge) = self.role_target(role, fit_edge)?;
         let started = Instant::now();
-        let Ok(size) = write_encoded_atomic(
-            target.namespace,
-            hash,
-            page,
-            target.edge,
-        ) else {
-            return SaveResult::default();
-        };
-        let prev =
-            target.namespace.total.fetch_add(size, Ordering::Relaxed);
-        let over = prev.saturating_add(size) > target.namespace.cap;
+        let size =
+            write_encoded_atomic(namespace, hash, page, edge).ok()?;
+        let prev = namespace.total.fetch_add(size, Ordering::Relaxed);
+        let over = prev.saturating_add(size) > namespace.cap;
         tracing::debug!(
             ?role,
             bytes = size,
             elapsed = ?started.elapsed(),
             "preview save"
         );
-        let evicted = if over {
-            target
-                .namespace
-                .prune()
-                .into_iter()
-                .map(|evicted| (role, evicted))
-                .collect()
-        } else {
-            Vec::new()
-        };
-        SaveResult {
-            persisted: true,
-            evicted,
-        }
+        Some(if over { namespace.prune() } else { Vec::new() })
     }
 
     fn role_target(
         &self,
         role: Role,
         fit_edge: u32,
-    ) -> Option<RoleTarget<'_>> {
+    ) -> Option<(&Namespace, u32)> {
         let state = self.state.as_ref()?;
         match role {
-            Role::Thumb => Some(RoleTarget {
-                namespace: &state.thumb,
-                edge: THUMB_EDGE,
-            }),
-            Role::Fit => Some(RoleTarget {
-                namespace: &state.view,
-                edge: fit_edge,
-            }),
+            Role::Thumb => Some((&state.thumb, THUMB_EDGE)),
+            Role::Fit => Some((&state.view, fit_edge)),
             Role::Full => None,
         }
     }
-}
-
-struct RoleTarget<'store> {
-    namespace: &'store Namespace,
-    edge: u32,
 }
 
 static NEXT_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -761,7 +689,7 @@ fn write_atomic(
 }
 
 const MAGIC: [u8; 4] = *b"CYPV";
-const VERSION: u16 = 4;
+const VERSION: u16 = 5;
 const PREFIX_BYTES: usize =
     MAGIC.len() + size_of::<u16>() + size_of::<u8>();
 const MAX_META_BYTES: usize = u8::MAX as usize;
@@ -769,24 +697,14 @@ const MAX_META_BYTES: usize = u8::MAX as usize;
 #[derive(Deserialize, Serialize)]
 struct CacheMeta {
     target_edge: u32,
-    page_dims: (u32, u32),
-    width: u32,
-    height: u32,
-    format: Format,
-    transfer: Transfer,
+    image: ImageMeta,
     pixels: PixelMeta,
 }
 
 #[derive(Deserialize, Serialize)]
 enum PixelMeta {
     Rgba8,
-    Yuv {
-        depth: u8,
-        subsampling: Subsampling,
-        full_range: bool,
-        matrix: Matrix,
-        has_alpha: bool,
-    },
+    Yuv { spec: YuvSpec, has_alpha: bool },
 }
 
 impl CacheMeta {
@@ -794,20 +712,13 @@ impl CacheMeta {
         let pixels = match page.pixels() {
             Pixels::Rgba8(_) => PixelMeta::Rgba8,
             Pixels::Yuv(yuv) => PixelMeta::Yuv {
-                depth: yuv.depth,
-                subsampling: yuv.subsampling,
-                full_range: yuv.full_range,
-                matrix: yuv.matrix,
+                spec: yuv.spec,
                 has_alpha: yuv.alpha.is_some(),
             },
         };
         Self {
             target_edge,
-            page_dims: page.page_dims(),
-            width: page.width(),
-            height: page.height(),
-            format: page.format(),
-            transfer: page.transfer(),
+            image: page.meta(),
             pixels,
         }
     }
@@ -905,24 +816,19 @@ fn read_stored(mut file: File, target_edge: u32) -> Option<Decoded> {
     let mut meta_buf = [0_u8; MAX_META_BYTES];
     let meta_bytes = meta_buf.get_mut(..meta_len)?;
     file.read_exact(meta_bytes).ok()?;
-    let meta: CacheMeta = postcard::from_bytes(meta_bytes).ok()?;
-    if meta.target_edge != target_edge {
+    let cached: CacheMeta = postcard::from_bytes(meta_bytes).ok()?;
+    if cached.target_edge != target_edge {
         return None;
     }
+    let meta = cached.image;
     decode::pixel_count(meta.page_dims.0, meta.page_dims.1)?;
-    let page = match meta.pixels {
-        PixelMeta::Rgba8 => read_rgba(&mut file, payload_len, &meta)?,
-        PixelMeta::Yuv {
-            depth,
-            subsampling,
-            full_range,
-            matrix,
-            has_alpha,
-        } => {
+    let page = match cached.pixels {
+        PixelMeta::Rgba8 => read_rgba(&mut file, payload_len, meta)?,
+        PixelMeta::Yuv { spec, has_alpha } => {
             let layout = decode::yuv_layout(
                 (meta.width, meta.height),
-                depth,
-                subsampling,
+                spec.depth,
+                spec.subsampling,
             )
             .ok()?;
             let expected_bytes = layout.total_bytes(has_alpha)?;
@@ -956,10 +862,7 @@ fn read_stored(mut file: File, target_edge: u32) -> Option<Decoded> {
                 meta.format,
                 meta.transfer,
                 YuvImage {
-                    depth,
-                    subsampling,
-                    full_range,
-                    matrix,
+                    spec,
                     luma,
                     cb,
                     cr,
@@ -975,7 +878,7 @@ fn read_stored(mut file: File, target_edge: u32) -> Option<Decoded> {
 fn read_rgba(
     file: &mut File,
     payload_len: u64,
-    meta: &CacheMeta,
+    meta: ImageMeta,
 ) -> Option<Decoded> {
     let expected_bytes =
         decode::rgba_byte_len(meta.width, meta.height).ok()?;
@@ -1027,6 +930,10 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::decode::Format;
+    use crate::decode::Matrix;
+    use crate::decode::Subsampling;
+    use crate::decode::Transfer;
 
     const TEST_FIT_EDGE: u32 = 2560;
 
@@ -1037,6 +944,13 @@ mod tests {
 
     fn count(width: u32, height: u32) -> usize {
         (width as usize) * (height as usize)
+    }
+
+    fn sample_count(plane: &Plane) -> usize {
+        match plane {
+            Plane::U8(bytes) => bytes.len(),
+            Plane::U16(words) => words.len(),
+        }
     }
 
     fn rgba_page(width: u32, height: u32) -> Decoded {
@@ -1094,10 +1008,12 @@ mod tests {
         };
         let luma = count(width, height);
         let yuv = YuvImage {
-            depth,
-            subsampling,
-            full_range: false,
-            matrix: Matrix::Bt709,
+            spec: YuvSpec {
+                depth,
+                subsampling,
+                full_range: false,
+                matrix: Matrix::Bt709,
+            },
             luma: plane(luma),
             cb: plane(chroma),
             cr: plane(chroma),
@@ -1134,10 +1050,12 @@ mod tests {
             count(chroma_w, chroma_h)
         };
         let yuv = YuvImage {
-            depth: 10,
-            subsampling,
-            full_range: false,
-            matrix: Matrix::Bt709,
+            spec: YuvSpec {
+                depth: 10,
+                subsampling,
+                full_range: false,
+                matrix: Matrix::Bt709,
+            },
             luma: plane(count(width, height), values[0]),
             cb: plane(chroma, values[1]),
             cr: plane(chroma, values[2]),
@@ -1197,7 +1115,7 @@ mod tests {
                         assert!(
                             store
                                 .save(hash, Role::Fit, page, TEST_FIT_EDGE)
-                                .persisted
+                                .is_some()
                         );
                     }
                     active_writers.fetch_sub(1, Ordering::Relaxed);
@@ -1226,20 +1144,20 @@ mod tests {
         assert!(
             store
                 .save(hash, Role::Thumb, &page, TEST_FIT_EDGE)
-                .persisted
+                .is_some()
         );
 
         // A dead writer leaves its temp unlocked.
         let stale_thumb = store
             .role_target(Role::Thumb, TEST_FIT_EDGE)
             .expect("thumb")
-            .namespace
+            .0
             .temp_path(hash);
         fs::write(&stale_thumb, b"partial").expect("thumb temp");
         let stale_view = store
             .role_target(Role::Fit, TEST_FIT_EDGE)
             .expect("view")
-            .namespace
+            .0
             .temp_path(hash);
         fs::write(&stale_view, b"partial").expect("view temp");
 
@@ -1247,7 +1165,7 @@ mod tests {
         let live_temp = store
             .role_target(Role::Thumb, TEST_FIT_EDGE)
             .expect("thumb")
-            .namespace
+            .0
             .temp_path(hash);
         drop(store);
         let locked_temp = File::options()
@@ -1293,10 +1211,10 @@ mod tests {
         assert!(
             store
                 .save(hash, Role::Thumb, &page, TEST_FIT_EDGE)
-                .persisted
+                .is_some()
         );
         assert!(
-            !store.save(hash, Role::Full, &page, TEST_FIT_EDGE).persisted
+            store.save(hash, Role::Full, &page, TEST_FIT_EDGE).is_none()
         );
         assert!(store.load(hash, Role::Full, TEST_FIT_EDGE).is_none());
 
@@ -1318,7 +1236,7 @@ mod tests {
         let store = Store::at(dir.path());
         let hash = content_hash(b"page-b");
         assert!(
-            store.save(hash, Role::Fit, &page, TEST_FIT_EDGE).persisted
+            store.save(hash, Role::Fit, &page, TEST_FIT_EDGE).is_some()
         );
         assert!(
             store.load(hash, Role::Fit, TEST_FIT_EDGE + 1).is_none(),
@@ -1335,10 +1253,10 @@ mod tests {
         let Pixels::Yuv(yuv) = loaded.pixels() else {
             panic!("expected yuv pixels");
         };
-        assert_eq!(yuv.depth, 10);
-        assert_eq!(yuv.subsampling, Subsampling::Yuv420);
-        assert!(!yuv.full_range);
-        assert_eq!(yuv.matrix, Matrix::Bt709);
+        assert_eq!(yuv.spec.depth, 10);
+        assert_eq!(yuv.spec.subsampling, Subsampling::Yuv420);
+        assert!(!yuv.spec.full_range);
+        assert_eq!(yuv.spec.matrix, Matrix::Bt709);
         assert_eq!(yuv_planes(&loaded), yuv_planes(&page));
     }
 
@@ -1351,7 +1269,7 @@ mod tests {
         assert!(
             store
                 .save(hash, Role::Thumb, &page, TEST_FIT_EDGE)
-                .persisted
+                .is_some()
         );
 
         let loaded = store
@@ -1360,7 +1278,7 @@ mod tests {
         let Pixels::Yuv(yuv) = loaded.pixels() else {
             panic!("expected yuv pixels");
         };
-        assert_eq!(yuv.depth, 8);
+        assert_eq!(yuv.spec.depth, 8);
         assert!(yuv.alpha.is_some());
         assert_eq!(yuv_planes(&loaded), yuv_planes(&page));
     }
@@ -1377,7 +1295,7 @@ mod tests {
         assert!(
             store
                 .save(hash, Role::Thumb, &page, TEST_FIT_EDGE)
-                .persisted
+                .is_some()
         );
         let path = dir.path().join("thumb").join(format!("{hash:032x}"));
         let good = fs::read(&path).expect("read cache file");
@@ -1420,8 +1338,8 @@ mod tests {
         // Admissible dims whose byte size exceeds the file reject against
         // file length before allocating.
         let mut forged_dims = CacheMeta::from_page(&page, THUMB_EDGE);
-        forged_dims.width = 4_096;
-        forged_dims.height = 4_096;
+        forged_dims.image.width = 4_096;
+        forged_dims.image.height = 4_096;
         let oversized =
             encode_header(&forged_dims).expect("encode oversized header");
         fs::write(&path, &oversized).expect("write oversized entry");
@@ -1451,16 +1369,16 @@ mod tests {
         let page = rgba_page(2, 2);
         let hash = content_hash(b"page-d");
         assert!(
-            !store
+            store
                 .save(hash, Role::Thumb, &page, TEST_FIT_EDGE)
-                .persisted
+                .is_none()
         );
         assert!(store.load(hash, Role::Thumb, TEST_FIT_EDGE).is_none());
 
         let nested = Store::at(&dir.path().join("not-a-directory/file"));
         assert!(nested.state.is_none());
         assert!(
-            !nested.save(hash, Role::Fit, &page, TEST_FIT_EDGE).persisted
+            nested.save(hash, Role::Fit, &page, TEST_FIT_EDGE).is_none()
         );
     }
 
@@ -1610,8 +1528,8 @@ mod tests {
             let Pixels::Yuv(yuv) = derived.pixels() else {
                 panic!("expected yuv pixels");
             };
-            assert_eq!(yuv.depth, 10, "{kind:?}");
-            assert_eq!(yuv.matrix, Matrix::Bt709, "{kind:?}");
+            assert_eq!(yuv.spec.depth, 10, "{kind:?}");
+            assert_eq!(yuv.spec.matrix, Matrix::Bt709, "{kind:?}");
             let [luma, cb, cr, alpha] = yuv_planes(&derived);
             for (name, plane, value) in [
                 ("luma", luma, 400_u16),
@@ -1637,11 +1555,11 @@ mod tests {
         let Pixels::Yuv(yuv) = thumb.pixels() else {
             panic!("expected yuv pixels");
         };
-        assert_eq!(yuv.luma.sample_count(), count(200, 80));
-        assert_eq!(yuv.cb.sample_count(), count(100, 40));
-        assert_eq!(yuv.cr.sample_count(), count(100, 40));
-        assert_eq!(yuv.depth, 10);
-        assert_eq!(yuv.matrix, Matrix::Bt709);
+        assert_eq!(sample_count(&yuv.luma), count(200, 80));
+        assert_eq!(sample_count(&yuv.cb), count(100, 40));
+        assert_eq!(sample_count(&yuv.cr), count(100, 40));
+        assert_eq!(yuv.spec.depth, 10);
+        assert_eq!(yuv.spec.matrix, Matrix::Bt709);
     }
 
     #[test]
@@ -1653,8 +1571,8 @@ mod tests {
         let Pixels::Yuv(yuv) = thumb.pixels() else {
             panic!("expected yuv pixels");
         };
-        assert_eq!(yuv.cb.sample_count(), count(3, 7));
-        assert_eq!(yuv.cr.sample_count(), count(3, 7));
+        assert_eq!(sample_count(&yuv.cb), count(3, 7));
+        assert_eq!(sample_count(&yuv.cr), count(3, 7));
     }
 
     #[test]
@@ -1667,7 +1585,7 @@ mod tests {
         assert!(
             Store::with_caps(&probe_root, THUMB_CAP_BYTES, FIT_CAP_BYTES)
                 .save(probe_hash, Role::Thumb, &page, TEST_FIT_EDGE)
-                .persisted
+                .is_some()
         );
         let size = fs::metadata(
             probe_root.join("thumb").join(format!("{probe_hash:032x}")),
@@ -1681,28 +1599,27 @@ mod tests {
         let third = content_hash(b"third");
         let mut evicted = Vec::new();
         for (age, hash) in [(10_u64, first), (11, second), (12, third)] {
-            let saved =
-                store.save(hash, Role::Thumb, &page, TEST_FIT_EDGE);
-            assert!(saved.persisted);
-            evicted.extend(saved.evicted);
+            let batch = store
+                .save(hash, Role::Thumb, &page, TEST_FIT_EDGE)
+                .expect("thumb save persists");
+            evicted.extend(batch);
             let path = root.join("thumb").join(format!("{hash:032x}"));
             set_modified(&path, age);
         }
 
         // The cap fits one entry, so each save after the first evicted
         // the oldest, and the caller was told which ones.
-        assert_eq!(
-            evicted,
-            vec![(Role::Thumb, first), (Role::Thumb, second)]
-        );
+        assert_eq!(evicted, vec![first, second]);
         assert!(store.load(first, Role::Thumb, TEST_FIT_EDGE).is_none());
         assert!(store.load(second, Role::Thumb, TEST_FIT_EDGE).is_none());
         assert!(store.load(third, Role::Thumb, TEST_FIT_EDGE).is_some());
 
         // The fit namespace has its own budget, so a fit save cannot
         // evict thumbnails and reports no evictions.
-        let saved = store.save(first, Role::Fit, &page, TEST_FIT_EDGE);
-        assert!(saved.persisted && saved.evicted.is_empty());
+        let fit_evicted = store
+            .save(first, Role::Fit, &page, TEST_FIT_EDGE)
+            .expect("fit save persists");
+        assert_eq!(fit_evicted, []);
         assert!(store.load(third, Role::Thumb, TEST_FIT_EDGE).is_some());
     }
 

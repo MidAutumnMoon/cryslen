@@ -2,8 +2,8 @@
 
 ## Roles and layout
 
-- Role selection (`Thumb`, `Fit`, `Full`), demand requests, and texture retention live in `src/presentation.rs`.
-- `Thumb` serves skims, `Fit` serves settled reading at session `fit_edge`, and `Full` bypasses persistent caches for zoom (`src/cache.rs`, `src/presentation.rs`).
+- Role selection (`Thumb`, `Fit`, `Full`), demand requests, and texture retention live in `src/reading.rs`.
+- `Thumb` serves skims, `Fit` serves settled reading at session `fit_edge`, and `Full` bypasses persistent caches for zoom (`src/cache.rs`, `src/reading.rs`).
 - Layout and status use page dimensions, so role promotion keeps spread pairing unchanged.
 - Animated pages persist only frame 0.
 
@@ -21,7 +21,7 @@
 
 ## Presentation and input
 
-- Presentable spread resolution, fallback order, and GPU upload/retention live in `src/presentation.rs` and `src/render.rs`.
+- Presentable spread resolution, fallback order, and GPU upload/retention live in `src/reading.rs` and `src/render.rs`.
 - Skim vs. still motion triggers live in `src/app.rs` (platform key auto-repeat starts a skim; key release or focus loss ends it).
 
 ## Limits
