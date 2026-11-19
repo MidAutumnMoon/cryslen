@@ -6,12 +6,14 @@
     reason = "scoped to render.rs, where batched GL calls share one current-context invariant"
 )]
 
+use core::f64::consts::PI;
 use core::num::NonZeroU32;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use egui_glow::glow;
 use egui_glow::glow::Context;
+use egui_glow::glow::Framebuffer;
 use egui_glow::glow::HasContext as _;
 use egui_glow::glow::PixelUnpackData;
 use egui_glow::glow::Program;
@@ -41,6 +43,7 @@ use crate::decode::Subsampling;
 use crate::decode::Transfer;
 use crate::fault::TextureFault;
 use crate::geometry;
+use crate::geometry::PageRect;
 use crate::geometry::Placement;
 use crate::geometry::SpreadLayout;
 use crate::geometry::Viewport;
@@ -69,26 +72,20 @@ const VERTEX_SHADER_SOURCE: &str = indoc! {"
     }
 "};
 
-// Per-draw constants are folded CPU-side; output is premultiplied.
-const FRAGMENT_SHADER_SOURCE: &str = indoc! {"
+const FULLSCREEN_VERTEX_SHADER_SOURCE: &str = indoc! {"
     #version 330 core
 
-    in vec2 v_seat_px;
-    layout(location = 0) out vec4 color;
-    uniform vec2 u_page_uv_per_pixel;   // screen px -> page fraction: 1 / (scale * page size)
-    uniform vec2 u_chroma_uv_per_pixel; // screen px -> chroma-page fraction, subsample-aware
-    uniform mat3 u_color_matrix;  // storage samples -> gamma RGB
-    uniform vec3 u_color_offset;  // u_color_matrix times the quantization anchors
-    uniform float u_alpha_normalization; // depth normalize of the alpha sample; 1.0 for 8-bit storage
-    uniform int u_pixel_layout;   // PIXEL_LAYOUT_RGBA or PIXEL_LAYOUT_YUV
+    void main() {
+        vec2 corner = vec2(float(gl_VertexID & 1), float(gl_VertexID >> 1));
+        gl_Position = vec4(corner * 2.0 - 1.0, 0.0, 1.0);
+    }
+"};
+
+const GLSL_TRANSFER_HEADER: &str = indoc! {"
     uniform int u_transfer_code;  // TRANSFER_SRGB or TRANSFER_PQ
-    uniform int u_dither;         // 0 = 8-bit source, 1 = deep source
-    uniform sampler2D u_rgba_or_luma;
-    uniform sampler2D u_cb;
-    uniform sampler2D u_cr;
-    uniform sampler2D u_alpha;
     const int PIXEL_LAYOUT_RGBA = 0;
     const int PIXEL_LAYOUT_YUV = 1;
+    const int PIXEL_LAYOUT_MONO = 2;
     const int TRANSFER_SRGB = 0;
     const int TRANSFER_PQ = 1;
     // ST 2084 constants.
@@ -101,7 +98,6 @@ const FRAGMENT_SHADER_SOURCE: &str = indoc! {"
     // brighter highlights clip, the fixed HDR->SDR compromise.
     const float PQ_DIFFUSE_WHITE = 203.0;
     const float PQ_PEAK = 10000.0;
-    const float OUTPUT_MAX = 255.0;
     vec3 to_srgb(vec3 rgb) {
         if (u_transfer_code == TRANSFER_SRGB) {
             return rgb;
@@ -112,6 +108,10 @@ const FRAGMENT_SHADER_SOURCE: &str = indoc! {"
         // Linear light to the sRGB transfer curve.
         return mix(sdr_linear * 12.92, 1.055 * pow(sdr_linear, vec3(1.0 / 2.4)) - 0.055, step(vec3(0.0031308), sdr_linear));
     }
+"};
+
+const GLSL_BAYER4: &str = indoc! {"
+    const float OUTPUT_MAX = 255.0;
     float bayer4(vec2 fragment_px) {
         float thresholds[16] = float[16](
             0.0, 8.0, 2.0, 10.0,
@@ -122,62 +122,376 @@ const FRAGMENT_SHADER_SOURCE: &str = indoc! {"
         ivec2 cell = ivec2(fragment_px) & 3;
         return thresholds[cell.x + 4 * cell.y] / 16.0;
     }
-    void main() {
-        // Fragment centers land on texel centers at 1:1 zoom with
-        // whole-pixel origins.
-        vec2 seat_px = v_seat_px;
-        // Dither the straight color at half an output quantum; an 8-bit
-        // source has nothing to hide.
-        float dither_offset = 0.0;
-        if (u_dither != 0) {
-            dither_offset = (bayer4(gl_FragCoord.xy) - 0.5) / OUTPUT_MAX;
-        }
-        if (u_pixel_layout == PIXEL_LAYOUT_RGBA) {
-            vec4 rgba_texel = texture(u_rgba_or_luma, seat_px * u_page_uv_per_pixel);
-            color = vec4((to_srgb(rgba_texel.rgb) + dither_offset) * rgba_texel.a, rgba_texel.a);
-            return;
-        }
-        vec3 yuv_samples = vec3(
-            texture(u_rgba_or_luma, seat_px * u_page_uv_per_pixel).r,
-            texture(u_cb, seat_px * u_chroma_uv_per_pixel).r,
-            texture(u_cr, seat_px * u_chroma_uv_per_pixel).r);
-        float alpha = texture(u_alpha, seat_px * u_page_uv_per_pixel).r * u_alpha_normalization;
-        color = vec4((to_srgb(u_color_matrix * yuv_samples - u_color_offset) + dither_offset) * alpha, alpha);
-    }
 "};
 
-/// Seat rect and page UV agree within float rounding; page dims are
-/// whole pixels.
-const SEAT_UV_TOLERANCE: f32 = 1e-3;
+#[derive(Clone, Copy)]
+enum EwaVariant {
+    Mono,
+    Color,
+}
 
-/// Page-keyed texture cache and spread draw; a seat draws its largest
-/// resident role.
+fn glsl_ewa_lut() -> String {
+    let lut_len = f64::from(EWA_LUT_WIDTH);
+    format!(
+        indoc! {"
+            const float EWA_SUPPORT = {support:.9};
+            const float EWA_LUT_SCALE = {scale:.9};
+            const float EWA_LUT_BIAS = {bias:.9};
+            vec2 ewa_weights(sampler1D lut, float distance) {{
+                float lut_coord = clamp(distance / EWA_SUPPORT, 0.0, 1.0);
+                return texture(lut, lut_coord * EWA_LUT_SCALE + EWA_LUT_BIAS).rg;
+            }}
+        "},
+        support = EWA_SUPPORT,
+        scale = (lut_len - 1.0) / lut_len,
+        bias = 0.5 / lut_len,
+    )
+}
+
+fn fragment_shader_source() -> String {
+    format!(
+        "{header}{transfer}{bayer}{body}",
+        header = "#version 330 core\n",
+        transfer = GLSL_TRANSFER_HEADER,
+        bayer = GLSL_BAYER4,
+        body = indoc! {"
+            in vec2 v_seat_px;
+            layout(location = 0) out vec4 color;
+            uniform vec2 u_page_uv_per_screen;
+            uniform vec2 u_chroma_uv_per_step;  // screen px -> chroma texture UV
+            uniform mat3 u_color_matrix;        // storage samples -> gamma RGB
+            uniform vec3 u_color_offset;        // u_color_matrix times the quantization anchors
+            uniform float u_alpha_normalization; // depth normalize of the alpha sample; 1.0 for 8-bit storage
+            uniform vec2 u_luma_gain_offset;
+            uniform int u_pixel_layout;
+            uniform int u_dither;               // 0 = 8-bit source, 1 = deep source
+            uniform sampler2D u_rgba_or_luma;
+            uniform sampler2D u_cb;
+            uniform sampler2D u_cr;
+            uniform sampler2D u_alpha;
+            void main() {
+                // Fragment centers land on texel centers at 1:1 zoom with
+                // whole-pixel origins.
+                vec2 seat_px = v_seat_px;
+                // Dither the straight color at half an output quantum; an 8-bit
+                // source has nothing to hide.
+                float dither_offset = 0.0;
+                if (u_dither != 0) {
+                    dither_offset = (bayer4(gl_FragCoord.xy) - 0.5) / OUTPUT_MAX;
+                }
+                if (u_pixel_layout == PIXEL_LAYOUT_MONO) {
+                    float luma_sample = texture(u_rgba_or_luma, seat_px * u_page_uv_per_screen).r;
+                    float gray = clamp(
+                        to_srgb(vec3(luma_sample * u_luma_gain_offset.x - u_luma_gain_offset.y)).r + dither_offset,
+                        0.0,
+                        1.0);
+                    color = vec4(gray, gray, gray, 1.0);
+                    return;
+                }
+                if (u_pixel_layout == PIXEL_LAYOUT_RGBA) {
+                    vec4 rgba_texel = texture(u_rgba_or_luma, seat_px * u_page_uv_per_screen);
+                    color = vec4((to_srgb(rgba_texel.rgb) + dither_offset) * rgba_texel.a, rgba_texel.a);
+                    return;
+                }
+                vec3 yuv_samples = vec3(
+                    texture(u_rgba_or_luma, seat_px * u_page_uv_per_screen).r,
+                    texture(u_cb, seat_px * u_chroma_uv_per_step).r,
+                    texture(u_cr, seat_px * u_chroma_uv_per_step).r);
+                float alpha = texture(u_alpha, seat_px * u_page_uv_per_screen).r * u_alpha_normalization;
+                color = vec4((to_srgb(u_color_matrix * yuv_samples - u_color_offset) + dither_offset) * alpha, alpha);
+            }
+        "},
+    )
+}
+
+fn ewa_horizontal_shader_source(variant: EwaVariant) -> String {
+    let variant_define = match variant {
+        EwaVariant::Mono => "#define EWA_MONO 1\n",
+        EwaVariant::Color => "#define EWA_MONO 0\n",
+    };
+    format!(
+        "{header}{variant_define}{transfer}{lut}{body}",
+        header = "#version 330 core\n",
+        transfer = GLSL_TRANSFER_HEADER,
+        lut = glsl_ewa_lut(),
+        body = indoc! {"
+            #if EWA_MONO
+            layout(location = 0) out vec4 out_accum;
+            uniform vec2 u_luma_gain_offset;
+            #else
+            layout(location = 0) out vec4 out_primary;
+            layout(location = 1) out vec4 out_secondary;
+            layout(location = 2) out vec4 out_weights;
+            uniform vec2 u_chroma_uv_per_step; // luma texel -> chroma texture UV
+            uniform mat3 u_color_matrix;
+            uniform vec3 u_color_offset;
+            uniform float u_alpha_normalization;
+            uniform int u_pixel_layout;
+            uniform sampler2D u_cb;
+            uniform sampler2D u_cr;
+            uniform sampler2D u_alpha;
+            #endif
+            uniform int u_visible_origin_x;
+            uniform int u_source_y_start;
+            uniform ivec2 u_texture_size;
+            uniform float u_seat_offset_x;
+            uniform float u_source_per_screen_x;
+            uniform sampler2D u_rgba_or_luma;
+            uniform sampler1D u_ewa_lut;
+            void main() {
+                float filter_source_per_screen = max(1.0, u_source_per_screen_x);
+                float screen_per_source = 1.0 / filter_source_per_screen;
+                float support_radius = EWA_SUPPORT * filter_source_per_screen;
+                float screen_x = float(u_visible_origin_x) + gl_FragCoord.x;
+                float center_x = (screen_x - u_seat_offset_x) * u_source_per_screen_x;
+                int source_x_start = max(0, int(floor(center_x - support_radius)));
+                int source_x_end = min(u_texture_size.x - 1, int(ceil(center_x + support_radius)));
+                int source_y = clamp(u_source_y_start + int(floor(gl_FragCoord.y)), 0, u_texture_size.y - 1);
+                #if EWA_MONO
+                vec2 accum = vec2(0.0);
+                #else
+                vec2 texture_size = vec2(u_texture_size);
+                vec4 accum_primary = vec4(0.0);
+                vec4 accum_secondary = vec4(0.0);
+                #endif
+                vec2 weight_sum = vec2(0.0);
+                for (int source_x = source_x_start; source_x <= source_x_end; ++source_x) {
+                    float distance = abs(((float(source_x) + 0.5) - center_x) * screen_per_source);
+                    vec2 weights = ewa_weights(u_ewa_lut, distance);
+                    #if EWA_MONO
+                    float luma_sample = texelFetch(u_rgba_or_luma, ivec2(source_x, source_y), 0).r;
+                    float gray = to_srgb(vec3(luma_sample * u_luma_gain_offset.x - u_luma_gain_offset.y)).r;
+                    accum += gray * weights;
+                    #else
+                    vec4 premultiplied_texel;
+                    if (u_pixel_layout == PIXEL_LAYOUT_RGBA) {
+                        vec4 rgba_texel = texelFetch(u_rgba_or_luma, ivec2(source_x, source_y), 0);
+                        premultiplied_texel = vec4(to_srgb(rgba_texel.rgb) * rgba_texel.a, rgba_texel.a);
+                    } else {
+                        vec2 luma_px = vec2(float(source_x) + 0.5, float(source_y) + 0.5);
+                        vec2 chroma_uv = luma_px * u_chroma_uv_per_step;
+                        vec3 yuv_samples = vec3(
+                            texelFetch(u_rgba_or_luma, ivec2(source_x, source_y), 0).r,
+                            texture(u_cb, chroma_uv).r,
+                            texture(u_cr, chroma_uv).r);
+                        float alpha = texture(u_alpha, luma_px / texture_size).r * u_alpha_normalization;
+                        vec3 rgb = to_srgb(u_color_matrix * yuv_samples - u_color_offset);
+                        premultiplied_texel = vec4(rgb * alpha, alpha);
+                    }
+                    accum_primary += premultiplied_texel * weights.x;
+                    accum_secondary += premultiplied_texel * weights.y;
+                    #endif
+                    weight_sum += weights;
+                }
+                #if EWA_MONO
+                out_accum = vec4(accum, weight_sum);
+                #else
+                out_primary = accum_primary;
+                out_secondary = accum_secondary;
+                out_weights = vec4(weight_sum, 0.0, 0.0);
+                #endif
+            }
+        "},
+    )
+}
+
+fn ewa_vertical_shader_source(variant: EwaVariant) -> String {
+    let variant_define = match variant {
+        EwaVariant::Mono => "#define EWA_MONO 1\n",
+        EwaVariant::Color => "#define EWA_MONO 0\n",
+    };
+    format!(
+        "{header}{variant_define}{bayer}{lut}{body}",
+        header = "#version 330 core\n",
+        bayer = GLSL_BAYER4,
+        lut = glsl_ewa_lut(),
+        body = indoc! {"
+            const float MIN_WEIGHT_SUM = 1e-6;
+            in vec2 v_seat_px;
+            layout(location = 0) out vec4 color;
+            uniform int u_visible_origin_x;
+            uniform int u_visible_width;
+            uniform int u_source_y_start;
+            uniform int u_source_y_end;
+            uniform float u_source_per_screen_y;
+            uniform int u_dither;
+            uniform sampler2D u_scratch_primary;
+            #if !EWA_MONO
+            uniform sampler2D u_scratch_secondary;
+            uniform sampler2D u_scratch_weights;
+            #endif
+            uniform sampler1D u_ewa_lut;
+            void main() {
+                float filter_source_per_screen = max(1.0, u_source_per_screen_y);
+                float screen_per_source = 1.0 / filter_source_per_screen;
+                float support_radius = EWA_SUPPORT * filter_source_per_screen;
+                float center_y = v_seat_px.y * u_source_per_screen_y;
+                int source_y_start = max(u_source_y_start, int(floor(center_y - support_radius)));
+                int source_y_end = min(u_source_y_end - 1, int(ceil(center_y + support_radius)));
+                int scratch_x = clamp(int(floor(gl_FragCoord.x)) - u_visible_origin_x, 0, u_visible_width - 1);
+                #if EWA_MONO
+                float accum = 0.0;
+                #else
+                vec4 accum = vec4(0.0);
+                #endif
+                float weight_sum = 0.0;
+                for (int source_y = source_y_start; source_y <= source_y_end; ++source_y) {
+                    float distance = abs(((float(source_y) + 0.5) - center_y) * screen_per_source);
+                    vec2 weights = ewa_weights(u_ewa_lut, distance);
+                    ivec2 scratch_texel = ivec2(scratch_x, source_y - u_source_y_start);
+                    // Subtract the second singular term: its eigenvalue is negative.
+                    #if EWA_MONO
+                    vec4 horizontal_sample = texelFetch(u_scratch_primary, scratch_texel, 0);
+                    accum += horizontal_sample.x * weights.x - horizontal_sample.y * weights.y;
+                    weight_sum += horizontal_sample.z * weights.x - horizontal_sample.w * weights.y;
+                    #else
+                    vec4 primary = texelFetch(u_scratch_primary, scratch_texel, 0);
+                    vec4 secondary = texelFetch(u_scratch_secondary, scratch_texel, 0);
+                    vec2 horizontal_weights = texelFetch(u_scratch_weights, scratch_texel, 0).rg;
+                    accum += primary * weights.x - secondary * weights.y;
+                    weight_sum += horizontal_weights.x * weights.x - horizontal_weights.y * weights.y;
+                    #endif
+                }
+                #if EWA_MONO
+                float gray = clamp(accum / max(weight_sum, MIN_WEIGHT_SUM), 0.0, 1.0);
+                if (u_dither != 0) {
+                    gray = clamp(gray + (bayer4(gl_FragCoord.xy) - 0.5) / OUTPUT_MAX, 0.0, 1.0);
+                }
+                color = vec4(gray, gray, gray, 1.0);
+                #else
+                vec4 premultiplied = accum / max(weight_sum, MIN_WEIGHT_SUM);
+                float alpha = clamp(premultiplied.a, 0.0, 1.0);
+                vec3 rgb = clamp(premultiplied.rgb, vec3(0.0), vec3(alpha));
+                if (u_dither != 0) {
+                    float dither_offset = (bayer4(gl_FragCoord.xy) - 0.5) / OUTPUT_MAX;
+                    rgb = clamp(rgb + dither_offset * alpha, vec3(0.0), vec3(alpha));
+                }
+                color = vec4(rgb, alpha);
+                #endif
+            }
+        "},
+    )
+}
+
+/// Seat rect and page dims agree within float rounding; page dims are
+/// whole pixels.
+const SEAT_PAGE_DIMS_TOLERANCE: f32 = 1e-3;
+
+const ROLE_COVER_MARGIN_PX: f32 = 1.0;
+const MINIFY_SCALE_TOLERANCE: f32 = 1e-3;
+const SLICE_PAD_TEXELS: f32 = 1.0;
+const QUAD_VERTEX_COUNT: i32 = 4;
+const EWA_LUT_SAMPLER_UNIT: i32 = 4;
+const EWA_LUT_TEXTURE_UNIT: u32 = glow::TEXTURE4;
+
+const EWA_JINC_FIRST_ZERO: f64 = 1.219_669_891_266_504_5;
+const EWA_SUPPORT: f64 = 3.238_315_484_166_236;
+const EWA_LUT_INTERVALS: i32 = 128;
+const EWA_LUT_WIDTH: i32 = EWA_LUT_INTERVALS + 1;
+const EWA_LUT_LEN: usize = EWA_LUT_WIDTH as usize;
+const EWA_GRID_LEN: usize = EWA_LUT_LEN * 2 - 1;
+
 pub struct PageTextures {
     gl: Arc<Context>,
+    vao: EmptyVao,
     pipeline: Pipeline,
+    ewa: EwaResampler,
     pages: HashMap<usize, EnumMap<Role, Option<PageTexture>>>,
     max_texture_edge: u32,
 }
 
-struct UniformLocations {
-    window_size: UniformLocation,
-    seat_offset: UniformLocation,
-    seat_size: UniformLocation,
-    page_uv_per_pixel: UniformLocation,
-    chroma_uv_per_pixel: UniformLocation,
+struct EmptyVao {
+    gl: Arc<Context>,
+    vao: VertexArray,
+}
+
+impl Drop for EmptyVao {
+    fn drop(&mut self) {
+        // SAFETY: Context is current (`Window` drop order) and `self` owns `vao`.
+        unsafe {
+            self.gl.delete_vertex_array(self.vao);
+        }
+    }
+}
+
+struct ColorSourceUniforms {
+    chroma_uv_per_step: UniformLocation,
     color_matrix: UniformLocation,
     color_offset: UniformLocation,
     alpha_normalization: UniformLocation,
     pixel_layout: UniformLocation,
     transfer_code: UniformLocation,
+}
+
+struct HorizontalCommonUniforms {
+    visible_origin_x: UniformLocation,
+    source_y_start: UniformLocation,
+    texture_size: UniformLocation,
+    seat_offset_x: UniformLocation,
+    source_per_screen_x: UniformLocation,
+}
+
+struct VerticalUniforms {
+    window_size: UniformLocation,
+    seat_offset: UniformLocation,
+    seat_size: UniformLocation,
+    visible_origin_x: UniformLocation,
+    visible_width: UniformLocation,
+    source_y_start: UniformLocation,
+    source_y_end: UniformLocation,
+    source_per_screen_y: UniformLocation,
     dither: UniformLocation,
+}
+
+struct HorizontalMonoProgram {
+    objects: ProgramObjects,
+    common: HorizontalCommonUniforms,
+    luma_gain_offset: UniformLocation,
+    transfer_code: UniformLocation,
+}
+
+struct HorizontalColorProgram {
+    objects: ProgramObjects,
+    common: HorizontalCommonUniforms,
+    color: ColorSourceUniforms,
+}
+
+struct VerticalProgram {
+    objects: ProgramObjects,
+    uniforms: VerticalUniforms,
+}
+
+struct EwaResampler {
+    gl: Arc<Context>,
+    max_texture_edge: u32,
+    lut: Texture,
+    fbo: Framebuffer,
+    scratch: [Option<Texture>; SCRATCH_TARGET_COUNT],
+    scratch_capacity: (u32, u32),
+    horizontal_mono: HorizontalMonoProgram,
+    vertical_mono: VerticalProgram,
+    horizontal_color: HorizontalColorProgram,
+    vertical_color: VerticalProgram,
+}
+
+impl Drop for EwaResampler {
+    fn drop(&mut self) {
+        // SAFETY: Context is current (`Window` drop order); `self` owns `lut`, `scratch`, and `fbo`.
+        unsafe {
+            self.gl.delete_texture(self.lut);
+            for texture in self.scratch.into_iter().flatten() {
+                self.gl.delete_texture(texture);
+            }
+            self.gl.delete_framebuffer(self.fbo);
+        }
+    }
 }
 
 /// One cached role's GPU state.
 struct PageTexture {
     gl: Arc<Context>,
-    /// Screen px -> page fraction, before the zoom-scale divide.
-    page_uv_per_pixel: (f32, f32),
+    dims: (u32, u32),
+    page_dims: (u32, u32),
     transfer: Transfer,
     needs_dither: bool,
     layout: PixelLayout,
@@ -189,8 +503,11 @@ impl Drop for PageTexture {
         // current and alive, and `self` owns these texture handles uniquely.
         unsafe {
             match self.layout {
-                PixelLayout::Rgba { texture, .. } => {
+                PixelLayout::Rgba { texture } => {
                     self.gl.delete_texture(texture);
+                }
+                PixelLayout::Mono { luma, .. } => {
+                    self.gl.delete_texture(luma);
                 }
                 PixelLayout::Yuv {
                     luma,
@@ -211,32 +528,40 @@ impl Drop for PageTexture {
 enum PixelLayout {
     Rgba {
         texture: Texture,
-        dims: (u32, u32),
+    },
+    Mono {
+        luma: Texture,
+        gain: f32,
+        offset: f32,
     },
     Yuv {
         luma: Texture,
         cb: Texture,
         cr: Texture,
         alpha: Texture,
-        /// Screen px -> chroma-page fraction, subsample-folded.
-        chroma_uv_per_pixel: (f32, f32),
+        /// Luma texel -> chroma UV, subsample-folded for this texture's dims.
+        chroma_uv_per_texel: (f32, f32),
         color_conversion: ColorConversion,
         /// Storage-sample normalization for the alpha plane.
         alpha_normalization: f32,
     },
 }
 
-impl PixelLayout {
-    fn shader_code(&self) -> i32 {
-        match self {
-            Self::Rgba { .. } => PIXEL_LAYOUT_RGBA,
-            Self::Yuv { .. } => PIXEL_LAYOUT_YUV,
-        }
-    }
-}
-
 const PIXEL_LAYOUT_RGBA: i32 = 0;
 const PIXEL_LAYOUT_YUV: i32 = 1;
+const PIXEL_LAYOUT_MONO: i32 = 2;
+
+#[derive(Clone, Copy)]
+struct DrawTarget {
+    window: (u32, u32),
+    clip: (u32, u32),
+}
+
+#[derive(Clone, Copy)]
+struct SeatGeometry {
+    origin: (f32, f32),
+    size: (f32, f32),
+}
 
 /// Fold storage samples to gamma RGB at upload: `matrix * samples - offset`.
 /// Samples are 0..1 storage units; R16 sampling already divides by 65535.
@@ -247,12 +572,107 @@ struct ColorConversion {
     offset: [f32; 3],
 }
 
+fn slot_roles(slots: &EnumMap<Role, Option<PageTexture>>) -> Roles {
+    let mut roles = Roles::default();
+    for (role, slot) in slots {
+        if slot.is_some() {
+            roles.set(role);
+        }
+    }
+    roles
+}
+
+/// Keep `Fit` whenever it covers `screen_edge` so zooming back out avoids
+/// re-filtering `Full`.
 fn best_texture(
     slots: &EnumMap<Role, Option<PageTexture>>,
+    screen_edge: f32,
 ) -> Option<&PageTexture> {
-    [Role::Full, Role::Fit, Role::Thumb]
-        .into_iter()
-        .find_map(|role| slots[role].as_ref())
+    if let Some(fit) = slots[Role::Fit].as_ref() {
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "texture edge stays far below f32's exact-integer range"
+        )]
+        let fit_edge = fit.dims.0.max(fit.dims.1) as f32;
+        if fit_edge + ROLE_COVER_MARGIN_PX >= screen_edge {
+            return Some(fit);
+        }
+    }
+    slots[slot_roles(slots).best()?].as_ref()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct VisibleSlice {
+    visible_origin: (i32, i32),
+    visible_size: (u32, u32),
+    source_y_range: (u32, u32),
+    source_per_screen: (f32, f32),
+}
+
+impl VisibleSlice {
+    fn source_row_count(self) -> u32 {
+        self.source_y_range.1 - self.source_y_range.0
+    }
+
+    fn is_minified(self) -> bool {
+        self.source_per_screen.0 > 1.0 + MINIFY_SCALE_TOLERANCE
+            || self.source_per_screen.1 > 1.0 + MINIFY_SCALE_TOLERANCE
+    }
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    reason = "coordinates fit i32 and exact f32, and clamping keeps u32 casts non-negative"
+)]
+fn compute_visible_slice(
+    seat: SeatGeometry,
+    clip_size: (u32, u32),
+    texture_dims: (u32, u32),
+) -> Option<VisibleSlice> {
+    if seat.size.0 <= 0.0
+        || seat.size.1 <= 0.0
+        || clip_size.0 == 0
+        || clip_size.1 == 0
+        || texture_dims.0 == 0
+        || texture_dims.1 == 0
+    {
+        return None;
+    }
+    let clip_width = gl_int(clip_size.0);
+    let clip_height = gl_int(clip_size.1);
+    let left = (seat.origin.0.floor() as i32).clamp(0, clip_width);
+    let right =
+        ((seat.origin.0 + seat.size.0).ceil() as i32).clamp(0, clip_width);
+    let top = (seat.origin.1.floor() as i32).clamp(0, clip_height);
+    let bottom = ((seat.origin.1 + seat.size.1).ceil() as i32)
+        .clamp(0, clip_height);
+    if right <= left || bottom <= top {
+        return None;
+    }
+    let texture_px = geometry::px_f32(texture_dims);
+    let source_per_screen_x = texture_px.0 / seat.size.0;
+    let source_per_screen_y = texture_px.1 / seat.size.1;
+    let support_radius_y = (EWA_SUPPORT as f32)
+        .mul_add(source_per_screen_y.max(1.0), SLICE_PAD_TEXELS);
+    let center_y_start =
+        (top as f32 + 0.5 - seat.origin.1) * source_per_screen_y;
+    let center_y_end =
+        (bottom as f32 - 0.5 - seat.origin.1) * source_per_screen_y;
+    let texture_height = gl_int(texture_dims.1);
+    let source_y_start = ((center_y_start - support_radius_y).floor()
+        as i32)
+        .clamp(0, texture_height - 1);
+    let source_y_end = ((center_y_end + support_radius_y).ceil() as i32
+        + 1)
+    .clamp(source_y_start + 1, texture_height);
+    Some(VisibleSlice {
+        visible_origin: (left, top),
+        visible_size: ((right - left) as u32, (bottom - top) as u32),
+        source_y_range: (source_y_start as u32, source_y_end as u32),
+        source_per_screen: (source_per_screen_x, source_per_screen_y),
+    })
 }
 
 /// Refuse a page over `MAX_TEXTURE_SIZE` before upload; an oversized
@@ -270,11 +690,6 @@ fn check_texture_dims(
 
 impl PageTextures {
     fn new(gl: Arc<Context>) -> eros::Result<Self> {
-        let pipeline = create_pipeline(
-            Arc::clone(&gl),
-            VERTEX_SHADER_SOURCE,
-            FRAGMENT_SHADER_SOURCE,
-        )?;
         // SAFETY: MAX_TEXTURE_SIZE is a pure query on the current context.
         let Ok(max_texture_edge) = u32::try_from(unsafe {
             gl.get_parameter_i32(glow::MAX_TEXTURE_SIZE)
@@ -287,9 +702,29 @@ impl PageTextures {
                 cache::THUMB_EDGE
             ));
         }
+        // SAFETY: Context is current (module invariant).
+        let raw_vao =
+            unsafe { gl.create_vertex_array() }.map_err(|error| {
+                eros::error!(
+                    "GL vertex array object creation failed: {error}"
+                )
+            })?;
+        let vao = EmptyVao {
+            gl: Arc::clone(&gl),
+            vao: raw_vao,
+        };
+        label(&gl, glow::VERTEX_ARRAY, vao.vao.0.get(), "page quad");
+        // SAFETY: Context is current and `vao.vao` was just created.
+        unsafe {
+            gl.bind_vertex_array(Some(vao.vao));
+        }
+        let pipeline = create_pipeline(Arc::clone(&gl))?;
+        let ewa = EwaResampler::new(Arc::clone(&gl), max_texture_edge)?;
         Ok(Self {
             gl,
+            vao,
             pipeline,
+            ewa,
             pages: HashMap::new(),
             max_texture_edge,
         })
@@ -327,11 +762,8 @@ impl PageTextures {
         let dims = (image.width(), image.height());
         check_texture_dims(dims, self.max_texture_edge)?;
         if let Some(PageTexture {
-            layout:
-                PixelLayout::Rgba {
-                    texture,
-                    dims: present_dims,
-                },
+            dims: present_dims,
+            layout: PixelLayout::Rgba { texture },
             transfer,
             ..
         }) =
@@ -354,16 +786,9 @@ impl PageTextures {
     }
 
     pub fn roles(&self, page: usize) -> Roles {
-        let Some(slots) = self.pages.get(&page) else {
-            return Roles::default();
-        };
-        let mut roles = Roles::default();
-        for (role, slot) in slots {
-            if slot.is_some() {
-                roles.set(role);
-            }
-        }
-        roles
+        self.pages
+            .get(&page)
+            .map_or_else(Roles::default, slot_roles)
     }
 
     fn has(&self, page: usize, role: Role) -> bool {
@@ -393,10 +818,9 @@ impl PageTextures {
         self.pages.clear();
     }
 
-    /// Draw the shown spread, clipped to `viewport`; each seat draws its
-    /// largest resident role. Does not clear the framebuffer.
+    /// Does not clear the framebuffer.
     pub fn draw(
-        &self,
+        &mut self,
         window_size: (u32, u32),
         viewport: Viewport,
         spread_layout: &SpreadLayout,
@@ -406,7 +830,6 @@ impl PageTextures {
         if window_size.0 == 0 || window_size.1 == 0 {
             return;
         }
-        begin_frame(&self.gl, &self.pipeline, window_size);
         // GL scissor is bottom-origin and the viewport hugs the window's
         // top-left, so only the height converts.
         #[expect(
@@ -414,62 +837,25 @@ impl PageTextures {
             clippy::cast_sign_loss,
             reason = "viewport size is clamped non-negative whole physical px held as f32"
         )]
-        let (width, height) =
+        let (viewport_width, viewport_height) =
             (viewport.size().0 as u32, viewport.size().1 as u32);
-        // SAFETY: the context is current.
-        unsafe {
-            self.gl.enable(glow::SCISSOR_TEST);
-            self.gl.scissor(
-                0,
-                gl_int(window_size.1.saturating_sub(height)),
-                gl_int(width),
-                gl_int(height),
-            );
+        let clip_size = (
+            viewport_width.min(window_size.0),
+            viewport_height.min(window_size.1),
+        );
+        if clip_size.0 == 0 || clip_size.1 == 0 {
+            return;
         }
+        let target = DrawTarget {
+            window: window_size,
+            clip: clip_size,
+        };
+        begin_frame(&self.gl, self.vao.vao, target);
         for (rect, page) in
             spread_layout.rects.iter().zip(seat_pages.iter())
         {
             let Some(rect) = rect else { continue };
             let Some(page) = page else { continue };
-            let Some(texture) =
-                self.pages.get(page).and_then(best_texture)
-            else {
-                continue;
-            };
-            let page_uv_per_pixel = texture.page_uv_per_pixel;
-            // A seat rect is in page pixels; a texture's UV spans the page.
-            let uv_extent = (
-                rect.size.0 * page_uv_per_pixel.0,
-                rect.size.1 * page_uv_per_pixel.1,
-            );
-            let aligned = (uv_extent.0 - 1.0).abs() <= SEAT_UV_TOLERANCE
-                && (uv_extent.1 - 1.0).abs() <= SEAT_UV_TOLERANCE;
-            if !aligned {
-                tracing::debug!(
-                    page = *page,
-                    rect = ?rect.size,
-                    ?page_uv_per_pixel,
-                    "seat layout disagrees with the texture's page dims"
-                );
-            }
-            debug_assert!(
-                aligned,
-                "seat rect and texture page dims disagree for page \
-                 {page}: rect {:?}, page uv {page_uv_per_pixel:?}",
-                rect.size
-            );
-            // Whole-pixel rect origin: at 1:1 zoom a fractional origin
-            // makes NEAREST draw uneven texel rows.
-            let screen_origin = (
-                rect.pos
-                    .0
-                    .mul_add(placement.scale, placement.offset.0)
-                    .round(),
-                rect.pos
-                    .1
-                    .mul_add(placement.scale, placement.offset.1)
-                    .round(),
-            );
             let screen_size = (
                 rect.size.0 * placement.scale,
                 rect.size.1 * placement.scale,
@@ -477,21 +863,82 @@ impl PageTextures {
             if screen_size.0 <= 0.0 || screen_size.1 <= 0.0 {
                 continue;
             }
-            draw_page(
-                &self.gl,
-                &self.pipeline,
-                texture,
-                screen_origin,
-                screen_size,
-                placement.scale,
-            );
+            let screen_edge = screen_size.0.max(screen_size.1);
+            let Some(texture) = self
+                .pages
+                .get(page)
+                .and_then(|slots| best_texture(slots, screen_edge))
+            else {
+                continue;
+            };
+            check_seat_page_dims(*page, rect, texture.page_dims);
+            // Whole-pixel rect origin: at 1:1 zoom a fractional origin
+            // makes NEAREST draw uneven texel rows.
+            let seat = SeatGeometry {
+                origin: (
+                    rect.pos
+                        .0
+                        .mul_add(placement.scale, placement.offset.0)
+                        .round(),
+                    rect.pos
+                        .1
+                        .mul_add(placement.scale, placement.offset.1)
+                        .round(),
+                ),
+                size: screen_size,
+            };
+            let Some(slice) =
+                compute_visible_slice(seat, clip_size, texture.dims)
+            else {
+                continue;
+            };
+            let drew_ewa = slice.is_minified()
+                && self.ewa.draw_minified(target, texture, seat, slice);
+            if !drew_ewa {
+                draw_page(
+                    &self.gl,
+                    &self.pipeline,
+                    target,
+                    texture,
+                    seat,
+                    slice.source_per_screen,
+                );
+            }
         }
-        // SAFETY: the context is current. This restores unclipped raster
-        // state.
+        // SAFETY: Context is current (`Window`); restore default FBO, unclipped
+        // raster state, and texture unit 0 before egui paints.
         unsafe {
+            self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
             self.gl.disable(glow::SCISSOR_TEST);
+            self.gl.active_texture(glow::TEXTURE0);
         }
     }
+}
+
+fn check_seat_page_dims(
+    page: usize,
+    rect: &PageRect,
+    page_dims: (u32, u32),
+) {
+    // A seat rect is in page pixels and spans the whole page.
+    let expected = geometry::px_f32(page_dims);
+    let aligned = (rect.size.0 - expected.0).abs()
+        <= SEAT_PAGE_DIMS_TOLERANCE
+        && (rect.size.1 - expected.1).abs() <= SEAT_PAGE_DIMS_TOLERANCE;
+    if !aligned {
+        tracing::debug!(
+            page,
+            rect = ?rect.size,
+            ?page_dims,
+            "seat layout disagrees with the texture's page dims"
+        );
+    }
+    debug_assert!(
+        aligned,
+        "seat rect and texture page dims disagree for page \
+         {page}: rect {:?}, page dims {page_dims:?}",
+        rect.size
+    );
 }
 
 struct ShaderGuard<'gl> {
@@ -531,54 +978,57 @@ fn compile_shader<'gl>(
     Ok(guard)
 }
 
-struct PipelineObjects {
+struct ProgramObjects {
     gl: Arc<Context>,
     program: Program,
-    vao: VertexArray,
 }
 
-impl Drop for PipelineObjects {
+impl Drop for ProgramObjects {
     fn drop(&mut self) {
-        // SAFETY: `Window` drops `PageTextures` while the context is still
-        // current and alive, and `self` owns both objects uniquely.
+        // SAFETY: Context is current (`Window` drop order) and `self` owns `program`.
         unsafe {
             self.gl.delete_program(self.program);
-            self.gl.delete_vertex_array(self.vao);
         }
     }
 }
 
-/// The linked program, cached uniform locations, and the empty VAO a
-/// core profile requires.
 struct Pipeline {
-    objects: PipelineObjects,
-    uniform_locations: UniformLocations,
+    objects: ProgramObjects,
+    window_size: UniformLocation,
+    seat_offset: UniformLocation,
+    seat_size: UniformLocation,
+    page_uv_per_screen: UniformLocation,
+    luma_gain_offset: UniformLocation,
+    dither: UniformLocation,
+    color: ColorSourceUniforms,
 }
 
-fn create_pipeline(
+fn uniform_location(
+    gl: &Context,
+    program: Program,
+    name: &str,
+) -> UniformLocation {
+    // SAFETY: Context is current (module invariant) and `program` is linked.
+    let found = unsafe { gl.get_uniform_location(program, name) };
+    #[expect(
+        clippy::expect_used,
+        reason = "declared and used in the in-tree shader sources, so a miss is an in-tree regression"
+    )]
+    found.expect("uniform location in shader")
+}
+
+fn link_program(
     gl: Arc<Context>,
     vertex_source: &str,
     fragment_source: &str,
-) -> eros::Result<Pipeline> {
-    // SAFETY: Caller ensures the GL context is current on the render thread.
+    samplers: &[(i32, &str)],
+    debug_name: &str,
+) -> eros::Result<ProgramObjects> {
+    // SAFETY: Context is current (module invariant).
     let program = unsafe { gl.create_program() }.map_err(|error| {
         eros::error!("GL program object creation failed: {error}")
     })?;
-    // SAFETY: Caller ensures the GL context is current on the render thread.
-    let vao = match unsafe { gl.create_vertex_array() } {
-        Ok(vao) => vao,
-        Err(error) => {
-            // SAFETY: `program` was just created on the current context.
-            unsafe {
-                gl.delete_program(program);
-            }
-            return Err(eros::error!(
-                "GL vertex array object creation failed: {error}"
-            ));
-        }
-    };
-    let objects = PipelineObjects { gl, program, vao };
-
+    let objects = ProgramObjects { gl, program };
     {
         let vertex_shader = compile_shader(
             &objects.gl,
@@ -590,8 +1040,7 @@ fn create_pipeline(
             glow::FRAGMENT_SHADER,
             fragment_source,
         )?;
-        // SAFETY: `objects.program` and both compiled shaders are live on the
-        // current context.
+        // SAFETY: Context is current; `objects.program` and both shaders are live.
         unsafe {
             objects
                 .gl
@@ -604,87 +1053,802 @@ fn create_pipeline(
                 let info =
                     objects.gl.get_program_info_log(objects.program);
                 return Err(eros::error!(
-                    "GL program link failed: {info}"
+                    "GL program link failed ({debug_name}): {info}"
                 ));
             }
         }
     }
-
-    let location = |name: &str| {
-        // SAFETY: `objects.program` is linked and live on the current context.
-        let found = unsafe {
-            objects.gl.get_uniform_location(objects.program, name)
-        };
-        #[expect(
-            clippy::expect_used,
-            reason = "declared and used in the in-tree shader sources, so a miss is an in-tree regression"
-        )]
-        found.expect("uniform location in page shader")
-    };
-    let sampler_locations = [
-        (0_i32, location("u_rgba_or_luma")),
-        (1, location("u_cb")),
-        (2, location("u_cr")),
-        (3, location("u_alpha")),
-    ];
-    // SAFETY: `objects.vao` and `objects.program` are live on the current
-    // context, and all sampler locations belong to `objects.program`.
+    // Sampler units are fixed; draw calls rebind textures only.
+    // SAFETY: Context is current and `objects.program` is linked.
     unsafe {
-        // A core profile still requires a VAO.
-        objects.gl.bind_vertex_array(Some(objects.vao));
-        // Sampler units are fixed. Draw rebinds textures only. A silently
-        // skipped sampler uniform would point every unit at 0, so a missing
-        // location fails creation.
         objects.gl.use_program(Some(objects.program));
-        for (unit, loc) in sampler_locations {
-            objects.gl.uniform_1_i32(Some(&loc), unit);
+        for &(unit, name) in samplers {
+            let location =
+                uniform_location(&objects.gl, objects.program, name);
+            objects.gl.uniform_1_i32(Some(&location), unit);
         }
     }
-    let uniform_locations = UniformLocations {
-        window_size: location("u_window_size"),
-        seat_offset: location("u_seat_offset"),
-        seat_size: location("u_seat_size"),
-        page_uv_per_pixel: location("u_page_uv_per_pixel"),
-        chroma_uv_per_pixel: location("u_chroma_uv_per_pixel"),
-        color_matrix: location("u_color_matrix"),
-        color_offset: location("u_color_offset"),
-        alpha_normalization: location("u_alpha_normalization"),
-        pixel_layout: location("u_pixel_layout"),
-        transfer_code: location("u_transfer_code"),
-        dither: location("u_dither"),
-    };
-
     label(
         &objects.gl,
         glow::PROGRAM,
         objects.program.0.get(),
-        "page program",
+        debug_name,
     );
-    label(
-        &objects.gl,
-        glow::VERTEX_ARRAY,
-        objects.vao.0.get(),
-        "page quad",
-    );
+    Ok(objects)
+}
 
+fn create_pipeline(gl: Arc<Context>) -> eros::Result<Pipeline> {
+    let fragment_source = fragment_shader_source();
+    let objects = link_program(
+        gl,
+        VERTEX_SHADER_SOURCE,
+        &fragment_source,
+        &[
+            (0, "u_rgba_or_luma"),
+            (1, "u_cb"),
+            (2, "u_cr"),
+            (3, "u_alpha"),
+        ],
+        "page program",
+    )?;
+    let location =
+        |name: &str| uniform_location(&objects.gl, objects.program, name);
+    let color = ColorSourceUniforms::lookup(&objects.gl, objects.program);
     Ok(Pipeline {
+        window_size: location("u_window_size"),
+        seat_offset: location("u_seat_offset"),
+        seat_size: location("u_seat_size"),
+        page_uv_per_screen: location("u_page_uv_per_screen"),
+        luma_gain_offset: location("u_luma_gain_offset"),
+        dither: location("u_dither"),
+        color,
         objects,
-        uniform_locations,
     })
 }
 
-/// Set the frame state the page draws depend on: the viewport, the
-/// premultiplied compositing pages draw with, and the window-size
-/// uniform. egui's own paint re-sets its blend state afterwards.
-fn begin_frame(
-    gl: &Context,
-    pipeline: &Pipeline,
-    window_size: (u32, u32),
-) {
-    let window_px = geometry::px_f32(window_size);
-    // SAFETY: Caller holds the current context; `pipeline` handles are live.
+fn jinc(radius: f64) -> f64 {
+    const SERIES_TERMS: usize = 35;
+
+    let half_arg = 0.5 * PI * radius;
+    let neg_square = -(half_arg * half_arg);
+    let mut term = 1.0_f64;
+    let mut sum = 1.0_f64;
+    for term_index in 1..=SERIES_TERMS {
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "term_index <= 35, exact in f64"
+        )]
+        let index_f64 = term_index as f64;
+        term *= neg_square / (index_f64 * (index_f64 + 1.0));
+        sum += term;
+    }
+    sum
+}
+
+fn ewa_lanczos3(radius: f64) -> f64 {
+    if radius >= EWA_SUPPORT {
+        return 0.0;
+    }
+    jinc(radius) * jinc(radius * (EWA_JINC_FIRST_ZERO / EWA_SUPPORT))
+}
+
+fn dot_product(left: &[f64], right: &[f64]) -> f64 {
+    left.iter().zip(right).map(|(lhs, rhs)| lhs * rhs).sum()
+}
+
+fn project_out(vector: &mut [f64], unit_basis: &[f64]) {
+    let projection = dot_product(vector, unit_basis);
+    for (slot, &basis) in vector.iter_mut().zip(unit_basis) {
+        *slot = projection.mul_add(-basis, *slot);
+    }
+}
+
+fn normalize_vector(vector: &mut [f64]) {
+    let norm = vector
+        .iter()
+        .map(|component| component * component)
+        .sum::<f64>()
+        .sqrt();
+    if norm > 0.0 {
+        for slot in vector.iter_mut() {
+            *slot /= norm;
+        }
+    }
+}
+
+fn power_eigen_symmetric(
+    matrix: &[f64],
+    center_index: usize,
+    initial_vector: &[f64],
+    orthogonal_basis: Option<&[f64]>,
+) -> (f64, Vec<f64>) {
+    const POWER_ITERATIONS: usize = 32;
+
+    let mut vector = initial_vector.to_vec();
+    if let Some(basis) = orthogonal_basis {
+        project_out(&mut vector, basis);
+    }
+    normalize_vector(&mut vector);
+
+    let mut next = vec![0.0_f64; EWA_GRID_LEN];
+    let rows = matrix.as_chunks::<EWA_GRID_LEN>().0;
+    for _ in 0..POWER_ITERATIONS {
+        for (target, row) in next.iter_mut().zip(rows) {
+            *target = dot_product(row, &vector);
+        }
+        if let Some(basis) = orthogonal_basis {
+            project_out(&mut next, basis);
+        }
+        normalize_vector(&mut next);
+        vector.copy_from_slice(&next);
+    }
+
+    let eigenvalue: f64 = vector
+        .iter()
+        .zip(rows)
+        .map(|(&component, row)| component * dot_product(row, &vector))
+        .sum();
+    if vector.get(center_index).is_some_and(|&center| center < 0.0) {
+        for slot in &mut vector {
+            *slot = -*slot;
+        }
+    }
+    (eigenvalue, vector)
+}
+
+/// Rank-2 symmetric eigendecomposition of circular 2D `EWA-Lanczos3`:
+/// `K(dx, dy) ≈ g0(|dx|) * g0(|dy|) - g1(|dx|) * g1(|dy|)`.
+fn ewa_rank2_lut() -> [[f32; 2]; EWA_LUT_LEN] {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "EWA_GRID_LEN is 257, exact in f64"
+    )]
+    let grid_step = 2.0 * EWA_SUPPORT / (EWA_GRID_LEN - 1) as f64;
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "grid index <= 256, exact in f64"
+    )]
+    let coords: Vec<f64> = (0..EWA_GRID_LEN)
+        .map(|index| (index as f64).mul_add(grid_step, -EWA_SUPPORT))
+        .collect();
+
+    let mut matrix = Vec::with_capacity(EWA_GRID_LEN * EWA_GRID_LEN);
+    for &coord_y in &coords {
+        for &coord_x in &coords {
+            matrix.push(ewa_lanczos3(coord_x.hypot(coord_y)));
+        }
+    }
+
+    let center_index = EWA_LUT_LEN - 1;
+    let primary_init: Vec<f64> = coords
+        .iter()
+        .map(|&coord| (0.5 * PI * coord / EWA_SUPPORT).cos())
+        .collect();
+    let (primary_eigenvalue, primary_vector) =
+        power_eigen_symmetric(&matrix, center_index, &primary_init, None);
+
+    for (row, &row_entry) in matrix
+        .as_chunks_mut::<EWA_GRID_LEN>()
+        .0
+        .iter_mut()
+        .zip(&primary_vector)
+    {
+        let row_scale = primary_eigenvalue * row_entry;
+        for (cell, &col_entry) in row.iter_mut().zip(&primary_vector) {
+            *cell = row_scale.mul_add(-col_entry, *cell);
+        }
+    }
+
+    let secondary_init: Vec<f64> = coords
+        .iter()
+        .map(|&coord| (2.0 * coord / EWA_SUPPORT).cos())
+        .collect();
+    let (secondary_eigenvalue, secondary_vector) = power_eigen_symmetric(
+        &matrix,
+        center_index,
+        &secondary_init,
+        Some(&primary_vector),
+    );
+
+    let primary_scale = primary_eigenvalue.abs().sqrt();
+    let secondary_scale = secondary_eigenvalue.abs().sqrt();
+    let mut lut = [[0.0_f32; 2]; EWA_LUT_LEN];
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "LUT stores GPU texture weights in f32"
+    )]
+    if let (Some(primary_half), Some(secondary_half)) = (
+        primary_vector.get(center_index..),
+        secondary_vector.get(center_index..),
+    ) {
+        for ((slot, &primary_weight), &secondary_weight) in
+            lut.iter_mut().zip(primary_half).zip(secondary_half)
+        {
+            *slot = [
+                (primary_scale * primary_weight) as f32,
+                (secondary_scale * secondary_weight) as f32,
+            ];
+        }
+    }
+    if let Some(last) = lut.last_mut() {
+        *last = [0.0, 0.0];
+    }
+    lut
+}
+
+fn upload_ewa_lut(gl: &Context) -> Texture {
+    let lut = ewa_rank2_lut();
+    // SAFETY: Context is current (module invariant); `lut` holds `EWA_LUT_WIDTH` RG floats.
     unsafe {
-        gl.viewport(0, 0, gl_int(window_size.0), gl_int(window_size.1));
+        #[expect(
+            clippy::expect_used,
+            reason = "texture-creation failure panics by policy"
+        )]
+        let texture = gl.create_texture().expect("GL EWA LUT texture");
+        gl.bind_texture(glow::TEXTURE_1D, Some(texture));
+        gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
+        gl.tex_parameter_i32(
+            glow::TEXTURE_1D,
+            glow::TEXTURE_WRAP_S,
+            gl_int(glow::CLAMP_TO_EDGE),
+        );
+        gl.tex_parameter_i32(
+            glow::TEXTURE_1D,
+            glow::TEXTURE_MIN_FILTER,
+            gl_int(glow::LINEAR),
+        );
+        gl.tex_parameter_i32(
+            glow::TEXTURE_1D,
+            glow::TEXTURE_MAG_FILTER,
+            gl_int(glow::LINEAR),
+        );
+        gl.tex_image_1d(
+            glow::TEXTURE_1D,
+            0,
+            gl_int(glow::RG32F),
+            EWA_LUT_WIDTH,
+            0,
+            glow::RG,
+            glow::FLOAT,
+            PixelUnpackData::Slice(Some(bytemuck::cast_slice(&lut))),
+        );
+        gl.bind_texture(glow::TEXTURE_1D, None);
+        label(gl, glow::TEXTURE, texture.0.get(), "ewa rank2 lut");
+        texture
+    }
+}
+
+const SCRATCH_TARGET_COUNT: usize = 3;
+const MONO_SCRATCH_TARGET_COUNT: usize = 1;
+
+const SCRATCH_SPECS: [(u32, u32, &str); SCRATCH_TARGET_COUNT] = [
+    (glow::RGBA16F, glow::RGBA, "ewa scratch primary"),
+    (glow::RGBA16F, glow::RGBA, "ewa scratch secondary"),
+    (glow::RG16F, glow::RG, "ewa scratch weights"),
+];
+
+enum ScratchTargets {
+    Mono(Texture),
+    Color([Texture; SCRATCH_TARGET_COUNT]),
+}
+
+fn alloc_scratch_texture(
+    gl: &Context,
+    existing: Option<Texture>,
+    dims: (u32, u32),
+    internal_format: u32,
+    format: u32,
+    debug_name: &str,
+) -> Texture {
+    // SAFETY: Context is current (module invariant); caller keeps `dims` within `1..=max_texture_edge`.
+    unsafe {
+        #[expect(
+            clippy::expect_used,
+            reason = "texture-creation failure panics by policy"
+        )]
+        let texture = existing.unwrap_or_else(|| {
+            let created =
+                gl.create_texture().expect("GL scratch texture object");
+            gl.bind_texture(glow::TEXTURE_2D, Some(created));
+            for (param, value) in [
+                (glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE),
+                (glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE),
+                (glow::TEXTURE_MIN_FILTER, glow::NEAREST),
+                (glow::TEXTURE_MAG_FILTER, glow::NEAREST),
+            ] {
+                gl.tex_parameter_i32(
+                    glow::TEXTURE_2D,
+                    param,
+                    gl_int(value),
+                );
+            }
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_BASE_LEVEL,
+                0,
+            );
+            gl.tex_parameter_i32(
+                glow::TEXTURE_2D,
+                glow::TEXTURE_MAX_LEVEL,
+                0,
+            );
+            label(gl, glow::TEXTURE, created.0.get(), debug_name);
+            created
+        });
+        gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+        gl.tex_image_2d(
+            glow::TEXTURE_2D,
+            0,
+            gl_int(internal_format),
+            gl_int(dims.0),
+            gl_int(dims.1),
+            0,
+            format,
+            glow::FLOAT,
+            PixelUnpackData::Slice(None),
+        );
+        texture
+    }
+}
+
+fn lookup_horizontal_common(
+    gl: &Context,
+    program: Program,
+) -> HorizontalCommonUniforms {
+    let location = |name: &str| uniform_location(gl, program, name);
+    HorizontalCommonUniforms {
+        visible_origin_x: location("u_visible_origin_x"),
+        source_y_start: location("u_source_y_start"),
+        texture_size: location("u_texture_size"),
+        seat_offset_x: location("u_seat_offset_x"),
+        source_per_screen_x: location("u_source_per_screen_x"),
+    }
+}
+
+fn create_vertical_program(
+    gl: Arc<Context>,
+    variant: EwaVariant,
+    samplers: &[(i32, &str)],
+    debug_name: &str,
+) -> eros::Result<VerticalProgram> {
+    let fragment_source = ewa_vertical_shader_source(variant);
+    let objects = link_program(
+        gl,
+        VERTEX_SHADER_SOURCE,
+        &fragment_source,
+        samplers,
+        debug_name,
+    )?;
+    let location =
+        |name: &str| uniform_location(&objects.gl, objects.program, name);
+    let uniforms = VerticalUniforms {
+        window_size: location("u_window_size"),
+        seat_offset: location("u_seat_offset"),
+        seat_size: location("u_seat_size"),
+        visible_origin_x: location("u_visible_origin_x"),
+        visible_width: location("u_visible_width"),
+        source_y_start: location("u_source_y_start"),
+        source_y_end: location("u_source_y_end"),
+        source_per_screen_y: location("u_source_per_screen_y"),
+        dither: location("u_dither"),
+    };
+    Ok(VerticalProgram { objects, uniforms })
+}
+
+fn bind_horizontal_common(
+    gl: &Context,
+    common: &HorizontalCommonUniforms,
+    slice: VisibleSlice,
+    texture_dims: (u32, u32),
+    seat_origin_x: f32,
+) {
+    // SAFETY: Context is current (module invariant) and the active program owns `common`.
+    unsafe {
+        gl.uniform_1_i32(
+            Some(&common.visible_origin_x),
+            slice.visible_origin.0,
+        );
+        gl.uniform_1_i32(
+            Some(&common.source_y_start),
+            gl_int(slice.source_y_range.0),
+        );
+        gl.uniform_2_i32(
+            Some(&common.texture_size),
+            gl_int(texture_dims.0),
+            gl_int(texture_dims.1),
+        );
+        gl.uniform_1_f32(Some(&common.seat_offset_x), seat_origin_x);
+        gl.uniform_1_f32(
+            Some(&common.source_per_screen_x),
+            slice.source_per_screen.0,
+        );
+    }
+}
+
+impl EwaResampler {
+    fn new(gl: Arc<Context>, max_texture_edge: u32) -> eros::Result<Self> {
+        let horizontal_mono_source =
+            ewa_horizontal_shader_source(EwaVariant::Mono);
+        let horizontal_mono_objects = link_program(
+            Arc::clone(&gl),
+            FULLSCREEN_VERTEX_SHADER_SOURCE,
+            &horizontal_mono_source,
+            &[(0, "u_rgba_or_luma"), (EWA_LUT_SAMPLER_UNIT, "u_ewa_lut")],
+            "ewa horiz mono",
+        )?;
+        let horizontal_mono = HorizontalMonoProgram {
+            common: lookup_horizontal_common(
+                &horizontal_mono_objects.gl,
+                horizontal_mono_objects.program,
+            ),
+            luma_gain_offset: uniform_location(
+                &horizontal_mono_objects.gl,
+                horizontal_mono_objects.program,
+                "u_luma_gain_offset",
+            ),
+            transfer_code: uniform_location(
+                &horizontal_mono_objects.gl,
+                horizontal_mono_objects.program,
+                "u_transfer_code",
+            ),
+            objects: horizontal_mono_objects,
+        };
+
+        let horizontal_color_source =
+            ewa_horizontal_shader_source(EwaVariant::Color);
+        let horizontal_color_objects = link_program(
+            Arc::clone(&gl),
+            FULLSCREEN_VERTEX_SHADER_SOURCE,
+            &horizontal_color_source,
+            &[
+                (0, "u_rgba_or_luma"),
+                (1, "u_cb"),
+                (2, "u_cr"),
+                (3, "u_alpha"),
+                (EWA_LUT_SAMPLER_UNIT, "u_ewa_lut"),
+            ],
+            "ewa horiz color",
+        )?;
+        let horizontal_color = HorizontalColorProgram {
+            common: lookup_horizontal_common(
+                &horizontal_color_objects.gl,
+                horizontal_color_objects.program,
+            ),
+            color: ColorSourceUniforms::lookup(
+                &horizontal_color_objects.gl,
+                horizontal_color_objects.program,
+            ),
+            objects: horizontal_color_objects,
+        };
+
+        let vertical_mono = create_vertical_program(
+            Arc::clone(&gl),
+            EwaVariant::Mono,
+            &[
+                (0, "u_scratch_primary"),
+                (EWA_LUT_SAMPLER_UNIT, "u_ewa_lut"),
+            ],
+            "ewa vert mono",
+        )?;
+        let vertical_color = create_vertical_program(
+            Arc::clone(&gl),
+            EwaVariant::Color,
+            &[
+                (0, "u_scratch_primary"),
+                (1, "u_scratch_secondary"),
+                (2, "u_scratch_weights"),
+                (EWA_LUT_SAMPLER_UNIT, "u_ewa_lut"),
+            ],
+            "ewa vert color",
+        )?;
+
+        let lut = upload_ewa_lut(&gl);
+        // SAFETY: Context is current (module invariant).
+        let fbo = unsafe { gl.create_framebuffer() }.map_err(|error| {
+            // SAFETY: Context is current (module invariant) and `lut` is owned locally.
+            unsafe {
+                gl.delete_texture(lut);
+            }
+            eros::error!("GL framebuffer creation failed: {error}")
+        })?;
+        label(&gl, glow::FRAMEBUFFER, fbo.0.get(), "ewa scratch fbo");
+
+        Ok(Self {
+            gl,
+            max_texture_edge,
+            lut,
+            fbo,
+            scratch: [None; SCRATCH_TARGET_COUNT],
+            scratch_capacity: (0, 0),
+            horizontal_mono,
+            vertical_mono,
+            horizontal_color,
+            vertical_color,
+        })
+    }
+
+    /// Leaves `self.fbo` bound on success; restores `FRAMEBUFFER = 0` on failure.
+    fn bind_scratch_fbo(
+        &mut self,
+        dims: (u32, u32),
+        variant: EwaVariant,
+    ) -> Option<ScratchTargets> {
+        if dims.0 == 0
+            || dims.1 == 0
+            || dims.0 > self.max_texture_edge
+            || dims.1 > self.max_texture_edge
+        {
+            return None;
+        }
+        let needs_grow = self.scratch[0].is_none()
+            || dims.0 > self.scratch_capacity.0
+            || dims.1 > self.scratch_capacity.1;
+        if needs_grow {
+            self.scratch_capacity = (
+                self.scratch_capacity.0.max(dims.0),
+                self.scratch_capacity.1.max(dims.1),
+            );
+        }
+        let target_count = match variant {
+            EwaVariant::Mono => MONO_SCRATCH_TARGET_COUNT,
+            EwaVariant::Color => SCRATCH_TARGET_COUNT,
+        };
+        for (index, (slot, &(internal_format, format, debug_name))) in
+            self.scratch.iter_mut().zip(&SCRATCH_SPECS).enumerate()
+        {
+            if (needs_grow && slot.is_some())
+                || (index < target_count && slot.is_none())
+            {
+                *slot = Some(alloc_scratch_texture(
+                    &self.gl,
+                    *slot,
+                    self.scratch_capacity,
+                    internal_format,
+                    format,
+                    debug_name,
+                ));
+            }
+        }
+        let [Some(primary), secondary_slot, weights_slot] = self.scratch
+        else {
+            return None;
+        };
+        let all_draw_buffers = [
+            glow::COLOR_ATTACHMENT0,
+            glow::COLOR_ATTACHMENT1,
+            glow::COLOR_ATTACHMENT2,
+        ];
+        let mono_draw_buffer = [glow::COLOR_ATTACHMENT0];
+        let (targets, attachments, draw_buffers): (
+            ScratchTargets,
+            [Option<Texture>; SCRATCH_TARGET_COUNT],
+            &[u32],
+        ) = match variant {
+            EwaVariant::Color => {
+                let [Some(secondary), Some(weights)] =
+                    [secondary_slot, weights_slot]
+                else {
+                    return None;
+                };
+                (
+                    ScratchTargets::Color([primary, secondary, weights]),
+                    [Some(primary), Some(secondary), Some(weights)],
+                    &all_draw_buffers,
+                )
+            }
+            EwaVariant::Mono => (
+                ScratchTargets::Mono(primary),
+                [Some(primary), None, None],
+                &mono_draw_buffer,
+            ),
+        };
+
+        // SAFETY: Context is current (module invariant); `self.fbo` and `attachments` are live.
+        unsafe {
+            self.gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.fbo));
+            for (&attachment, &texture) in
+                all_draw_buffers.iter().zip(&attachments)
+            {
+                self.gl.framebuffer_texture_2d(
+                    glow::FRAMEBUFFER,
+                    attachment,
+                    glow::TEXTURE_2D,
+                    texture,
+                    0,
+                );
+            }
+            self.gl.draw_buffers(draw_buffers);
+            let status =
+                self.gl.check_framebuffer_status(glow::FRAMEBUFFER);
+            if status != glow::FRAMEBUFFER_COMPLETE {
+                tracing::debug!(
+                    status,
+                    needs_color = matches!(variant, EwaVariant::Color),
+                    ?dims,
+                    "ewa scratch framebuffer incomplete; falling back"
+                );
+                self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+                return None;
+            }
+        }
+        Some(targets)
+    }
+
+    fn draw_minified(
+        &mut self,
+        target: DrawTarget,
+        page_texture: &PageTexture,
+        seat: SeatGeometry,
+        slice: VisibleSlice,
+    ) -> bool {
+        const ONE_TEXEL_PER_STEP: (f32, f32) = (1.0, 1.0);
+
+        let scratch_dims =
+            (slice.visible_size.0, slice.source_row_count());
+        let variant =
+            if matches!(page_texture.layout, PixelLayout::Mono { .. }) {
+                EwaVariant::Mono
+            } else {
+                EwaVariant::Color
+            };
+        let Some(scratch) = self.bind_scratch_fbo(scratch_dims, variant)
+        else {
+            return false;
+        };
+
+        // Scratch rows carry signed lobes outside viewport bounds.
+        // SAFETY: Context is current (module invariant); `self.fbo` is complete and bound.
+        unsafe {
+            self.gl.disable(glow::SCISSOR_TEST);
+            self.gl.disable(glow::BLEND);
+            self.gl.viewport(
+                0,
+                0,
+                gl_int(scratch_dims.0),
+                gl_int(scratch_dims.1),
+            );
+            self.gl.active_texture(EWA_LUT_TEXTURE_UNIT);
+            self.gl.bind_texture(glow::TEXTURE_1D, Some(self.lut));
+
+            if let PixelLayout::Mono { luma, gain, offset } =
+                page_texture.layout
+            {
+                self.gl.use_program(Some(
+                    self.horizontal_mono.objects.program,
+                ));
+                bind_horizontal_common(
+                    &self.gl,
+                    &self.horizontal_mono.common,
+                    slice,
+                    page_texture.dims,
+                    seat.origin.0,
+                );
+                bind_mono_source(
+                    &self.gl,
+                    self.horizontal_mono.luma_gain_offset,
+                    self.horizontal_mono.transfer_code,
+                    page_texture.transfer,
+                    luma,
+                    (gain, offset),
+                );
+            } else {
+                self.gl.use_program(Some(
+                    self.horizontal_color.objects.program,
+                ));
+                bind_horizontal_common(
+                    &self.gl,
+                    &self.horizontal_color.common,
+                    slice,
+                    page_texture.dims,
+                    seat.origin.0,
+                );
+                self.horizontal_color.color.bind(
+                    &self.gl,
+                    page_texture,
+                    ONE_TEXEL_PER_STEP,
+                );
+            }
+            self.gl.draw_arrays(
+                glow::TRIANGLE_STRIP,
+                0,
+                QUAD_VERTEX_COUNT,
+            );
+        }
+
+        restore_screen_state(&self.gl, target);
+        let vertical = match scratch {
+            ScratchTargets::Mono(_) => &self.vertical_mono,
+            ScratchTargets::Color(_) => &self.vertical_color,
+        };
+        let window_px = geometry::px_f32(target.window);
+        // SAFETY: Context is current (module invariant) and default FBO is restored.
+        unsafe {
+            self.gl.use_program(Some(vertical.objects.program));
+            self.gl.uniform_2_f32(
+                Some(&vertical.uniforms.window_size),
+                window_px.0,
+                window_px.1,
+            );
+            self.gl.uniform_2_f32(
+                Some(&vertical.uniforms.seat_offset),
+                seat.origin.0,
+                seat.origin.1,
+            );
+            self.gl.uniform_2_f32(
+                Some(&vertical.uniforms.seat_size),
+                seat.size.0,
+                seat.size.1,
+            );
+            self.gl.uniform_1_i32(
+                Some(&vertical.uniforms.visible_origin_x),
+                slice.visible_origin.0,
+            );
+            self.gl.uniform_1_i32(
+                Some(&vertical.uniforms.visible_width),
+                gl_int(slice.visible_size.0),
+            );
+            self.gl.uniform_1_i32(
+                Some(&vertical.uniforms.source_y_start),
+                gl_int(slice.source_y_range.0),
+            );
+            self.gl.uniform_1_i32(
+                Some(&vertical.uniforms.source_y_end),
+                gl_int(slice.source_y_range.1),
+            );
+            self.gl.uniform_1_f32(
+                Some(&vertical.uniforms.source_per_screen_y),
+                slice.source_per_screen.1,
+            );
+            self.gl.uniform_1_i32(
+                Some(&vertical.uniforms.dither),
+                i32::from(page_texture.needs_dither),
+            );
+            match scratch {
+                ScratchTargets::Mono(primary) => {
+                    self.gl.active_texture(glow::TEXTURE0);
+                    self.gl.bind_texture(glow::TEXTURE_2D, Some(primary));
+                }
+                ScratchTargets::Color([primary, secondary, weights]) => {
+                    for (unit, texture) in [
+                        (glow::TEXTURE0, primary),
+                        (glow::TEXTURE1, secondary),
+                        (glow::TEXTURE2, weights),
+                    ] {
+                        self.gl.active_texture(unit);
+                        self.gl
+                            .bind_texture(glow::TEXTURE_2D, Some(texture));
+                    }
+                }
+            }
+            self.gl.active_texture(EWA_LUT_TEXTURE_UNIT);
+            self.gl.bind_texture(glow::TEXTURE_1D, Some(self.lut));
+            self.gl.draw_arrays(
+                glow::TRIANGLE_STRIP,
+                0,
+                QUAD_VERTEX_COUNT,
+            );
+        }
+        true
+    }
+}
+
+fn restore_screen_state(gl: &Context, target: DrawTarget) {
+    // SAFETY: Context is current (module invariant).
+    unsafe {
+        gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+        gl.viewport(
+            0,
+            0,
+            gl_int(target.window.0),
+            gl_int(target.window.1),
+        );
+        gl.enable(glow::SCISSOR_TEST);
+        gl.scissor(
+            0,
+            gl_int(target.window.1.saturating_sub(target.clip.1)),
+            gl_int(target.clip.0),
+            gl_int(target.clip.1),
+        );
         gl.enable(glow::BLEND);
         gl.blend_func_separate(
             glow::ONE,
@@ -692,102 +1856,182 @@ fn begin_frame(
             glow::ONE,
             glow::ONE_MINUS_SRC_ALPHA,
         );
-        gl.use_program(Some(pipeline.objects.program));
-        gl.bind_vertex_array(Some(pipeline.objects.vao));
-        gl.uniform_2_f32(
-            Some(&pipeline.uniform_locations.window_size),
-            window_px.0,
-            window_px.1,
-        );
     }
 }
 
-/// Draw one seat's quad. `u_pixel_layout` guards the layout-specific
-/// uniforms.
+fn begin_frame(gl: &Context, vao: VertexArray, target: DrawTarget) {
+    restore_screen_state(gl, target);
+    // SAFETY: Context is current (module invariant) and `vao` is owned by `PageTextures`.
+    unsafe {
+        gl.bind_vertex_array(Some(vao));
+    }
+}
+
+impl ColorSourceUniforms {
+    fn lookup(gl: &Context, program: Program) -> Self {
+        let location = |name: &str| uniform_location(gl, program, name);
+        Self {
+            chroma_uv_per_step: location("u_chroma_uv_per_step"),
+            color_matrix: location("u_color_matrix"),
+            color_offset: location("u_color_offset"),
+            alpha_normalization: location("u_alpha_normalization"),
+            pixel_layout: location("u_pixel_layout"),
+            transfer_code: location("u_transfer_code"),
+        }
+    }
+
+    fn bind(
+        &self,
+        gl: &Context,
+        page_texture: &PageTexture,
+        luma_texels_per_step: (f32, f32),
+    ) {
+        // SAFETY: Context is current (module invariant); `self` belongs to the active
+        // program and `page_texture` owns live textures.
+        unsafe {
+            gl.uniform_1_i32(
+                Some(&self.transfer_code),
+                transfer_code(page_texture.transfer),
+            );
+            match &page_texture.layout {
+                PixelLayout::Rgba { texture } => {
+                    gl.uniform_1_i32(
+                        Some(&self.pixel_layout),
+                        PIXEL_LAYOUT_RGBA,
+                    );
+                    gl.active_texture(glow::TEXTURE0);
+                    gl.bind_texture(glow::TEXTURE_2D, Some(*texture));
+                }
+                PixelLayout::Yuv {
+                    luma,
+                    cb,
+                    cr,
+                    alpha,
+                    chroma_uv_per_texel,
+                    color_conversion,
+                    alpha_normalization,
+                } => {
+                    gl.uniform_1_i32(
+                        Some(&self.pixel_layout),
+                        PIXEL_LAYOUT_YUV,
+                    );
+                    gl.uniform_2_f32(
+                        Some(&self.chroma_uv_per_step),
+                        chroma_uv_per_texel.0 * luma_texels_per_step.0,
+                        chroma_uv_per_texel.1 * luma_texels_per_step.1,
+                    );
+                    gl.uniform_1_f32(
+                        Some(&self.alpha_normalization),
+                        *alpha_normalization,
+                    );
+                    gl.uniform_matrix_3_f32_slice(
+                        Some(&self.color_matrix),
+                        false,
+                        &color_conversion.matrix,
+                    );
+                    gl.uniform_3_f32(
+                        Some(&self.color_offset),
+                        color_conversion.offset[0],
+                        color_conversion.offset[1],
+                        color_conversion.offset[2],
+                    );
+                    for (unit, texture) in [
+                        (glow::TEXTURE0, *luma),
+                        (glow::TEXTURE1, *cb),
+                        (glow::TEXTURE2, *cr),
+                        (glow::TEXTURE3, *alpha),
+                    ] {
+                        gl.active_texture(unit);
+                        gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+                    }
+                }
+                PixelLayout::Mono { .. } => {
+                    debug_assert!(
+                        false,
+                        "mono layout routes through the mono path"
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn bind_mono_source(
+    gl: &Context,
+    luma_gain_offset_location: UniformLocation,
+    transfer_location: UniformLocation,
+    transfer: Transfer,
+    luma: Texture,
+    (gain, offset): (f32, f32),
+) {
+    // SAFETY: Context is current (module invariant); active program owns locations and `luma` is live.
+    unsafe {
+        gl.uniform_2_f32(Some(&luma_gain_offset_location), gain, offset);
+        gl.uniform_1_i32(
+            Some(&transfer_location),
+            transfer_code(transfer),
+        );
+        gl.active_texture(glow::TEXTURE0);
+        gl.bind_texture(glow::TEXTURE_2D, Some(luma));
+    }
+}
+
 fn draw_page(
     gl: &Context,
     pipeline: &Pipeline,
+    target: DrawTarget,
     page_texture: &PageTexture,
-    screen_origin: (f32, f32),
-    screen_size: (f32, f32),
-    scale: f32,
+    seat: SeatGeometry,
+    source_per_screen: (f32, f32),
 ) {
-    let locations = &pipeline.uniform_locations;
-    // SAFETY: The context is current, the empty VAO is bound by `begin_frame`,
-    // and `pipeline` and `page_texture` own live GL objects for this call.
+    let window_px = geometry::px_f32(target.window);
+    // SAFETY: Context is current (module invariant); `pipeline` and `page_texture` own live objects
+    // and `begin_frame` bound the empty VAO.
     unsafe {
         gl.use_program(Some(pipeline.objects.program));
         gl.uniform_2_f32(
-            Some(&locations.seat_offset),
-            screen_origin.0,
-            screen_origin.1,
+            Some(&pipeline.window_size),
+            window_px.0,
+            window_px.1,
         );
         gl.uniform_2_f32(
-            Some(&locations.seat_size),
-            screen_size.0,
-            screen_size.1,
+            Some(&pipeline.seat_offset),
+            seat.origin.0,
+            seat.origin.1,
+        );
+        gl.uniform_2_f32(
+            Some(&pipeline.seat_size),
+            seat.size.0,
+            seat.size.1,
+        );
+        gl.uniform_2_f32(
+            Some(&pipeline.page_uv_per_screen),
+            1.0 / seat.size.0,
+            1.0 / seat.size.1,
         );
         gl.uniform_1_i32(
-            Some(&locations.pixel_layout),
-            page_texture.layout.shader_code(),
-        );
-        gl.uniform_1_i32(
-            Some(&locations.transfer_code),
-            transfer_code(page_texture.transfer),
-        );
-        gl.uniform_1_i32(
-            Some(&locations.dither),
+            Some(&pipeline.dither),
             i32::from(page_texture.needs_dither),
         );
-        gl.uniform_2_f32(
-            Some(&locations.page_uv_per_pixel),
-            page_texture.page_uv_per_pixel.0 / scale,
-            page_texture.page_uv_per_pixel.1 / scale,
-        );
-        gl.active_texture(glow::TEXTURE0);
-        match &page_texture.layout {
-            PixelLayout::Rgba { texture, .. } => {
-                gl.bind_texture(glow::TEXTURE_2D, Some(*texture));
-            }
-            PixelLayout::Yuv {
+        if let PixelLayout::Mono { luma, gain, offset } =
+            page_texture.layout
+        {
+            gl.uniform_1_i32(
+                Some(&pipeline.color.pixel_layout),
+                PIXEL_LAYOUT_MONO,
+            );
+            bind_mono_source(
+                gl,
+                pipeline.luma_gain_offset,
+                pipeline.color.transfer_code,
+                page_texture.transfer,
                 luma,
-                cb,
-                cr,
-                alpha,
-                chroma_uv_per_pixel,
-                color_conversion,
-                alpha_normalization,
-            } => {
-                gl.uniform_2_f32(
-                    Some(&locations.chroma_uv_per_pixel),
-                    chroma_uv_per_pixel.0 / scale,
-                    chroma_uv_per_pixel.1 / scale,
-                );
-                gl.uniform_1_f32(
-                    Some(&locations.alpha_normalization),
-                    *alpha_normalization,
-                );
-                gl.uniform_matrix_3_f32_slice(
-                    Some(&locations.color_matrix),
-                    false,
-                    &color_conversion.matrix,
-                );
-                gl.uniform_3_f32(
-                    Some(&locations.color_offset),
-                    color_conversion.offset[0],
-                    color_conversion.offset[1],
-                    color_conversion.offset[2],
-                );
-                gl.bind_texture(glow::TEXTURE_2D, Some(*luma));
-                gl.active_texture(glow::TEXTURE1);
-                gl.bind_texture(glow::TEXTURE_2D, Some(*cb));
-                gl.active_texture(glow::TEXTURE2);
-                gl.bind_texture(glow::TEXTURE_2D, Some(*cr));
-                gl.active_texture(glow::TEXTURE3);
-                gl.bind_texture(glow::TEXTURE_2D, Some(*alpha));
-            }
+                (gain, offset),
+            );
+        } else {
+            pipeline.color.bind(gl, page_texture, source_per_screen);
         }
-        gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+        gl.draw_arrays(glow::TRIANGLE_STRIP, 0, QUAD_VERTEX_COUNT);
     }
 }
 
@@ -819,11 +2063,17 @@ fn label_entry(
         return;
     }
     match &page_texture.layout {
-        PixelLayout::Rgba { texture, .. } => label(
+        PixelLayout::Rgba { texture } => label(
             gl,
             glow::TEXTURE,
             texture.0.get(),
             &format!("page {page} {role} rgba"),
+        ),
+        PixelLayout::Mono { luma, .. } => label(
+            gl,
+            glow::TEXTURE,
+            luma.0.get(),
+            &format!("page {page} {role} luma"),
         ),
         PixelLayout::Yuv {
             luma,
@@ -832,30 +2082,16 @@ fn label_entry(
             alpha,
             ..
         } => {
-            label(
-                gl,
-                glow::TEXTURE,
-                luma.0.get(),
-                &format!("page {page} {role} luma"),
-            );
-            label(
-                gl,
-                glow::TEXTURE,
-                cb.0.get(),
-                &format!("page {page} {role} cb"),
-            );
-            label(
-                gl,
-                glow::TEXTURE,
-                cr.0.get(),
-                &format!("page {page} {role} cr"),
-            );
-            label(
-                gl,
-                glow::TEXTURE,
-                alpha.0.get(),
-                &format!("page {page} {role} alpha"),
-            );
+            for (slot, name) in
+                [(luma, "luma"), (cb, "cb"), (cr, "cr"), (alpha, "alpha")]
+            {
+                label(
+                    gl,
+                    glow::TEXTURE,
+                    slot.0.get(),
+                    &format!("page {page} {role} {name}"),
+                );
+            }
         }
     }
 }
@@ -893,13 +2129,12 @@ fn needs_dither(transfer: Transfer, plane_depth: Option<u8>) -> bool {
         || plane_depth.is_some_and(|depth| depth > decode::BYTE_DEPTH)
 }
 
-/// Create a texture with mipmapped minification and the requested
-/// magnification filter.
+/// Create a single-level texture with linear minification and the
+/// requested magnification filter.
 fn new_texture(
     gl: &Context,
     magnification_filter: MagnificationFilter,
 ) -> Texture {
-    let min_filter = glow::LINEAR_MIPMAP_LINEAR;
     let mag_filter = magnification_filter.gl_filter();
     // SAFETY: Caller ensures the GL context is current on the render thread.
     unsafe {
@@ -922,13 +2157,19 @@ fn new_texture(
         gl.tex_parameter_i32(
             glow::TEXTURE_2D,
             glow::TEXTURE_MIN_FILTER,
-            gl_int(min_filter),
+            gl_int(glow::LINEAR),
         );
         gl.tex_parameter_i32(
             glow::TEXTURE_2D,
             glow::TEXTURE_MAG_FILTER,
             gl_int(mag_filter),
         );
+        gl.tex_parameter_i32(
+            glow::TEXTURE_2D,
+            glow::TEXTURE_BASE_LEVEL,
+            0,
+        );
+        gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAX_LEVEL, 0);
         texture
     }
 }
@@ -949,6 +2190,7 @@ fn upload_rgba(
     // matches `dims.0 * dims.1 * 4` RGBA8 bytes.
     unsafe {
         gl.bind_texture(glow::TEXTURE_2D, Some(texture));
+        gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 4);
         gl.tex_image_2d(
             glow::TEXTURE_2D,
             0,
@@ -960,7 +2202,6 @@ fn upload_rgba(
             glow::UNSIGNED_BYTE,
             PixelUnpackData::Slice(Some(data)),
         );
-        gl.generate_mipmap(glow::TEXTURE_2D);
     }
     texture
 }
@@ -992,7 +2233,6 @@ fn update_rgba(
             glow::UNSIGNED_BYTE,
             PixelUnpackData::Slice(Some(data)),
         );
-        gl.generate_mipmap(glow::TEXTURE_2D);
     }
 }
 
@@ -1033,7 +2273,6 @@ fn upload_plane(
             ty,
             PixelUnpackData::Slice(Some(data)),
         );
-        gl.generate_mipmap(glow::TEXTURE_2D);
     }
     texture
 }
@@ -1049,17 +2288,17 @@ fn upload_page_texture(
     let dims = (image.width(), image.height());
     let page_dims = image.page_dims();
     let magnification_filter = magnification_filter(dims, page_dims);
-    let page_uv_per_pixel = page_uv_per_pixel(page_dims);
     match image.pixels() {
         WirePixels::Rgba8(rgba_bytes) => {
             let texture =
                 upload_rgba(&gl, rgba_bytes, dims, magnification_filter);
             PageTexture {
                 gl,
-                page_uv_per_pixel,
+                dims,
+                page_dims,
                 transfer: image.transfer(),
                 needs_dither: needs_dither(image.transfer(), None),
-                layout: PixelLayout::Rgba { texture, dims },
+                layout: PixelLayout::Rgba { texture },
             }
         }
         WirePixels::Yuv {
@@ -1083,10 +2322,26 @@ fn upload_page_texture(
                 wide,
                 magnification_filter,
             );
-            let (cb_texture, cr_texture) =
-                if *subsampling == Subsampling::Mono {
-                    // 1x1 chroma at the neutral code, which the folded
-                    // quantization anchor cancels exactly.
+            let color_conversion = page_color_conversion(
+                depth,
+                *subsampling,
+                *full_range,
+                *matrix,
+                wide,
+            );
+            let layout = if *subsampling == Subsampling::Mono
+                && alpha.is_none()
+            {
+                PixelLayout::Mono {
+                    luma: luma_texture,
+                    gain: color_conversion.matrix[0],
+                    offset: color_conversion.offset[0],
+                }
+            } else {
+                let (cb_texture, cr_texture) = if *subsampling
+                    == Subsampling::Mono
+                {
+                    // `color_conversion` zeroes columns 1 and 2.
                     let neutral_code = 1_u32 << (depth - 1);
                     (
                         upload_constant_plane(&gl, depth, neutral_code),
@@ -1110,64 +2365,51 @@ fn upload_page_texture(
                         ),
                     )
                 };
-            let alpha_texture = alpha.as_ref().map_or_else(
-                // 1x1 opaque: the max code, which the alpha normalization
-                // maps to 1.0.
-                || upload_constant_plane(&gl, depth, (1_u32 << depth) - 1),
-                |alpha| {
-                    upload_plane(
-                        &gl,
-                        alpha,
-                        dims,
-                        wide,
-                        MagnificationFilter::Linear,
-                    )
-                },
-            );
-            PageTexture {
-                gl,
-                page_uv_per_pixel,
-                transfer: image.transfer(),
-                needs_dither: needs_dither(image.transfer(), Some(depth)),
-                layout: PixelLayout::Yuv {
+                let alpha_texture = alpha.as_ref().map_or_else(
+                    // 1x1 opaque: the max code, which the alpha normalization
+                    // maps to 1.0.
+                    || {
+                        upload_constant_plane(
+                            &gl,
+                            depth,
+                            (1_u32 << depth) - 1,
+                        )
+                    },
+                    |alpha| {
+                        upload_plane(
+                            &gl,
+                            alpha,
+                            dims,
+                            wide,
+                            MagnificationFilter::Linear,
+                        )
+                    },
+                );
+                let chroma_px = geometry::px_f32((chroma_w, chroma_h));
+                let ratio = subsampling.chroma_ratio();
+                PixelLayout::Yuv {
                     luma: luma_texture,
                     cb: cb_texture,
                     cr: cr_texture,
                     alpha: alpha_texture,
-                    chroma_uv_per_pixel: chroma_uv_per_pixel(
-                        page_dims,
-                        *subsampling,
+                    chroma_uv_per_texel: (
+                        ratio.0 / chroma_px.0,
+                        ratio.1 / chroma_px.1,
                     ),
-                    color_conversion: page_color_conversion(
-                        depth,
-                        *subsampling,
-                        *full_range,
-                        *matrix,
-                        wide,
-                    ),
+                    color_conversion,
                     alpha_normalization: depth_normalization(depth, wide),
-                },
+                }
+            };
+            PageTexture {
+                gl,
+                dims,
+                page_dims,
+                transfer: image.transfer(),
+                needs_dither: needs_dither(image.transfer(), Some(depth)),
+                layout,
             }
         }
     }
-}
-
-/// Page fractions per screen pixel before zoom. Use the page's dims; a
-/// preview covers the whole page at lower resolution.
-fn page_uv_per_pixel(page_dims: (u32, u32)) -> (f32, f32) {
-    let page_px = geometry::px_f32(page_dims);
-    (1.0 / page_px.0, 1.0 / page_px.1)
-}
-
-fn chroma_uv_per_pixel(
-    page_dims: (u32, u32),
-    subsampling: Subsampling,
-) -> (f32, f32) {
-    let (_, (chroma_w, chroma_h)) =
-        decode::plane_dims(page_dims, subsampling);
-    let chroma_px = geometry::px_f32((chroma_w, chroma_h));
-    let ratio = subsampling.chroma_ratio();
-    (ratio.0 / chroma_px.0, ratio.1 / chroma_px.1)
 }
 
 fn upload_constant_plane(
@@ -1305,18 +2547,20 @@ fn page_color_conversion(
         chroma_scale,
         luma_black,
         chroma_neutral,
-    ) = if color_matrix == Matrix::Identity {
+    ) = if subsampling == Subsampling::Mono {
+        (
+            [1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            quantization.luma_scale,
+            0.0,
+            quantization.luma_black,
+            0.0,
+        )
+    } else if color_matrix == Matrix::Identity {
         // H.273 identity planes are GBR in the (Y, Cb, Cr) slots,
         // quantized as luma on all three axes: permute into RGB and
-        // anchor every axis at luma black. Mono identity repeats the
-        // luma plane to RGB.
-        let base_matrix = if subsampling == Subsampling::Mono {
-            [1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-        } else {
-            [0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0]
-        };
+        // anchor every axis at luma black.
         (
-            base_matrix,
+            [0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0],
             quantization.luma_scale,
             quantization.luma_scale,
             quantization.luma_black,
@@ -1620,6 +2864,10 @@ const INITIAL_WINDOW_WIDTH: f64 = 1000.0;
 const INITIAL_WINDOW_HEIGHT: f64 = 750.0;
 
 #[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "a panic in test code is inconsequential"
+)]
 mod tests {
     use super::*;
 
@@ -1679,32 +2927,34 @@ mod tests {
 
     #[test]
     fn color_conversion_anchors_black_and_white_at_every_depth() {
-        for depth in [8_u8, 10, 12, 16] {
-            for full_range in [true, false] {
-                let conversion = page_color_conversion(
-                    depth,
-                    Subsampling::Yuv444,
-                    full_range,
-                    Matrix::Bt601,
-                    depth > decode::BYTE_DEPTH,
-                );
-                let (black, white, neutral, storage_max) =
-                    code_quantization_codes(depth, full_range);
-                for (code, expected) in [(black, 0.0), (white, 1.0)] {
-                    // Chroma at its neutral code contributes nothing.
-                    let rgb = convert(
-                        &conversion,
-                        [
-                            code / storage_max,
-                            neutral / storage_max,
-                            neutral / storage_max,
-                        ],
+        for subsampling in [Subsampling::Yuv444, Subsampling::Mono] {
+            for depth in [8_u8, 10, 12, 16] {
+                for full_range in [true, false] {
+                    let conversion = page_color_conversion(
+                        depth,
+                        subsampling,
+                        full_range,
+                        Matrix::Bt601,
+                        depth > decode::BYTE_DEPTH,
                     );
-                    for (row, channel) in rgb.into_iter().enumerate() {
-                        assert!(
-                            (channel - expected).abs() < 1e-4,
-                            "depth {depth} full {full_range} row {row}: {channel} vs {expected}"
+                    let (black, white, neutral, storage_max) =
+                        code_quantization_codes(depth, full_range);
+                    for (code, expected) in [(black, 0.0), (white, 1.0)] {
+                        // Chroma at its neutral code contributes nothing.
+                        let rgb = convert(
+                            &conversion,
+                            [
+                                code / storage_max,
+                                neutral / storage_max,
+                                neutral / storage_max,
+                            ],
                         );
+                        for (row, channel) in rgb.into_iter().enumerate() {
+                            assert!(
+                                (channel - expected).abs() < 1e-4,
+                                "{subsampling:?} depth {depth} full {full_range} row {row}: {channel} vs {expected}"
+                            );
+                        }
                     }
                 }
             }
@@ -1783,5 +3033,93 @@ mod tests {
             magnification_filter((100, 100), (1000, 2000)),
             MagnificationFilter::Linear
         ));
+    }
+
+    #[test]
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::indexing_slicing,
+        reason = "indices stay within 0..EWA_GRID_LEN, which is exact in f64"
+    )]
+    fn ewa_rank2_lut_approximates_circular_lanczos3() {
+        assert!(jinc(EWA_JINC_FIRST_ZERO).abs() < 1e-12);
+        assert!(jinc(EWA_SUPPORT).abs() < 1e-12);
+
+        let lut = ewa_rank2_lut();
+        assert_eq!(lut[EWA_LUT_LEN - 1], [0.0, 0.0]);
+
+        let center_index = EWA_LUT_LEN - 1;
+        let grid_step = 2.0 * EWA_SUPPORT / (EWA_GRID_LEN - 1) as f64;
+        let lut_weights = |index_from_center: usize| -> (f64, f64) {
+            let entry = lut[index_from_center];
+            (f64::from(entry[0]), f64::from(entry[1]))
+        };
+        let mut squared_error = 0.0_f64;
+        let mut squared_reference = 0.0_f64;
+        for row in 0..EWA_GRID_LEN {
+            let coord_y = (row as f64).mul_add(grid_step, -EWA_SUPPORT);
+            let (row_primary, row_secondary) =
+                lut_weights(row.abs_diff(center_index));
+            for col in 0..EWA_GRID_LEN {
+                let coord_x =
+                    (col as f64).mul_add(grid_step, -EWA_SUPPORT);
+                let (col_primary, col_secondary) =
+                    lut_weights(col.abs_diff(center_index));
+                let approx = row_secondary
+                    .mul_add(-col_secondary, row_primary * col_primary);
+                let exact = ewa_lanczos3(coord_x.hypot(coord_y));
+                let difference = exact - approx;
+                squared_error =
+                    difference.mul_add(difference, squared_error);
+                squared_reference =
+                    exact.mul_add(exact, squared_reference);
+            }
+        }
+        let relative_l2_error = (squared_error / squared_reference).sqrt();
+        assert!(
+            relative_l2_error < 0.02,
+            "rank-2 rel L2 error {relative_l2_error}"
+        );
+    }
+
+    #[test]
+    fn visible_slice_clips_viewport_and_pads_source_rows() {
+        // 2x minification panned off top edge: center rows cover [1001..2999].
+        let panned = compute_visible_slice(
+            SeatGeometry {
+                origin: (-200.0, -500.0),
+                size: (2031.0, 2880.0),
+            },
+            (1280, 1000),
+            (4062, 5760),
+        )
+        .expect("panned slice");
+        assert_eq!(panned.visible_origin, (0, 0));
+        assert_eq!(panned.visible_size, (1280, 1000));
+        assert!((900..=993).contains(&panned.source_y_range.0));
+        assert!((3007..3100).contains(&panned.source_y_range.1));
+        assert!(panned.is_minified());
+
+        let exact = compute_visible_slice(
+            SeatGeometry {
+                origin: (0.0, 0.0),
+                size: (1805.0, 2560.0),
+            },
+            (2560, 1440),
+            (1805, 2560),
+        )
+        .expect("1:1 slice");
+        assert!(!exact.is_minified());
+        assert!(
+            compute_visible_slice(
+                SeatGeometry {
+                    origin: (2600.0, 0.0),
+                    size: (500.0, 500.0),
+                },
+                (2560, 1440),
+                (1805, 2560),
+            )
+            .is_none()
+        );
     }
 }

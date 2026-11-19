@@ -90,8 +90,8 @@ impl ImageLimits {
 fn derivation(role: Role, limits: ImageLimits) -> (u32, FilterType) {
     match role {
         Role::Thumb => (THUMB_EDGE, FilterType::Box),
-        Role::Fit => (limits.fit_edge(), FilterType::Hamming),
-        Role::Full => (limits.max_texture_edge(), FilterType::Hamming),
+        Role::Fit => (limits.fit_edge(), FilterType::Lanczos3),
+        Role::Full => (limits.max_texture_edge(), FilterType::Lanczos3),
     }
 }
 
@@ -761,7 +761,7 @@ fn write_atomic(
 }
 
 const MAGIC: [u8; 4] = *b"CYPV";
-const VERSION: u16 = 3;
+const VERSION: u16 = 4;
 const PREFIX_BYTES: usize =
     MAGIC.len() + size_of::<u16>() + size_of::<u8>();
 const MAX_META_BYTES: usize = u8::MAX as usize;

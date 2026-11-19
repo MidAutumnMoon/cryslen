@@ -1,5 +1,6 @@
 use super::Decoded;
 use super::Format;
+use super::Plane;
 use super::Transfer;
 
 /// Decode with a concrete decoder so EXIF orientation is readable, then
@@ -34,14 +35,34 @@ pub(super) fn decode(
     let orientation = decoder.orientation()?;
     let mut oriented = DynamicImage::from_decoder(decoder)?;
     oriented.apply_orientation(orientation);
-    let rgba = oriented.into_rgba8();
-    Ok(Decoded::rgba(
-        rgba.width(),
-        rgba.height(),
-        format,
-        Transfer::Srgb,
-        rgba.into_raw().into_boxed_slice(),
-    )?)
+    Ok(if let DynamicImage::ImageLuma8(gray) = oriented {
+        Decoded::mono(
+            gray.width(),
+            gray.height(),
+            format,
+            Transfer::Srgb,
+            super::BYTE_DEPTH,
+            Plane::U8(gray.into_raw().into_boxed_slice()),
+        )?
+    } else if let DynamicImage::ImageLuma16(gray) = oriented {
+        Decoded::mono(
+            gray.width(),
+            gray.height(),
+            format,
+            Transfer::Srgb,
+            super::MAX_SAMPLE_DEPTH,
+            Plane::U16(gray.into_raw().into_boxed_slice()),
+        )?
+    } else {
+        let rgba = oriented.into_rgba8();
+        Decoded::rgba(
+            rgba.width(),
+            rgba.height(),
+            format,
+            Transfer::Srgb,
+            rgba.into_raw().into_boxed_slice(),
+        )?
+    })
 }
 
 #[cfg(test)]
@@ -55,6 +76,7 @@ mod tests {
 
     use crate::decode;
     use crate::decode::Pixels;
+    use crate::decode::Subsampling;
     use crate::testkit;
 
     // The encoder cannot write EXIF orientation tags, so orientation
@@ -94,5 +116,57 @@ mod tests {
             decode::decode(&tiff, "p.tiff").expect("tiff decodes");
         assert_eq!(tiff_page.format, Format::Tiff);
         assert_eq!((tiff_page.width, tiff_page.height), (3, 1));
+    }
+
+    #[test]
+    fn opaque_grayscale_png_decodes_to_mono() {
+        use ::image::DynamicImage;
+        use ::image::GrayImage;
+        use ::image::ImageBuffer;
+        use ::image::ImageFormat;
+        use ::image::Luma;
+        use std::io::Cursor;
+
+        let mut png8 = Vec::new();
+        let gray8 =
+            GrayImage::from_raw(3, 2, vec![0, 40, 80, 120, 160, 200])
+                .expect("gray8 dims");
+        DynamicImage::ImageLuma8(gray8)
+            .write_to(&mut Cursor::new(&mut png8), ImageFormat::Png)
+            .expect("encode 8-bit grayscale png");
+        let page8 =
+            decode::decode(&png8, "g8.png").expect("luma8 decodes");
+        let Pixels::Yuv(yuv8) = page8.pixels else {
+            panic!("opaque luma8 png must decode to mono");
+        };
+        assert_eq!((yuv8.depth, yuv8.subsampling), (8, Subsampling::Mono));
+        assert!(matches!(
+            &yuv8.luma,
+            Plane::U8(luma) if **luma == [0, 40, 80, 120, 160, 200]
+        ));
+
+        let mut png16 = Vec::new();
+        let gray16 = ImageBuffer::<Luma<u16>, Vec<u16>>::from_raw(
+            2,
+            2,
+            vec![0, 15000, 30000, 45000],
+        )
+        .expect("gray16 dims");
+        DynamicImage::ImageLuma16(gray16)
+            .write_to(&mut Cursor::new(&mut png16), ImageFormat::Png)
+            .expect("encode 16-bit grayscale png");
+        let page16 =
+            decode::decode(&png16, "g16.png").expect("luma16 decodes");
+        let Pixels::Yuv(yuv16) = page16.pixels else {
+            panic!("opaque luma16 png must decode to mono");
+        };
+        assert_eq!(
+            (yuv16.depth, yuv16.subsampling),
+            (16, Subsampling::Mono)
+        );
+        assert!(matches!(
+            &yuv16.luma,
+            Plane::U16(luma) if **luma == [0, 15000, 30000, 45000]
+        ));
     }
 }

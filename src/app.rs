@@ -793,7 +793,7 @@ fn present_frame(
     if let (Some(draw), Some(placement)) = (spread, drawn)
         && let Some(shown) = draw.shown
     {
-        gl.window.pages().draw(
+        gl.window.pages_mut().draw(
             (size.width, size.height),
             viewport,
             &draw.layout,

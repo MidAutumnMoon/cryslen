@@ -17,19 +17,19 @@ winit owns the window and events, glutin binds EGL, glow calls GL, egui-winit fe
 - Each texture owns wrap and filter state; sampler objects would leak page filtering onto egui's texture units.
 - The frame prologue sets the viewport and premultiplied blend for page quads; egui paints after and sets its own state.
 - Snap quad origins to whole pixels; nearest sampling at 1:1 draws uneven rows at a fractional origin.
-- Minify with mipmaps and trilinear filtering. Magnify a preview linearly and page-resolution pixels nearest, so zoom stays crisp. Chroma reconstructs bilinearly.
+- Minify with two-pass circular EWA-Lanczos3 (`EwaResampler` in `src/render.rs`); magnify a preview linearly and page-resolution pixels nearest, so zoom stays crisp. Chroma reconstructs bilinearly.
 - Dither only when the source has more precision than the 8-bit output: PQ or a plane deeper than 8 bits. An 8-bit sRGB source is not perturbed.
 - Set the unpack alignment to 1 for single-channel planes.
-- `R16` planes are texture-filterable, so they minify and mipmap like `R8`.
+- `R16` planes are texture-filterable, so they sample and minify like `R8`.
 - Refuse a page over the maximum texture size before upload; an oversized upload samples black.
 - Delete GL objects while the context lives; the owner drops the egui renderer before the window.
 
 ## Quads and YUV
 
-One program handles RGBA and YUV, sRGB and PQ; per-draw constants are folded on the CPU. Chroma samples bilinearly.
+The 1-pass and 2-pass shaders (`src/render.rs`) cover RGBA, Mono, and YUV, sRGB and PQ; per-draw constants are folded on the CPU. Chroma samples bilinearly.
 
 A seat rect is in page pixels and a texture's UV spans the page; each draw compares them and logs a mismatch at debug (`debug_assert!` in debug builds).
 
 ## Page textures
 
-The cache maps each page to one slot per role, in `Role::VARIANTS` order; a seat draws the largest resident slot.
+The cache maps each page to one slot per role, in `Role::VARIANTS` order; a seat keeps `Fit` while it covers the screen size (`best_texture`), otherwise draws the largest resident slot.

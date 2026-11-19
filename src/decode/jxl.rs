@@ -13,11 +13,8 @@ use jxl::error::Result as JxlResult;
 
 use super::Decoded;
 use super::Format;
-use super::Matrix;
 use super::Plane;
-use super::Subsampling;
 use super::Transfer;
-use super::YuvImage;
 
 const MAX_THREADS: usize = 16;
 
@@ -110,17 +107,14 @@ pub(super) fn decode(
     // The crate either converts to sRGB or emits simple PQ values its
     // API does not distinguish, so jxl pages ride the sRGB path.
     Ok(if mono {
-        let yuv = YuvImage {
-            depth: super::BYTE_DEPTH,
-            subsampling: Subsampling::Mono,
-            full_range: true,
-            matrix: Matrix::Identity,
-            luma: Plane::U8(pixels.into_boxed_slice()),
-            cb: Plane::U8(Box::new([])),
-            cr: Plane::U8(Box::new([])),
-            alpha: None,
-        };
-        Decoded::yuv(width, height, Format::Jxl, Transfer::Srgb, yuv)?
+        Decoded::mono(
+            width,
+            height,
+            Format::Jxl,
+            Transfer::Srgb,
+            super::BYTE_DEPTH,
+            Plane::U8(pixels.into_boxed_slice()),
+        )?
     } else {
         Decoded::rgba(
             width,

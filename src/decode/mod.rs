@@ -130,6 +130,27 @@ impl Decoded {
         })
     }
 
+    pub fn mono(
+        width: u32,
+        height: u32,
+        format: Format,
+        transfer: Transfer,
+        depth: u8,
+        luma: Plane,
+    ) -> Result<Self, MsgError> {
+        let yuv = YuvImage {
+            depth,
+            subsampling: Subsampling::Mono,
+            full_range: true,
+            matrix: Matrix::Identity,
+            luma,
+            cb: Plane::U8(Box::new([])),
+            cr: Plane::U8(Box::new([])),
+            alpha: None,
+        };
+        Self::yuv(width, height, format, transfer, yuv)
+    }
+
     pub fn resident_bytes(&self) -> usize {
         match &self.pixels {
             Pixels::Rgba8(bytes) => bytes.len(),
