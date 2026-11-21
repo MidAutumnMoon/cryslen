@@ -18,6 +18,7 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
+use bytes::Bytes;
 use ipc_channel::TryRecvError as IpcTryRecvError;
 use ipc_channel::ipc;
 use ipc_channel::ipc::IpcReceiver;
@@ -404,11 +405,14 @@ impl BookState {
             || (role == Role::Full && self.failed_full.contains(&page))
     }
 
+    fn is_unsettled(&self, request: Request) -> bool {
+        !self.served.contains(&request)
+            && !self.role_failed(request.page, request.role)
+    }
+
     fn wants_unserved(&self, page: usize, role: Role) -> bool {
         let request = Request { page, role };
-        self.requests.contains(&request)
-            && !self.served.contains(&request)
-            && !self.role_failed(page, role)
+        self.requests.contains(&request) && self.is_unsettled(request)
     }
 
     fn wanted_roles(&self, page: usize) -> Roles {
@@ -458,11 +462,11 @@ impl BookState {
             .count()
     }
 
-    fn take_request_page(&mut self) -> Option<PageJob> {
-        let request = *self.requests.iter().find(|request| {
-            !self.served.contains(request)
-                && !self.role_failed(request.page, request.role)
+    fn take_request_page(&mut self, source: &Source) -> Option<PageJob> {
+        let request = *self.requests.iter().find(|&&request| {
+            self.is_unsettled(request)
                 && !self.in_flight.contains_key(&request.page)
+                && source.is_ready(request.page)
         })?;
         let kind = JobKind::Request {
             requested_at: self.requests_at,
@@ -474,7 +478,18 @@ impl BookState {
         })
     }
 
-    fn next_prefetch_job(&self) -> Option<(usize, Role, bool, Motion)> {
+    fn has_pending_request(&self) -> bool {
+        self.in_flight.values().any(|kind| !kind.is_prefetch())
+            || self
+                .requests
+                .iter()
+                .any(|&request| self.is_unsettled(request))
+    }
+
+    fn next_prefetch_job(
+        &self,
+        source: &Source,
+    ) -> Option<(usize, Role, bool, Motion)> {
         let prefetch = self.prefetch.as_ref()?;
         for (index, spread) in prefetch.spreads().iter().enumerate() {
             let in_head = index < prefetch.head;
@@ -483,6 +498,7 @@ impl BookState {
             {
                 if self.failed.contains(&page)
                     || self.in_flight.contains_key(&page)
+                    || !source.is_ready(page)
                 {
                     continue;
                 }
@@ -558,6 +574,13 @@ impl Shared {
         self.wake.notify_all();
     }
 
+    fn wake_all(&self) {
+        // Acquire and release `state` before notifying so idle workers
+        // cannot observe stale state and park after `notify_all`.
+        drop(self.state.lock());
+        self.wake.notify_all();
+    }
+
     fn is_stopped(&self) -> bool {
         self.state.lock().stopped
     }
@@ -581,10 +604,7 @@ impl Shared {
                         "ignoring duplicate limits"
                     ),
                 }
-                // Acquire and release `state` before notifying so idle workers
-                // cannot observe `None` and park after `notify_all`.
-                drop(self.state.lock());
-                self.wake.notify_all();
+                self.wake_all();
             }
             // Ignore playback so animation frames keep the preload quiet
             // window and avoid locking `state`.
@@ -654,7 +674,11 @@ impl Shared {
         clippy::significant_drop_tightening,
         reason = "condvar wait loop holds the mutex guard across iterations"
     )]
-    fn next_job(&self, max_prefetch: usize) -> Option<PageJob> {
+    fn next_job(
+        &self,
+        source: &Source,
+        max_prefetch: usize,
+    ) -> Option<PageJob> {
         let mut state = self.state.lock();
         loop {
             if state.stopped {
@@ -664,15 +688,19 @@ impl Shared {
                 self.wake.wait(&mut state);
                 continue;
             }
-            if let Some(job) = state.take_request_page() {
+            if let Some(job) = state.take_request_page(source) {
                 return Some(job);
+            }
+            if state.has_pending_request() {
+                self.wake.wait(&mut state);
+                continue;
             }
             if state.in_flight_prefetch() >= max_prefetch {
                 self.wake.wait(&mut state);
                 continue;
             }
             let Some((page, role, preload, motion)) =
-                state.next_prefetch_job()
+                state.next_prefetch_job(source)
             else {
                 self.wake.wait(&mut state);
                 continue;
@@ -731,7 +759,7 @@ impl Shared {
         &self,
         source: &Source,
         page: usize,
-    ) -> Option<(u128, Option<Arc<[u8]>>)> {
+    ) -> Option<(u128, Option<Bytes>)> {
         let known = self.state.lock().hashes.get(&page).copied();
         if let Some(known) = known {
             return Some((known, None));
@@ -853,11 +881,7 @@ impl Shared {
         }
     }
 
-    fn read_source(
-        &self,
-        source: &Source,
-        page: usize,
-    ) -> Option<Arc<[u8]>> {
+    fn read_source(&self, source: &Source, page: usize) -> Option<Bytes> {
         match source.bytes(page) {
             Ok(bytes) => Some(bytes),
             Err(error) => {
@@ -1135,7 +1159,7 @@ impl PlaybackRunner {
 
         self.playing_pages.remove(&page);
         let opened = panic::catch_unwind(AssertUnwindSafe(|| {
-            decode::open_animation(Arc::clone(&bytes), name)
+            decode::open_animation(bytes.clone(), name)
         }));
         match opened {
             Ok(Ok(Some(animation))) => {
@@ -1272,7 +1296,7 @@ fn worker_loop(
     cpu_threads: usize,
 ) {
     let prefetch_threads = cpu_threads.div_ceil(max_prefetch);
-    while let Some(job) = shared.next_job(max_prefetch) {
+    while let Some(job) = shared.next_job(source, max_prefetch) {
         let _guard = InFlightGuard {
             shared,
             page: job.page,
@@ -1303,20 +1327,18 @@ fn run(
     let cpu_threads = available_parallelism();
     let workers = cpu_threads.clamp(MIN_WORKERS, MAX_WORKERS);
     let max_prefetch = max_prefetch_workers(workers);
-    let shared = Shared::new(source.len(), store, to_parent);
+    let shared = Arc::new(Shared::new(source.len(), store, to_parent));
+    let wake_shared = Arc::clone(&shared);
+    let _ready_guard = source.on_ready(move || wake_shared.wake_all());
     let mut playback = PlaybackRunner::new();
 
     thread::scope(|scope| {
+        let shared = shared.as_ref();
         for index in 0..workers {
             let spawned = thread::Builder::new()
                 .name(format!("cy-worker-{index}"))
                 .spawn_scoped(scope, || {
-                    worker_loop(
-                        source,
-                        &shared,
-                        max_prefetch,
-                        cpu_threads,
-                    );
+                    worker_loop(source, shared, max_prefetch, cpu_threads);
                 });
             if let Err(error) = spawned {
                 tracing::warn!(
@@ -1334,7 +1356,7 @@ fn run(
                 break;
             }
             if let Some(step) = playback.pop_front() {
-                playback.serve(source, step, &shared);
+                playback.serve(source, step, shared);
                 continue;
             }
             let Ok(message) = commands.recv() else {
@@ -2502,5 +2524,49 @@ mod tests {
             .map(|spread| spread.first)
             .collect();
         assert_eq!(unique.len(), prefetch.spreads().len());
+    }
+
+    #[test]
+    fn unready_archive_slots_do_not_starve_and_wake_when_filled() {
+        const WORKER_PARK_SETTLE: Duration = Duration::from_millis(20);
+
+        let names = (0..=MAX_WORKERS)
+            .map(|index| format!("p{index:03}.png"))
+            .collect();
+        let (source, slots) =
+            Source::from_test_slots(names).expect("test archive");
+        let source = Arc::new(source);
+        slots.fill(
+            0,
+            Bytes::from(testkit::tiny_png(16, 16, [10, 20, 30, 255])),
+        );
+
+        let root = TempDir::new().expect("create temp dir");
+        let (events, to_parent) = Updates::new();
+        let worker = TestWorker::spawn_at(
+            Arc::clone(&source),
+            None,
+            root.path(),
+            Some(to_parent),
+        );
+
+        worker.set_requests(
+            (1..=MAX_WORKERS).chain([0]).map(request_fit).collect(),
+        );
+        events.ready(
+            "ready page 0 starved behind unready requests",
+            |page, role| page == 0 && is_fit(role),
+        );
+
+        thread::sleep(WORKER_PARK_SETTLE);
+        slots.fill(
+            1,
+            Bytes::from(testkit::tiny_png(12, 12, [40, 50, 60, 255])),
+        );
+        events.ready(
+            "worker never woke when requested slot filled",
+            |page, role| page == 1 && is_fit(role),
+        );
+        drop(worker);
     }
 }

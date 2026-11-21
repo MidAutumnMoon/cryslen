@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use bytes::Bytes;
 use eros::ErrorUnion;
 use image::Delay;
 use image::DynamicImage;
@@ -75,7 +76,7 @@ pub fn tiny_tiff(width: u32, height: u32, rgb: [u8; 3]) -> Vec<u8> {
     encode(&DynamicImage::ImageRgb8(img), ImageFormat::Tiff)
 }
 
-pub fn readable_page(source: &Source, index: usize) -> Arc<[u8]> {
+pub fn readable_page(source: &Source, index: usize) -> Bytes {
     match source.bytes(index) {
         Ok(bytes) => bytes,
         Err(error) => panic!("page {index} failed: {error}"),

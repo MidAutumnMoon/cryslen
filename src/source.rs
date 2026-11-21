@@ -4,27 +4,98 @@
 
 use std::any::Any;
 use std::collections::HashMap;
+use std::fmt;
 use std::fs;
 use std::fs::File;
 use std::io;
 use std::io::BufReader;
 use std::io::ErrorKind;
 use std::io::Read;
+use std::io::Seek;
+use std::io::SeekFrom;
+use std::iter;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 use std::time::Instant;
 
+use bytes::Bytes;
 use eros::ErrorUnion;
-use parking_lot::Condvar;
 use parking_lot::Mutex;
+use rustfs_mimalloc::MiMalloc;
 
 use crate::browse::PageNames;
 use crate::catalog;
 use crate::catalog::ArchiveKind;
 use crate::decode;
+
+const ARCHIVE_READ_BUFFER_BYTES: usize = 64 * 1024;
+const MAX_PREALLOCATED_BYTES: usize = 16 * 1024 * 1024;
+const READ_TO_END_PROBE_BYTES: usize = 32;
+
+/// Preserves `BufReader`'s buffer across adjacent `SeekFrom::Start` seeks
+/// from `zip` and `sevenz-rust2`.
+struct SeekBufReader<Reader> {
+    inner: BufReader<Reader>,
+    position: u64,
+}
+
+impl<Reader: Read> SeekBufReader<Reader> {
+    fn new(inner: Reader, capacity: usize) -> Self {
+        Self {
+            inner: BufReader::with_capacity(capacity, inner),
+            position: 0,
+        }
+    }
+}
+
+impl<Reader: Read> Read for SeekBufReader<Reader> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let bytes_read = self.inner.read(buf)?;
+        self.position = self
+            .position
+            .saturating_add(u64::try_from(bytes_read).unwrap_or(u64::MAX));
+        Ok(bytes_read)
+    }
+}
+
+fn relative_offset(from: u64, to: u64) -> Option<i64> {
+    if to >= from {
+        i64::try_from(to - from).ok()
+    } else {
+        i64::try_from(from - to).ok().and_then(i64::checked_neg)
+    }
+}
+
+impl<Reader: Read + Seek> Seek for SeekBufReader<Reader> {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let relative = match pos {
+            SeekFrom::Start(target) => {
+                relative_offset(self.position, target)
+                    .map(|delta| (delta, target))
+            }
+            SeekFrom::Current(offset) => self
+                .position
+                .checked_add_signed(offset)
+                .map(|target| (offset, target)),
+            SeekFrom::End(_) => None,
+        };
+        if let Some((delta, target)) = relative {
+            self.inner.seek_relative(delta)?;
+            self.position = target;
+            return Ok(target);
+        }
+        self.position = self.inner.seek(pos)?;
+        Ok(self.position)
+    }
+
+    fn stream_position(&mut self) -> io::Result<u64> {
+        Ok(self.position)
+    }
+}
 
 pub fn panic_message(payload: &(dyn Any + Send)) -> &str {
     payload
@@ -34,58 +105,88 @@ pub fn panic_message(payload: &(dyn Any + Send)) -> &str {
         .unwrap_or("non-string panic payload")
 }
 
-type PageRead = Result<Arc<[u8]>, Arc<ErrorUnion>>;
+type PageRead = Result<Bytes, Arc<ErrorUnion>>;
+type ReadyHook = Arc<dyn Fn() + Send + Sync>;
 
-#[derive(Debug)]
 struct ArchiveSlots {
-    slots: Mutex<Box<[Option<PageRead>]>>,
-    ready: Condvar,
+    slots: Box<[OnceLock<PageRead>]>,
+    on_ready: Mutex<Option<ReadyHook>>,
+}
+
+impl fmt::Debug for ArchiveSlots {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ArchiveSlots")
+            .field("count", &self.slots.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl ArchiveSlots {
     fn new(count: usize) -> Self {
+        let slots = iter::repeat_with(OnceLock::new).take(count).collect();
         Self {
-            slots: Mutex::new(vec![None; count].into_boxed_slice()),
-            ready: Condvar::new(),
+            slots,
+            on_ready: Mutex::new(None),
+        }
+    }
+
+    fn is_ready(&self, index: usize) -> bool {
+        self.slots
+            .get(index)
+            .is_none_or(|slot| slot.get().is_some())
+    }
+
+    fn set_on_ready(&self, hook: Option<ReadyHook>) {
+        *self.on_ready.lock() = hook;
+    }
+
+    fn notify_ready(&self) {
+        let hook = self.on_ready.lock().clone();
+        if let Some(hook) = hook {
+            hook();
         }
     }
 
     fn get(&self, index: usize) -> PageRead {
-        let mut slots = self.slots.lock();
-        loop {
-            match slots.get(index) {
-                Some(Some(page)) => return page.clone(),
-                Some(None) => self.ready.wait(&mut slots),
-                None => {
-                    return Err(Arc::new(eros::error!("no such page")));
-                }
-            }
-        }
+        self.slots.get(index).map_or_else(
+            || Err(Arc::new(eros::error!("no such page"))),
+            |slot| slot.wait().clone(),
+        )
     }
 
     fn fill(&self, index: usize, page: PageRead) {
+        if let Some(slot) = self.slots.get(index)
+            && slot.set(page).is_ok()
         {
-            let mut slots = self.slots.lock();
-            if let Some(slot @ None) = slots.get_mut(index) {
-                *slot = Some(page);
-            }
+            self.notify_ready();
         }
-        self.ready.notify_all();
     }
 
     fn finish(&self, verdict: Result<(), Arc<ErrorUnion>>) {
         let fallback = verdict.err().unwrap_or_else(|| {
             Arc::new(eros::error!("missing archive entry"))
         });
-        {
-            let mut slots = self.slots.lock();
-            for slot in &mut *slots {
-                if slot.is_none() {
-                    *slot = Some(Err(Arc::clone(&fallback)));
-                }
+        let mut filled_any = false;
+        for slot in &self.slots {
+            if slot.get().is_none()
+                && slot.set(Err(Arc::clone(&fallback))).is_ok()
+            {
+                filled_any = true;
             }
         }
-        self.ready.notify_all();
+        if filled_any {
+            self.notify_ready();
+        }
+    }
+}
+
+#[cfg(test)]
+pub struct TestArchiveSlots(Arc<ArchiveSlots>);
+
+#[cfg(test)]
+impl TestArchiveSlots {
+    pub fn fill(&self, index: usize, bytes: Bytes) {
+        self.0.fill(index, Ok(bytes));
     }
 }
 
@@ -136,8 +237,12 @@ impl Source {
     /// Listing reads the central directory, so a damaged local header fails
     /// only that member when materialization reaches it.
     fn open_zip(path: &Path) -> eros::Result<Self> {
-        let zip = zip::ZipArchive::new(BufReader::new(File::open(path)?))?;
-        let mut listed: Vec<(String, u64)> = Vec::new();
+        let reader = SeekBufReader::new(
+            File::open(path)?,
+            ARCHIVE_READ_BUFFER_BYTES,
+        );
+        let zip = zip::ZipArchive::new(reader)?;
+        let mut entries = Vec::new();
         for entry_index in 0..zip.len() {
             let entry = zip.by_index_data(entry_index)?;
             if entry.is_dir() {
@@ -145,45 +250,91 @@ impl Source {
             }
             let name = entry.name()?.into_owned();
             if decode::format_from_name(&name).is_some() {
-                listed.push((name, entry.size()));
+                entries.push(ListedEntry {
+                    name,
+                    unpacked_bytes: entry.size(),
+                    archive_index: entry_index,
+                });
             }
         }
-        let (source, slots) = Self::archive_from_listing(listed)?;
-        spawn_zip_materialize(zip, source.names.to_vec(), &slots);
+        let listing = validated_listing(entries)?;
+        let (source, slots) = Self::open_archive_slots(
+            listing.names,
+            listing.unpacked_bytes,
+        )?;
+        spawn_zip_materialize(zip, listing.archive_indices, &slots);
         Ok(source)
     }
 
     /// No password: a 7z with encrypted headers fails to open, and the
     /// first encrypted block ends the pass.
     fn open_sevenzip(path: &Path) -> eros::Result<Self> {
-        let archive = sevenz_rust2::ArchiveReader::open(
-            path,
-            sevenz_rust2::Password::empty(),
+        let mut reader = SeekBufReader::new(
+            File::open(path)?,
+            ARCHIVE_READ_BUFFER_BYTES,
+        );
+        let password = sevenz_rust2::Password::empty();
+        let header_limit_kib =
+            sevenzip_header_limit_kib(mem_available_bytes());
+        let archive = sevenz_rust2::Archive::read_with_memory_limit(
+            &mut reader,
+            &password,
+            header_limit_kib,
         )?;
-        let listed: Vec<(String, u64)> = archive
-            .archive()
+        let entries: Vec<ListedEntry> = archive
             .files
             .iter()
-            .filter(|entry| {
+            .enumerate()
+            .filter(|(_, entry)| {
                 !entry.is_directory()
                     && decode::format_from_name(&entry.name).is_some()
             })
-            .map(|entry| (entry.name.clone(), entry.size()))
+            .map(|(file_index, entry)| ListedEntry {
+                name: entry.name.clone(),
+                unpacked_bytes: entry.size(),
+                archive_index: file_index,
+            })
             .collect();
-        let (source, slots) = Self::archive_from_listing(listed)?;
-        spawn_sevenzip_materialize(archive, &source.names, &slots);
+        let listing = validated_listing(entries)?;
+        let plan = SevenZipPlan::build(
+            &archive.stream_map.file_block_index,
+            archive.blocks.len(),
+            &listing.archive_indices,
+        );
+        let needed_bytes = listing
+            .unpacked_bytes
+            .saturating_add(plan.decoder_peak_bytes(&archive));
+        let (source, slots) =
+            Self::open_archive_slots(listing.names, needed_bytes)?;
+        spawn_sevenzip_materialize(
+            archive,
+            reader,
+            plan,
+            &source.names,
+            &slots,
+        );
         Ok(source)
     }
 
-    fn archive_from_listing(
-        listed: Vec<(String, u64)>,
+    fn open_archive_slots(
+        names: Vec<String>,
+        needed_bytes: u64,
     ) -> eros::Result<(Self, Arc<ArchiveSlots>)> {
-        let (names, unpacked) = validated_listing(listed)?;
-        guard_memory(unpacked, mem_available_bytes())?;
+        guard_memory(needed_bytes, mem_available_bytes())?;
         let slots = Arc::new(ArchiveSlots::new(names.len()));
         let source =
             Self::from_names(Backend::Archive(Arc::clone(&slots)), names)?;
         Ok((source, slots))
+    }
+
+    #[cfg(test)]
+    pub fn from_test_slots(
+        names: Vec<String>,
+    ) -> eros::Result<(Self, TestArchiveSlots)> {
+        let slots = Arc::new(ArchiveSlots::new(names.len()));
+        let source =
+            Self::from_names(Backend::Archive(Arc::clone(&slots)), names)?;
+        Ok((source, TestArchiveSlots(slots)))
     }
 
     fn from_names(
@@ -219,7 +370,7 @@ impl Source {
         };
         match &self.backend {
             Backend::Directory(dir) => match fs::read(dir.join(name)) {
-                Ok(bytes) => Ok(bytes.into()),
+                Ok(bytes) => Ok(Bytes::from(bytes)),
                 Err(error) => Err(Arc::new(error.into())),
             },
             Backend::Archive(slots) => slots.get(index),
@@ -228,6 +379,41 @@ impl Source {
 
     pub fn is_archive(&self) -> bool {
         matches!(&self.backend, Backend::Archive(_))
+    }
+
+    pub fn is_ready(&self, index: usize) -> bool {
+        match &self.backend {
+            Backend::Directory(_) => true,
+            Backend::Archive(slots) => slots.is_ready(index),
+        }
+    }
+
+    pub fn on_ready(
+        &self,
+        hook: impl Fn() + Send + Sync + 'static,
+    ) -> ReadyGuard<'_> {
+        let slots = match &self.backend {
+            Backend::Directory(_) => None,
+            Backend::Archive(slots) => {
+                slots.set_on_ready(Some(Arc::new(hook)));
+                Some(slots.as_ref())
+            }
+        };
+        ReadyGuard { slots }
+    }
+}
+
+#[must_use]
+#[derive(Debug)]
+pub struct ReadyGuard<'source> {
+    slots: Option<&'source ArchiveSlots>,
+}
+
+impl Drop for ReadyGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(slots) = self.slots {
+            slots.set_on_ready(None);
+        }
     }
 }
 
@@ -246,69 +432,92 @@ fn sort_page_names(names: &mut [String]) {
     names.sort_by(|left, right| catalog::compare_names(left, right));
 }
 
+struct ListedEntry {
+    name: String,
+    unpacked_bytes: u64,
+    archive_index: usize,
+}
+
+#[derive(Debug)]
+struct ArchiveListing {
+    names: Vec<String>,
+    archive_indices: Vec<usize>,
+    unpacked_bytes: u64,
+}
+
 fn validated_listing(
-    listed: Vec<(String, u64)>,
-) -> eros::Result<(Vec<String>, u64)> {
+    mut entries: Vec<ListedEntry>,
+) -> eros::Result<ArchiveListing> {
     // Header sizes are claims; saturating addition keeps the sum within
     // the guard even for a liar archive.
-    let unpacked_bytes: u64 = listed
+    let unpacked_bytes: u64 = entries
         .iter()
-        .map(|&(_, size)| size)
+        .map(|entry| entry.unpacked_bytes)
         .fold(0, u64::saturating_add);
-    let mut names: Vec<String> =
-        listed.into_iter().map(|(name, _)| name).collect();
-    sort_page_names(&mut names);
+    entries.sort_by(|left, right| {
+        catalog::compare_names(&left.name, &right.name)
+    });
+    let mut names = Vec::with_capacity(entries.len());
+    let mut archive_indices = Vec::with_capacity(entries.len());
+    for entry in entries {
+        names.push(entry.name);
+        archive_indices.push(entry.archive_index);
+    }
     if let Some(name) = duplicate_name(&names) {
         eros::bail!("duplicate entry name: {name}");
     }
-    Ok((names, unpacked_bytes))
+    Ok(ArchiveListing {
+        names,
+        archive_indices,
+        unpacked_bytes,
+    })
 }
 
-/// One member's bytes, or its read error. A failed member is drained,
-/// so the next member of a solid stream decodes from its true start;
-/// an independent entry discards the rest.
 fn read_member(
     member: &mut (impl Read + ?Sized),
-) -> eros::Result<Arc<[u8]>> {
+    expected_bytes: u64,
+) -> eros::Result<Bytes> {
     let started = Instant::now();
-    let mut bytes = Vec::new();
-    match member.read_to_end(&mut bytes) {
-        Ok(_) => {
-            let elapsed = started.elapsed();
-            if elapsed >= Duration::from_millis(200) {
-                tracing::debug!(
-                    bytes = bytes.len(),
-                    elapsed = ?elapsed,
-                    "slow member read"
-                );
-            }
-            Ok(bytes.into())
-        }
-        Err(error) => {
-            #[expect(
-                clippy::let_underscore_must_use,
-                clippy::let_underscore_untyped,
-                reason = "only the drain's side effect matters; its result is irrelevant"
-            )]
-            let _ = member.read_to_end(&mut bytes);
-            Err(error.into())
-        }
+    let capacity = usize::try_from(expected_bytes)
+        .unwrap_or(MAX_PREALLOCATED_BYTES)
+        .min(MAX_PREALLOCATED_BYTES)
+        .saturating_add(READ_TO_END_PROBE_BYTES);
+    let mut bytes = Vec::with_capacity(capacity);
+    member.read_to_end(&mut bytes)?;
+    if bytes.capacity()
+        > bytes.len().saturating_add(READ_TO_END_PROBE_BYTES)
+    {
+        bytes.shrink_to_fit();
     }
+    let elapsed = started.elapsed();
+    if elapsed >= Duration::from_millis(200) {
+        tracing::debug!(
+            bytes = bytes.len(),
+            elapsed = ?elapsed,
+            "slow member read"
+        );
+    }
+    Ok(Bytes::from(bytes))
 }
 
-/// Materialize a zip's pages in reading order.
 fn spawn_zip_materialize(
-    mut zip: zip::ZipArchive<BufReader<File>>,
-    names: Vec<String>,
+    mut zip: zip::ZipArchive<SeekBufReader<File>>,
+    entry_indices: Vec<usize>,
     slots: &Arc<ArchiveSlots>,
 ) {
     spawn_materialize(slots, move |slots| {
-        for (index, name) in names.iter().enumerate() {
-            let page = match zip.by_name(name) {
-                Ok(mut entry) => read_member(&mut entry).map_err(Arc::new),
+        for (page_index, entry_index) in
+            entry_indices.into_iter().enumerate()
+        {
+            let page = match zip.by_index(entry_index) {
+                Ok(mut entry) => {
+                    let expected_bytes = entry.size();
+                    read_member(&mut entry, expected_bytes)
+                        .map_err(Arc::new)
+                }
                 Err(error) => Err(Arc::new(error.into())),
             };
-            slots.fill(index, page);
+            slots.fill(page_index, page);
         }
         Ok(())
     });
@@ -348,6 +557,8 @@ fn spawn_materialize(
                 "unpack pass ended"
             );
             thread_slots.finish(verdict);
+            MiMalloc::collect(true);
+            MiMalloc::arenas_purge();
         });
     if let Err(error) = spawned {
         tracing::warn!(?error, "could not start the unpack thread");
@@ -356,35 +567,200 @@ fn spawn_materialize(
     }
 }
 
-/// Materialize a 7z's pages in storage order, the only order a solid
-/// stream permits.
+struct PlannedBlock {
+    index: usize,
+    page_count: NonZeroUsize,
+}
+
+struct SevenZipPlan {
+    blocks: Vec<PlannedBlock>,
+    empty_pages: Vec<usize>,
+}
+
+impl SevenZipPlan {
+    fn build(
+        file_block_index: &[Option<usize>],
+        block_count: usize,
+        page_file_indices: &[usize],
+    ) -> Self {
+        let mut block_page_counts = vec![0_usize; block_count];
+        let mut block_order = Vec::new();
+        let mut empty_pages = Vec::new();
+        for (page_index, &file_index) in
+            page_file_indices.iter().enumerate()
+        {
+            let block = file_block_index
+                .get(file_index)
+                .copied()
+                .flatten()
+                .filter(|&block_index| block_index < block_count);
+            if let Some(block_index) = block
+                && let Some(page_count) =
+                    block_page_counts.get_mut(block_index)
+            {
+                if *page_count == 0 {
+                    block_order.push(block_index);
+                }
+                *page_count += 1;
+            } else {
+                empty_pages.push(page_index);
+            }
+        }
+        let blocks = block_order
+            .into_iter()
+            .filter_map(|index| {
+                block_page_counts
+                    .get(index)
+                    .copied()
+                    .and_then(NonZeroUsize::new)
+                    .map(|page_count| PlannedBlock { index, page_count })
+            })
+            .collect();
+        Self {
+            blocks,
+            empty_pages,
+        }
+    }
+
+    fn decoder_peak_bytes(&self, archive: &sevenz_rust2::Archive) -> u64 {
+        let mut peak_bytes = 0_u64;
+        for planned in &self.blocks {
+            let Some(block) = archive.blocks.get(planned.index) else {
+                continue;
+            };
+            let block_unpacked_bytes = block.get_unpack_size();
+            let mut block_peak_bytes = 0_u64;
+            for (coder_index, coder) in block.coders.iter().enumerate() {
+                let Some(dictionary_bytes) = coder_dictionary_bytes(
+                    coder.encoder_method_id(),
+                    coder.properties(),
+                ) else {
+                    continue;
+                };
+                let coder_unpacked_bytes =
+                    block.get_unpack_size_at_index(coder_index);
+                let unpacked_bytes = if coder_unpacked_bytes > 0 {
+                    coder_unpacked_bytes
+                } else {
+                    block_unpacked_bytes
+                };
+                block_peak_bytes = block_peak_bytes.saturating_add(
+                    lzma_growth_peak_bytes(
+                        dictionary_bytes,
+                        unpacked_bytes,
+                    ),
+                );
+            }
+            peak_bytes = peak_bytes.max(block_peak_bytes);
+        }
+        peak_bytes
+    }
+}
+
+#[expect(
+    clippy::little_endian_bytes,
+    reason = "LZMA properties store the dictionary size little-endian by format specification"
+)]
+fn coder_dictionary_bytes(
+    method_id: &[u8],
+    properties: &[u8],
+) -> Option<u64> {
+    use sevenz_rust2::EncoderMethod;
+
+    const LZMA2_MAX_DICTIONARY_CODE: u8 = 40;
+    const LZMA2_MANTISSA_BASE: u64 = 2;
+    const LZMA2_BASE_EXPONENT: u32 = 11;
+    const LZMA_DICTIONARY_OFFSET: usize = 1;
+    const LZMA_DICTIONARY_BYTES: usize = size_of::<u32>();
+
+    match method_id {
+        EncoderMethod::ID_LZMA2 => match properties.first().copied()? {
+            LZMA2_MAX_DICTIONARY_CODE => Some(u64::from(u32::MAX)),
+            code @ 0..LZMA2_MAX_DICTIONARY_CODE => {
+                let mantissa = LZMA2_MANTISSA_BASE | u64::from(code & 1);
+                let exponent = u32::from(code >> 1) + LZMA2_BASE_EXPONENT;
+                Some(mantissa << exponent)
+            }
+            _ => None,
+        },
+        EncoderMethod::ID_LZMA => {
+            let end = LZMA_DICTIONARY_OFFSET + LZMA_DICTIONARY_BYTES;
+            let raw: [u8; LZMA_DICTIONARY_BYTES] = properties
+                .get(LZMA_DICTIONARY_OFFSET..end)?
+                .try_into()
+                .ok()?;
+            Some(u64::from(u32::from_le_bytes(raw)))
+        }
+        _ => None,
+    }
+}
+
+/// Models `lzma-rust2`'s `LzDecoder::grow_slow` doubling reallocation
+/// where old and new dictionary buffers coexist.
+fn lzma_growth_peak_bytes(
+    dictionary_bytes: u64,
+    unpacked_bytes: u64,
+) -> u64 {
+    const MIN_GROWTH_BYTES: u64 = 64 * 1024;
+
+    let target_bytes = unpacked_bytes.min(dictionary_bytes);
+    if target_bytes == 0 {
+        return 0;
+    }
+    let mut previous_bytes = 0_u64;
+    let mut capacity_bytes = 0_u64;
+    while capacity_bytes < target_bytes {
+        previous_bytes = capacity_bytes;
+        capacity_bytes = capacity_bytes
+            .saturating_mul(2)
+            .max(MIN_GROWTH_BYTES)
+            .min(dictionary_bytes);
+    }
+    previous_bytes.saturating_add(capacity_bytes)
+}
+
 fn spawn_sevenzip_materialize(
-    mut reader: sevenz_rust2::ArchiveReader<File>,
+    archive: sevenz_rust2::Archive,
+    mut reader: SeekBufReader<File>,
+    plan: SevenZipPlan,
     names: &[String],
     slots: &Arc<ArchiveSlots>,
 ) {
-    let by_name: HashMap<String, usize> = names
+    const BLOCK_DECODER_THREADS: u32 = 1;
+
+    let page_by_name: HashMap<String, usize> = names
         .iter()
         .enumerate()
         .map(|(index, name)| (name.clone(), index))
         .collect();
     spawn_materialize(slots, move |slots| {
-        reader.for_each_entries(|entry, data| {
-            let page_index = (!entry.is_directory())
-                .then(|| by_name.get(&entry.name).copied())
-                .flatten();
-            match page_index {
-                Some(index) => {
-                    slots.fill(index, read_member(data).map_err(Arc::new));
+        for page_index in plan.empty_pages {
+            slots.fill(page_index, Ok(Bytes::new()));
+        }
+        let password = sevenz_rust2::Password::empty();
+        for planned in plan.blocks {
+            let mut remaining_pages = planned.page_count.get();
+            let decoder = sevenz_rust2::BlockDecoder::new(
+                BLOCK_DECODER_THREADS,
+                planned.index,
+                &archive,
+                &password,
+                &mut reader,
+            );
+            decoder.for_each_entries(&mut |entry, data| {
+                let page_index = (!entry.is_directory())
+                    .then(|| page_by_name.get(&entry.name).copied())
+                    .flatten();
+                if let Some(index) = page_index {
+                    slots.fill(
+                        index,
+                        read_member(data, entry.size()).map_err(Arc::new),
+                    );
+                    remaining_pages = remaining_pages.saturating_sub(1);
                 }
-                None => {
-                    // A solid block yields its later members only
-                    // after this one is consumed, so non-pages are drained.
-                    io::copy(data, &mut io::sink())?;
-                }
-            }
-            Ok(true)
-        })?;
+                Ok(remaining_pages > 0)
+            })?;
+        }
         Ok(())
     });
 }
@@ -403,21 +779,36 @@ fn mem_available_bytes() -> Option<u64> {
     parse_mem_available_bytes(&fs::read_to_string("/proc/meminfo").ok()?)
 }
 
-/// Kept free of the archive's unpacked pages: the worker's in-flight
-/// decode, the app's page textures, the preview store, and the rest of
-/// the system also live in `MemAvailable`.
+/// Kept free in `MemAvailable` for in-flight decodes, GPU textures, the
+/// preview store, and the rest of the system.
 const MEM_RESERVE_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_SEVENZIP_HEADER_KIB: u64 = 128 * 1024;
+
+fn sevenzip_header_limit_kib(available_bytes: Option<u64>) -> usize {
+    const KIB_SHIFT: u32 = 10;
+
+    let budget_kib = available_bytes.map_or(
+        MAX_SEVENZIP_HEADER_KIB,
+        |available_bytes| {
+            (available_bytes.saturating_sub(MEM_RESERVE_BYTES)
+                >> KIB_SHIFT)
+                .min(MAX_SEVENZIP_HEADER_KIB)
+        },
+    );
+    usize::try_from(budget_kib).unwrap_or(usize::MAX)
+}
 
 fn guard_memory(
-    unpacked: u64,
-    available: Option<u64>,
+    needed_bytes: u64,
+    available_bytes: Option<u64>,
 ) -> eros::Result<()> {
-    match available {
-        Some(available)
-            if unpacked > available.saturating_sub(MEM_RESERVE_BYTES) =>
+    match available_bytes {
+        Some(available_bytes)
+            if needed_bytes
+                > available_bytes.saturating_sub(MEM_RESERVE_BYTES) =>
         {
             eros::bail!(
-                "archive too big: {unpacked} bytes claimed, {available} bytes available"
+                "archive too big: {needed_bytes} bytes needed, {available_bytes} bytes available"
             );
         }
         _ => Ok(()),
@@ -473,15 +864,15 @@ mod tests {
 
     #[test]
     fn a_failed_pass_answers_only_unfilled_pages() {
-        let good: Arc<[u8]> = Arc::from(&b"a"[..]);
+        let good = Bytes::from_static(b"a");
         let bad = failed_page("bad page");
         let fatal = failed_page("stream broke");
         let slots = ArchiveSlots::new(3);
-        slots.fill(0, Ok(Arc::clone(&good)));
+        slots.fill(0, Ok(good.clone()));
         slots.fill(1, Err(Arc::clone(&bad)));
         slots.finish(Err(Arc::clone(&fatal)));
         assert!(
-            matches!(slots.get(0), Ok(bytes) if Arc::ptr_eq(&bytes, &good))
+            matches!(slots.get(0), Ok(bytes) if bytes.as_ptr() == good.as_ptr() && bytes.len() == good.len())
         );
         assert!(
             matches!(slots.get(1), Err(error) if Arc::ptr_eq(&error, &bad))
@@ -492,7 +883,7 @@ mod tests {
 
         // A whole pass that missed a page rejects unfilled slots.
         let whole = ArchiveSlots::new(2);
-        whole.fill(0, Ok(Arc::clone(&good)));
+        whole.fill(0, Ok(good));
         whole.finish(Ok(()));
         let missed = whole.get(1).expect_err("missed slot must fail");
         assert!(missed.to_string().contains("missing archive entry"));
@@ -655,13 +1046,28 @@ mod tests {
             )
             .is_err()
         );
+
+        let max_header_kib =
+            usize::try_from(MAX_SEVENZIP_HEADER_KIB).unwrap();
+        assert_eq!(sevenzip_header_limit_kib(None), max_header_kib);
+        assert_eq!(
+            sevenzip_header_limit_kib(Some(available)),
+            max_header_kib
+        );
+        assert_eq!(
+            sevenzip_header_limit_kib(Some(
+                MEM_RESERVE_BYTES + 4 * 1024 * 1024
+            )),
+            4 * 1024
+        );
+        assert_eq!(sevenzip_header_limit_kib(Some(MEM_RESERVE_BYTES)), 0);
     }
 
     #[test]
     fn a_panicking_materializer_answers_unfilled_pages() {
         let slots = Arc::new(ArchiveSlots::new(2));
         spawn_materialize(&slots, |slots| {
-            slots.fill(0, Ok(Arc::from(&b"a"[..])));
+            slots.fill(0, Ok(Bytes::from_static(b"a")));
             panic!("boom");
         });
         assert_eq!(slots.get(0).unwrap().as_ref(), b"a");
@@ -678,9 +1084,9 @@ mod tests {
         let slots = Arc::new(ArchiveSlots::new(2));
         let (release_tx, release_rx) = mpsc::channel();
         spawn_materialize(&slots, move |slots| {
-            slots.fill(0, Ok(Arc::from(&b"first"[..])));
+            slots.fill(0, Ok(Bytes::from_static(b"first")));
             release_rx.recv().expect("gate releases slot 1");
-            slots.fill(1, Ok(Arc::from(&b"second"[..])));
+            slots.fill(1, Ok(Bytes::from_static(b"second")));
             Ok(())
         });
 
@@ -694,29 +1100,192 @@ mod tests {
 
     #[test]
     fn liar_sizes_refuse() {
-        let listed = vec![
-            ("a.png".to_owned(), u64::MAX),
-            ("b.png".to_owned(), u64::MAX),
+        let entries = vec![
+            ListedEntry {
+                name: "a.png".to_owned(),
+                unpacked_bytes: u64::MAX,
+                archive_index: 0,
+            },
+            ListedEntry {
+                name: "b.png".to_owned(),
+                unpacked_bytes: u64::MAX,
+                archive_index: 1,
+            },
         ];
-        let (names, unpacked) =
-            validated_listing(listed).expect("liar names still list");
-        assert_eq!(names, ["a.png", "b.png"]);
-        assert_eq!(unpacked, u64::MAX);
+        let listing =
+            validated_listing(entries).expect("liar names still list");
+        assert_eq!(listing.names, ["a.png", "b.png"]);
+        assert_eq!(listing.unpacked_bytes, u64::MAX);
         assert!(
-            guard_memory(unpacked, Some(4 * 1024 * 1024 * 1024)).is_err()
+            guard_memory(
+                listing.unpacked_bytes,
+                Some(4 * 1024 * 1024 * 1024)
+            )
+            .is_err()
         );
     }
 
     #[test]
     fn duplicate_names_refuse() {
-        let listed = vec![
-            ("b.png".to_owned(), 8),
-            ("a.png".to_owned(), 8),
-            ("a.png".to_owned(), 8),
+        let entries = vec![
+            ListedEntry {
+                name: "b.png".to_owned(),
+                unpacked_bytes: 8,
+                archive_index: 0,
+            },
+            ListedEntry {
+                name: "a.png".to_owned(),
+                unpacked_bytes: 8,
+                archive_index: 1,
+            },
+            ListedEntry {
+                name: "a.png".to_owned(),
+                unpacked_bytes: 8,
+                archive_index: 2,
+            },
         ];
-        let error =
-            validated_listing(listed).expect_err("duplicates must refuse");
+        let error = validated_listing(entries)
+            .expect_err("duplicates must refuse");
         assert!(error.to_string().contains("a.png"));
+    }
+
+    #[test]
+    fn seek_buf_reader_preserves_buffer_for_in_window_seeks() {
+        use std::io::Cursor;
+
+        const BUFFER_BYTES: usize = 64;
+
+        struct CountingReader {
+            inner: Cursor<Vec<u8>>,
+            reads: usize,
+            seeks: usize,
+        }
+
+        impl Read for CountingReader {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                self.reads += 1;
+                self.inner.read(buf)
+            }
+        }
+
+        impl Seek for CountingReader {
+            fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+                self.seeks += 1;
+                self.inner.seek(pos)
+            }
+        }
+
+        let data: Vec<u8> = (0..=u8::MAX).collect();
+        let mut reader = SeekBufReader::new(
+            CountingReader {
+                inner: Cursor::new(data.clone()),
+                reads: 0,
+                seeks: 0,
+            },
+            BUFFER_BYTES,
+        );
+
+        let mut head = [0_u8; 8];
+        reader.read_exact(&mut head).expect("read initial slice");
+        assert_eq!(Some(head.as_slice()), data.get(0..8));
+        assert_eq!(reader.stream_position().expect("current position"), 8);
+
+        let mut slice = [0_u8; 4];
+        for (seek_to, expected_position) in [
+            (SeekFrom::Start(32), 32),
+            (SeekFrom::Start(16), 16),
+            (SeekFrom::Current(-8), 12),
+        ] {
+            assert_eq!(
+                reader.seek(seek_to).expect("in-window seek"),
+                expected_position
+            );
+            reader.read_exact(&mut slice).expect("read in-window slice");
+            let offset =
+                usize::try_from(expected_position).expect("offset fits");
+            assert_eq!(
+                Some(slice.as_slice()),
+                data.get(offset..offset + slice.len())
+            );
+        }
+        let underlying = reader.inner.get_ref();
+        assert_eq!((underlying.reads, underlying.seeks), (1, 0));
+
+        for (seek_to, expected_position) in [
+            (SeekFrom::Start(200), 200),
+            (SeekFrom::End(-4), 252),
+            (SeekFrom::Current(-4), 252),
+        ] {
+            assert_eq!(
+                reader.seek(seek_to).expect("out-of-window seek"),
+                expected_position
+            );
+            reader.read_exact(&mut slice).expect("read after seek");
+            let offset =
+                usize::try_from(expected_position).expect("offset fits");
+            assert_eq!(
+                Some(slice.as_slice()),
+                data.get(offset..offset + slice.len())
+            );
+        }
+    }
+
+    #[test]
+    fn sevenzip_plan_orders_blocks_and_skips_unused() {
+        let file_block_index =
+            [Some(2), Some(0), None, Some(1), Some(2), None];
+        let page_file_indices = [3, 2, 0, 4];
+        let plan =
+            SevenZipPlan::build(&file_block_index, 3, &page_file_indices);
+        let blocks: Vec<(usize, usize)> = plan
+            .blocks
+            .iter()
+            .map(|planned| (planned.index, planned.page_count.get()))
+            .collect();
+        assert_eq!(blocks, [(1, 1), (2, 2)]);
+        assert_eq!(plan.empty_pages, [1]);
+    }
+
+    #[test]
+    fn lzma_growth_peak_bytes_estimates_realloc_spike() {
+        use sevenz_rust2::EncoderMethod;
+
+        const KIB: u64 = 1024;
+        const MIB: u64 = 1024 * 1024;
+
+        assert_eq!(
+            coder_dictionary_bytes(EncoderMethod::ID_LZMA2, &[0]),
+            Some(4 * KIB)
+        );
+        assert_eq!(
+            coder_dictionary_bytes(EncoderMethod::ID_LZMA2, &[37]),
+            Some(1536 * MIB)
+        );
+        assert_eq!(
+            coder_dictionary_bytes(EncoderMethod::ID_LZMA2, &[40]),
+            Some(u64::from(u32::MAX))
+        );
+        assert_eq!(
+            coder_dictionary_bytes(EncoderMethod::ID_LZMA2, &[41]),
+            None
+        );
+        assert_eq!(
+            coder_dictionary_bytes(
+                EncoderMethod::ID_LZMA,
+                &[0x5d, 0, 0, 0x01, 0]
+            ),
+            Some(64 * KIB)
+        );
+
+        assert_eq!(
+            lzma_growth_peak_bytes(1536 * MIB, 1_119_464_490),
+            2560 * MIB
+        );
+        assert_eq!(
+            lzma_growth_peak_bytes(1024 * MIB, MIB),
+            512 * KIB + MIB
+        );
+        assert_eq!(lzma_growth_peak_bytes(16 * MIB, 147 * MIB), 24 * MIB);
     }
 
     #[test]

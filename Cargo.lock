@@ -440,6 +440,7 @@ name = "cryslen"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "bytes",
  "crossbeam-channel",
  "egui",
  "egui-winit",
@@ -3600,7 +3601,6 @@ dependencies = [
  "typed-path",
  "windows-sys 0.61.2",
  "zeroize",
- "zopfli",
 ]
 
 [[package]]
@@ -3608,18 +3608,6 @@ name = "zlib-rs"
 version = "0.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112"
-
-[[package]]
-name = "zopfli"
-version = "0.8.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aaf7fc5d30c28483d93805c4a5e12b05bbb52407fa67c5f8bd552374cd01fb11"
-dependencies = [
- "bumpalo",
- "crc32fast",
- "log",
- "simd-adler32",
-]
 
 [[package]]
 name = "zune-core"

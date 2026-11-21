@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 bytemuck = "1"
+bytes = "1"
 egui = { version = "0.37", default-features = false, features = ["default_fonts"] }
 egui-winit = { version = "0.37", default-features = false, features = ["wayland", "clipboard"] }
 egui_glow = { version = "0.37", default-features = false, features = ["winit", "wayland"] }
@@ -36,7 +37,7 @@ gif = "0.14"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "bmp", "tiff"] }
 indoc = "2"
 parking_lot = "0.13"
-zip = { version = "9", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 sevenz-rust2 = { version = "0.25", default-features = false, features = ["bzip2"] }
 libavif-sys = { version = "0.18", default-features = false, features = ["codec-dav1d"] }
 libwebp-sys = "0.14"

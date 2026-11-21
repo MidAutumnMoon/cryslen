@@ -5,10 +5,10 @@
     reason = "the decode tree's shared vocabulary lives in its module root by design"
 )]
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use ::image::Delay;
+use bytes::Bytes;
 use eros::MsgError;
 use serde::Deserialize;
 use serde::Serialize;
@@ -578,7 +578,7 @@ pub fn decode_with_threads(
 /// An animated page's frame stream. Frames arrive sequentially; there is
 /// no seek.
 pub struct Animation {
-    bytes: Arc<[u8]>,
+    bytes: Bytes,
     loops: Loops,
     frames: ::image::Frames<'static>,
 }
@@ -591,7 +591,7 @@ impl Animation {
 
     /// Restart the pass at frame 0.
     pub fn rewind(&mut self) -> eros::Result<()> {
-        self.frames = open_gif_frames(Arc::clone(&self.bytes))?;
+        self.frames = open_gif_frames(self.bytes.clone())?;
         Ok(())
     }
 
@@ -630,7 +630,7 @@ pub struct Frame {
 }
 
 fn open_gif_frames(
-    bytes: Arc<[u8]>,
+    bytes: Bytes,
 ) -> eros::Result<::image::Frames<'static>> {
     use ::image::AnimationDecoder as _;
     use ::image::ImageDecoder as _;
@@ -646,7 +646,7 @@ fn open_gif_frames(
 /// `Ok(None)` means the format has no animation path; a still GIF
 /// streams one frame.
 pub fn open_animation(
-    bytes: Arc<[u8]>,
+    bytes: Bytes,
     name: &str,
 ) -> eros::Result<Option<Animation>> {
     let Some(format) = sniff(&bytes).or_else(|| format_from_name(name))
@@ -657,7 +657,7 @@ pub fn open_animation(
         return Ok(None);
     }
     let loops = gif_loops(&bytes);
-    let frames = open_gif_frames(Arc::clone(&bytes))?;
+    let frames = open_gif_frames(bytes.clone())?;
     tracing::debug!(%format, ?loops, "animation opened");
     Ok(Some(Animation {
         bytes,
@@ -1113,10 +1113,6 @@ mod tests {
         );
     }
 
-    fn arc(bytes: Vec<u8>) -> Arc<[u8]> {
-        Arc::from(bytes.into_boxed_slice())
-    }
-
     fn first_pixel(image: &Decoded) -> [u8; 4] {
         let Pixels::Rgba8(bytes) = image.pixels() else {
             panic!("a gif frame decodes to rgba");
@@ -1137,7 +1133,7 @@ mod tests {
             50,
             Repeat::Infinite,
         );
-        let mut animation = open_animation(arc(bytes), "a.gif")
+        let mut animation = open_animation(Bytes::from(bytes), "a.gif")
             .expect("animated gif decodes")
             .expect("gif has a frame stream");
         assert_eq!(animation.loops(), Loops::Infinite);
@@ -1162,7 +1158,7 @@ mod tests {
         // No NETSCAPE extension: the decoder's zero default means one
         // play, not forever.
         let still = testkit::tiny_gif(2, 2, [10, 20, 30]);
-        let mut once = open_animation(arc(still), "a.gif")
+        let mut once = open_animation(Bytes::from(still), "a.gif")
             .expect("still gif decodes")
             .expect("gif has a frame stream");
         assert_eq!(once.loops(), Loops::Finite(1));
@@ -1178,7 +1174,7 @@ mod tests {
             100,
             Repeat::Finite(2),
         );
-        let animation = open_animation(arc(finite), "a.gif")
+        let animation = open_animation(Bytes::from(finite), "a.gif")
             .expect("finite gif decodes")
             .expect("gif has a frame stream");
         assert_eq!(animation.loops(), Loops::Finite(3));
@@ -1195,7 +1191,7 @@ mod tests {
             20,
             Repeat::Infinite,
         );
-        let mut animation = open_animation(arc(bytes), "a.gif")
+        let mut animation = open_animation(Bytes::from(bytes), "a.gif")
             .expect("gif decodes")
             .expect("gif has a frame stream");
         for color in colors {
