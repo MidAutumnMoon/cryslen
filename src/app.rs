@@ -1137,11 +1137,7 @@ const GLASS_FILL: Color32 = Color32::from_rgba_unmultiplied_const(
 /// Framebuffer clear color, premultiplied because Wayland composites
 /// ARGB buffers that way.
 fn clear_color(translucent: bool) -> [f32; 4] {
-    let color = if translucent {
-        GLASS_FILL
-    } else {
-        OPAQUE_FILL
-    };
+    let color = if translucent { GLASS_FILL } else { OPAQUE_FILL };
     color.to_normalized_gamma_f32()
 }
 

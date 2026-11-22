@@ -354,7 +354,8 @@ mod tests {
         let mut bad_dims = wire.clone();
         wire.validate().expect("valid yuv wire image validates");
 
-        if let WirePixels::Yuv { spec, .. } = &mut mismatched_depth.pixels {
+        if let WirePixels::Yuv { spec, .. } = &mut mismatched_depth.pixels
+        {
             spec.depth = Depth::D8;
         }
         assert_eq!(

@@ -357,8 +357,7 @@ const EWA_LUT_TEXTURE_UNIT: u32 = glow::TEXTURE4;
 const EWA_SUPPORT: f64 = 3.238_315_484_166_236;
 const EWA_JINC_FIRST_ZERO: f64 = 1.219_669_891_266_504_5;
 const EWA_LUT_INTERVALS: i32 = 128;
-const EWA_LUT_LEN: usize =
-    EWA_LUT_INTERVALS.cast_unsigned() as usize + 1;
+const EWA_LUT_LEN: usize = EWA_LUT_INTERVALS.cast_unsigned() as usize + 1;
 const EWA_GRID_LEN: usize = EWA_LUT_LEN * 2 - 1;
 
 pub struct PageTextures {
@@ -634,8 +633,8 @@ fn compute_visible_slice(
     )?;
     let source_per_screen_x = f64::from(texture_dims.0) / seat.size.0;
     let source_per_screen_y = f64::from(texture_dims.1) / seat.size.1;
-    let support_radius_y =
-        EWA_SUPPORT.mul_add(source_per_screen_y.max(1.0), SLICE_PAD_TEXELS);
+    let support_radius_y = EWA_SUPPORT
+        .mul_add(source_per_screen_y.max(1.0), SLICE_PAD_TEXELS);
     let center_y_start =
         (f64::from(top) + 0.5 - seat.origin.1) * source_per_screen_y;
     let center_y_end =
@@ -2318,45 +2317,44 @@ fn upload_page_texture(
                 const STUB_DIMS: (u32, u32) = (1, 1);
                 const OPAQUE_ALPHA_8BIT: u8 = u8::MAX;
 
-                let (cb_texture, cr_texture) = if spec.subsampling
-                    == Subsampling::Mono
-                {
-                    // `color_conversion` zeroes columns 1 and 2; two distinct
-                    // textures keep unique ownership for `Drop`.
-                    (
-                        upload_plane(
-                            &gl,
-                            &[CHROMA_NEUTRAL_8BIT],
-                            STUB_DIMS,
-                            false,
-                            MagnificationFilter::Linear,
-                        ),
-                        upload_plane(
-                            &gl,
-                            &[CHROMA_NEUTRAL_8BIT],
-                            STUB_DIMS,
-                            false,
-                            MagnificationFilter::Linear,
-                        ),
-                    )
-                } else {
-                    (
-                        upload_plane(
-                            &gl,
-                            cb,
-                            (chroma_w, chroma_h),
-                            wide,
-                            MagnificationFilter::Linear,
-                        ),
-                        upload_plane(
-                            &gl,
-                            cr,
-                            (chroma_w, chroma_h),
-                            wide,
-                            MagnificationFilter::Linear,
-                        ),
-                    )
-                };
+                let (cb_texture, cr_texture) =
+                    if spec.subsampling == Subsampling::Mono {
+                        // `color_conversion` zeroes columns 1 and 2; two distinct
+                        // textures keep unique ownership for `Drop`.
+                        (
+                            upload_plane(
+                                &gl,
+                                &[CHROMA_NEUTRAL_8BIT],
+                                STUB_DIMS,
+                                false,
+                                MagnificationFilter::Linear,
+                            ),
+                            upload_plane(
+                                &gl,
+                                &[CHROMA_NEUTRAL_8BIT],
+                                STUB_DIMS,
+                                false,
+                                MagnificationFilter::Linear,
+                            ),
+                        )
+                    } else {
+                        (
+                            upload_plane(
+                                &gl,
+                                cb,
+                                (chroma_w, chroma_h),
+                                wide,
+                                MagnificationFilter::Linear,
+                            ),
+                            upload_plane(
+                                &gl,
+                                cr,
+                                (chroma_w, chroma_h),
+                                wide,
+                                MagnificationFilter::Linear,
+                            ),
+                        )
+                    };
                 let (alpha_texture, alpha_normalization) =
                     alpha.as_ref().map_or_else(
                         || {
@@ -2470,7 +2468,8 @@ fn page_color_conversion(
             (
                 f32::from(STUDIO_LUMA_BLACK_8BIT * depth_scale),
                 max_code / f32::from(STUDIO_LUMA_SWING_8BIT * depth_scale),
-                max_code / f32::from(STUDIO_CHROMA_SWING_8BIT * depth_scale),
+                max_code
+                    / f32::from(STUDIO_CHROMA_SWING_8BIT * depth_scale),
             )
         };
     let storage_max = max_storage_code(depth);

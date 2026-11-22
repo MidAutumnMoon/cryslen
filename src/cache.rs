@@ -1264,7 +1264,8 @@ mod tests {
     #[test]
     fn yuv_u8_planes_and_alpha_roundtrip() {
         let dir = TempDir::new().expect("create temp dir");
-        let page = yuv_page_with(6, 4, Subsampling::Yuv444, Depth::D8, true);
+        let page =
+            yuv_page_with(6, 4, Subsampling::Yuv444, Depth::D8, true);
         let store = Store::at(dir.path());
         let hash = content_hash(b"page-e");
         assert!(
