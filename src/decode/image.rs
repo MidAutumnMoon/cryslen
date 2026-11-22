@@ -1,4 +1,5 @@
 use super::Decoded;
+use super::Depth;
 use super::Format;
 use super::Plane;
 use super::Transfer;
@@ -41,7 +42,7 @@ pub(super) fn decode(
             gray.height(),
             format,
             Transfer::Srgb,
-            super::BYTE_DEPTH,
+            Depth::D8,
             Plane::U8(gray.into_raw().into_boxed_slice()),
         )?
     } else if let DynamicImage::ImageLuma16(gray) = oriented {
@@ -50,7 +51,7 @@ pub(super) fn decode(
             gray.height(),
             format,
             Transfer::Srgb,
-            super::MAX_SAMPLE_DEPTH,
+            Depth::D16,
             Plane::U16(gray.into_raw().into_boxed_slice()),
         )?
     } else {
@@ -141,7 +142,7 @@ mod tests {
         };
         assert_eq!(
             (yuv8.spec.depth, yuv8.spec.subsampling),
-            (8, Subsampling::Mono)
+            (Depth::D8, Subsampling::Mono)
         );
         assert!(matches!(
             &yuv8.luma,
@@ -165,7 +166,7 @@ mod tests {
         };
         assert_eq!(
             (yuv16.spec.depth, yuv16.spec.subsampling),
-            (16, Subsampling::Mono)
+            (Depth::D16, Subsampling::Mono)
         );
         assert!(matches!(
             &yuv16.luma,

@@ -6,7 +6,6 @@
     reason = "scoped to render.rs, where batched GL calls share one current-context invariant"
 )]
 
-use core::f64::consts::PI;
 use core::num::NonZeroU32;
 use core::slice;
 use std::collections::HashMap;
@@ -38,10 +37,10 @@ use winit::window::Window as WinitWindow;
 use crate::browse::Role;
 use crate::browse::Roles;
 use crate::decode;
+use crate::decode::Depth;
 use crate::decode::Matrix;
 use crate::decode::Subsampling;
 use crate::decode::Transfer;
-use crate::geometry;
 use crate::geometry::PageRect;
 use crate::geometry::Placement;
 use crate::geometry::SpreadLayout;
@@ -346,20 +345,20 @@ const EWA_VERTICAL_BODY: &str = indoc! {"
 
 /// Seat rect and page dims agree within float rounding; page dims are
 /// whole pixels.
-const SEAT_PAGE_DIMS_TOLERANCE: f32 = 1e-3;
+const SEAT_PAGE_DIMS_TOLERANCE: f64 = 1e-3;
 
-const ROLE_COVER_MARGIN_PX: f32 = 1.0;
-const MINIFY_SCALE_TOLERANCE: f32 = 1e-3;
-const SLICE_PAD_TEXELS: f32 = 1.0;
+const ROLE_COVER_MARGIN_PX: f64 = 1.0;
+const MINIFY_SCALE_TOLERANCE: f64 = 1e-3;
+const SLICE_PAD_TEXELS: f64 = 1.0;
 const QUAD_VERTEX_COUNT: i32 = 4;
 const EWA_LUT_SAMPLER_UNIT: i32 = 4;
 const EWA_LUT_TEXTURE_UNIT: u32 = glow::TEXTURE4;
 
-const EWA_JINC_FIRST_ZERO: f64 = 1.219_669_891_266_504_5;
 const EWA_SUPPORT: f64 = 3.238_315_484_166_236;
+const EWA_JINC_FIRST_ZERO: f64 = 1.219_669_891_266_504_5;
 const EWA_LUT_INTERVALS: i32 = 128;
-const EWA_LUT_WIDTH: i32 = EWA_LUT_INTERVALS + 1;
-const EWA_LUT_LEN: usize = EWA_LUT_WIDTH as usize;
+const EWA_LUT_LEN: usize =
+    EWA_LUT_INTERVALS.cast_unsigned() as usize + 1;
 const EWA_GRID_LEN: usize = EWA_LUT_LEN * 2 - 1;
 
 pub struct PageTextures {
@@ -432,11 +431,11 @@ struct VerticalProgram {
 
 struct EwaResampler {
     gl: Arc<Context>,
-    max_texture_edge: u32,
+    max_texture_edge: i32,
     lut: Texture,
     fbo: Framebuffer,
     scratch: [Option<Texture>; SCRATCH_TARGET_COUNT],
-    scratch_capacity: (u32, u32),
+    scratch_capacity: (i32, i32),
     horizontal_mono: HorizontalMonoProgram,
     vertical_mono: VerticalProgram,
     horizontal_color: HorizontalColorProgram,
@@ -494,7 +493,7 @@ struct YuvTexture {
     cr: Texture,
     alpha: Texture,
     /// Luma texel -> chroma UV, subsample-folded for this texture's dims.
-    chroma_uv_per_texel: (f32, f32),
+    chroma_uv_per_texel: (f64, f64),
     color_conversion: ColorConversion,
     /// Storage-sample normalization for the alpha plane.
     alpha_normalization: f32,
@@ -518,14 +517,26 @@ const PIXEL_LAYOUT_MONO: i32 = 2;
 
 #[derive(Clone, Copy)]
 struct DrawTarget {
-    window: (u32, u32),
-    clip: (u32, u32),
+    window: (i32, i32),
+    clip: (i32, i32),
+}
+
+impl DrawTarget {
+    fn new(window: (u32, u32), viewport: Viewport) -> Option<Self> {
+        let window = (gl_size(window.0), gl_size(window.1));
+        let (viewport_width, viewport_height) = viewport.size();
+        let clip = (
+            gl_size(viewport_width).min(window.0),
+            gl_size(viewport_height).min(window.1),
+        );
+        (clip.0 > 0 && clip.1 > 0).then_some(Self { window, clip })
+    }
 }
 
 #[derive(Clone, Copy)]
 struct SeatGeometry {
-    origin: (f32, f32),
-    size: (f32, f32),
+    origin: (f64, f64),
+    size: (f64, f64),
 }
 
 /// Fold storage samples to gamma RGB at upload: `matrix * samples - offset`.
@@ -551,14 +562,10 @@ fn slot_roles(slots: &EnumMap<Role, Option<PageTexture>>) -> Roles {
 /// re-filtering `Full`.
 fn best_texture(
     slots: &EnumMap<Role, Option<PageTexture>>,
-    screen_edge: f32,
+    screen_edge: f64,
 ) -> Option<&PageTexture> {
     if let Some(fit) = slots[Role::Fit].as_ref() {
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "texture edge stays far below f32's exact-integer range"
-        )]
-        let fit_edge = fit.dims.0.max(fit.dims.1) as f32;
+        let fit_edge = f64::from(fit.dims.0.max(fit.dims.1));
         if fit_edge + ROLE_COVER_MARGIN_PX >= screen_edge {
             return Some(fit);
         }
@@ -568,14 +575,14 @@ fn best_texture(
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct VisibleSlice {
-    visible_origin: (i32, i32),
-    visible_size: (u32, u32),
-    source_y_range: (u32, u32),
-    source_per_screen: (f32, f32),
+    visible_origin_x: i32,
+    visible_width: i32,
+    source_y_range: (i32, i32),
+    source_per_screen: (f64, f64),
 }
 
 impl VisibleSlice {
-    fn source_row_count(self) -> u32 {
+    fn source_row_count(self) -> i32 {
         self.source_y_range.1 - self.source_y_range.0
     }
 
@@ -587,55 +594,63 @@ impl VisibleSlice {
 
 #[expect(
     clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_precision_loss,
-    reason = "coordinates fit i32 and exact f32, and clamping keeps u32 casts non-negative"
+    reason = "both endpoints are whole numbers clamped to 0..=limit (i32)"
 )]
+fn clip_span(start: f64, end: f64, limit: i32) -> Option<(i32, i32)> {
+    if limit <= 0 || start.is_nan() || end.is_nan() {
+        return None;
+    }
+    let max = f64::from(limit);
+    let start = start.floor().clamp(0.0, max);
+    let end = end.ceil().clamp(0.0, max);
+    (end > start).then_some((start as i32, end as i32))
+}
+
 fn compute_visible_slice(
     seat: SeatGeometry,
-    clip_size: (u32, u32),
+    clip_size: (i32, i32),
     texture_dims: (u32, u32),
 ) -> Option<VisibleSlice> {
     if seat.size.0 <= 0.0
         || seat.size.1 <= 0.0
-        || clip_size.0 == 0
-        || clip_size.1 == 0
+        || !seat.origin.0.is_finite()
+        || !seat.origin.1.is_finite()
+        || !seat.size.0.is_finite()
+        || !seat.size.1.is_finite()
         || texture_dims.0 == 0
         || texture_dims.1 == 0
     {
         return None;
     }
-    let clip_width = gl_int(clip_size.0);
-    let clip_height = gl_int(clip_size.1);
-    let left = (seat.origin.0.floor() as i32).clamp(0, clip_width);
-    let right =
-        ((seat.origin.0 + seat.size.0).ceil() as i32).clamp(0, clip_width);
-    let top = (seat.origin.1.floor() as i32).clamp(0, clip_height);
-    let bottom = ((seat.origin.1 + seat.size.1).ceil() as i32)
-        .clamp(0, clip_height);
-    if right <= left || bottom <= top {
-        return None;
-    }
-    let texture_px = geometry::px_f32(texture_dims);
-    let source_per_screen_x = texture_px.0 / seat.size.0;
-    let source_per_screen_y = texture_px.1 / seat.size.1;
-    let support_radius_y = (EWA_SUPPORT as f32)
-        .mul_add(source_per_screen_y.max(1.0), SLICE_PAD_TEXELS);
+    let (left, right) = clip_span(
+        seat.origin.0,
+        seat.origin.0 + seat.size.0,
+        clip_size.0,
+    )?;
+    let (top, bottom) = clip_span(
+        seat.origin.1,
+        seat.origin.1 + seat.size.1,
+        clip_size.1,
+    )?;
+    let source_per_screen_x = f64::from(texture_dims.0) / seat.size.0;
+    let source_per_screen_y = f64::from(texture_dims.1) / seat.size.1;
+    let support_radius_y =
+        EWA_SUPPORT.mul_add(source_per_screen_y.max(1.0), SLICE_PAD_TEXELS);
     let center_y_start =
-        (top as f32 + 0.5 - seat.origin.1) * source_per_screen_y;
+        (f64::from(top) + 0.5 - seat.origin.1) * source_per_screen_y;
     let center_y_end =
-        (bottom as f32 - 0.5 - seat.origin.1) * source_per_screen_y;
-    let texture_height = gl_int(texture_dims.1);
-    let source_y_start = ((center_y_start - support_radius_y).floor()
-        as i32)
-        .clamp(0, texture_height - 1);
-    let source_y_end = ((center_y_end + support_radius_y).ceil() as i32
-        + 1)
-    .clamp(source_y_start + 1, texture_height);
+        (f64::from(bottom) - 0.5 - seat.origin.1) * source_per_screen_y;
+    let texture_height = gl_size(texture_dims.1);
+    let (source_y_start, source_y_end) = clip_span(
+        (center_y_start - support_radius_y)
+            .min(f64::from(texture_height - 1)),
+        center_y_end + support_radius_y + 1.0,
+        texture_height,
+    )?;
     Some(VisibleSlice {
-        visible_origin: (left, top),
-        visible_size: ((right - left) as u32, (bottom - top) as u32),
-        source_y_range: (source_y_start as u32, source_y_end as u32),
+        visible_origin_x: left,
+        visible_width: right - left,
+        source_y_range: (source_y_start, source_y_end),
         source_per_screen: (source_per_screen_x, source_per_screen_y),
     })
 }
@@ -656,9 +671,9 @@ fn check_texture_dims(
 impl PageTextures {
     fn new(gl: Arc<Context>) -> eros::Result<Self> {
         // SAFETY: MAX_TEXTURE_SIZE is a pure query on the current context.
-        let Ok(max_texture_edge) = u32::try_from(unsafe {
-            gl.get_parameter_i32(glow::MAX_TEXTURE_SIZE)
-        }) else {
+        let gl_max_edge =
+            unsafe { gl.get_parameter_i32(glow::MAX_TEXTURE_SIZE) };
+        let Ok(max_texture_edge) = u32::try_from(gl_max_edge) else {
             eros::bail!("GL MAX_TEXTURE_SIZE is not a positive GLint");
         };
         if max_texture_edge < THUMB_EDGE {
@@ -683,7 +698,7 @@ impl PageTextures {
             gl.bind_vertex_array(Some(vao.vao));
         }
         let pipeline = create_pipeline(Arc::clone(&gl))?;
-        let ewa = EwaResampler::new(Arc::clone(&gl), max_texture_edge)?;
+        let ewa = EwaResampler::new(Arc::clone(&gl), gl_max_edge)?;
         Ok(Self {
             gl,
             vao,
@@ -791,28 +806,8 @@ impl PageTextures {
         seat_pages: [Option<usize>; 2],
         placement: &Placement,
     ) {
-        if window_size.0 == 0 || window_size.1 == 0 {
+        let Some(target) = DrawTarget::new(window_size, viewport) else {
             return;
-        }
-        // GL scissor is bottom-origin and the viewport hugs the window's
-        // top-left, so only the height converts.
-        #[expect(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "viewport size is clamped non-negative whole physical px held as f32"
-        )]
-        let (viewport_width, viewport_height) =
-            (viewport.size().0 as u32, viewport.size().1 as u32);
-        let clip_size = (
-            viewport_width.min(window_size.0),
-            viewport_height.min(window_size.1),
-        );
-        if clip_size.0 == 0 || clip_size.1 == 0 {
-            return;
-        }
-        let target = DrawTarget {
-            window: window_size,
-            clip: clip_size,
         };
         begin_frame(&self.gl, self.vao.vao, target);
         for (rect, page) in
@@ -852,7 +847,7 @@ impl PageTextures {
                 size: screen_size,
             };
             let Some(slice) =
-                compute_visible_slice(seat, clip_size, texture.dims)
+                compute_visible_slice(seat, target.clip, texture.dims)
             else {
                 continue;
             };
@@ -885,7 +880,7 @@ fn check_seat_page_dims(
     page_dims: (u32, u32),
 ) {
     // A seat rect is in page pixels and spans the whole page.
-    let expected = geometry::px_f32(page_dims);
+    let expected = (f64::from(page_dims.0), f64::from(page_dims.1));
     let aligned = (rect.size.0 - expected.0).abs()
         <= SEAT_PAGE_DIMS_TOLERANCE
         && (rect.size.1 - expected.1).abs() <= SEAT_PAGE_DIMS_TOLERANCE;
@@ -1056,15 +1051,11 @@ fn link_ewa_program(
         samplers,
         debug_name,
     )?;
-    let lut_len = f64::from(EWA_LUT_WIDTH);
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "EWA filter parameters are uploaded as f32 uniforms"
-    )]
+    let texel_count = f64::from(EWA_LUT_INTERVALS + 1);
     let (support, scale, bias) = (
-        EWA_SUPPORT as f32,
-        ((lut_len - 1.0) / lut_len) as f32,
-        (0.5 / lut_len) as f32,
+        gl_f32(EWA_SUPPORT),
+        gl_f32(f64::from(EWA_LUT_INTERVALS) / texel_count),
+        gl_f32(0.5 / texel_count),
     );
     let support_location =
         uniform_location(&objects.gl, objects.program, "u_ewa_support");
@@ -1118,18 +1109,16 @@ fn create_pipeline(gl: Arc<Context>) -> eros::Result<Pipeline> {
 }
 
 fn jinc(radius: f64) -> f64 {
-    const SERIES_TERMS: usize = 35;
+    use core::f64::consts::PI;
 
-    let half_arg = 0.5 * PI * radius;
-    let neg_square = -(half_arg * half_arg);
+    const SERIES_TERMS: u32 = 35;
+
+    let half_argument = 0.5 * PI * radius;
+    let neg_square = -(half_argument * half_argument);
     let mut term = 1.0_f64;
     let mut sum = 1.0_f64;
     for term_index in 1..=SERIES_TERMS {
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "term_index <= 35, exact in f64"
-        )]
-        let index_f64 = term_index as f64;
+        let index_f64 = f64::from(term_index);
         term *= neg_square / (index_f64 * (index_f64 + 1.0));
         sum += term;
     }
@@ -1155,13 +1144,9 @@ fn project_out(vector: &mut [f64], unit_basis: &[f64]) {
 }
 
 fn normalize_vector(vector: &mut [f64]) {
-    let norm = vector
-        .iter()
-        .map(|component| component * component)
-        .sum::<f64>()
-        .sqrt();
+    let norm = dot_product(vector, vector).sqrt();
     if norm > 0.0 {
-        for slot in vector.iter_mut() {
+        for slot in vector {
             *slot /= norm;
         }
     }
@@ -1181,7 +1166,7 @@ fn power_eigen_symmetric(
     }
     normalize_vector(&mut vector);
 
-    let mut next = vec![0.0_f64; EWA_GRID_LEN];
+    let mut next = [0.0_f64; EWA_GRID_LEN];
     let rows = matrix.as_chunks::<EWA_GRID_LEN>().0;
     for _ in 0..POWER_ITERATIONS {
         for (target, row) in next.iter_mut().zip(rows) {
@@ -1210,17 +1195,11 @@ fn power_eigen_symmetric(
 /// Rank-2 symmetric eigendecomposition of circular 2D `EWA-Lanczos3`:
 /// `K(dx, dy) ≈ g0(|dx|) * g0(|dy|) - g1(|dx|) * g1(|dy|)`.
 fn ewa_rank2_lut() -> [[f32; 2]; EWA_LUT_LEN] {
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "EWA_GRID_LEN is 257, exact in f64"
-    )]
-    let grid_step = 2.0 * EWA_SUPPORT / (EWA_GRID_LEN - 1) as f64;
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "grid index <= 256, exact in f64"
-    )]
-    let coords: Vec<f64> = (0..EWA_GRID_LEN)
-        .map(|index| (index as f64).mul_add(grid_step, -EWA_SUPPORT))
+    use core::f64::consts::PI;
+
+    let grid_step = EWA_SUPPORT / f64::from(EWA_LUT_INTERVALS);
+    let coords: Vec<f64> = (-EWA_LUT_INTERVALS..=EWA_LUT_INTERVALS)
+        .map(|index| f64::from(index) * grid_step)
         .collect();
 
     let mut matrix = Vec::with_capacity(EWA_GRID_LEN * EWA_GRID_LEN);
@@ -1264,10 +1243,6 @@ fn ewa_rank2_lut() -> [[f32; 2]; EWA_LUT_LEN] {
     let primary_scale = primary_eigenvalue.abs().sqrt();
     let secondary_scale = secondary_eigenvalue.abs().sqrt();
     let mut lut = [[0.0_f32; 2]; EWA_LUT_LEN];
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "LUT stores GPU texture weights in f32"
-    )]
     if let (Some(primary_half), Some(secondary_half)) = (
         primary_vector.get(center_index..),
         secondary_vector.get(center_index..),
@@ -1276,8 +1251,8 @@ fn ewa_rank2_lut() -> [[f32; 2]; EWA_LUT_LEN] {
             lut.iter_mut().zip(primary_half).zip(secondary_half)
         {
             *slot = [
-                (primary_scale * primary_weight) as f32,
-                (secondary_scale * secondary_weight) as f32,
+                gl_f32(primary_scale * primary_weight),
+                gl_f32(secondary_scale * secondary_weight),
             ];
         }
     }
@@ -1289,7 +1264,7 @@ fn ewa_rank2_lut() -> [[f32; 2]; EWA_LUT_LEN] {
 
 fn upload_ewa_lut(gl: &Context) -> Texture {
     let lut = ewa_rank2_lut();
-    // SAFETY: Context is current (module invariant); `lut` holds `EWA_LUT_WIDTH` RG floats.
+    // SAFETY: Context is current (module invariant); `lut` holds `EWA_LUT_LEN` RG floats.
     unsafe {
         #[expect(
             clippy::expect_used,
@@ -1301,23 +1276,23 @@ fn upload_ewa_lut(gl: &Context) -> Texture {
         gl.tex_parameter_i32(
             glow::TEXTURE_1D,
             glow::TEXTURE_WRAP_S,
-            gl_int(glow::CLAMP_TO_EDGE),
+            glow::CLAMP_TO_EDGE.cast_signed(),
         );
         gl.tex_parameter_i32(
             glow::TEXTURE_1D,
             glow::TEXTURE_MIN_FILTER,
-            gl_int(glow::LINEAR),
+            glow::LINEAR.cast_signed(),
         );
         gl.tex_parameter_i32(
             glow::TEXTURE_1D,
             glow::TEXTURE_MAG_FILTER,
-            gl_int(glow::LINEAR),
+            glow::LINEAR.cast_signed(),
         );
         gl.tex_image_1d(
             glow::TEXTURE_1D,
             0,
-            gl_int(glow::RG32F),
-            EWA_LUT_WIDTH,
+            glow::RG32F.cast_signed(),
+            EWA_LUT_INTERVALS + 1,
             0,
             glow::RG,
             glow::FLOAT,
@@ -1346,7 +1321,7 @@ enum ScratchTargets {
 fn alloc_scratch_texture(
     gl: &Context,
     existing: Option<Texture>,
-    dims: (u32, u32),
+    dims: (i32, i32),
     internal_format: u32,
     format: u32,
     debug_name: &str,
@@ -1370,7 +1345,7 @@ fn alloc_scratch_texture(
                 gl.tex_parameter_i32(
                     glow::TEXTURE_2D,
                     param,
-                    gl_int(value),
+                    value.cast_signed(),
                 );
             }
             gl.tex_parameter_i32(
@@ -1390,9 +1365,9 @@ fn alloc_scratch_texture(
         gl.tex_image_2d(
             glow::TEXTURE_2D,
             0,
-            gl_int(internal_format),
-            gl_int(dims.0),
-            gl_int(dims.1),
+            internal_format.cast_signed(),
+            dims.0,
+            dims.1,
             0,
             format,
             glow::FLOAT,
@@ -1422,7 +1397,7 @@ impl HorizontalCommon {
         &self,
         slice: VisibleSlice,
         texture_dims: (u32, u32),
-        seat_origin_x: f32,
+        seat_origin_x: f64,
         transfer: Transfer,
     ) {
         let gl = &self.objects.gl;
@@ -1431,21 +1406,24 @@ impl HorizontalCommon {
             gl.use_program(Some(self.objects.program));
             gl.uniform_1_i32(
                 Some(&self.visible_origin_x),
-                slice.visible_origin.0,
+                slice.visible_origin_x,
             );
             gl.uniform_1_i32(
                 Some(&self.source_y_start),
-                gl_int(slice.source_y_range.0),
+                slice.source_y_range.0,
             );
             gl.uniform_2_i32(
                 Some(&self.texture_size),
-                gl_int(texture_dims.0),
-                gl_int(texture_dims.1),
+                gl_size(texture_dims.0),
+                gl_size(texture_dims.1),
             );
-            gl.uniform_1_f32(Some(&self.seat_offset_x), seat_origin_x);
+            gl.uniform_1_f32(
+                Some(&self.seat_offset_x),
+                gl_f32(seat_origin_x),
+            );
             gl.uniform_1_f32(
                 Some(&self.source_per_screen_x),
-                slice.source_per_screen.0,
+                gl_f32(slice.source_per_screen.0),
             );
             gl.uniform_1_i32(
                 Some(&self.transfer_code),
@@ -1489,7 +1467,7 @@ fn create_vertical_program(
 }
 
 impl EwaResampler {
-    fn new(gl: Arc<Context>, max_texture_edge: u32) -> eros::Result<Self> {
+    fn new(gl: Arc<Context>, max_texture_edge: i32) -> eros::Result<Self> {
         let horizontal_mono_objects = link_ewa_program(
             Arc::clone(&gl),
             FULLSCREEN_VERTEX_SHADER_SOURCE,
@@ -1596,11 +1574,11 @@ impl EwaResampler {
     /// Leaves `self.fbo` bound on success; restores `FRAMEBUFFER = 0` on failure.
     fn bind_scratch_fbo(
         &mut self,
-        dims: (u32, u32),
+        dims: (i32, i32),
         variant: EwaVariant,
     ) -> Option<ScratchTargets> {
-        if dims.0 == 0
-            || dims.1 == 0
+        if dims.0 <= 0
+            || dims.1 <= 0
             || dims.0 > self.max_texture_edge
             || dims.1 > self.max_texture_edge
         {
@@ -1707,10 +1685,9 @@ impl EwaResampler {
         seat: SeatGeometry,
         slice: VisibleSlice,
     ) -> bool {
-        const ONE_TEXEL_PER_STEP: (f32, f32) = (1.0, 1.0);
+        const ONE_TEXEL_PER_STEP: (f64, f64) = (1.0, 1.0);
 
-        let scratch_dims =
-            (slice.visible_size.0, slice.source_row_count());
+        let scratch_dims = (slice.visible_width, slice.source_row_count());
         let variant =
             if matches!(page_texture.layout, PixelLayout::Mono { .. }) {
                 EwaVariant::Mono
@@ -1727,12 +1704,7 @@ impl EwaResampler {
         unsafe {
             self.gl.disable(glow::SCISSOR_TEST);
             self.gl.disable(glow::BLEND);
-            self.gl.viewport(
-                0,
-                0,
-                gl_int(scratch_dims.0),
-                gl_int(scratch_dims.1),
-            );
+            self.gl.viewport(0, 0, scratch_dims.0, scratch_dims.1);
             self.gl.active_texture(EWA_LUT_TEXTURE_UNIT);
             self.gl.bind_texture(glow::TEXTURE_1D, Some(self.lut));
 
@@ -1802,23 +1774,23 @@ impl EwaResampler {
             vertical.quad.bind(&self.gl, target.window, seat);
             self.gl.uniform_1_i32(
                 Some(&vertical.visible_origin_x),
-                slice.visible_origin.0,
+                slice.visible_origin_x,
             );
             self.gl.uniform_1_i32(
                 Some(&vertical.visible_width),
-                gl_int(slice.visible_size.0),
+                slice.visible_width,
             );
             self.gl.uniform_1_i32(
                 Some(&vertical.source_y_start),
-                gl_int(slice.source_y_range.0),
+                slice.source_y_range.0,
             );
             self.gl.uniform_1_i32(
                 Some(&vertical.source_y_end),
-                gl_int(slice.source_y_range.1),
+                slice.source_y_range.1,
             );
             self.gl.uniform_1_f32(
                 Some(&vertical.source_per_screen_y),
-                slice.source_per_screen.1,
+                gl_f32(slice.source_per_screen.1),
             );
             self.gl.uniform_1_i32(
                 Some(&vertical.dither),
@@ -1848,18 +1820,14 @@ fn restore_screen_state(gl: &Context, target: DrawTarget) {
     // SAFETY: Context is current (module invariant).
     unsafe {
         gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-        gl.viewport(
-            0,
-            0,
-            gl_int(target.window.0),
-            gl_int(target.window.1),
-        );
+        gl.viewport(0, 0, target.window.0, target.window.1);
         gl.enable(glow::SCISSOR_TEST);
+        // GL scissor is bottom-origin; viewport sits at the window's top-left.
         gl.scissor(
             0,
-            gl_int(target.window.1.saturating_sub(target.clip.1)),
-            gl_int(target.clip.0),
-            gl_int(target.clip.1),
+            target.window.1 - target.clip.1,
+            target.clip.0,
+            target.clip.1,
         );
         gl.enable(glow::BLEND);
         gl.blend_func_separate(
@@ -1889,24 +1857,23 @@ impl QuadUniforms {
         }
     }
 
-    fn bind(&self, gl: &Context, window: (u32, u32), seat: SeatGeometry) {
-        let window_px = geometry::px_f32(window);
+    fn bind(&self, gl: &Context, window: (i32, i32), seat: SeatGeometry) {
         // SAFETY: Context is current (module invariant); `self` belongs to the active program.
         unsafe {
             gl.uniform_2_f32(
                 Some(&self.window_size),
-                window_px.0,
-                window_px.1,
+                gl_f32(f64::from(window.0)),
+                gl_f32(f64::from(window.1)),
             );
             gl.uniform_2_f32(
                 Some(&self.seat_offset),
-                seat.origin.0,
-                seat.origin.1,
+                gl_f32(seat.origin.0),
+                gl_f32(seat.origin.1),
             );
             gl.uniform_2_f32(
                 Some(&self.seat_size),
-                seat.size.0,
-                seat.size.1,
+                gl_f32(seat.size.0),
+                gl_f32(seat.size.1),
             );
         }
     }
@@ -1928,7 +1895,7 @@ impl YuvUniforms {
         gl: &Context,
         pixel_layout: UniformLocation,
         yuv: &YuvTexture,
-        luma_texels_per_step: (f32, f32),
+        luma_texels_per_step: (f64, f64),
     ) {
         // SAFETY: Context is current (module invariant); `self` belongs to the active
         // program and `yuv` owns live textures.
@@ -1936,8 +1903,8 @@ impl YuvUniforms {
             gl.uniform_1_i32(Some(&pixel_layout), PIXEL_LAYOUT_YUV);
             gl.uniform_2_f32(
                 Some(&self.chroma_uv_per_step),
-                yuv.chroma_uv_per_texel.0 * luma_texels_per_step.0,
-                yuv.chroma_uv_per_texel.1 * luma_texels_per_step.1,
+                gl_f32(yuv.chroma_uv_per_texel.0 * luma_texels_per_step.0),
+                gl_f32(yuv.chroma_uv_per_texel.1 * luma_texels_per_step.1),
             );
             gl.uniform_1_f32(
                 Some(&self.alpha_normalization),
@@ -2000,7 +1967,7 @@ fn draw_page(
     target: DrawTarget,
     page_texture: &PageTexture,
     seat: SeatGeometry,
-    source_per_screen: (f32, f32),
+    source_per_screen: (f64, f64),
 ) {
     // SAFETY: Context is current (module invariant); `pipeline` and `page_texture` own live objects
     // and `begin_frame` bound the empty VAO.
@@ -2009,8 +1976,8 @@ fn draw_page(
         pipeline.quad.bind(gl, target.window, seat);
         gl.uniform_2_f32(
             Some(&pipeline.page_uv_per_screen),
-            1.0 / seat.size.0,
-            1.0 / seat.size.1,
+            gl_f32(1.0 / seat.size.0),
+            gl_f32(1.0 / seat.size.1),
         );
         gl.uniform_1_i32(
             Some(&pipeline.dither),
@@ -2049,12 +2016,16 @@ fn draw_page(
     }
 }
 
+fn gl_size(px: u32) -> i32 {
+    i32::try_from(px).unwrap_or(i32::MAX)
+}
+
 #[expect(
-    clippy::cast_possible_wrap,
-    reason = "GL enums, capped texture edges, and window px fit i32; the GL ABI takes i32 enums"
+    clippy::cast_possible_truncation,
+    reason = "GL uniforms and textures take f32; narrowing happens at this boundary"
 )]
-fn gl_int(value: u32) -> i32 {
-    value as i32
+fn gl_f32(value: f64) -> f32 {
+    value as f32
 }
 
 /// Name one object when the driver exposes `KHR_debug`.
@@ -2135,9 +2106,8 @@ fn magnification_filter(
 
 /// Dither hides precision loss from a PQ or >8-bit source; 8-bit sRGB
 /// has none.
-fn needs_dither(transfer: Transfer, plane_depth: Option<u8>) -> bool {
-    transfer == Transfer::Pq
-        || plane_depth.is_some_and(|depth| depth > decode::BYTE_DEPTH)
+fn needs_dither(transfer: Transfer, plane_depth: Option<Depth>) -> bool {
+    transfer == Transfer::Pq || plane_depth.is_some_and(Depth::is_wide)
 }
 
 /// Create a single-level texture with linear minification and the
@@ -2158,22 +2128,22 @@ fn new_texture(
         gl.tex_parameter_i32(
             glow::TEXTURE_2D,
             glow::TEXTURE_WRAP_S,
-            gl_int(glow::CLAMP_TO_EDGE),
+            glow::CLAMP_TO_EDGE.cast_signed(),
         );
         gl.tex_parameter_i32(
             glow::TEXTURE_2D,
             glow::TEXTURE_WRAP_T,
-            gl_int(glow::CLAMP_TO_EDGE),
+            glow::CLAMP_TO_EDGE.cast_signed(),
         );
         gl.tex_parameter_i32(
             glow::TEXTURE_2D,
             glow::TEXTURE_MIN_FILTER,
-            gl_int(glow::LINEAR),
+            glow::LINEAR.cast_signed(),
         );
         gl.tex_parameter_i32(
             glow::TEXTURE_2D,
             glow::TEXTURE_MAG_FILTER,
-            gl_int(mag_filter),
+            mag_filter.cast_signed(),
         );
         gl.tex_parameter_i32(
             glow::TEXTURE_2D,
@@ -2205,9 +2175,9 @@ fn upload_rgba(
         gl.tex_image_2d(
             glow::TEXTURE_2D,
             0,
-            gl_int(glow::RGBA8),
-            gl_int(dims.0),
-            gl_int(dims.1),
+            glow::RGBA8.cast_signed(),
+            gl_size(dims.0),
+            gl_size(dims.1),
             0,
             glow::RGBA,
             glow::UNSIGNED_BYTE,
@@ -2238,8 +2208,8 @@ fn update_rgba(
             0,
             0,
             0,
-            gl_int(dims.0),
-            gl_int(dims.1),
+            gl_size(dims.0),
+            gl_size(dims.1),
             glow::RGBA,
             glow::UNSIGNED_BYTE,
             PixelUnpackData::Slice(Some(data)),
@@ -2276,9 +2246,9 @@ fn upload_plane(
         gl.tex_image_2d(
             glow::TEXTURE_2D,
             0,
-            gl_int(internal),
-            gl_int(dims.0),
-            gl_int(dims.1),
+            internal.cast_signed(),
+            gl_size(dims.0),
+            gl_size(dims.1),
             0,
             glow::RED,
             ty,
@@ -2322,7 +2292,7 @@ fn upload_page_texture(
             let depth = spec.depth;
             let ((luma_w, luma_h), (chroma_w, chroma_h)) =
                 decode::plane_dims(dims, spec.subsampling);
-            let wide = depth > decode::BYTE_DEPTH;
+            let wide = depth.is_wide();
             let luma_texture = upload_plane(
                 &gl,
                 luma,
@@ -2335,7 +2305,6 @@ fn upload_page_texture(
                 spec.subsampling,
                 spec.full_range,
                 spec.matrix,
-                wide,
             );
             let layout = if spec.subsampling == Subsampling::Mono
                 && alpha.is_none()
@@ -2346,14 +2315,29 @@ fn upload_page_texture(
                     offset: color_conversion.offset[0],
                 }
             } else {
+                const STUB_DIMS: (u32, u32) = (1, 1);
+                const OPAQUE_ALPHA_8BIT: u8 = u8::MAX;
+
                 let (cb_texture, cr_texture) = if spec.subsampling
                     == Subsampling::Mono
                 {
-                    // `color_conversion` zeroes columns 1 and 2.
-                    let neutral_code = 1_u32 << (depth - 1);
+                    // `color_conversion` zeroes columns 1 and 2; two distinct
+                    // textures keep unique ownership for `Drop`.
                     (
-                        upload_constant_plane(&gl, depth, neutral_code),
-                        upload_constant_plane(&gl, depth, neutral_code),
+                        upload_plane(
+                            &gl,
+                            &[CHROMA_NEUTRAL_8BIT],
+                            STUB_DIMS,
+                            false,
+                            MagnificationFilter::Linear,
+                        ),
+                        upload_plane(
+                            &gl,
+                            &[CHROMA_NEUTRAL_8BIT],
+                            STUB_DIMS,
+                            false,
+                            MagnificationFilter::Linear,
+                        ),
                     )
                 } else {
                     (
@@ -2373,27 +2357,34 @@ fn upload_page_texture(
                         ),
                     )
                 };
-                let alpha_texture = alpha.as_ref().map_or_else(
-                    // 1x1 opaque: the max code, which the alpha normalization
-                    // maps to 1.0.
-                    || {
-                        upload_constant_plane(
-                            &gl,
-                            depth,
-                            (1_u32 << depth) - 1,
-                        )
-                    },
-                    |alpha| {
-                        upload_plane(
-                            &gl,
-                            alpha,
-                            dims,
-                            wide,
-                            MagnificationFilter::Linear,
-                        )
-                    },
-                );
-                let chroma_px = geometry::px_f32((chroma_w, chroma_h));
+                let (alpha_texture, alpha_normalization) =
+                    alpha.as_ref().map_or_else(
+                        || {
+                            (
+                                upload_plane(
+                                    &gl,
+                                    &[OPAQUE_ALPHA_8BIT],
+                                    STUB_DIMS,
+                                    false,
+                                    MagnificationFilter::Linear,
+                                ),
+                                1.0,
+                            )
+                        },
+                        |alpha| {
+                            (
+                                upload_plane(
+                                    &gl,
+                                    alpha,
+                                    dims,
+                                    wide,
+                                    MagnificationFilter::Linear,
+                                ),
+                                depth_normalization(depth),
+                            )
+                        },
+                    );
+                let chroma_px = (f64::from(chroma_w), f64::from(chroma_h));
                 let ratio = spec.subsampling.chroma_ratio();
                 PixelLayout::Yuv(YuvTexture {
                     luma: luma_texture,
@@ -2405,7 +2396,7 @@ fn upload_page_texture(
                         ratio.1 / chroma_px.1,
                     ),
                     color_conversion,
-                    alpha_normalization: depth_normalization(depth, wide),
+                    alpha_normalization,
                 })
             };
             PageTexture {
@@ -2423,43 +2414,6 @@ fn upload_page_texture(
     }
 }
 
-fn upload_constant_plane(
-    gl: &Context,
-    depth: u8,
-    sample_code: u32,
-) -> Texture {
-    if depth > decode::BYTE_DEPTH {
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "depth stays within decode::MAX_SAMPLE_DEPTH, so sample_code fits u16"
-        )]
-        let wide = sample_code as u16;
-        #[expect(
-            clippy::host_endian_bytes,
-            reason = "GL UNSIGNED_SHORT uploads expect native-endian bytes"
-        )]
-        upload_plane(
-            gl,
-            &wide.to_ne_bytes(),
-            (1, 1),
-            true,
-            MagnificationFilter::Linear,
-        )
-    } else {
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "depths up to decode::BYTE_DEPTH keep codes within u8"
-        )]
-        upload_plane(
-            gl,
-            &[sample_code as u8],
-            (1, 1),
-            false,
-            MagnificationFilter::Linear,
-        )
-    }
-}
-
 const TRANSFER_SRGB: i32 = 0;
 const TRANSFER_PQ: i32 = 1;
 
@@ -2470,76 +2424,57 @@ fn transfer_code(transfer: Transfer) -> i32 {
     }
 }
 
-/// Normalize R16 output for U16-stored planes: sampling divides by
-/// [`R16_STORAGE_MAX`] but only `depth` bits are significant. 1.0 for 8-bit
-/// storage.
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "the depth mask 2^depth - 1 is at most 65535, exact in f32"
-)]
-fn depth_normalization(depth: u8, wide: bool) -> f32 {
-    debug_assert!(
-        (1..=decode::MAX_SAMPLE_DEPTH).contains(&depth),
-        "YUV bit depth out of range"
-    );
-    if !wide {
-        return 1.0;
+const R8_STORAGE_MAX: f32 = 255.0;
+const R16_STORAGE_MAX: f32 = 65535.0;
+const CHROMA_NEUTRAL_8BIT: u8 = 128;
+
+fn max_storage_code(depth: Depth) -> f32 {
+    if depth.is_wide() {
+        R16_STORAGE_MAX
+    } else {
+        R8_STORAGE_MAX
     }
-    R16_STORAGE_MAX / ((1_u32 << depth) - 1) as f32
 }
 
-const R16_STORAGE_MAX: f32 = 65535.0;
-const R8_STORAGE_MAX: f32 = 255.0;
+fn max_sample_code(depth: Depth) -> u16 {
+    u16::MAX >> (Depth::D16.bits() - depth.bits())
+}
+
+/// Compensate for GL `R16` normalization: sampling divides by
+/// [`R16_STORAGE_MAX`] even when only `depth` bits are used.
+fn depth_normalization(depth: Depth) -> f32 {
+    max_storage_code(depth) / f32::from(max_sample_code(depth))
+}
 
 /// Fold storage samples to gamma RGB: depth normalization, quantization,
 /// and the KR/KB matrix (or GBR permutation). The offset is the matrix
 /// times the anchor codes.
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "codes and scales stay below 65536, exact in f32"
-)]
 fn page_color_conversion(
-    depth: u8,
+    depth: Depth,
     subsampling: Subsampling,
     full_range: bool,
     color_matrix: Matrix,
-    wide: bool,
 ) -> ColorConversion {
-    const STUDIO_LUMA_BLACK_8BIT: u32 = 16;
-    const STUDIO_CHROMA_NEUTRAL_8BIT: u32 = 128;
-    const STUDIO_LUMA_SWING_8BIT: u32 = 219;
-    const STUDIO_CHROMA_SWING_8BIT: u32 = 224;
+    const STUDIO_LUMA_BLACK_8BIT: u16 = 16;
+    const STUDIO_LUMA_SWING_8BIT: u16 = 219;
+    const STUDIO_CHROMA_SWING_8BIT: u16 = 224;
 
-    debug_assert!(
-        (1..=decode::MAX_SAMPLE_DEPTH).contains(&depth),
-        "YUV bit depth out of range"
-    );
-    let max_code = (1_u32 << depth) - 1;
-    let storage_max = if wide {
-        R16_STORAGE_MAX
-    } else {
-        R8_STORAGE_MAX
-    };
-    let (
-        range_luma_black,
-        range_chroma_neutral,
-        range_luma_scale,
-        range_chroma_scale,
-    ) = if full_range {
-        (0.0, (1_u32 << (depth - 1)) as f32, 1.0, 1.0)
-    } else {
-        let extra_bits =
-            u32::from(depth.saturating_sub(decode::BYTE_DEPTH));
-        (
-            (STUDIO_LUMA_BLACK_8BIT << extra_bits) as f32,
-            (STUDIO_CHROMA_NEUTRAL_8BIT << extra_bits) as f32,
-            max_code as f32
-                / (STUDIO_LUMA_SWING_8BIT << extra_bits) as f32,
-            max_code as f32
-                / (STUDIO_CHROMA_SWING_8BIT << extra_bits) as f32,
-        )
-    };
-    let normalization = depth_normalization(depth, wide);
+    let depth_scale = 1_u16 << (depth.bits() - Depth::D8.bits());
+    let range_chroma_neutral =
+        f32::from(u16::from(CHROMA_NEUTRAL_8BIT) * depth_scale);
+    let (range_luma_black, range_luma_scale, range_chroma_scale) =
+        if full_range {
+            (0.0, 1.0, 1.0)
+        } else {
+            let max_code = f32::from(max_sample_code(depth));
+            (
+                f32::from(STUDIO_LUMA_BLACK_8BIT * depth_scale),
+                max_code / f32::from(STUDIO_LUMA_SWING_8BIT * depth_scale),
+                max_code / f32::from(STUDIO_CHROMA_SWING_8BIT * depth_scale),
+            )
+        };
+    let storage_max = max_storage_code(depth);
+    let normalization = depth_normalization(depth);
     let (
         base_matrix,
         luma_scale,
@@ -2906,17 +2841,18 @@ mod tests {
     /// Code values of one depth's quantization (black, white, neutral) in
     /// code units, and the largest code the storage layout holds.
     fn code_quantization_codes(
-        depth: u8,
+        depth: Depth,
         full_range: bool,
     ) -> (f32, f32, f32, f32) {
-        let scale = 2.0_f32.powi(i32::from(depth) - 8);
+        let bits = depth.bits();
+        let scale = 2.0_f32.powi(i32::from(bits) - 8);
         let storage_max =
-            2.0_f32.powi(if depth > 8 { 16 } else { 8 }) - 1.0;
+            2.0_f32.powi(if depth.is_wide() { 16 } else { 8 }) - 1.0;
         let codes = if full_range {
             (
                 0.0,
-                2.0_f32.powi(i32::from(depth)) - 1.0,
-                2.0_f32.powi(i32::from(depth) - 1),
+                2.0_f32.powi(i32::from(bits)) - 1.0,
+                2.0_f32.powi(i32::from(bits) - 1),
             )
         } else {
             (16.0 * scale, 235.0 * scale, 128.0 * scale)
@@ -2927,14 +2863,13 @@ mod tests {
     #[test]
     fn color_conversion_anchors_black_and_white_at_every_depth() {
         for subsampling in [Subsampling::Yuv444, Subsampling::Mono] {
-            for depth in [8_u8, 10, 12, 16] {
+            for depth in [Depth::D8, Depth::D10, Depth::D12, Depth::D16] {
                 for full_range in [true, false] {
                     let conversion = page_color_conversion(
                         depth,
                         subsampling,
                         full_range,
                         Matrix::Bt601,
-                        depth > decode::BYTE_DEPTH,
                     );
                     let (black, white, neutral, storage_max) =
                         code_quantization_codes(depth, full_range);
@@ -2951,7 +2886,7 @@ mod tests {
                         for (row, channel) in rgb.into_iter().enumerate() {
                             assert!(
                                 (channel - expected).abs() < 1e-4,
-                                "{subsampling:?} depth {depth} full {full_range} row {row}: {channel} vs {expected}"
+                                "{subsampling:?} depth {depth:?} full {full_range} row {row}: {channel} vs {expected}"
                             );
                         }
                     }
@@ -2963,11 +2898,10 @@ mod tests {
     #[test]
     fn identity_pages_permute_gbr() {
         let color = page_color_conversion(
-            8,
+            Depth::D8,
             Subsampling::Yuv444,
             true,
             Matrix::Identity,
-            false,
         );
         // Column j is plane j's contribution: Y->G, U->B, V->R.
         for (col, row) in [(0, 1), (1, 2), (2, 0)] {
@@ -2984,11 +2918,10 @@ mod tests {
         assert_eq!(color.offset, [0.0; 3]);
 
         let mono = page_color_conversion(
-            10,
+            Depth::D10,
             Subsampling::Mono,
             true,
             Matrix::Identity,
-            true,
         );
         for row in 0..3 {
             assert!(
@@ -3015,9 +2948,9 @@ mod tests {
 
     #[test]
     fn dither_only_for_deep_or_pq_sources() {
-        assert!(!needs_dither(Transfer::Srgb, Some(8)));
-        assert!(needs_dither(Transfer::Srgb, Some(10)));
-        assert!(needs_dither(Transfer::Pq, Some(8)));
+        assert!(!needs_dither(Transfer::Srgb, Some(Depth::D8)));
+        assert!(needs_dither(Transfer::Srgb, Some(Depth::D10)));
+        assert!(needs_dither(Transfer::Pq, Some(Depth::D8)));
         assert!(!needs_dither(Transfer::Srgb, None));
         assert!(needs_dither(Transfer::Pq, None));
     }
@@ -3035,35 +2968,28 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::cast_precision_loss,
-        clippy::indexing_slicing,
-        reason = "indices stay within 0..EWA_GRID_LEN, which is exact in f64"
-    )]
     fn ewa_rank2_lut_approximates_circular_lanczos3() {
         assert!(jinc(EWA_JINC_FIRST_ZERO).abs() < 1e-12);
         assert!(jinc(EWA_SUPPORT).abs() < 1e-12);
 
         let lut = ewa_rank2_lut();
-        assert_eq!(lut[EWA_LUT_LEN - 1], [0.0, 0.0]);
+        assert_eq!(lut.last().copied(), Some([0.0, 0.0]));
 
-        let center_index = EWA_LUT_LEN - 1;
-        let grid_step = 2.0 * EWA_SUPPORT / (EWA_GRID_LEN - 1) as f64;
-        let lut_weights = |index_from_center: usize| -> (f64, f64) {
-            let entry = lut[index_from_center];
+        let grid_step = EWA_SUPPORT / f64::from(EWA_LUT_INTERVALS);
+        let lut_weights = |offset: i32| -> (f64, f64) {
+            let index = usize::try_from(offset.unsigned_abs())
+                .expect("offset fits usize");
+            let entry = lut.get(index).expect("offset inside LUT");
             (f64::from(entry[0]), f64::from(entry[1]))
         };
         let mut squared_error = 0.0_f64;
         let mut squared_reference = 0.0_f64;
-        for row in 0..EWA_GRID_LEN {
-            let coord_y = (row as f64).mul_add(grid_step, -EWA_SUPPORT);
-            let (row_primary, row_secondary) =
-                lut_weights(row.abs_diff(center_index));
-            for col in 0..EWA_GRID_LEN {
-                let coord_x =
-                    (col as f64).mul_add(grid_step, -EWA_SUPPORT);
-                let (col_primary, col_secondary) =
-                    lut_weights(col.abs_diff(center_index));
+        for row in -EWA_LUT_INTERVALS..=EWA_LUT_INTERVALS {
+            let coord_y = f64::from(row) * grid_step;
+            let (row_primary, row_secondary) = lut_weights(row);
+            for col in -EWA_LUT_INTERVALS..=EWA_LUT_INTERVALS {
+                let coord_x = f64::from(col) * grid_step;
+                let (col_primary, col_secondary) = lut_weights(col);
                 let approx = row_secondary
                     .mul_add(-col_secondary, row_primary * col_primary);
                 let exact = ewa_lanczos3(coord_x.hypot(coord_y));
@@ -3093,8 +3019,8 @@ mod tests {
             (4062, 5760),
         )
         .expect("panned slice");
-        assert_eq!(panned.visible_origin, (0, 0));
-        assert_eq!(panned.visible_size, (1280, 1000));
+        assert_eq!(panned.visible_origin_x, 0);
+        assert_eq!(panned.visible_width, 1280);
         assert!((900..=993).contains(&panned.source_y_range.0));
         assert!((3007..3100).contains(&panned.source_y_range.1));
         assert!(panned.is_minified());
@@ -3119,6 +3045,39 @@ mod tests {
                 (1805, 2560),
             )
             .is_none()
+        );
+
+        let huge_pan = compute_visible_slice(
+            SeatGeometry {
+                origin: (-1e12, -1e12),
+                size: (2e12, 2e12),
+            },
+            (1280, 1000),
+            (4062, 5760),
+        )
+        .expect("huge pan still covers viewport");
+        assert_eq!(huge_pan.visible_origin_x, 0);
+        assert_eq!(huge_pan.visible_width, 1280);
+        assert!(
+            0 <= huge_pan.source_y_range.0
+                && huge_pan.source_y_range.0 < huge_pan.source_y_range.1
+                && huge_pan.source_y_range.1 <= 5760
+        );
+
+        let tiny_scale = compute_visible_slice(
+            SeatGeometry {
+                origin: (0.0, 0.0),
+                size: (1e-9, 1e-9),
+            },
+            (1280, 1000),
+            (4062, 5760),
+        )
+        .expect("tiny scale covers one pixel");
+        assert!(
+            0 <= tiny_scale.source_y_range.0
+                && tiny_scale.source_y_range.0
+                    < tiny_scale.source_y_range.1
+                && tiny_scale.source_y_range.1 <= 5760
         );
     }
 }

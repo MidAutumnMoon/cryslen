@@ -25,7 +25,7 @@ pub struct ReadingStatus {
     /// Set only when the decoded format differs from the filename extension.
     pub actual_format: Option<Format>,
     /// Placement scale, screen px per image px.
-    pub zoom: f32,
+    pub zoom: f64,
 }
 
 pub struct StatusLine<'fault> {
@@ -66,7 +66,7 @@ impl Timers {
         // The checked subtraction is the grace boundary itself: some
         // of the grace remains, or none does.
         let since = self.waiting_since?;
-        WAIT_GRACE.checked_sub(now - since)
+        WAIT_GRACE.checked_sub(now.saturating_duration_since(since))
     }
 
     /// Whether an active wait has passed the grace period.
@@ -74,15 +74,19 @@ impl Timers {
         let Some(since) = self.waiting_since else {
             return false;
         };
-        now - since >= WAIT_GRACE
+        now.saturating_duration_since(since) >= WAIT_GRACE
     }
 
     /// Expire the toast and return the delay until it does.
     pub fn tick_toast(&mut self, now: Instant) -> Option<Duration> {
-        self.toast_since =
-            self.toast_since.filter(|&since| now - since < MODE_TOAST);
-        self.toast_since
-            .map(|since| MODE_TOAST.saturating_sub(now - since))
+        let elapsed = now.saturating_duration_since(self.toast_since?);
+        let remaining = MODE_TOAST
+            .checked_sub(elapsed)
+            .filter(|remaining| !remaining.is_zero());
+        if remaining.is_none() {
+            self.toast_since = None;
+        }
+        remaining
     }
 
     pub fn toasting(&self) -> bool {
@@ -376,6 +380,14 @@ mod tests {
         assert!(timers.toasting());
         assert_eq!(timers.tick_toast(start + MODE_TOAST), None);
         assert!(!timers.toasting());
+
+        // Non-monotonic clock: elapsed saturates to zero.
+        let later = start + Duration::from_millis(50);
+        assert_eq!(timers.tick_wait(later, true), Some(WAIT_GRACE));
+        assert_eq!(timers.tick_wait(start, true), Some(WAIT_GRACE));
+        assert!(!timers.waiting(start));
+        timers.toast(later);
+        assert_eq!(timers.tick_toast(start), Some(MODE_TOAST));
     }
 
     fn status() -> StatusLine<'static> {

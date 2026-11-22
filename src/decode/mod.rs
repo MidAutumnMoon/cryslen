@@ -32,8 +32,33 @@ pub struct ImageMeta {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub enum Depth {
+    D8,
+    D10,
+    D12,
+    D16,
+}
+
+impl Depth {
+    #[must_use]
+    pub const fn is_wide(self) -> bool {
+        !matches!(self, Self::D8)
+    }
+
+    #[must_use]
+    pub const fn bits(self) -> u8 {
+        match self {
+            Self::D8 => 8,
+            Self::D10 => 10,
+            Self::D12 => 12,
+            Self::D16 => 16,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub struct YuvSpec {
-    pub depth: u8,
+    pub depth: Depth,
     pub subsampling: Subsampling,
     /// Limited (video) or full (JPEG) range quantization.
     pub full_range: bool,
@@ -121,7 +146,7 @@ impl Decoded {
         transfer: Transfer,
         yuv: YuvImage,
     ) -> Result<Self, MsgError> {
-        let wide = yuv.spec.depth > BYTE_DEPTH;
+        let wide = yuv.spec.depth.is_wide();
         let matches_depth =
             |plane: &Plane| matches!(plane, Plane::U16(_)) == wide;
         if !matches_depth(&yuv.luma)
@@ -158,7 +183,7 @@ impl Decoded {
         height: u32,
         format: Format,
         transfer: Transfer,
-        depth: u8,
+        depth: Depth,
         luma: Plane,
     ) -> Result<Self, MsgError> {
         let yuv = YuvImage {
@@ -188,11 +213,6 @@ impl Decoded {
         }
     }
 }
-
-/// 8-bit storage; deeper planes store one `u16` per sample.
-pub const BYTE_DEPTH: u8 = 8;
-
-pub const MAX_SAMPLE_DEPTH: u8 = 16;
 
 /// Pixel count of `(width, height)` when non-empty and within
 /// [`MAX_PIXELS`].
@@ -257,16 +277,12 @@ pub fn validate_rgba_extent(
 
 pub fn yuv_layout(
     dims: (u32, u32),
-    depth: u8,
+    depth: Depth,
     subsampling: Subsampling,
 ) -> Result<YuvLayout, MsgError> {
     let luma_samples =
         admit_dims(dims.0, dims.1, "bad dimensions")? as usize;
-    let is_u16 = match depth {
-        1..=BYTE_DEPTH => false,
-        9..=MAX_SAMPLE_DEPTH => true,
-        _ => return Err(MsgError::from_static("yuv depth")),
-    };
+    let is_u16 = depth.is_wide();
     let (_, (chroma_w, chroma_h)) = plane_dims(dims, subsampling);
     let chroma_samples = if subsampling == Subsampling::Mono {
         0
@@ -282,15 +298,21 @@ pub fn yuv_layout(
 
 pub fn validate_yuv_extents(
     dims: (u32, u32),
-    depth: u8,
+    depth: Depth,
     subsampling: Subsampling,
     [luma_bytes, chroma_blue_bytes, chroma_red_bytes]: [usize; 3],
     alpha_bytes: Option<usize>,
 ) -> Result<(), MsgError> {
     let layout = yuv_layout(dims, depth, subsampling)?;
     let sample_bytes = layout.sample_bytes();
-    let expected_luma_bytes = layout.luma_samples * sample_bytes;
-    let expected_chroma_bytes = layout.chroma_samples * sample_bytes;
+    let expected_luma_bytes = layout
+        .luma_samples
+        .checked_mul(sample_bytes)
+        .ok_or_else(|| MsgError::from_static("yuv plane extent"))?;
+    let expected_chroma_bytes = layout
+        .chroma_samples
+        .checked_mul(sample_bytes)
+        .ok_or_else(|| MsgError::from_static("yuv plane extent"))?;
     if luma_bytes != expected_luma_bytes
         || alpha_bytes.is_some_and(|len| len != expected_luma_bytes)
         || (subsampling != Subsampling::Mono
@@ -303,11 +325,8 @@ pub fn validate_yuv_extents(
 }
 
 /// The image crate's 512 MiB allocation ceiling, as RGBA pixels.
-#[expect(
-    clippy::integer_division,
-    reason = "the 512 MiB ceiling in 4-byte pixels divides exactly"
-)]
-pub const MAX_PIXELS: u32 = (512 << 20) / 4;
+pub const MAX_PIXELS: u32 =
+    (512 * 1024 * 1024) >> RGBA_BYTES_PER_PIXEL.ilog2();
 
 #[derive(Clone)]
 pub enum Pixels {
@@ -378,7 +397,7 @@ impl Subsampling {
     /// behind `plane_dims`'s texel counts. Mono carries no chroma, so
     /// its ratio is identity for the renderer's midpoint stub.
     #[must_use]
-    pub fn chroma_ratio(self) -> (f32, f32) {
+    pub fn chroma_ratio(self) -> (f64, f64) {
         match self {
             Self::Mono | Self::Yuv444 => (1.0, 1.0),
             Self::Yuv420 => (0.5, 0.5),
@@ -896,7 +915,7 @@ mod tests {
         // a short alpha plane does not either
         let mono = |luma: Plane, alpha: Option<Plane>| YuvImage {
             spec: YuvSpec {
-                depth: 10,
+                depth: Depth::D10,
                 subsampling: Subsampling::Mono,
                 full_range: true,
                 matrix: Matrix::Bt601,
@@ -939,7 +958,7 @@ mod tests {
         // 2x1 chroma samples.
         let undersized = YuvImage {
             spec: YuvSpec {
-                depth: 8,
+                depth: Depth::D8,
                 subsampling: Subsampling::Yuv420,
                 full_range: true,
                 matrix: Matrix::Bt601,
@@ -1041,7 +1060,7 @@ mod tests {
         assert_eq!(gray.format(), Format::Jxl);
         match gray.pixels {
             Pixels::Yuv(yuv) => {
-                assert_eq!(yuv.spec.depth, 8);
+                assert_eq!(yuv.spec.depth, Depth::D8);
                 assert_eq!(yuv.spec.subsampling, Subsampling::Mono);
                 assert!(yuv.spec.full_range);
                 assert_eq!(yuv.spec.matrix, Matrix::Identity);

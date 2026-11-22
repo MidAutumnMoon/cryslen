@@ -28,6 +28,7 @@ pub use crate::browse::PageNames;
 pub use crate::browse::ReadingMode;
 pub use crate::browse::Request;
 pub use crate::browse::Role;
+pub use crate::decode::Depth;
 pub use crate::decode::Format;
 pub use crate::decode::ImageMeta;
 pub use crate::decode::Matrix;
@@ -334,7 +335,7 @@ mod tests {
 
         let yuv = YuvImage {
             spec: YuvSpec {
-                depth: 10,
+                depth: Depth::D10,
                 subsampling: Subsampling::Yuv420,
                 full_range: false,
                 matrix: Matrix::Bt709,
@@ -349,18 +350,18 @@ mod tests {
                 .expect("valid yuv page");
         let wire = WireImage::from_decoded(&decoded);
         assert_eq!(wire.resident_bytes(), (8 + 2 + 2) * 2);
-        let mut bad_depth = wire.clone();
+        let mut mismatched_depth = wire.clone();
         let mut bad_dims = wire.clone();
         wire.validate().expect("valid yuv wire image validates");
 
-        if let WirePixels::Yuv { spec, .. } = &mut bad_depth.pixels {
-            spec.depth = 0;
+        if let WirePixels::Yuv { spec, .. } = &mut mismatched_depth.pixels {
+            spec.depth = Depth::D8;
         }
         assert_eq!(
-            bad_depth
+            mismatched_depth
                 .validate()
-                .expect_err("out-of-range depth is rejected"),
-            MsgError::from_static("yuv depth")
+                .expect_err("mismatched plane depth is rejected"),
+            MsgError::from_static("yuv plane extent")
         );
 
         bad_dims.meta.width = 6;

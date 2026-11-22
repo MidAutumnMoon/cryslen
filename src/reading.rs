@@ -601,7 +601,7 @@ impl Reading {
         &mut self,
         mode: ReadingMode,
         on_screen: Spread,
-        on_screen_scale: Option<f32>,
+        on_screen_scale: Option<f64>,
         limits: ImageLimits,
         roles: impl Fn(usize) -> Roles,
     ) -> Option<Vec<Request>> {
@@ -647,7 +647,7 @@ impl Reading {
         demand: Spread,
         on_screen: Spread,
         mode: ReadingMode,
-        on_screen_scale: Option<f32>,
+        on_screen_scale: Option<f64>,
         limits: ImageLimits,
         roles: impl Fn(usize) -> Roles,
     ) -> Vec<Request> {
@@ -857,7 +857,7 @@ impl Reading {
         &'fault self,
         on_screen: Spread,
         mode: ReadingMode,
-        zoom: f32,
+        zoom: f64,
         book_fault: Option<&'fault str>,
         has_texture: impl Fn(usize) -> bool,
     ) -> StatusLine<'fault> {
@@ -942,22 +942,18 @@ fn min_deadline(deadline: Option<Duration>, delay: Duration) -> Duration {
     deadline.map_or(delay, |current| current.min(delay))
 }
 
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "page edges and image limits stay far below f32's exact-integer range, so the threshold comparison holds"
-)]
 fn full_wanted(
-    scale: f32,
+    scale: f64,
     page_dims: (u32, u32),
     limits: ImageLimits,
 ) -> bool {
-    const ROUNDING_MARGIN_PX: f32 = 1.0;
+    const ROUNDING_MARGIN_PX: f64 = 1.0;
 
     let page_edge = page_dims.0.max(page_dims.1);
     let full_edge = page_edge.min(limits.max_texture_edge());
     full_edge > limits.fit_edge()
-        && scale * page_edge as f32
-            > limits.fit_edge() as f32 + ROUNDING_MARGIN_PX
+        && scale * f64::from(page_edge)
+            > f64::from(limits.fit_edge()) + ROUNDING_MARGIN_PX
 }
 
 #[cfg(test)]
@@ -1113,6 +1109,10 @@ mod tests {
         assert!(!full_wanted(0.25, ten_k, limits));
         assert!(full_wanted(0.26, ten_k, limits));
         assert!(!full_wanted(16.0, ten_k, ImageLimits::new(2560, 2560)));
+        // Dimensions above f32's exact-integer limit (2^24) keep sub-pixel precision.
+        let wide_strip = (20_000_001, 1);
+        assert!(!full_wanted(2560.5 / 20_000_001.0, wide_strip, limits));
+        assert!(full_wanted(2561.5 / 20_000_001.0, wide_strip, limits));
     }
 
     #[test]

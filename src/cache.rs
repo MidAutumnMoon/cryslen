@@ -689,7 +689,7 @@ fn write_atomic(
 }
 
 const MAGIC: [u8; 4] = *b"CYPV";
-const VERSION: u16 = 5;
+const VERSION: u16 = 6;
 const PREFIX_BYTES: usize =
     MAGIC.len() + size_of::<u16>() + size_of::<u8>();
 const MAX_META_BYTES: usize = u8::MAX as usize;
@@ -930,6 +930,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::decode::Depth;
     use crate::decode::Format;
     use crate::decode::Matrix;
     use crate::decode::Subsampling;
@@ -968,20 +969,20 @@ mod tests {
         height: u32,
         subsampling: Subsampling,
     ) -> Decoded {
-        yuv_page_with(width, height, subsampling, 10, false)
+        yuv_page_with(width, height, subsampling, Depth::D10, false)
     }
 
     fn yuv_page_with(
         width: u32,
         height: u32,
         subsampling: Subsampling,
-        depth: u8,
+        depth: Depth,
         with_alpha: bool,
     ) -> Decoded {
         let ((_, _), (chroma_w, chroma_h)) =
             decode::plane_dims((width, height), subsampling);
         let plane = |samples: usize| {
-            if depth > 8 {
+            if depth.is_wide() {
                 Plane::U16(
                     (0..samples)
                         .map(|index| {
@@ -1051,7 +1052,7 @@ mod tests {
         };
         let yuv = YuvImage {
             spec: YuvSpec {
-                depth: 10,
+                depth: Depth::D10,
                 subsampling,
                 full_range: false,
                 matrix: Matrix::Bt709,
@@ -1253,7 +1254,7 @@ mod tests {
         let Pixels::Yuv(yuv) = loaded.pixels() else {
             panic!("expected yuv pixels");
         };
-        assert_eq!(yuv.spec.depth, 10);
+        assert_eq!(yuv.spec.depth, Depth::D10);
         assert_eq!(yuv.spec.subsampling, Subsampling::Yuv420);
         assert!(!yuv.spec.full_range);
         assert_eq!(yuv.spec.matrix, Matrix::Bt709);
@@ -1263,7 +1264,7 @@ mod tests {
     #[test]
     fn yuv_u8_planes_and_alpha_roundtrip() {
         let dir = TempDir::new().expect("create temp dir");
-        let page = yuv_page_with(6, 4, Subsampling::Yuv444, 8, true);
+        let page = yuv_page_with(6, 4, Subsampling::Yuv444, Depth::D8, true);
         let store = Store::at(dir.path());
         let hash = content_hash(b"page-e");
         assert!(
@@ -1278,7 +1279,7 @@ mod tests {
         let Pixels::Yuv(yuv) = loaded.pixels() else {
             panic!("expected yuv pixels");
         };
-        assert_eq!(yuv.spec.depth, 8);
+        assert_eq!(yuv.spec.depth, Depth::D8);
         assert!(yuv.alpha.is_some());
         assert_eq!(yuv_planes(&loaded), yuv_planes(&page));
     }
@@ -1528,7 +1529,7 @@ mod tests {
             let Pixels::Yuv(yuv) = derived.pixels() else {
                 panic!("expected yuv pixels");
             };
-            assert_eq!(yuv.spec.depth, 10, "{kind:?}");
+            assert_eq!(yuv.spec.depth, Depth::D10, "{kind:?}");
             assert_eq!(yuv.spec.matrix, Matrix::Bt709, "{kind:?}");
             let [luma, cb, cr, alpha] = yuv_planes(&derived);
             for (name, plane, value) in [
@@ -1558,7 +1559,7 @@ mod tests {
         assert_eq!(sample_count(&yuv.luma), count(200, 80));
         assert_eq!(sample_count(&yuv.cb), count(100, 40));
         assert_eq!(sample_count(&yuv.cr), count(100, 40));
-        assert_eq!(yuv.spec.depth, 10);
+        assert_eq!(yuv.spec.depth, Depth::D10);
         assert_eq!(yuv.spec.matrix, Matrix::Bt709);
     }
 

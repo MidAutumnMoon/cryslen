@@ -772,7 +772,7 @@ fn parse_mem_available_bytes(meminfo: &str) -> Option<u64> {
         .lines()
         .find(|line| line.starts_with("MemAvailable:"))?;
     let kib = line.split_whitespace().nth(1)?.parse::<u64>().ok()?;
-    Some(kib * 1024)
+    kib.checked_mul(1024)
 }
 
 fn mem_available_bytes() -> Option<u64> {
@@ -1025,6 +1025,13 @@ mod tests {
         assert_eq!(parse_mem_available_bytes("MemTotal: 1 kB\n"), None);
         assert_eq!(
             parse_mem_available_bytes("MemAvailable: notanumber kB\n"),
+            None
+        );
+        assert_eq!(
+            parse_mem_available_bytes(&format!(
+                "MemAvailable: {} kB\n",
+                u64::MAX
+            )),
             None
         );
     }

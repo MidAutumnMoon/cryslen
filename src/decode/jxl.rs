@@ -12,6 +12,7 @@ use jxl::error::Error as JxlError;
 use jxl::error::Result as JxlResult;
 
 use super::Decoded;
+use super::Depth;
 use super::Format;
 use super::Plane;
 use super::Transfer;
@@ -68,7 +69,7 @@ pub(super) fn decode(
         JxlPixelFormat {
             color_type: JxlColorType::Grayscale,
             color_data_format: Some(JxlDataFormat::U8 {
-                bit_depth: super::BYTE_DEPTH,
+                bit_depth: Depth::D8.bits(),
             }),
             extra_channel_format: vec![None; extra_channels],
         }
@@ -112,7 +113,7 @@ pub(super) fn decode(
             height,
             Format::Jxl,
             Transfer::Srgb,
-            super::BYTE_DEPTH,
+            Depth::D8,
             Plane::U8(pixels.into_boxed_slice()),
         )?
     } else {

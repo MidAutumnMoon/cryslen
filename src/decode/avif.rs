@@ -31,6 +31,7 @@ use libavif_sys::avifResultToString;
 use std::marker::PhantomData;
 
 use super::Decoded;
+use super::Depth;
 use super::DisplayTransform;
 use super::Format;
 use super::Matrix;
@@ -42,7 +43,7 @@ use super::YuvSpec;
 
 /// dav1d parallelism saturates quickly on stills, so the thread count
 /// is capped.
-const MAX_THREADS: usize = 8;
+const MAX_THREADS: i32 = 8;
 
 #[expect(
     clippy::similar_names,
@@ -57,10 +58,10 @@ pub(super) fn decode(
 
     let (width, height) = (frame.width, frame.height);
     let depth = match frame.depth {
-        8 => 8_u8,
-        10 => 10,
-        12 => 12,
-        16 => 16,
+        8 => Depth::D8,
+        10 => Depth::D10,
+        12 => Depth::D12,
+        16 => Depth::D16,
         _ => eros::bail!("avif: bad depth"),
     };
     super::admit_dims(width, height, "avif: bad dimensions")?;
@@ -206,13 +207,10 @@ fn display_transform(frame: &avifImage) -> DisplayTransform {
     }
 }
 
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap,
-    reason = "the thread count is capped at MAX_THREADS, so it fits the C int field"
-)]
 fn clamp_threads(max_threads: usize) -> i32 {
-    max_threads.clamp(1, MAX_THREADS) as i32
+    i32::try_from(max_threads)
+        .unwrap_or(MAX_THREADS)
+        .clamp(1, MAX_THREADS)
 }
 
 fn check(code: avifResult, what: &'static str) -> eros::Result<()> {
@@ -238,7 +236,7 @@ unsafe fn copy_plane(
     row_stride: u32,
     width: u32,
     height: u32,
-    depth: u8,
+    depth: Depth,
 ) -> eros::Result<Plane> {
     if plane_ptr.is_null() {
         eros::bail!("avif: missing plane");
@@ -246,7 +244,7 @@ unsafe fn copy_plane(
     let width = width as usize;
     let height = height as usize;
     let row_stride = row_stride as usize;
-    let wide = depth > super::BYTE_DEPTH;
+    let wide = depth.is_wide();
     let sample_bytes = if wide { size_of::<u16>() } else { 1 };
     let row_bytes = width * sample_bytes;
     if row_stride < row_bytes {
@@ -404,7 +402,7 @@ mod tests {
         let raw_u8 = [10_u8, 20, 30, 40];
         // SAFETY: `raw_u8` holds two contiguous 2-byte rows.
         let contiguous_u8 =
-            unsafe { copy_plane(raw_u8.as_ptr(), 2, 2, 2, 8) };
+            unsafe { copy_plane(raw_u8.as_ptr(), 2, 2, 2, Depth::D8) };
         assert!(matches!(
             contiguous_u8,
             Ok(Plane::U8(bytes)) if *bytes == [10, 20, 30, 40]
@@ -413,7 +411,7 @@ mod tests {
         let padded_u8 = [10_u8, 20, 0xff, 0xff, 30, 40];
         // SAFETY: `padded_u8` holds 2 rows at stride 4 with the last row 2 bytes wide.
         let strided_u8 =
-            unsafe { copy_plane(padded_u8.as_ptr(), 4, 2, 2, 8) };
+            unsafe { copy_plane(padded_u8.as_ptr(), 4, 2, 2, Depth::D8) };
         assert!(matches!(
             strided_u8,
             Ok(Plane::U8(bytes)) if *bytes == [10, 20, 30, 40]
@@ -423,7 +421,7 @@ mod tests {
         let raw_u16: &[u8] = bytemuck::cast_slice(&padded_u16);
         // SAFETY: `raw_u16` holds 2 rows of 4 bytes spaced by stride 6 (10 bytes total).
         let strided_u16 =
-            unsafe { copy_plane(raw_u16.as_ptr(), 6, 2, 2, 10) };
+            unsafe { copy_plane(raw_u16.as_ptr(), 6, 2, 2, Depth::D10) };
         assert!(matches!(
             strided_u16,
             Ok(Plane::U16(words)) if *words == [100, 200, 300, 400]

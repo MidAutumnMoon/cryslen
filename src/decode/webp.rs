@@ -28,6 +28,7 @@ use libwebp_sys::WebPRGBABuffer;
 use libwebp_sys::WebPYUVABuffer;
 
 use super::Decoded;
+use super::Depth;
 use super::DisplayTransform;
 use super::Format;
 use super::Matrix;
@@ -167,7 +168,7 @@ fn decode_yuv(
         Transfer::Srgb,
         YuvImage {
             spec: YuvSpec {
-                depth: super::BYTE_DEPTH,
+                depth: Depth::D8,
                 subsampling: Subsampling::Yuv420,
                 full_range: false,
                 matrix: Matrix::Bt601,
@@ -742,7 +743,7 @@ mod tests {
         assert_eq!(yuv.spec.subsampling, Subsampling::Yuv420);
         assert_eq!(yuv.spec.matrix, Matrix::Bt601);
         assert!(!yuv.spec.full_range);
-        assert_eq!(yuv.spec.depth, 8);
+        assert_eq!(yuv.spec.depth, Depth::D8);
         assert!(yuv.alpha.is_none());
 
         let lossless =

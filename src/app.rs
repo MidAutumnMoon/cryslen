@@ -872,7 +872,7 @@ fn present_reading(
 
     let (view_width, view_height) = view.last_viewport.size();
     let on_screen_scale =
-        (view_width > 0.0 && view_height > 0.0).then_some(placed.scale);
+        (view_width > 0 && view_height > 0).then_some(placed.scale);
     if let Some(requests) = reading.update_requests(
         view.mode,
         on_screen,
@@ -963,7 +963,7 @@ impl ApplicationHandler<WakeEvent> for App {
                 post(&proxy.lock(), WakeEvent::Repaint(info.delay));
             });
         }
-        let panel_fill = window.translucent().then(glass_fill);
+        let panel_fill = window.translucent().then_some(GLASS_FILL);
         apply_dark_theme(&egui.egui_ctx, panel_fill);
         window.winit().request_redraw();
         self.gl = Some(Gl {
@@ -1125,25 +1125,24 @@ impl ApplicationHandler<WakeEvent> for App {
     }
 }
 
-/// Window background color, straight channels.
-const BACKGROUND: [f32; 3] = [0.08, 0.08, 0.09];
-
-const GLASS_ALPHA: f32 = 0.7;
+const OPAQUE_FILL: Color32 = Color32::from_rgb(20, 20, 23);
+const GLASS_ALPHA: u8 = 179;
+const GLASS_FILL: Color32 = Color32::from_rgba_unmultiplied_const(
+    OPAQUE_FILL.r(),
+    OPAQUE_FILL.g(),
+    OPAQUE_FILL.b(),
+    GLASS_ALPHA,
+);
 
 /// Framebuffer clear color, premultiplied because Wayland composites
 /// ARGB buffers that way.
 fn clear_color(translucent: bool) -> [f32; 4] {
-    let [red, green, blue] = BACKGROUND;
-    if translucent {
-        [
-            red * GLASS_ALPHA,
-            green * GLASS_ALPHA,
-            blue * GLASS_ALPHA,
-            GLASS_ALPHA,
-        ]
+    let color = if translucent {
+        GLASS_FILL
     } else {
-        [red, green, blue, 1.0]
-    }
+        OPAQUE_FILL
+    };
+    color.to_normalized_gamma_f32()
 }
 
 /// The page viewport from the chrome egui just laid out: the full-width
@@ -1153,11 +1152,8 @@ fn content_viewport(
     content: Rect,
     pixels_per_point: f32,
 ) -> Viewport {
-    let win = geometry::px_f32((window.width, window.height));
-    // The bar's top edge rounds to a whole physical px, matching the
-    // painter's clip-rect rounding.
-    let bar_top = (content.max.y * pixels_per_point).round();
-    Viewport::above_bottom_bar(win, bar_top)
+    let bar_top = f64::from(content.max.y) * f64::from(pixels_per_point);
+    Viewport::above_bottom_bar((window.width, window.height), bar_top)
 }
 
 fn raw_zoom_factor(page_surface: &Response, points_per_line: f32) -> f32 {
@@ -1190,7 +1186,7 @@ fn raw_zoom_factor(page_surface: &Response, points_per_line: f32) -> f32 {
 fn apply_page_input(
     fit: &mut Fit,
     page_surface: &Response,
-    spread_size: (f32, f32),
+    spread_size: (f64, f64),
     viewport: Viewport,
 ) -> bool {
     use egui::PointerButton;
@@ -1199,7 +1195,11 @@ fn apply_page_input(
     if page_surface.dragged_by(PointerButton::Primary) {
         let delta = page_surface.drag_delta() * pixels_per_point;
         if delta.length_sq() > 0.0 {
-            fit.pan((delta.x, delta.y), spread_size, viewport);
+            fit.pan(
+                (f64::from(delta.x), f64::from(delta.y)),
+                spread_size,
+                viewport,
+            );
         }
     }
     if !page_surface.hovered() {
@@ -1219,25 +1219,13 @@ fn apply_page_input(
         return false;
     };
     let anchor = (hover_pos - page_surface.rect.min) * pixels_per_point;
-    fit.zoom(zoom_factor, (anchor.x, anchor.y), spread_size, viewport);
+    fit.zoom(
+        f64::from(zoom_factor),
+        (f64::from(anchor.x), f64::from(anchor.y)),
+        spread_size,
+        viewport,
+    );
     true
-}
-
-/// The glass in egui's premultiplied u8 color, converted from [`clear_color`].
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "the clear color's channels lie in 0..=1, so the rounded scaled value is a valid u8"
-)]
-fn glass_fill() -> Color32 {
-    let [red, green, blue, alpha] = clear_color(true);
-    let channel = |value: f32| value.mul_add(255.0, 0.5) as u8;
-    Color32::from_rgba_premultiplied(
-        channel(red),
-        channel(green),
-        channel(blue),
-        channel(alpha),
-    )
 }
 
 /// A light desktop theme would otherwise pick dark status text over the
@@ -1275,20 +1263,20 @@ mod tests {
 
     #[test]
     fn clear_color_premultiplies_the_glass() {
-        assert_eq!(clear_color(false), [0.08, 0.08, 0.09, 1.0]);
-        let [red, green, blue, alpha] = clear_color(true);
-        assert!((alpha - 0.7).abs() < 1e-6, "{alpha}");
-        for (channel, want) in
-            [(red, 0.056), (green, 0.056), (blue, 0.063)]
-        {
-            assert!((channel - want).abs() < 1e-6, "{channel} vs {want}");
-        }
+        assert_eq!(
+            clear_color(false),
+            [20.0 / 255.0, 20.0 / 255.0, 23.0 / 255.0, 1.0]
+        );
+        assert_eq!(
+            clear_color(true),
+            [14.0 / 255.0, 14.0 / 255.0, 16.0 / 255.0, 179.0 / 255.0]
+        );
     }
 
     #[test]
     fn egui_stays_dark_when_the_desktop_is_light() {
         let ctx = Context::default();
-        apply_dark_theme(&ctx, Some(glass_fill()));
+        apply_dark_theme(&ctx, Some(GLASS_FILL));
         ctx.run_ui(
             RawInput {
                 system_theme: Some(Theme::Light),
@@ -1298,7 +1286,7 @@ mod tests {
         )
         .drop_without_applying_deltas();
         assert_eq!(ctx.theme(), Theme::Dark);
-        assert_eq!(ctx.global_style().visuals.panel_fill, glass_fill());
+        assert_eq!(ctx.global_style().visuals.panel_fill, GLASS_FILL);
     }
 
     #[test]
@@ -1307,12 +1295,12 @@ mod tests {
             Rect::from_min_max(Pos2::ZERO, egui::pos2(1280.0, 772.0));
         let integer =
             content_viewport(PhysicalSize::new(1280, 800), content, 1.0);
-        assert_eq!(integer.size(), (1280.0, 772.0));
+        assert_eq!(integer.size(), (1280, 772));
         // Fractional output scale: 772 pt at 1.25 pixels per point leaves
         // 965 physical px of content in a 1000 px window.
         let fractional =
             content_viewport(PhysicalSize::new(1600, 1000), content, 1.25);
-        assert_eq!(fractional.size(), (1600.0, 965.0));
+        assert_eq!(fractional.size(), (1600, 965));
     }
 }
 

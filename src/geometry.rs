@@ -5,26 +5,38 @@ use strum::VariantArray;
 
 /// Where pages live: the window area left after egui chrome, in physical
 /// px, anchored at the window's top-left.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Viewport {
-    size: (f32, f32),
+    size: (u32, u32),
 }
 
 impl Viewport {
     /// A viewport filling the window above a bottom chrome strip whose top
     /// edge sits `bar_top` physical px from the window top. The only sizing
     /// constructor, so every non-empty viewport is chrome-aware.
-    pub fn above_bottom_bar(window: (f32, f32), bar_top: f32) -> Self {
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the clamped height is a non-negative integer within window.1 (u32)"
+    )]
+    pub fn above_bottom_bar(window: (u32, u32), bar_top: f64) -> Self {
+        let height = if bar_top.is_nan() {
+            0
+        } else {
+            // Nearest whole px matches egui's painter clip-rect rounding.
+            bar_top.round().clamp(0.0, f64::from(window.1)) as u32
+        };
         Self {
-            size: (
-                window.0.max(0.0),
-                bar_top.clamp(0.0, window.1.max(0.0)),
-            ),
+            size: (window.0, height),
         }
     }
 
-    pub fn size(self) -> (f32, f32) {
+    pub fn size(self) -> (u32, u32) {
         self.size
+    }
+
+    fn size_f64(self) -> (f64, f64) {
+        (f64::from(self.size.0), f64::from(self.size.1))
     }
 }
 
@@ -32,8 +44,8 @@ impl Viewport {
 /// is the position of the spread's top-left corner in viewport px.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Placement {
-    pub scale: f32,
-    pub offset: (f32, f32),
+    pub scale: f64,
+    pub offset: (f64, f64),
 }
 
 impl Default for Placement {
@@ -58,8 +70,8 @@ pub enum FitMode {
 /// A page's rect inside the composed spread, in image-pixel space.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PageRect {
-    pub pos: (f32, f32),
-    pub size: (f32, f32),
+    pub pos: (f64, f64),
+    pub size: (f64, f64),
 }
 
 /// Layout of a spread's visual seats. `rects` is always [left, right].
@@ -70,7 +82,7 @@ pub struct SpreadLayout {
 
 impl SpreadLayout {
     /// Bounding size of the composed spread, in image pixels.
-    pub fn total(&self) -> (f32, f32) {
+    pub fn total(&self) -> (f64, f64) {
         self.rects
             .iter()
             .flatten()
@@ -80,20 +92,14 @@ impl SpreadLayout {
     }
 }
 
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "page edges and window extents stay far below f32's exact-integer range 2^24"
-)]
-pub fn px_f32(dims: (u32, u32)) -> (f32, f32) {
-    (dims.0 as f32, dims.1 as f32)
-}
-
 /// `dims[i]` is the page size in visual seat i, 0 = left, 1 = right.
 pub fn layout(dims: [Option<(u32, u32)>; 2]) -> SpreadLayout {
     let mut next_seat_x = 0.0;
     SpreadLayout {
         rects: dims.map(|seat_dims| {
-            seat_dims.map(px_f32).map(|(width, height)| {
+            seat_dims.map(|(width, height)| {
+                let (width, height) =
+                    (f64::from(width), f64::from(height));
                 let rect = PageRect {
                     pos: (next_seat_x, 0.0),
                     size: (width, height),
@@ -110,10 +116,10 @@ pub fn layout(dims: [Option<(u32, u32)>; 2]) -> SpreadLayout {
 /// to one screen px. Degenerate inputs are inert.
 fn fit_as(
     mode: FitMode,
-    total: (f32, f32),
+    total: (f64, f64),
     viewport: Viewport,
 ) -> Placement {
-    let size = viewport.size();
+    let size = viewport.size_f64();
     if total.0 <= 0.0 || total.1 <= 0.0 || size.0 <= 0.0 || size.1 <= 0.0 {
         return Placement {
             scale: 1.0,
@@ -137,15 +143,15 @@ fn fit_as(
 
 /// Zoom scale bounds, in screen px per image px. Applied at zoom time
 /// only; `fit_as` does not clamp.
-const MIN_SCALE: f32 = 0.05;
-const MAX_SCALE: f32 = 40.0;
+const MIN_SCALE: f64 = 0.05;
+const MAX_SCALE: f64 = 40.0;
 
 /// Zoom by `factor`, anchoring the point under `cursor`; clamps to
 /// [`MIN_SCALE`]..=[`MAX_SCALE`] with the applied factor.
 fn zoom_at(
     mut placement: Placement,
-    cursor: (f32, f32),
-    factor: f32,
+    cursor: (f64, f64),
+    factor: f64,
 ) -> Placement {
     let old = placement.scale;
     placement.scale = (old * factor).clamp(MIN_SCALE, MAX_SCALE);
@@ -157,7 +163,7 @@ fn zoom_at(
     placement
 }
 
-fn pan(placement: Placement, delta: (f32, f32)) -> Placement {
+fn pan(placement: Placement, delta: (f64, f64)) -> Placement {
     Placement {
         scale: placement.scale,
         offset: (
@@ -169,16 +175,16 @@ fn pan(placement: Placement, delta: (f32, f32)) -> Placement {
 
 /// Reachability margin for [`clamp`]: at most this many px of the spread
 /// may hang off any viewport edge.
-const EDGE_KEEP_PX: f32 = 64.0;
+const EDGE_KEEP_PX: f64 = 64.0;
 
 /// Clamp pan so the spread cannot be lost. An axis where the scaled
 /// spread fits the viewport is pinned to the centered position.
 fn clamp(
     placement: Placement,
-    total: (f32, f32),
+    total: (f64, f64),
     viewport: Viewport,
 ) -> Placement {
-    let size = viewport.size();
+    let size = viewport.size_f64();
     let scaled = (total.0 * placement.scale, total.1 * placement.scale);
     Placement {
         scale: placement.scale,
@@ -189,7 +195,7 @@ fn clamp(
     }
 }
 
-fn clamp_axis(offset: f32, content: f32, size: f32) -> f32 {
+fn clamp_axis(offset: f64, content: f64, size: f64) -> f64 {
     if content <= size {
         (size - content) / 2.0
     } else {
@@ -203,7 +209,7 @@ fn clamp_axis(offset: f32, content: f32, size: f32) -> f32 {
 pub struct Fit {
     mode: FitMode,
     placement: Placement,
-    settled: Option<(f32, f32)>,
+    settled: Option<(f64, f64)>,
     user_moved: bool,
 }
 
@@ -213,7 +219,7 @@ impl Fit {
     /// new shape or viewport; otherwise the fit mode places the spread.
     pub fn resolve(
         &mut self,
-        total: (f32, f32),
+        total: (f64, f64),
         viewport: Viewport,
     ) -> Placement {
         if self.settled == Some(total) {
@@ -232,9 +238,9 @@ impl Fit {
     /// spread stays reachable.
     pub fn zoom(
         &mut self,
-        factor: f32,
-        cursor: (f32, f32),
-        total: (f32, f32),
+        factor: f64,
+        cursor: (f64, f64),
+        total: (f64, f64),
         viewport: Viewport,
     ) {
         self.placement = clamp(
@@ -248,8 +254,8 @@ impl Fit {
     /// Pan by `delta` viewport px, clamped so the spread stays reachable.
     pub fn pan(
         &mut self,
-        delta: (f32, f32),
-        total: (f32, f32),
+        delta: (f64, f64),
+        total: (f64, f64),
         viewport: Viewport,
     ) {
         self.placement =
@@ -291,21 +297,23 @@ mod tests {
 
     #[test]
     fn above_bottom_bar_sizes_and_clamps() {
-        let viewport = Viewport::above_bottom_bar((1000.0, 800.0), 740.0);
-        assert_eq!(viewport.size(), (1000.0, 740.0));
+        let viewport = Viewport::above_bottom_bar((1000, 800), 740.0);
+        assert_eq!(viewport.size(), (1000, 740));
         // A bar top past the window bottom degenerates to the window.
-        // A negative one degenerates to nothing.
-        let past = Viewport::above_bottom_bar((100.0, 50.0), 80.0);
-        assert_eq!(past.size(), (100.0, 50.0));
-        let negative = Viewport::above_bottom_bar((100.0, 50.0), -10.0);
-        assert_eq!(negative.size(), (100.0, 0.0));
+        // A negative or NaN one degenerates to nothing.
+        let past = Viewport::above_bottom_bar((100, 50), 80.0);
+        assert_eq!(past.size(), (100, 50));
+        let negative = Viewport::above_bottom_bar((100, 50), -10.0);
+        assert_eq!(negative.size(), (100, 0));
+        let nan = Viewport::above_bottom_bar((100, 50), f64::NAN);
+        assert_eq!(nan.size(), (100, 0));
     }
 
     #[test]
     fn layout_places_seats() {
         let left = (100_u32, 300);
         let right = (200, 150);
-        let rect = |pos: (f32, f32), size: (f32, f32)| {
+        let rect = |pos: (f64, f64), size: (f64, f64)| {
             Some(PageRect { pos, size })
         };
         let cases = [
@@ -334,18 +342,22 @@ mod tests {
             assert_eq!(spread.rects, rects, "seats {dims:?}");
             assert_eq!(spread.total(), total, "seats {dims:?}");
         }
+
+        // Dimensions above 2^24 keep exact integer precision in f64.
+        let wide_strip = layout([Some((20_000_001, 1)), None]);
+        assert_eq!(wide_strip.total(), (20_000_001.0, 1.0));
     }
 
-    fn full_window(win: (f32, f32)) -> Viewport {
-        Viewport::above_bottom_bar(win, win.1)
+    fn full_window(win: (u32, u32)) -> Viewport {
+        Viewport::above_bottom_bar(win, f64::from(win.1))
     }
 
     #[test]
     fn fit_page_centers_on_the_min_axis() {
         let cases = [
             (
-                (1000.0_f32, 2000.0),
-                full_window((500.0, 500.0)),
+                (1000.0_f64, 2000.0),
+                full_window((500, 500)),
                 Placement {
                     scale: 0.25,
                     offset: (125.0, 0.0),
@@ -353,7 +365,7 @@ mod tests {
             ),
             (
                 (2000.0, 1000.0),
-                full_window((500.0, 500.0)),
+                full_window((500, 500)),
                 Placement {
                     scale: 0.25,
                     offset: (0.0, 125.0),
@@ -363,7 +375,7 @@ mod tests {
             // not the 800-px window.
             (
                 (500.0, 400.0),
-                Viewport::above_bottom_bar((1000.0, 800.0), 600.0),
+                Viewport::above_bottom_bar((1000, 800), 600.0),
                 Placement {
                     scale: 1.5,
                     offset: (125.0, 0.0),
@@ -372,7 +384,7 @@ mod tests {
             // Degenerate total and empty viewport are inert.
             (
                 (0.0, 100.0),
-                full_window((500.0, 500.0)),
+                full_window((500, 500)),
                 Placement {
                     scale: 1.0,
                     offset: (0.0, 0.0),
@@ -399,8 +411,8 @@ mod tests {
 
     #[test]
     fn fit_modes_fill_their_axis() {
-        let total = (2000.0_f32, 1000.0);
-        let viewport = full_window((500.0, 500.0));
+        let total = (2000.0_f64, 1000.0);
+        let viewport = full_window((500, 500));
         let width = fit_as(FitMode::Width, total, viewport);
         assert_eq!(width.scale, 0.25);
         assert!(
@@ -436,13 +448,13 @@ mod tests {
     #[test]
     fn zoom_at_anchors_and_clamps() {
         for (scale, factor) in [
-            (2.0_f32, 2.0), // plain zoom
+            (2.0_f64, 2.0), // plain zoom
             (1.0, 0.5),     // plain shrink
             (30.0, 100.0),  // clamps at MAX_SCALE
             (0.1, 0.001),   // clamps at MIN_SCALE
         ] {
             for cursor in
-                [(300.0_f32, 200.0), (0.0, 0.0), (1234.0, 4321.0)]
+                [(300.0_f64, 200.0), (0.0, 0.0), (1234.0, 4321.0)]
             {
                 let before = Placement {
                     scale,
@@ -497,7 +509,7 @@ mod tests {
 
     #[test]
     fn clamp_keeps_spread_reachable() {
-        let viewport = full_window((500.0, 500.0));
+        let viewport = full_window((500, 500));
         // 2000 content px at scale 1 in a 500 px viewport, dragged off both ends.
         let wide = clamp(
             Placement {
@@ -546,7 +558,7 @@ mod tests {
 
     #[test]
     fn fit_lifecycle() {
-        let viewport = full_window((500.0, 500.0));
+        let viewport = full_window((500, 500));
         let total = (100.0, 200.0);
         let mut fit = Fit::default();
 
