@@ -1,7 +1,7 @@
 //! App: the windowed parent process. Parses the command line, runs the
 //! event loop, owns the reading state and input, and composes frames.
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::num::NonZeroUsize;
 use std::path::Path;
@@ -13,21 +13,30 @@ use std::time::Instant;
 
 use egui::Color32;
 use egui::Context;
+use egui::Pos2;
+use egui::RawInput;
 use egui::Rect;
-use egui::Response;
-use egui_glow::EguiGlow;
-use egui_winit::winit;
+use egui::TexturesDelta;
+use egui::ViewportId;
+use egui::ViewportInfo;
+use egui::epaint::ClippedShape;
+use egui_glow::Painter;
+use egui_glow::glow::Context as GlowContext;
 use eros::ErrorUnion;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
+use winit::event::ElementState;
 use winit::event::KeyEvent;
-use winit::event::StartCause;
+use winit::event::MouseButton;
+use winit::event::MouseScrollDelta;
 use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
 use winit::event_loop::ControlFlow;
 use winit::event_loop::EventLoopProxy;
 use winit::keyboard::KeyCode;
 use winit::keyboard::ModifiersState;
+use winit::keyboard::PhysicalKey;
+use winit::window::CursorIcon;
 use winit::window::WindowId;
 
 use crate::book::BookEvent;
@@ -54,23 +63,111 @@ use crate::ui;
 use crate::ui::StatusLine;
 use crate::ui::Timers;
 
-enum WakeEvent {
-    /// Arms a wake; `new_events` requests the redraw at the deadline.
-    Repaint(Duration),
-    /// A book's reader thread forwarded an event, or a switch landed;
-    /// the loop must draw a frame to drain it.
-    Wake,
+/// A book's reader thread forwarded an event, or an open finished; the
+/// loop reconciles state in `about_to_wait`.
+struct Wake;
+
+struct Egui {
+    ctx: Context,
+    painter: Painter,
 }
 
-fn post(proxy: &EventLoopProxy<WakeEvent>, event: WakeEvent) {
-    let Ok(()) = proxy.send_event(event) else {
-        return;
-    };
+struct EguiFrame {
+    shapes: Vec<ClippedShape>,
+    textures_delta: TexturesDelta,
+    pixels_per_point: f32,
+    repaint_requested: bool,
+}
+
+impl Egui {
+    fn new(
+        gl: Arc<GlowContext>,
+        panel_fill: Option<Color32>,
+    ) -> eros::Result<Self> {
+        use egui_system_font_provider::SystemFontProvider;
+
+        let painter = Painter::new(gl, "", None, true)?;
+        let ctx = Context::default();
+        // System fonts cover filename characters the built-in fonts cannot
+        // render.
+        ctx.add_font_provider(Arc::new(SystemFontProvider::new()));
+        apply_dark_theme(&ctx, panel_fill);
+        Ok(Self { ctx, painter })
+    }
+
+    fn layout(
+        &self,
+        size: PhysicalSize<u32>,
+        scale_factor: f64,
+        run_ui: impl FnMut(&mut egui::Ui),
+    ) -> EguiFrame {
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "egui pixels_per_point is f32"
+        )]
+        let pixels_per_point = scale_factor as f32;
+        let logical = size.to_logical::<f32>(scale_factor);
+        let screen_rect = (logical.width > 0.0 && logical.height > 0.0)
+            .then(|| {
+                Rect::from_min_size(
+                    Pos2::ZERO,
+                    egui::vec2(logical.width, logical.height),
+                )
+            });
+        let mut viewports = egui::ViewportIdMap::default();
+        viewports.insert(
+            ViewportId::ROOT,
+            ViewportInfo {
+                native_pixels_per_point: Some(pixels_per_point),
+                ..Default::default()
+            },
+        );
+        let input = RawInput {
+            viewport_id: ViewportId::ROOT,
+            viewports,
+            screen_rect,
+            max_texture_side: Some(self.painter.max_texture_side()),
+            ..Default::default()
+        };
+        let output = self.ctx.run_ui(input, run_ui);
+        let repaint_requested = output
+            .viewport_output
+            .get(&ViewportId::ROOT)
+            .is_some_and(|viewport| viewport.repaint_delay.is_zero());
+        EguiFrame {
+            shapes: output.shapes,
+            textures_delta: output.textures_delta,
+            pixels_per_point: output.pixels_per_point,
+            repaint_requested,
+        }
+    }
+
+    fn clear(&self, size: PhysicalSize<u32>, color: [f32; 4]) {
+        self.painter.clear([size.width, size.height], color);
+    }
+
+    fn paint(&mut self, size: PhysicalSize<u32>, mut frame: EguiFrame) {
+        let clipped =
+            self.ctx.tessellate(frame.shapes, frame.pixels_per_point);
+        self.painter.paint_and_update_textures(
+            [size.width, size.height],
+            frame.pixels_per_point,
+            &clipped,
+            &mut frame.textures_delta,
+        );
+    }
+}
+
+impl Drop for Egui {
+    fn drop(&mut self) {
+        // egui_glow reports leaked resources if destroy never runs.
+        self.painter.destroy();
+    }
 }
 
 struct Gl {
     limits: ImageLimits,
-    egui: EguiGlow,
+    egui: Egui,
     // Must drop last: owns the GL context used by the fields above.
     window: Window,
 }
@@ -80,60 +177,57 @@ fn display_limits(
     window: &Window,
     max_texture_edge: u32,
 ) -> ImageLimits {
-    let monitor_edge = event_loop
-        .available_monitors()
+    let monitor_box = window
+        .winit()
+        .current_monitor()
+        .or_else(|| event_loop.primary_monitor())
+        .or_else(|| {
+            event_loop.available_monitors().max_by_key(|monitor| {
+                let size = monitor.size();
+                u64::from(size.width) * u64::from(size.height)
+            })
+        })
         .map(|monitor| {
             let size = monitor.size();
-            size.width.max(size.height)
+            (size.width, size.height)
         })
-        .max()
-        .filter(|&edge| edge > 0);
+        .filter(|&(width, height)| width > 0 && height > 0);
     let window_size = window.winit().inner_size();
-    let window_edge = window_size.width.max(window_size.height);
+    let window_box = (window_size.width, window_size.height);
     let limits = ImageLimits::new(
-        monitor_edge.unwrap_or(window_edge),
+        monitor_box.unwrap_or(window_box),
         max_texture_edge,
     );
     tracing::debug!(
-        ?monitor_edge,
-        window_edge,
-        fit_edge = limits.fit_edge(),
+        ?monitor_box,
+        ?window_box,
+        fit_box = ?limits.fit_box(),
         max_texture_edge = limits.max_texture_edge(),
         "display limits"
     );
     limits
 }
 
-impl Drop for Gl {
-    fn drop(&mut self) {
-        // egui_glow reports leaked resources if destroy never runs.
-        self.egui.destroy();
-    }
-}
-
-/// Page-turn keys currently down, and whether the platform has repeated
-/// them.
 #[derive(Default)]
-struct HeldKeys {
-    page_turn_keys: BTreeMap<KeyCode, bool>,
+enum InputMode {
+    #[default]
+    Browse,
+    Jump(String),
 }
 
-impl HeldKeys {
-    fn press(&mut self, code: KeyCode, repeated: bool) {
-        *self.page_turn_keys.entry(code).or_default() |= repeated;
+impl InputMode {
+    fn jump_digits(&self) -> Option<&str> {
+        match self {
+            Self::Browse => None,
+            Self::Jump(digits) => Some(digits.as_str()),
+        }
     }
+}
 
-    fn release(&mut self, code: KeyCode) {
-        self.page_turn_keys.remove(&code);
-    }
-
-    fn clear(&mut self) {
-        self.page_turn_keys.clear();
-    }
-
-    fn skimming(&self) -> bool {
-        self.page_turn_keys.values().any(|&repeated| repeated)
-    }
+#[derive(Default)]
+struct PointerState {
+    position: Option<(f64, f64)>,
+    dragging: bool,
 }
 
 fn page_number(digits: &str, page_count: usize) -> Option<NonZeroUsize> {
@@ -205,20 +299,6 @@ struct ViewState {
     last_viewport: Viewport,
 }
 
-fn tick_timers(
-    timers: &mut Timers,
-    proxy: &EventLoopProxy<WakeEvent>,
-    now: Instant,
-    waiting: bool,
-) {
-    if let Some(delay) = timers.tick_wait(now, waiting) {
-        post(proxy, WakeEvent::Repaint(delay));
-    }
-    if let Some(delay) = timers.tick_toast(now) {
-        post(proxy, WakeEvent::Repaint(delay));
-    }
-}
-
 fn present_frame(
     gl: &mut Gl,
     view: &mut ViewState,
@@ -226,7 +306,7 @@ fn present_frame(
     status: &StatusLine<'_>,
     spread: Option<(&SpreadLayout, Option<Spread>)>,
     jump_digits: Option<&str>,
-) -> eros::Result<()> {
+) -> eros::Result<bool> {
     let show_status_bar = gl.window.winit().fullscreen().is_none();
     let jump = jump_digits.and_then(|digits| {
         let page_count = status.reading.as_ref()?.page_count;
@@ -237,58 +317,30 @@ fn present_frame(
         ))
     });
 
-    // `EguiGlow::run` only records shapes, so egui lays out before pages
-    // are placed; `paint` later draws the bar above them.
-    let mut page_surface = None;
-    gl.egui.run(gl.window.winit(), |ui| {
-        let page_response = ui::show(ui, status, show_status_bar);
+    let scale_factor = gl.window.winit().scale_factor();
+    let mut page_rect = Rect::NOTHING;
+    let frame = gl.egui.layout(size, scale_factor, |ui| {
+        page_rect = ui::show(ui, status, show_status_bar);
         if let Some((digits, page_count, valid)) = jump {
-            ui::page_jump(
-                ui.ctx(),
-                page_response.rect,
-                digits,
-                page_count,
-                valid,
-            );
+            ui::page_jump(ui.ctx(), page_rect, digits, page_count, valid);
         }
-        page_surface = Some(page_response);
     });
-    let Some(page_surface) = page_surface else {
-        return Ok(());
-    };
 
-    let viewport = content_viewport(
-        size,
-        page_surface.rect,
-        page_surface.ctx.pixels_per_point(),
-    );
-    // The bar can change height without a resize; the status scale needs
-    // a repaint.
-    if viewport != view.last_viewport {
+    let viewport =
+        content_viewport(size, page_rect, frame.pixels_per_point);
+    // The bar can change height without a resize; refit immediately and
+    // request one follow-up frame so the status scale matches.
+    let viewport_changed = viewport != view.last_viewport;
+    if viewport_changed {
         view.fit.refit();
         view.last_viewport = viewport;
-        gl.window.winit().request_redraw();
     }
 
-    let placement = spread.as_ref().map(|(layout, _)| {
-        let spread_size = layout.total();
-        if jump.is_none()
-            && apply_page_input(
-                &mut view.fit,
-                &page_surface,
-                spread_size,
-                viewport,
-            )
-        {
-            gl.window.winit().request_redraw();
-        }
-        view.fit.resolve(spread_size, viewport)
-    });
+    let placement = spread
+        .as_ref()
+        .map(|(layout, _)| view.fit.resolve(layout.total(), viewport));
 
-    gl.egui.painter.clear(
-        [size.width, size.height],
-        clear_color(gl.window.translucent()),
-    );
+    gl.egui.clear(size, clear_color(gl.window.translucent()));
     if let (Some((layout, Some(shown))), Some(placement)) =
         (spread, placement)
     {
@@ -300,9 +352,10 @@ fn present_frame(
             &placement,
         );
     }
-    gl.egui.paint(gl.window.winit());
+    let followup_redraw = viewport_changed || frame.repaint_requested;
+    gl.egui.paint(size, frame);
     gl.window.pre_present_and_swap()?;
-    Ok(())
+    Ok(followup_redraw)
 }
 
 struct App {
@@ -311,22 +364,22 @@ struct App {
     gl: Option<Gl>,
     fatal_error: Option<ErrorUnion>,
     view: ViewState,
-    held_keys: HeldKeys,
-    /// Digits typed in `:` mode; `None` while the prompt is closed.
-    jump_digits: Option<String>,
+    skimming_keys: BTreeSet<KeyCode>,
+    input_mode: InputMode,
+    pointer: PointerState,
+    needs_redraw: bool,
     /// Held modifier state; winit 0.30 key events carry none, only
     /// `ModifiersChanged` does.
     modifiers: ModifiersState,
-    /// Wakes the parked loop from egui, timed waits, and book readers,
-    /// which all run outside the event loop's handlers.
-    proxy: EventLoopProxy<WakeEvent>,
+    /// Wakes the parked loop from background opens and book readers.
+    proxy: EventLoopProxy<Wake>,
 }
 
 impl App {
     fn new(
         open_path: &Path,
         land_on: Option<&str>,
-        proxy: EventLoopProxy<WakeEvent>,
+        proxy: EventLoopProxy<Wake>,
     ) -> Self {
         let mut app = Self {
             book: BookSlot::Initial(catalog::opening_name(
@@ -336,8 +389,10 @@ impl App {
             gl: None,
             fatal_error: None,
             view: ViewState::default(),
-            held_keys: HeldKeys::default(),
-            jump_digits: None,
+            skimming_keys: BTreeSet::new(),
+            input_mode: InputMode::Browse,
+            pointer: PointerState::default(),
+            needs_redraw: false,
             modifiers: ModifiersState::empty(),
             proxy,
         };
@@ -362,12 +417,14 @@ impl App {
         self.child = ChildProcess::Stopped;
         let proxy = self.proxy.clone();
         self.child = match BookOpen::start(path, move || {
-            post(&proxy, WakeEvent::Wake);
+            let Ok(()) = proxy.send_event(Wake) else {
+                return;
+            };
         }) {
             Ok(open) => ChildProcess::Opening { open, land_on },
             Err(fault) => {
                 tracing::warn!(%fault, "book open failed");
-                self.request_redraw();
+                self.needs_redraw = true;
                 ChildProcess::Faulted(fault.to_string())
             }
         };
@@ -381,8 +438,9 @@ impl App {
         process: BookProcess,
         limits: ImageLimits,
     ) {
-        self.held_keys.clear();
-        self.jump_digits = None;
+        self.skimming_keys.clear();
+        self.input_mode = InputMode::Browse;
+        self.set_dragging(false);
         self.view.fit.refit();
         if let Some(gl) = self.gl.as_mut() {
             gl.window.pages_mut().clear_all();
@@ -403,10 +461,7 @@ impl App {
         );
         self.book = BookSlot::Loaded(Box::new(reading));
         self.child = ChildProcess::Live(process);
-    }
-
-    fn send(&self, message: ParentMsg) {
-        self.child.send(message);
+        self.needs_redraw = true;
     }
 
     fn is_fullscreen(&self) -> bool {
@@ -425,10 +480,72 @@ impl App {
         Some(size)
     }
 
-    fn request_redraw(&self) {
-        if let Some(gl) = self.gl.as_ref() {
-            gl.window.winit().request_redraw();
+    fn set_dragging(&mut self, dragging: bool) {
+        if self.pointer.dragging == dragging {
+            return;
         }
+        self.pointer.dragging = dragging;
+        if let Some(gl) = self.gl.as_ref() {
+            let icon = if dragging {
+                CursorIcon::Move
+            } else {
+                CursorIcon::Default
+            };
+            gl.window.winit().set_cursor(icon);
+        }
+    }
+
+    fn cursor_in_viewport(&self) -> Option<(f64, f64)> {
+        let cursor = self.pointer.position?;
+        let (width, height) = self.view.last_viewport.size();
+        (width > 0
+            && height > 0
+            && cursor.0 >= 0.0
+            && cursor.1 >= 0.0
+            && cursor.0 < f64::from(width)
+            && cursor.1 < f64::from(height))
+        .then_some(cursor)
+    }
+
+    fn browsing_cursor(&self) -> Option<(f64, f64)> {
+        matches!(self.input_mode, InputMode::Browse)
+            .then(|| self.cursor_in_viewport())
+            .flatten()
+    }
+
+    fn current_spread_size(&self) -> Option<(f64, f64)> {
+        let reading = self.book.reading()?;
+        let mode = self.view.mode;
+        let on_screen = reading.on_screen(mode);
+        let dims = reading.seat_dims(mode, on_screen);
+        let total = geometry::layout(dims).total();
+        (total.0 > 0.0 && total.1 > 0.0).then_some(total)
+    }
+
+    fn update_fit(
+        &mut self,
+        update: impl FnOnce(&mut Fit, (f64, f64), Viewport),
+    ) {
+        let viewport = self.view.last_viewport;
+        let (width, height) = viewport.size();
+        if width == 0 || height == 0 {
+            return;
+        }
+        let Some(spread_size) = self.current_spread_size() else {
+            return;
+        };
+        self.view.fit.resolve(spread_size, viewport);
+        update(&mut self.view.fit, spread_size, viewport);
+        self.needs_redraw = true;
+    }
+
+    fn zoom_at(&mut self, factor: f64, cursor: (f64, f64)) {
+        if (factor - 1.0).abs() <= f64::EPSILON {
+            return;
+        }
+        self.update_fit(|fit, spread_size, viewport| {
+            fit.zoom(factor, cursor, spread_size, viewport);
+        });
     }
 
     fn poll_child(&mut self, limits: ImageLimits) {
@@ -452,21 +569,25 @@ impl App {
                         tracing::warn!(%fault, "book open failed");
                         self.child =
                             ChildProcess::Faulted(fault.to_string());
+                        self.needs_redraw = true;
                     }
                 }
-                self.request_redraw();
             }
             ChildProcess::Live(process) => {
                 let Some(reading) = self.book.reading_mut() else {
                     return;
                 };
                 let mut died = None;
+                let mut failed = false;
                 for event in process.drain() {
                     match event {
                         BookEvent::Died(detail) => died = Some(detail),
                         other @ (BookEvent::Ready { .. }
                         | BookEvent::Playback(_)
                         | BookEvent::Failed { .. }) => {
+                            if matches!(other, BookEvent::Failed { .. }) {
+                                failed = true;
+                            }
                             if let Some(command) =
                                 reading.apply_event(other)
                             {
@@ -475,31 +596,26 @@ impl App {
                         }
                     }
                 }
+                if failed {
+                    self.needs_redraw = true;
+                }
                 if let Some(detail) = died {
                     tracing::warn!(%detail, "the book process failed");
                     self.child = ChildProcess::Faulted(format!(
                         "the book process died: {detail}"
                     ));
-                    self.request_redraw();
+                    self.needs_redraw = true;
                 }
             }
             ChildProcess::Faulted(_) | ChildProcess::Stopped => {}
         }
     }
 
-    fn frame(&mut self) -> eros::Result<()> {
-        const SLOW_FRAME_THRESHOLD: Duration = Duration::from_millis(50);
-
-        let frame_started = Instant::now();
-        let Some(size) = self.sync_surface_size() else {
-            return Ok(());
-        };
+    fn reconcile(&mut self, event_loop: &ActiveEventLoop) {
         let Some(limits) = self.gl.as_ref().map(|gl| gl.limits) else {
-            return Ok(());
+            return;
         };
         self.poll_child(limits);
-        self.drain_uploads();
-        let drain_elapsed = frame_started.elapsed();
         let now = Instant::now();
 
         let Self {
@@ -507,143 +623,188 @@ impl App {
             child,
             gl,
             view,
-            jump_digits,
-            proxy,
+            needs_redraw,
+            ..
+        } = self;
+        let Some(gl) = gl.as_mut() else {
+            return;
+        };
+
+        let (waiting, playback_deadline) = match book {
+            BookSlot::Initial(_) => (child.is_opening(), None),
+            BookSlot::Loaded(reading) => {
+                let touched = drain_uploads(reading, gl);
+                let (shown, changed) =
+                    reading.resolve_shown(view.mode, now, |page| {
+                        gl.window.pages().roles(page)
+                    });
+                if changed {
+                    view.fit.commit();
+                    *needs_redraw = true;
+                }
+                let on_screen = reading.on_screen(view.mode);
+                if touched.iter().any(|&page| on_screen.contains(page)) {
+                    *needs_redraw = true;
+                }
+                let dims = reading.seat_dims(view.mode, on_screen);
+                let layout = geometry::layout(dims);
+                let spread_size = layout.total();
+                let placement =
+                    view.fit.resolve(spread_size, view.last_viewport);
+                if changed {
+                    tracing::debug!(
+                        ?on_screen,
+                        ?shown,
+                        total = ?spread_size,
+                        ?dims,
+                        scale = placement.scale,
+                        "placement"
+                    );
+                }
+
+                let (viewport_width, viewport_height) =
+                    view.last_viewport.size();
+                let on_screen_scale = (viewport_width > 0
+                    && viewport_height > 0)
+                    .then_some(placement.scale);
+                if let Some(requests) = reading.update_requests(
+                    view.mode,
+                    on_screen,
+                    on_screen_scale,
+                    gl.limits,
+                    |page| gl.window.pages().roles(page),
+                ) {
+                    child.send(ParentMsg::SetRequests(requests));
+                }
+                reading.note_hold(view.mode, now);
+
+                gl.window.pages_mut().retain(|page, role| {
+                    reading
+                        .retains_texture(view.mode, on_screen, page, role)
+                });
+                for command in
+                    reading.sync_playback(view.mode, on_screen, |page| {
+                        gl.window.pages().roles(page)
+                    })
+                {
+                    child.send(ParentMsg::Playback(command));
+                }
+                let playback =
+                    reading.tick_playback(now, |page, role, image| {
+                        gl.window.pages_mut().update(page, role, image)
+                    });
+                for command in playback.commands {
+                    child.send(ParentMsg::Playback(command));
+                }
+                if playback.updated {
+                    *needs_redraw = true;
+                }
+
+                let waiting = reading.is_waiting(on_screen, |page| {
+                    gl.window.pages().has_any(page)
+                });
+                (waiting && child.is_live(), playback.next_deadline)
+            }
+        };
+        let timers = view.timers.tick(now, waiting);
+        if timers.changed {
+            *needs_redraw = true;
+        }
+        let deadline = [playback_deadline, timers.next_deadline]
+            .into_iter()
+            .flatten()
+            .min();
+
+        if *needs_redraw {
+            gl.window.winit().request_redraw();
+        }
+        event_loop.set_control_flow(
+            deadline.map_or(ControlFlow::Wait, ControlFlow::WaitUntil),
+        );
+    }
+
+    fn draw_frame(&mut self) -> eros::Result<()> {
+        const SLOW_FRAME_THRESHOLD: Duration = Duration::from_millis(50);
+
+        self.needs_redraw = false;
+        let frame_started = Instant::now();
+        let Some(size) = self.sync_surface_size() else {
+            return Ok(());
+        };
+        let Self {
+            book,
+            child,
+            gl,
+            view,
+            input_mode,
+            needs_redraw,
             ..
         } = self;
         let Some(gl) = gl.as_mut() else {
             return Ok(());
         };
-        match book {
+        let followup_redraw = match book {
             BookSlot::Initial(name) => {
-                tick_timers(
-                    &mut view.timers,
-                    proxy,
-                    now,
-                    child.is_opening(),
-                );
                 let status = StatusLine {
                     reading: None,
                     mode: view.mode,
-                    toast: view.timers.toasting(),
+                    toast: view.timers.is_toasting(),
                     name: name.clone(),
-                    waiting: view.timers.waiting(now),
+                    waiting: view.timers.is_waiting()
+                        && child.is_opening(),
                     fault: child.fault(),
                 };
-                present_frame(gl, view, size, &status, None, None)
+                present_frame(gl, view, size, &status, None, None)?
             }
             BookSlot::Loaded(reading) => {
-                present_reading(
-                    reading,
-                    child,
+                let on_screen = reading.on_screen(view.mode);
+                let dims = reading.seat_dims(view.mode, on_screen);
+                let layout = geometry::layout(dims);
+                let placement =
+                    view.fit.resolve(layout.total(), view.last_viewport);
+                let mut status = reading.status_line(
+                    on_screen,
+                    view.mode,
+                    placement.scale,
+                    child.fault(),
+                    |page| gl.window.pages().has_any(page),
+                );
+                status.waiting =
+                    status.waiting && view.timers.is_waiting();
+                status.toast = view.timers.is_toasting();
+                present_frame(
                     gl,
                     view,
-                    jump_digits.as_deref(),
                     size,
-                    proxy,
-                )?;
-                let total = frame_started.elapsed();
-                if total >= SLOW_FRAME_THRESHOLD {
-                    tracing::info!(
-                        total = ?total,
-                        drain = ?drain_elapsed,
-                        pending_uploads = reading.pending_upload_count(),
-                        shown = ?reading.shown(),
-                        "slow frame"
-                    );
-                }
-                Ok(())
+                    &status,
+                    Some((&layout, reading.shown())),
+                    input_mode.jump_digits(),
+                )?
             }
-        }
-    }
-
-    fn drain_uploads(&mut self) {
-        const SLOW_UPLOAD_THRESHOLD: Duration = Duration::from_millis(30);
-
-        let Self {
-            book, gl, proxy, ..
-        } = self;
-        let (Some(gl), Some(reading)) = (gl.as_mut(), book.reading_mut())
-        else {
-            return;
         };
-        let started = Instant::now();
-        let mut uploaded_count = 0_usize;
-        let mut uploaded_bytes = 0_usize;
-        let textures = gl.window.pages_mut();
-        while let Some(upload) =
-            reading.pop_upload(uploaded_count, uploaded_bytes)
-        {
-            let image_bytes = upload.image.resident_bytes();
-            let upload_started = Instant::now();
-            match textures.insert(upload.page, upload.role, &upload.image)
-            {
-                Ok(()) => {
-                    let elapsed = upload_started.elapsed();
-                    reading.record_uploaded(upload.page, &upload.image);
-                    tracing::debug!(
-                        page = upload.page,
-                        role = ?upload.role,
-                        width = upload.image.meta.width,
-                        height = upload.image.meta.height,
-                        elapsed = ?elapsed,
-                        "uploaded"
-                    );
-                    if elapsed >= SLOW_UPLOAD_THRESHOLD {
-                        tracing::info!(
-                            page = upload.page,
-                            role = ?upload.role,
-                            width = upload.image.meta.width,
-                            height = upload.image.meta.height,
-                            elapsed = ?elapsed,
-                            "slow upload"
-                        );
-                    }
-                    uploaded_count += 1;
-                    uploaded_bytes =
-                        uploaded_bytes.saturating_add(image_bytes);
-                }
-                Err(fault) => {
-                    tracing::warn!(
-                        page = upload.page,
-                        role = ?upload.role,
-                        %fault,
-                        "texture upload refused"
-                    );
-                    let has_settled_image =
-                        textures.roles(upload.page).has_settled_image();
-                    reading.record_upload_refused(
-                        upload.page,
-                        upload.role,
-                        has_settled_image,
-                        fault,
-                    );
-                }
-            }
+        if followup_redraw {
+            *needs_redraw = true;
         }
-        if uploaded_count > 0 {
-            tracing::debug!(
-                count = uploaded_count,
-                bytes = uploaded_bytes,
-                elapsed = ?started.elapsed(),
-                "drained"
+        let total = frame_started.elapsed();
+        if total >= SLOW_FRAME_THRESHOLD {
+            tracing::info!(
+                total = ?total,
+                shown = ?book.reading().and_then(Reading::shown),
+                "slow frame"
             );
         }
-        if reading.has_pending_uploads() {
-            post(proxy, WakeEvent::Repaint(Duration::ZERO));
-        }
+        Ok(())
     }
 
-    fn update_held_keys(&mut self, update: impl FnOnce(&mut HeldKeys)) {
+    fn sync_motion(&mut self) {
         let mode = self.view.mode;
-        update(&mut self.held_keys);
         let Some(reading) = self.book.reading_mut() else {
             return;
         };
-        let motion = if self.held_keys.skimming() {
-            Motion::Skimming
-        } else {
+        let motion = if self.skimming_keys.is_empty() {
             Motion::Still
+        } else {
+            Motion::Skimming
         };
         let before = reading.target();
         if !reading.set_motion(motion, mode) {
@@ -652,8 +813,101 @@ impl App {
         if reading.target() != before {
             self.set_view();
         }
-        self.send(ParentMsg::SetMotion(motion));
-        self.request_redraw();
+        self.child.send(ParentMsg::SetMotion(motion));
+    }
+
+    fn clear_skimming_keys(&mut self) {
+        self.skimming_keys.clear();
+        self.sync_motion();
+    }
+
+    fn on_key(
+        &mut self,
+        key: &KeyEvent,
+        is_synthetic: bool,
+        event_loop: &ActiveEventLoop,
+    ) {
+        if is_synthetic && key.state == ElementState::Pressed {
+            return;
+        }
+        match key.state {
+            ElementState::Pressed => {
+                if let InputMode::Jump(digits) = &mut self.input_mode {
+                    let Some(page_count) = self
+                        .book
+                        .reading()
+                        .map(|reading| reading.page_count().get())
+                    else {
+                        return;
+                    };
+                    match step_jump(
+                        digits,
+                        key,
+                        self.modifiers,
+                        page_count,
+                    ) {
+                        JumpOutcome::Ignored => {}
+                        JumpOutcome::Edited => self.needs_redraw = true,
+                        JumpOutcome::Canceled => {
+                            self.input_mode = InputMode::Browse;
+                            self.needs_redraw = true;
+                        }
+                        JumpOutcome::Committed(target_page) => {
+                            self.input_mode = InputMode::Browse;
+                            let mode = self.view.mode;
+                            if let Some(reading) = self.book.reading_mut()
+                                && reading.jump_to_page(
+                                    target_page,
+                                    mode,
+                                    Instant::now(),
+                                )
+                            {
+                                self.after_page_change();
+                            }
+                            self.needs_redraw = true;
+                        }
+                    }
+                    return;
+                }
+                if !key.repeat
+                    && !self.modifiers.control_key()
+                    && !self.modifiers.alt_key()
+                    && !self.modifiers.super_key()
+                    && key.text.as_deref() == Some(":")
+                {
+                    if self.book.reading().is_some() {
+                        self.clear_skimming_keys();
+                        self.set_dragging(false);
+                        self.input_mode = InputMode::Jump(String::new());
+                        self.needs_redraw = true;
+                    }
+                    return;
+                }
+                let PhysicalKey::Code(code) = key.physical_key else {
+                    return;
+                };
+                let Some(action) = Action::from_key(code, self.modifiers)
+                else {
+                    return;
+                };
+                if key.repeat && !action.repeats() {
+                    return;
+                }
+                if action.repeats() && key.repeat {
+                    self.skimming_keys.insert(code);
+                    self.sync_motion();
+                }
+                self.dispatch(action, event_loop);
+            }
+            ElementState::Released => {
+                let PhysicalKey::Code(code) = key.physical_key else {
+                    return;
+                };
+                if self.skimming_keys.remove(&code) {
+                    self.sync_motion();
+                }
+            }
+        }
     }
 
     fn dispatch(&mut self, action: Action, event_loop: &ActiveEventLoop) {
@@ -664,6 +918,7 @@ impl App {
                     if let Some(gl) = self.gl.as_ref() {
                         gl.window.winit().set_fullscreen(None);
                     }
+                    self.needs_redraw = true;
                 } else {
                     event_loop.exit();
                 }
@@ -676,10 +931,11 @@ impl App {
                         .then_some(Fullscreen::Borderless(None));
                     gl.window.winit().set_fullscreen(request);
                 }
+                self.needs_redraw = true;
             }
             Action::SelectFit(mode) => {
                 self.view.fit.select(mode);
-                self.request_redraw();
+                self.needs_redraw = true;
             }
             Action::SelectMode(mode) => {
                 let previous = self.view.mode;
@@ -693,7 +949,7 @@ impl App {
                     }
                     self.set_view();
                 }
-                self.request_redraw();
+                self.needs_redraw = true;
             }
             Action::First | Action::Last => {
                 let mode = self.view.mode;
@@ -740,91 +996,11 @@ impl App {
         }
     }
 
-    fn on_jump_key(&mut self, key: &KeyEvent) {
-        use winit::keyboard::PhysicalKey;
-
-        if self.modifiers.control_key()
-            || self.modifiers.alt_key()
-            || self.modifiers.super_key()
-        {
-            return;
-        }
-
-        // Digits and Backspace repeat at the compositor's rate.
-        let digit = key.text.as_deref().and_then(|text| {
-            let [digit] = text.as_bytes() else {
-                return None;
-            };
-            digit.is_ascii_digit().then(|| char::from(*digit))
-        });
-        if let Some(digit) = digit {
-            if let Some(digits) = &mut self.jump_digits {
-                digits.push(digit);
-            }
-            self.request_redraw();
-            return;
-        }
-
-        let PhysicalKey::Code(code) = key.physical_key else {
-            return;
-        };
-        if code == KeyCode::Backspace {
-            if let Some(digits) = &mut self.jump_digits {
-                digits.pop();
-            }
-            self.request_redraw();
-            return;
-        }
-        if matches!(code, KeyCode::Enter | KeyCode::NumpadEnter) {
-            if key.repeat {
-                return;
-            }
-            let Some(page_count) = self
-                .book
-                .reading()
-                .map(|reading| reading.page_count().get())
-            else {
-                return;
-            };
-            let Some(digits) = self.jump_digits.as_deref() else {
-                return;
-            };
-            if digits.is_empty() {
-                self.jump_digits = None;
-                self.request_redraw();
-                return;
-            }
-            if let Some(page_number) = page_number(digits, page_count) {
-                self.jump_digits = None;
-                self.jump_to_page(page_number);
-            }
-            self.request_redraw();
-            return;
-        }
-        if code == KeyCode::Escape {
-            if key.repeat {
-                return;
-            }
-            self.jump_digits = None;
-            self.request_redraw();
-        }
-    }
-
-    fn jump_to_page(&mut self, page_number: NonZeroUsize) {
-        let mode = self.view.mode;
-        let Some(reading) = self.book.reading_mut() else {
-            return;
-        };
-        if reading.jump_to_page(page_number, mode, Instant::now()) {
-            self.after_page_change();
-        }
-    }
-
     fn set_view(&self) {
         let Some(reading) = self.book.reading() else {
             return;
         };
-        self.send(ParentMsg::SetView {
+        self.child.send(ParentMsg::SetView {
             page: reading.target(),
             mode: self.view.mode,
             direction: reading.direction(),
@@ -834,104 +1010,152 @@ impl App {
     fn after_page_change(&mut self) {
         self.set_view();
         self.view.fit.begin_turn();
-        self.request_redraw();
     }
 }
 
-fn present_reading(
-    reading: &mut Reading,
-    child: &ChildProcess,
-    gl: &mut Gl,
-    view: &mut ViewState,
-    jump_digits: Option<&str>,
-    size: PhysicalSize<u32>,
-    proxy: &EventLoopProxy<WakeEvent>,
-) -> eros::Result<()> {
-    let now = Instant::now();
-    let (shown, changed) = reading.resolve_shown(view.mode, now, |page| {
-        gl.window.pages().roles(page)
-    });
-    if changed {
-        view.fit.commit();
+enum JumpOutcome {
+    Ignored,
+    Edited,
+    Canceled,
+    Committed(NonZeroUsize),
+}
+
+fn step_jump(
+    digits: &mut String,
+    key: &KeyEvent,
+    modifiers: ModifiersState,
+    page_count: usize,
+) -> JumpOutcome {
+    if modifiers.control_key()
+        || modifiers.alt_key()
+        || modifiers.super_key()
+    {
+        return JumpOutcome::Ignored;
     }
-    let on_screen = reading.on_screen(view.mode);
-    let dims = reading.seat_dims(view.mode, on_screen);
-    let layout = geometry::layout(dims);
-    let spread_size = layout.total();
-    let placed = view.fit.resolve(spread_size, view.last_viewport);
-    if changed {
+
+    // Digits and Backspace repeat at the compositor's rate.
+    let digit = key.text.as_deref().and_then(|text| {
+        let [byte] = text.as_bytes() else {
+            return None;
+        };
+        byte.is_ascii_digit().then(|| char::from(*byte))
+    });
+    if let Some(digit) = digit {
+        digits.push(digit);
+        return JumpOutcome::Edited;
+    }
+
+    let PhysicalKey::Code(code) = key.physical_key else {
+        return JumpOutcome::Ignored;
+    };
+    if code == KeyCode::Backspace {
+        digits.pop();
+        return JumpOutcome::Edited;
+    }
+    if key.repeat {
+        return JumpOutcome::Ignored;
+    }
+    if matches!(code, KeyCode::Enter | KeyCode::NumpadEnter) {
+        if digits.is_empty() {
+            JumpOutcome::Canceled
+        } else if let Some(target) = page_number(digits, page_count) {
+            JumpOutcome::Committed(target)
+        } else {
+            JumpOutcome::Ignored
+        }
+    } else if code == KeyCode::Escape {
+        JumpOutcome::Canceled
+    } else {
+        JumpOutcome::Ignored
+    }
+}
+
+fn wheel_zoom_factor(delta: MouseScrollDelta, scale_factor: f64) -> f64 {
+    const POINTS_PER_LINE: f64 = 40.0;
+    const WHEEL_ZOOM_PER_LINE: f64 = 0.2;
+
+    let wheel_lines = match delta {
+        MouseScrollDelta::LineDelta(_, y) => f64::from(y),
+        MouseScrollDelta::PixelDelta(pixels) => {
+            pixels.y / scale_factor / POINTS_PER_LINE
+        }
+    };
+    (wheel_lines * WHEEL_ZOOM_PER_LINE).exp()
+}
+
+fn drain_uploads(reading: &mut Reading, gl: &mut Gl) -> Vec<usize> {
+    const SLOW_UPLOAD_THRESHOLD: Duration = Duration::from_millis(30);
+
+    let pending = reading.take_pending_uploads();
+    if pending.is_empty() {
+        return Vec::new();
+    }
+    let started = Instant::now();
+    let mut uploaded_count = 0_usize;
+    let mut uploaded_bytes = 0_usize;
+    let mut touched = Vec::with_capacity(pending.len());
+    let textures = gl.window.pages_mut();
+    for upload in pending {
+        let image_bytes = upload.image.resident_bytes();
+        let upload_started = Instant::now();
+        touched.push(upload.page);
+        match textures.insert(upload.page, upload.role, &upload.image) {
+            Ok(()) => {
+                let elapsed = upload_started.elapsed();
+                reading.record_uploaded(upload.page, &upload.image);
+                tracing::debug!(
+                    page = upload.page,
+                    role = ?upload.role,
+                    width = upload.image.meta.width,
+                    height = upload.image.meta.height,
+                    elapsed = ?elapsed,
+                    "uploaded"
+                );
+                if elapsed >= SLOW_UPLOAD_THRESHOLD {
+                    tracing::info!(
+                        page = upload.page,
+                        role = ?upload.role,
+                        width = upload.image.meta.width,
+                        height = upload.image.meta.height,
+                        elapsed = ?elapsed,
+                        "slow upload"
+                    );
+                }
+                uploaded_count += 1;
+                uploaded_bytes =
+                    uploaded_bytes.saturating_add(image_bytes);
+            }
+            Err(fault) => {
+                tracing::warn!(
+                    page = upload.page,
+                    role = ?upload.role,
+                    %fault,
+                    "texture upload refused"
+                );
+                let has_settled_image =
+                    textures.roles(upload.page).has_settled_image();
+                reading.record_upload_refused(
+                    upload.page,
+                    upload.role,
+                    has_settled_image,
+                    fault,
+                );
+            }
+        }
+    }
+    if uploaded_count > 0 {
         tracing::debug!(
-            ?on_screen,
-            ?shown,
-            total = ?spread_size,
-            ?dims,
-            scale = placed.scale,
-            "placement"
+            count = uploaded_count,
+            bytes = uploaded_bytes,
+            elapsed = ?started.elapsed(),
+            "drained"
         );
     }
-
-    let (view_width, view_height) = view.last_viewport.size();
-    let on_screen_scale =
-        (view_width > 0 && view_height > 0).then_some(placed.scale);
-    if let Some(requests) = reading.update_requests(
-        view.mode,
-        on_screen,
-        on_screen_scale,
-        gl.limits,
-        |page| gl.window.pages().roles(page),
-    ) {
-        child.send(ParentMsg::SetRequests(requests));
-    }
-    reading.note_hold(view.mode, now);
-
-    gl.window.pages_mut().retain(|page, role| {
-        reading.retains_texture(view.mode, on_screen, page, role)
-    });
-    for command in reading.sync_playback(view.mode, on_screen, |page| {
-        gl.window.pages().roles(page)
-    }) {
-        child.send(ParentMsg::Playback(command));
-    }
-    let (deadline, commands) =
-        reading.tick_playback(now, |page, role, image| {
-            gl.window.pages_mut().update(page, role, image)
-        });
-    for command in commands {
-        child.send(ParentMsg::Playback(command));
-    }
-    if let Some(delay) = deadline {
-        post(proxy, WakeEvent::Repaint(delay));
-    }
-
-    let mut status = reading.status_line(
-        on_screen,
-        view.mode,
-        placed.scale,
-        child.fault(),
-        |page| gl.window.pages().has_any(page),
-    );
-    tick_timers(
-        &mut view.timers,
-        proxy,
-        now,
-        status.waiting && child.is_live(),
-    );
-    status.waiting = view.timers.waiting(now);
-    status.toast = view.timers.toasting();
-    present_frame(
-        gl,
-        view,
-        size,
-        &status,
-        Some((&layout, reading.shown())),
-        jump_digits,
-    )
+    touched
 }
 
-impl ApplicationHandler<WakeEvent> for App {
+impl ApplicationHandler<Wake> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        use egui_system_font_provider::SystemFontProvider;
-
         let window = match Window::new(event_loop) {
             Ok(window) => window,
             Err(error) => {
@@ -947,25 +1171,15 @@ impl ApplicationHandler<WakeEvent> for App {
         // Adopt an already-ready book before egui and system font scanning
         // so page 0 decodes concurrently.
         self.poll_child(limits);
-        // `EguiGlow::new` panics if its painter cannot initialize; accepted
-        // upstream risk.
-        let egui =
-            EguiGlow::new(event_loop, window.glow(), None, None, true);
-        // System fonts cover filename characters the built-in fonts cannot
-        // render.
-        egui.egui_ctx
-            .add_font_provider(Arc::new(SystemFontProvider::new()));
-        {
-            use parking_lot::Mutex;
-
-            let proxy = Mutex::new(self.proxy.clone());
-            egui.egui_ctx.set_request_repaint_callback(move |info| {
-                post(&proxy.lock(), WakeEvent::Repaint(info.delay));
-            });
-        }
         let panel_fill = window.translucent().then_some(GLASS_FILL);
-        apply_dark_theme(&egui.egui_ctx, panel_fill);
-        window.winit().request_redraw();
+        let egui = match Egui::new(window.glow(), panel_fill) {
+            Ok(egui) => egui,
+            Err(error) => {
+                self.fail(error, event_loop);
+                return;
+            }
+        };
+        self.needs_redraw = true;
         self.gl = Some(Gl {
             limits,
             egui,
@@ -973,38 +1187,11 @@ impl ApplicationHandler<WakeEvent> for App {
         });
     }
 
-    fn user_event(
-        &mut self,
-        event_loop: &ActiveEventLoop,
-        event: WakeEvent,
-    ) {
-        match event {
-            WakeEvent::Repaint(delay) => {
-                let Some(deadline) = Instant::now().checked_add(delay)
-                else {
-                    return;
-                };
-                if let ControlFlow::WaitUntil(armed) =
-                    event_loop.control_flow()
-                    && armed <= deadline
-                {
-                    return;
-                }
-                event_loop
-                    .set_control_flow(ControlFlow::WaitUntil(deadline));
-            }
-            WakeEvent::Wake => self.request_redraw(),
-        }
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: Wake) {
     }
 
-    fn new_events(
-        &mut self,
-        _event_loop: &ActiveEventLoop,
-        cause: StartCause,
-    ) {
-        if let StartCause::ResumeTimeReached { .. } = cause {
-            self.request_redraw();
-        }
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.reconcile(event_loop);
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
@@ -1024,101 +1211,85 @@ impl ApplicationHandler<WakeEvent> for App {
         _id: WindowId,
         event: WindowEvent,
     ) {
-        use winit::event::ElementState;
-        use winit::event::WindowEvent;
-        use winit::keyboard::PhysicalKey;
-
-        if matches!(
-            event,
-            WindowEvent::CloseRequested | WindowEvent::Destroyed
-        ) {
-            event_loop.exit();
-        }
-        let Some(gl) = self.gl.as_mut() else {
-            return;
-        };
-
-        // egui-winit reports repaint on RedrawRequested; honoring it would
-        // self-sustain the loop at compositor refresh.
-        if !matches!(event, WindowEvent::RedrawRequested) {
-            let response =
-                gl.egui.on_window_event(gl.window.winit(), &event);
-            if response.repaint {
-                gl.window.winit().request_redraw();
+        match event {
+            WindowEvent::CloseRequested | WindowEvent::Destroyed => {
+                event_loop.exit();
             }
-        }
-        let egui_wants_keyboard =
-            gl.egui.egui_ctx.egui_wants_keyboard_input();
-
-        match &event {
             WindowEvent::Resized(_) => {
                 self.sync_surface_size();
-                self.request_redraw();
+                self.needs_redraw = true;
+            }
+            WindowEvent::ScaleFactorChanged { .. } => {
+                self.needs_redraw = true;
             }
             WindowEvent::ModifiersChanged(modifiers) => {
                 self.modifiers = modifiers.state();
             }
-            WindowEvent::KeyboardInput { event: key, .. } => {
-                match key.state {
-                    ElementState::Pressed => {
-                        if self.jump_digits.is_some() {
-                            self.on_jump_key(key);
-                            return;
-                        }
-                        if egui_wants_keyboard {
-                            return;
-                        }
-                        if !key.repeat
-                            && !self.modifiers.control_key()
-                            && !self.modifiers.alt_key()
-                            && !self.modifiers.super_key()
-                            && key.text.as_deref() == Some(":")
-                        {
-                            if self.book.reading().is_some() {
-                                self.jump_digits = Some(String::new());
-                                self.request_redraw();
-                            }
-                            return;
-                        }
-                        let PhysicalKey::Code(code) = key.physical_key
-                        else {
-                            return;
-                        };
-                        let Some(action) =
-                            Action::from_key(code, self.modifiers)
-                        else {
-                            return;
-                        };
-                        if key.repeat && !action.repeats() {
-                            return;
-                        }
-                        if action.repeats() {
-                            self.update_held_keys(|keys| {
-                                keys.press(code, key.repeat);
-                            });
-                        }
-                        self.dispatch(action, event_loop);
-                    }
-                    ElementState::Released => {
-                        let PhysicalKey::Code(code) = key.physical_key
-                        else {
-                            return;
-                        };
-                        self.update_held_keys(|keys| {
-                            keys.release(code);
+            WindowEvent::KeyboardInput {
+                event: key,
+                is_synthetic,
+                ..
+            } => {
+                self.on_key(&key, is_synthetic, event_loop);
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                let current = (position.x, position.y);
+                if let Some(previous) =
+                    self.pointer.position.replace(current)
+                    && self.pointer.dragging
+                    && matches!(self.input_mode, InputMode::Browse)
+                {
+                    let delta =
+                        (current.0 - previous.0, current.1 - previous.1);
+                    if delta != (0.0, 0.0) {
+                        self.update_fit(|fit, spread_size, viewport| {
+                            fit.pan(delta, spread_size, viewport);
                         });
                     }
                 }
             }
+            WindowEvent::CursorLeft { .. } => {
+                self.pointer.position = None;
+            }
+            WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left,
+                ..
+            } => match state {
+                ElementState::Pressed => {
+                    if self.book.reading().is_some()
+                        && self.browsing_cursor().is_some()
+                    {
+                        self.set_dragging(true);
+                    }
+                }
+                ElementState::Released => self.set_dragging(false),
+            },
+            WindowEvent::MouseWheel { delta, .. } => {
+                if let Some(cursor) = self.browsing_cursor()
+                    && let Some(gl) = self.gl.as_ref()
+                {
+                    let factor = wheel_zoom_factor(
+                        delta,
+                        gl.window.winit().scale_factor(),
+                    );
+                    self.zoom_at(factor, cursor);
+                }
+            }
+            WindowEvent::PinchGesture { delta, .. } => {
+                if let Some(cursor) = self.browsing_cursor() {
+                    self.zoom_at(delta.exp(), cursor);
+                }
+            }
             WindowEvent::Focused(false) => {
-                self.update_held_keys(HeldKeys::clear);
+                self.clear_skimming_keys();
+                self.set_dragging(false);
+                self.modifiers = ModifiersState::empty();
             }
             WindowEvent::RedrawRequested => {
-                if let Err(error) = self.frame() {
+                if let Err(error) = self.draw_frame() {
                     self.fail(error, event_loop);
-                    return;
                 }
-                event_loop.set_control_flow(ControlFlow::Wait);
             }
             _ => {}
         }
@@ -1152,78 +1323,6 @@ fn content_viewport(
     Viewport::above_bottom_bar((window.width, window.height), bar_top)
 }
 
-fn raw_zoom_factor(page_surface: &Response, points_per_line: f32) -> f32 {
-    use egui::Event;
-    use egui::MouseWheelUnit;
-
-    let viewport_height = page_surface.ctx.viewport_rect().height();
-    page_surface.ctx.input(|i| {
-        let mut wheel_lines = 0.0;
-        let mut pinch_factor = 1.0;
-        // egui smooths wheel deltas over frames; page zoom follows each
-        // raw event.
-        for event in &i.raw.events {
-            if let Event::MouseWheel { unit, delta, .. } = event {
-                let scroll_points = match unit {
-                    MouseWheelUnit::Point => delta.y,
-                    MouseWheelUnit::Line => delta.y * points_per_line,
-                    MouseWheelUnit::Page => delta.y * viewport_height,
-                };
-                wheel_lines += scroll_points / points_per_line;
-            }
-            if let Event::Zoom(zoom_factor) = event {
-                pinch_factor *= zoom_factor;
-            }
-        }
-        pinch_factor * (wheel_lines * WHEEL_ZOOM_PER_LINE).exp()
-    })
-}
-
-fn apply_page_input(
-    fit: &mut Fit,
-    page_surface: &Response,
-    spread_size: (f64, f64),
-    viewport: Viewport,
-) -> bool {
-    use egui::PointerButton;
-
-    let pixels_per_point = page_surface.ctx.pixels_per_point();
-    if page_surface.dragged_by(PointerButton::Primary) {
-        let delta = page_surface.drag_delta() * pixels_per_point;
-        if delta.length_sq() > 0.0 {
-            fit.pan(
-                (f64::from(delta.x), f64::from(delta.y)),
-                spread_size,
-                viewport,
-            );
-        }
-    }
-    if !page_surface.hovered() {
-        return false;
-    }
-    let points_per_line = page_surface
-        .ctx
-        .options(|options| options.input_options.line_scroll_speed);
-    if points_per_line <= 0.0 {
-        return false;
-    }
-    let zoom_factor = raw_zoom_factor(page_surface, points_per_line);
-    if (zoom_factor - 1.0).abs() <= f32::EPSILON {
-        return false;
-    }
-    let Some(hover_pos) = page_surface.hover_pos() else {
-        return false;
-    };
-    let anchor = (hover_pos - page_surface.rect.min) * pixels_per_point;
-    fit.zoom(
-        f64::from(zoom_factor),
-        (f64::from(anchor.x), f64::from(anchor.y)),
-        spread_size,
-        viewport,
-    );
-    true
-}
-
 /// A light desktop theme would otherwise pick dark status text over the
 /// dark window.
 fn apply_dark_theme(egui_ctx: &Context, panel_fill: Option<Color32>) {
@@ -1237,25 +1336,10 @@ fn apply_dark_theme(egui_ctx: &Context, panel_fill: Option<Color32>) {
     }
 }
 
-const WHEEL_ZOOM_PER_LINE: f32 = 0.2;
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use egui::Pos2;
-    use egui::RawInput;
     use egui::Theme;
-
-    #[test]
-    fn a_tap_stays_still_and_a_repeat_skims_until_release() {
-        let mut held_keys = HeldKeys::default();
-        held_keys.press(KeyCode::ArrowRight, false);
-        assert!(!held_keys.skimming());
-        held_keys.press(KeyCode::ArrowRight, true);
-        assert!(held_keys.skimming());
-        held_keys.release(KeyCode::ArrowRight);
-        assert!(!held_keys.skimming());
-    }
 
     #[test]
     fn clear_color_premultiplies_the_glass() {
@@ -1581,11 +1665,11 @@ fn classify(path: &Path) -> eros::Result<(PathBuf, Option<String>)> {
 }
 
 fn run(open_path: &Path, land_on: Option<&str>) -> eros::Result<()> {
-    use egui_winit::winit::event_loop::EventLoop;
+    use winit::event_loop::EventLoop;
 
     // Build the loop and fork the child here so `PR_SET_PDEATHSIG` tracks
     // the event-loop thread.
-    let event_loop = EventLoop::<WakeEvent>::with_user_event().build()?;
+    let event_loop = EventLoop::<Wake>::with_user_event().build()?;
     let mut app = App::new(open_path, land_on, event_loop.create_proxy());
     event_loop.run_app(&mut app)?;
     if let Some(error) = app.take_fatal_error() {

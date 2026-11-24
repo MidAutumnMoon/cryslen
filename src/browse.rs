@@ -262,25 +262,40 @@ pub fn advance(
     mode: ReadingMode,
     len: NonZeroUsize,
 ) -> usize {
-    let forward = direction == Direction::Forward;
+    step(current, direction, mode, len).unwrap_or_else(
+        || match direction {
+            Direction::Forward => 0,
+            Direction::Backward => last_spread(mode, len),
+        },
+    )
+}
+
+/// Next/previous spread start from `current`, or `None` at the book ends.
+pub fn step(
+    current: usize,
+    direction: Direction,
+    mode: ReadingMode,
+    len: NonZeroUsize,
+) -> Option<usize> {
     let len = len.get();
     let current = current.min(len - 1);
     if !mode.pairs() {
-        let next = if forward {
-            current + 1
-        } else {
-            current + len - 1
+        return match direction {
+            Direction::Forward => {
+                (current + 1 < len).then_some(current + 1)
+            }
+            Direction::Backward => current.checked_sub(1),
         };
-        return next % len;
     }
-    let spreads = spread_count(len);
     let number = spread_number(current);
-    let next = if forward {
-        (number + 1) % spreads
-    } else {
-        (number + spreads - 1) % spreads
+    let next = match direction {
+        Direction::Forward => {
+            let candidate = number + 1;
+            (candidate < spread_count(len)).then_some(candidate)?
+        }
+        Direction::Backward => number.checked_sub(1)?,
     };
-    spread_start(next)
+    Some(spread_start(next))
 }
 
 fn spread_number(page: usize) -> usize {
@@ -364,6 +379,8 @@ mod tests {
             for &mode in ReadingMode::VARIANTS {
                 for page in 0..=len {
                     for &direction in Direction::VARIANTS {
+                        let start =
+                            spread_for(page, mode, pages(len)).first;
                         let stepped =
                             advance(page, direction, mode, pages(len));
                         assert_eq!(
@@ -377,8 +394,19 @@ mod tests {
                         };
                         assert_eq!(
                             advance(stepped, back, mode, pages(len)),
-                            spread_for(page, mode, pages(len)).first,
+                            start,
                             "step then step back must round-trip: len {len} mode {mode:?} page {page} direction {direction:?}"
+                        );
+                        let at_end = match direction {
+                            Direction::Forward => {
+                                start == last_spread(mode, pages(len))
+                            }
+                            Direction::Backward => start == 0,
+                        };
+                        assert_eq!(
+                            step(page, direction, mode, pages(len)),
+                            (!at_end).then_some(stepped),
+                            "bounded step must match advance except at book ends: len {len} mode {mode:?} page {page} direction {direction:?}"
                         );
                     }
                 }

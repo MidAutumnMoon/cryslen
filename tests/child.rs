@@ -176,7 +176,7 @@ fn accept_hello(
 
 #[test]
 fn child_serves_a_decoded_thumb() {
-    const FIT_EDGE: u32 = 2560;
+    const FIT_BOX: (u32, u32) = (2560, 1440);
     const MAX_TEXTURE_EDGE: u32 = 8192;
 
     let binary = env!("CARGO_BIN_EXE_cy");
@@ -209,7 +209,7 @@ fn child_serves_a_decoded_thumb() {
 
     commands
         .send(ParentMsg::SetLimits(ImageLimits::new(
-            FIT_EDGE,
+            FIT_BOX,
             MAX_TEXTURE_EDGE,
         )))
         .expect("send SetLimits");

@@ -21,7 +21,6 @@ use egui_glow::glow::Shader;
 use egui_glow::glow::Texture;
 use egui_glow::glow::UniformLocation;
 use egui_glow::glow::VertexArray;
-use egui_winit::winit;
 use enum_map::EnumMap;
 use glutin::context::PossiblyCurrentContext;
 use glutin::surface::Surface;
@@ -557,17 +556,17 @@ fn slot_roles(slots: &EnumMap<Role, Option<PageTexture>>) -> Roles {
     roles
 }
 
-/// Keep `Fit` whenever it covers `screen_edge` so zooming back out avoids
-/// re-filtering `Full`.
+/// Keep `Fit` whenever it covers `screen_size` so zooming back out
+/// avoids re-filtering `Full`.
 fn best_texture(
     slots: &EnumMap<Role, Option<PageTexture>>,
-    screen_edge: f64,
+    screen_size: (f64, f64),
 ) -> Option<&PageTexture> {
-    if let Some(fit) = slots[Role::Fit].as_ref() {
-        let fit_edge = f64::from(fit.dims.0.max(fit.dims.1));
-        if fit_edge + ROLE_COVER_MARGIN_PX >= screen_edge {
-            return Some(fit);
-        }
+    if let Some(fit) = slots[Role::Fit].as_ref()
+        && f64::from(fit.dims.0) + ROLE_COVER_MARGIN_PX >= screen_size.0
+        && f64::from(fit.dims.1) + ROLE_COVER_MARGIN_PX >= screen_size.1
+    {
+        return Some(fit);
     }
     slots[slot_roles(slots).best()?].as_ref()
 }
@@ -821,11 +820,10 @@ impl PageTextures {
             if screen_size.0 <= 0.0 || screen_size.1 <= 0.0 {
                 continue;
             }
-            let screen_edge = screen_size.0.max(screen_size.1);
             let Some(texture) = self
                 .pages
                 .get(page)
-                .and_then(|slots| best_texture(slots, screen_edge))
+                .and_then(|slots| best_texture(slots, screen_size))
             else {
                 continue;
             };

@@ -36,8 +36,8 @@ pub struct Player<Image> {
 }
 
 pub enum Due<Image> {
-    Show { image: Image, delay: Duration },
-    Wait(Duration),
+    Show { image: Image, next_due: Instant },
+    Wait(Instant),
     Idle,
 }
 
@@ -107,7 +107,7 @@ impl<Image> Player<Image> {
         if let Some(due) = self.next_due
             && now < due
         {
-            return Due::Wait(due - now);
+            return Due::Wait(due);
         }
         if let Some(frame) = self.buffered.pop_front() {
             return self.show(frame, now);
@@ -120,11 +120,12 @@ impl<Image> Player<Image> {
         frame: BufferedFrame<Image>,
         now: Instant,
     ) -> Due<Image> {
-        self.next_due = Some(now + frame.delay);
+        let next_due = now + frame.delay;
+        self.next_due = Some(next_due);
         self.replenish();
         Due::Show {
             image: frame.image,
-            delay: frame.delay,
+            next_due,
         }
     }
 
@@ -161,9 +162,14 @@ mod tests {
         )
     }
 
-    fn shown_delay<Image>(due: &Due<Image>) -> Option<Duration> {
+    fn shown_delay<Image>(
+        due: &Due<Image>,
+        now: Instant,
+    ) -> Option<Duration> {
         match due {
-            Due::Show { delay, .. } => Some(*delay),
+            Due::Show { next_due, .. } => {
+                Some(next_due.saturating_duration_since(now))
+            }
             Due::Wait(_) | Due::Idle => None,
         }
     }
@@ -176,7 +182,7 @@ mod tests {
         let start = Instant::now();
         assert!(player.on_frame(Duration::from_millis(50), 1));
         assert_eq!(
-            shown_delay(&player.tick(start)),
+            shown_delay(&player.tick(start), start),
             Some(Duration::from_millis(50))
         );
         assert!(player.take_next());
@@ -186,8 +192,9 @@ mod tests {
             Due::Wait(_)
         ));
         assert!(player.on_frame(Duration::from_millis(50), 2));
+        let second_due = start + Duration::from_millis(50);
         assert_eq!(
-            shown_delay(&player.tick(start + Duration::from_millis(50))),
+            shown_delay(&player.tick(second_due), second_due),
             Some(Duration::from_millis(50))
         );
         assert!(player.take_next());
@@ -203,10 +210,11 @@ mod tests {
     #[test]
     fn tiny_delays_are_clamped() {
         let mut player = player(1);
+        let start = Instant::now();
         assert!(player.take_next());
         assert!(player.on_frame(Duration::ZERO, 1));
         assert_eq!(
-            shown_delay(&player.tick(Instant::now())),
+            shown_delay(&player.tick(start), start),
             Some(FALLBACK_FRAME_DELAY)
         );
     }
@@ -232,7 +240,7 @@ mod tests {
         assert!(player.on_finished());
 
         assert_eq!(
-            shown_delay(&player.tick(start)),
+            shown_delay(&player.tick(start), start),
             Some(Duration::from_millis(50))
         );
         assert!(matches!(

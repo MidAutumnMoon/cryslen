@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::iter;
+use std::mem;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::path::PathBuf;
@@ -19,6 +20,7 @@ use crate::browse::Request;
 use crate::browse::Role;
 use crate::browse::Roles;
 use crate::browse::Spread;
+use crate::cache;
 use crate::catalog;
 use crate::catalog::PageName;
 use crate::decode;
@@ -33,8 +35,6 @@ use crate::protocol::ValidatedImage;
 use crate::ui::ReadingStatus;
 use crate::ui::StatusLine;
 
-const UPLOAD_BUDGET_COUNT: usize = 16;
-const UPLOAD_BUDGET_BYTES: usize = 8 * 1024 * 1024;
 const FIT_KEEP_SPREADS: usize = 2;
 
 /// Native page dimensions and decoded format, fixed across roles.
@@ -182,12 +182,8 @@ impl Reading {
         self.direction
     }
 
-    pub fn pending_upload_count(&self) -> usize {
-        self.pending_uploads.len()
-    }
-
-    pub fn has_pending_uploads(&self) -> bool {
-        !self.pending_uploads.is_empty()
+    pub fn take_pending_uploads(&mut self) -> VecDeque<PendingUpload> {
+        mem::take(&mut self.pending_uploads)
     }
 
     pub fn sibling(&self, forward: bool) -> Option<PathBuf> {
@@ -418,23 +414,6 @@ impl Reading {
         }
     }
 
-    pub fn pop_upload(
-        &mut self,
-        uploaded_count: usize,
-        uploaded_bytes: usize,
-    ) -> Option<PendingUpload> {
-        let upload_bytes =
-            self.pending_uploads.front()?.image.resident_bytes();
-        let over_budget = uploaded_count >= UPLOAD_BUDGET_COUNT
-            || uploaded_bytes.saturating_add(upload_bytes)
-                > UPLOAD_BUDGET_BYTES;
-        // Upload at least one queued image so an oversized page makes progress.
-        if uploaded_count > 0 && over_budget {
-            return None;
-        }
-        self.pending_uploads.pop_front()
-    }
-
     pub fn record_uploaded(
         &mut self,
         page: usize,
@@ -535,12 +514,23 @@ impl Reading {
         if presentable(target) {
             return Some(target);
         }
-        let (low, high) = shown.map_or((0, usize::MAX), |previous| {
-            (
-                previous.first.min(target.first),
-                previous.first.max(target.first),
-            )
-        });
+        if !skimming {
+            return shown;
+        }
+        let (low, high) = match shown {
+            None => (0, usize::MAX),
+            Some(previous) => {
+                let (low, high) = if forward {
+                    (previous.first, target.first)
+                } else {
+                    (target.first, previous.first)
+                };
+                if low > high {
+                    return shown;
+                }
+                (low, high)
+            }
+        };
         let page_count = self.page_count();
         let mut best: Option<Spread> = None;
         for &page in self.pages.keys() {
@@ -642,6 +632,20 @@ impl Reading {
         browse::spread_for(next_start, mode, page_count)
     }
 
+    fn preupload_spread(&self, mode: ReadingMode) -> Option<Spread> {
+        if self.motion != Motion::Still {
+            return None;
+        }
+        let target = self.target_spread(mode);
+        if self.shown() != Some(target) {
+            return None;
+        }
+        let page_count = self.page_count();
+        let next_start =
+            browse::step(target.first, self.direction, mode, page_count)?;
+        Some(browse::spread_for(next_start, mode, page_count))
+    }
+
     fn request_roles(
         &self,
         demand: Spread,
@@ -653,7 +657,11 @@ impl Reading {
     ) -> Vec<Request> {
         let still = self.motion == Motion::Still;
         let mut requests = Vec::new();
-        for spread in [demand, on_screen] {
+        for spread in
+            [Some(demand), Some(on_screen), self.preupload_spread(mode)]
+                .into_iter()
+                .flatten()
+        {
             for page in spread.seats(mode).into_iter().flatten() {
                 let state = self.pages.get(&page);
                 if state
@@ -702,7 +710,6 @@ impl Reading {
                     ?target,
                     ?shown,
                     ?waited,
-                    pending_uploads = self.pending_uploads.len(),
                     "holding for a fit image"
                 );
             }
@@ -809,9 +816,10 @@ impl Reading {
             Role,
             &ValidatedImage,
         ) -> Result<(), TextureFault>,
-    ) -> (Option<Duration>, Vec<PlaybackCommand>) {
-        let mut deadline: Option<Duration> = None;
+    ) -> PlaybackTick {
+        let mut next_deadline: Option<Instant> = None;
         let mut commands = Vec::new();
+        let mut updated = false;
         for (&page, state) in &mut self.pages {
             let Some(PagePlayback::Playing(player)) = &mut state.playback
             else {
@@ -820,7 +828,7 @@ impl Reading {
             let id = player.id();
             let role = player.role();
             match player.tick(now) {
-                Due::Show { image, delay } => {
+                Due::Show { image, next_due } => {
                     if let Err(error) = upload(page, role, &image) {
                         tracing::warn!(
                             page,
@@ -836,13 +844,16 @@ impl Reading {
                     tracing::debug!(
                         page,
                         ?role,
-                        ?delay,
+                        delay = ?next_due.saturating_duration_since(now),
                         "playback frame shown"
                     );
-                    deadline = Some(min_deadline(deadline, delay));
+                    updated = true;
+                    next_deadline =
+                        Some(min_deadline(next_deadline, next_due));
                 }
-                Due::Wait(delay) => {
-                    deadline = Some(min_deadline(deadline, delay));
+                Due::Wait(next_due) => {
+                    next_deadline =
+                        Some(min_deadline(next_deadline, next_due));
                 }
                 Due::Idle => {}
             }
@@ -850,7 +861,30 @@ impl Reading {
                 commands.push(PlaybackCommand::Next { id });
             }
         }
-        (deadline, commands)
+        PlaybackTick {
+            next_deadline,
+            commands,
+            updated,
+        }
+    }
+
+    pub fn is_waiting(
+        &self,
+        on_screen: Spread,
+        has_texture: impl Fn(usize) -> bool,
+    ) -> bool {
+        iter::once(on_screen.first)
+            .chain(on_screen.second)
+            .all(|page| {
+                let state = self.pages.get(&page);
+                let decoded = state
+                    .and_then(|page_state| page_state.info)
+                    .is_some_and(|_| has_texture(page));
+                let faulted = state
+                    .and_then(|page_state| page_state.fault.as_deref())
+                    .is_some();
+                !decoded && !faulted
+            })
     }
 
     pub fn status_line<'fault>(
@@ -861,8 +895,6 @@ impl Reading {
         book_fault: Option<&'fault str>,
         has_texture: impl Fn(usize) -> bool,
     ) -> StatusLine<'fault> {
-        let mut has_decoded = false;
-        let mut has_fault = false;
         let mut failure: Option<(usize, &'fault str)> = None;
         let mut first_decoded: Option<(usize, PageInfo)> = None;
         for page in iter::once(on_screen.first).chain(on_screen.second) {
@@ -872,8 +904,6 @@ impl Reading {
                 .filter(|_| has_texture(page));
             let fault =
                 state.and_then(|page_state| page_state.fault.as_deref());
-            has_decoded |= info.is_some();
-            has_fault |= fault.is_some();
             if failure.is_some() {
                 continue;
             }
@@ -913,10 +943,17 @@ impl Reading {
             mode,
             toast: false,
             name: self.page_name(named_page),
-            waiting: !has_decoded && !has_fault,
+            waiting: failure.is_none() && first_decoded.is_none(),
             fault: page_fault.or(book_fault),
         }
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct PlaybackTick {
+    pub next_deadline: Option<Instant>,
+    pub commands: Vec<PlaybackCommand>,
+    pub updated: bool,
 }
 
 fn cold_requests(spread: Spread, mode: ReadingMode) -> Vec<Request> {
@@ -938,8 +975,8 @@ fn push_request(requests: &mut Vec<Request>, page: usize, role: Role) {
     }
 }
 
-fn min_deadline(deadline: Option<Duration>, delay: Duration) -> Duration {
-    deadline.map_or(delay, |current| current.min(delay))
+fn min_deadline(deadline: Option<Instant>, next_due: Instant) -> Instant {
+    deadline.map_or(next_due, |current| current.min(next_due))
 }
 
 fn full_wanted(
@@ -949,11 +986,14 @@ fn full_wanted(
 ) -> bool {
     const ROUNDING_MARGIN_PX: f64 = 1.0;
 
-    let page_edge = page_dims.0.max(page_dims.1);
-    let full_edge = page_edge.min(limits.max_texture_edge());
-    full_edge > limits.fit_edge()
-        && scale * f64::from(page_edge)
-            > f64::from(limits.fit_edge()) + ROUNDING_MARGIN_PX
+    let fit = cache::fit_dims(page_dims, limits.fit_box());
+    let max_edge = limits.max_texture_edge();
+    let full = cache::fit_dims(page_dims, (max_edge, max_edge));
+    full != fit
+        && (scale * f64::from(page_dims.0)
+            > f64::from(fit.0) + ROUNDING_MARGIN_PX
+            || scale * f64::from(page_dims.1)
+                > f64::from(fit.1) + ROUNDING_MARGIN_PX)
 }
 
 #[cfg(test)]
@@ -968,9 +1008,9 @@ mod tests {
     use crate::protocol::WireImage;
 
     fn test_limits() -> ImageLimits {
-        const FIT_EDGE: u32 = 2560;
+        const FIT_BOX: (u32, u32) = (2560, 1440);
         const MAX_TEXTURE_EDGE: u32 = 16_384;
-        ImageLimits::new(FIT_EDGE, MAX_TEXTURE_EDGE)
+        ImageLimits::new(FIT_BOX, MAX_TEXTURE_EDGE)
     }
 
     fn roles_with(role: Role) -> Roles {
@@ -1044,55 +1084,17 @@ mod tests {
         }
     }
 
-    struct FakeTextures {
-        roles: BTreeMap<usize, Roles>,
+    fn check_texture_edge(
+        image: &ValidatedImage,
         max_edge: u32,
-    }
-
-    impl FakeTextures {
-        fn new(max_edge: u32) -> Self {
-            Self {
-                roles: BTreeMap::new(),
+    ) -> Result<(), TextureFault> {
+        if image.meta.width > max_edge || image.meta.height > max_edge {
+            return Err(TextureFault {
+                dims: (image.meta.width, image.meta.height),
                 max_edge,
-            }
+            });
         }
-
-        fn check_edge(
-            &self,
-            image: &ValidatedImage,
-        ) -> Result<(), TextureFault> {
-            if image.meta.width > self.max_edge
-                || image.meta.height > self.max_edge
-            {
-                return Err(TextureFault {
-                    dims: (image.meta.width, image.meta.height),
-                    max_edge: self.max_edge,
-                });
-            }
-            Ok(())
-        }
-
-        fn insert(
-            &mut self,
-            page: usize,
-            role: Role,
-            image: &ValidatedImage,
-        ) -> Result<(), TextureFault> {
-            self.check_edge(image)?;
-            self.roles.entry(page).or_default().set(role);
-            Ok(())
-        }
-
-        fn update(
-            &self,
-            image: &ValidatedImage,
-        ) -> Result<(), TextureFault> {
-            self.check_edge(image)
-        }
-
-        fn roles(&self, page: usize) -> Roles {
-            self.roles.get(&page).copied().unwrap_or_default()
-        }
+        Ok(())
     }
 
     #[test]
@@ -1100,15 +1102,22 @@ mod tests {
         let limits = test_limits();
         assert!(!full_wanted(16.0, (1920, 1080), limits));
         assert!(!full_wanted(16.0, (2560, 1440), limits));
+        let portrait = (3628, 5148);
+        assert!(!full_wanted(1440.0 / 5148.0, portrait, limits));
+        assert!(full_wanted(0.4, portrait, limits));
         let four_k = (3840, 2160);
         assert!(!full_wanted(0.66, four_k, limits));
         assert!(full_wanted(0.67, four_k, limits));
-        // Fractional Wayland scales can push fit rendering a sub-pixel past fit_edge.
-        assert!(!full_wanted(2560.5 / 5000.0, (5000, 3000), limits));
+        // Fractional Wayland scales can push fit rendering a sub-pixel past fit_box.
+        assert!(!full_wanted(1440.5 / 3000.0, (5000, 3000), limits));
         let ten_k = (10080, 5640);
         assert!(!full_wanted(0.25, ten_k, limits));
         assert!(full_wanted(0.26, ten_k, limits));
-        assert!(!full_wanted(16.0, ten_k, ImageLimits::new(2560, 2560)));
+        assert!(!full_wanted(
+            16.0,
+            ten_k,
+            ImageLimits::new((2560, 1440), 2560)
+        ));
         // Dimensions above f32's exact-integer limit (2^24) keep sub-pixel precision.
         let wide_strip = (20_000_001, 1);
         assert!(!full_wanted(2560.5 / 20_000_001.0, wide_strip, limits));
@@ -1243,6 +1252,23 @@ mod tests {
         reading.target = 5;
         reading.shown = None;
         assert_eq!(reading.choose_presented(mode, roles(&[])), None);
+
+        // Skimming across a wrap holds the shown spread until target lands.
+        reading.target = 0;
+        reading.shown = Some((mode, lone(4)));
+        assert_eq!(
+            reading.choose_presented(mode, roles(&[2, 4])),
+            Some(lone(4))
+        );
+
+        // Still mode holds the shown spread on jumps until target lands.
+        reading.motion = Motion::Still;
+        reading.target = 9;
+        reading.shown = Some((mode, lone(0)));
+        assert_eq!(
+            reading.choose_presented(mode, roles(&[0, 4])),
+            Some(lone(0))
+        );
     }
 
     #[test]
@@ -1568,130 +1594,37 @@ mod tests {
     }
 
     #[test]
-    fn drain_uploads_enforces_budget_and_fault_rules() {
-        const LARGE_MAX_EDGE: u32 = 4096;
-        const OVER_HALF_BUDGET_WIDTH: u32 = 1200;
-        const OVER_HALF_BUDGET_HEIGHT: u32 = 1100;
-        const SMALL_MAX_EDGE: u32 = 100;
-        const FITTING_EDGE: u32 = 50;
-        const OVERSIZED_EDGE: u32 = 200;
-
-        let drain_into =
-            |reading: &mut Reading, textures: &mut FakeTextures| {
-                let mut uploaded_count = 0_usize;
-                let mut uploaded_bytes = 0_usize;
-                while let Some(upload) =
-                    reading.pop_upload(uploaded_count, uploaded_bytes)
-                {
-                    let image_bytes = upload.image.resident_bytes();
-                    match textures.insert(
-                        upload.page,
-                        upload.role,
-                        &upload.image,
-                    ) {
-                        Ok(()) => {
-                            reading.record_uploaded(
-                                upload.page,
-                                &upload.image,
-                            );
-                            uploaded_count += 1;
-                            uploaded_bytes =
-                                uploaded_bytes.saturating_add(image_bytes);
-                        }
-                        Err(fault) => {
-                            let has_settled_image = textures
-                                .roles(upload.page)
-                                .has_settled_image();
-                            reading.record_upload_refused(
-                                upload.page,
-                                upload.role,
-                                has_settled_image,
-                                fault,
-                            );
-                        }
-                    }
-                }
-                reading.has_pending_uploads()
-            };
-
+    fn refused_upload_faults_only_unsettled_non_thumb_roles() {
+        let fault = || TextureFault {
+            dims: (200, 200),
+            max_edge: 100,
+        };
         let (mut reading, _) =
-            reading_with_pages(10, None, ReadingMode::Normal);
-        for event in [
-            ready_event(
-                0,
-                Role::Fit,
-                OVER_HALF_BUDGET_WIDTH,
-                OVER_HALF_BUDGET_HEIGHT,
-                Format::Png,
-            ),
-            ready_event(
-                1,
-                Role::Fit,
-                OVER_HALF_BUDGET_WIDTH,
-                OVER_HALF_BUDGET_HEIGHT,
-                Format::Png,
-            ),
-        ] {
-            assert_eq!(reading.apply_event(event), None);
-        }
-        let mut textures = FakeTextures::new(LARGE_MAX_EDGE);
-        assert!(drain_into(&mut reading, &mut textures));
+            reading_with_pages(4, None, ReadingMode::Normal);
+
+        reading.record_upload_refused(0, Role::Thumb, false, fault());
         assert!(
-            reading.pages.get(&0).and_then(|state| state.info).is_some()
-        );
-        assert!(!reading.pages.contains_key(&1));
-        assert!(!drain_into(&mut reading, &mut textures));
-        assert!(
-            reading.pages.get(&1).and_then(|state| state.info).is_some()
+            reading
+                .pages
+                .get(&0)
+                .is_none_or(|state| state.fault.is_none())
         );
 
-        let mut capped_textures = FakeTextures::new(SMALL_MAX_EDGE);
-        for event in [
-            ready_event(
-                2,
-                Role::Thumb,
-                OVERSIZED_EDGE,
-                OVERSIZED_EDGE,
-                Format::Png,
-            ),
-            ready_event(
-                2,
-                Role::Fit,
-                OVERSIZED_EDGE,
-                OVERSIZED_EDGE,
-                Format::Png,
-            ),
-            ready_event(
-                3,
-                Role::Fit,
-                FITTING_EDGE,
-                FITTING_EDGE,
-                Format::Png,
-            ),
-            ready_event(
-                3,
-                Role::Full,
-                OVERSIZED_EDGE,
-                OVERSIZED_EDGE,
-                Format::Png,
-            ),
-        ] {
-            assert_eq!(reading.apply_event(event), None);
-        }
-        assert!(!drain_into(&mut reading, &mut capped_textures));
-        let faulted_state =
-            reading.pages.get(&2).expect("faulted page state");
-        assert!(faulted_state.info.is_none());
+        reading.record_upload_refused(0, Role::Fit, false, fault());
         assert!(
-            faulted_state.fault.is_some(),
-            "refused Fit without settled image faults"
+            reading
+                .pages
+                .get(&0)
+                .and_then(|state| state.fault.as_ref())
+                .is_some()
         );
-        let settled_state =
-            reading.pages.get(&3).expect("settled page state");
-        assert!(settled_state.info.is_some());
+
+        reading.record_upload_refused(1, Role::Full, true, fault());
         assert!(
-            settled_state.fault.is_none(),
-            "refused Full stays fault-free when Fit is settled"
+            reading
+                .pages
+                .get(&1)
+                .is_none_or(|state| state.fault.is_none())
         );
     }
 
@@ -1734,7 +1667,6 @@ mod tests {
 
         let mode = ReadingMode::Normal;
         let (mut reading, _) = reading_with_pages(5, None, mode);
-        let mut textures = FakeTextures::new(MAX_EDGE);
         for page in [0, 1, 2] {
             let event = ready_event(
                 page,
@@ -1745,10 +1677,7 @@ mod tests {
             );
             assert_eq!(reading.apply_event(event), None);
         }
-        while let Some(upload) = reading.pop_upload(0, 0) {
-            textures
-                .insert(upload.page, upload.role, &upload.image)
-                .expect("small gif uploads");
+        for upload in reading.take_pending_uploads() {
             reading.record_uploaded(upload.page, &upload.image);
         }
 
@@ -1778,9 +1707,16 @@ mod tests {
 
         let now = Instant::now();
         assert_eq!(
-            reading
-                .tick_playback(now, |_, _, image| textures.update(image)),
-            (None, vec![PlaybackCommand::Next { id: full_playback }])
+            reading.tick_playback(now, |_, _, image| {
+                check_texture_edge(image, MAX_EDGE)
+            }),
+            PlaybackTick {
+                next_deadline: None,
+                commands: vec![PlaybackCommand::Next {
+                    id: full_playback
+                }],
+                updated: false,
+            }
         );
 
         assert_eq!(
@@ -1792,12 +1728,16 @@ mod tests {
             None
         );
         assert_eq!(
-            reading
-                .tick_playback(now, |_, _, image| textures.update(image)),
-            (
-                Some(FRAME_DELAY),
-                vec![PlaybackCommand::Next { id: full_playback }]
-            )
+            reading.tick_playback(now, |_, _, image| {
+                check_texture_edge(image, MAX_EDGE)
+            }),
+            PlaybackTick {
+                next_deadline: Some(now + FRAME_DELAY),
+                commands: vec![PlaybackCommand::Next {
+                    id: full_playback
+                }],
+                updated: true,
+            }
         );
         assert_eq!(
             reading.apply_event(BookEvent::Playback(
@@ -1858,14 +1798,16 @@ mod tests {
             }]
         );
         assert_eq!(
-            reading
-                .tick_playback(now, |_, _, image| textures.update(image)),
-            (
-                None,
-                vec![PlaybackCommand::Next {
+            reading.tick_playback(now, |_, _, image| {
+                check_texture_edge(image, MAX_EDGE)
+            }),
+            PlaybackTick {
+                next_deadline: None,
+                commands: vec![PlaybackCommand::Next {
                     id: oversized_playback
-                }]
-            )
+                }],
+                updated: false,
+            }
         );
         assert_eq!(
             reading.apply_event(frame_event(
@@ -1875,20 +1817,81 @@ mod tests {
             None
         );
         assert_eq!(
-            reading
-                .tick_playback(now, |_, _, image| textures.update(image)),
-            (
-                None,
-                vec![PlaybackCommand::Stop {
+            reading.tick_playback(now, |_, _, image| {
+                check_texture_edge(image, MAX_EDGE)
+            }),
+            PlaybackTick {
+                next_deadline: None,
+                commands: vec![PlaybackCommand::Stop {
                     id: oversized_playback
-                }]
-            )
+                }],
+                updated: false,
+            }
         );
         assert_eq!(
             reading.sync_playback(mode, Spread::lone(2), |_| {
                 roles_with(Role::Fit)
             }),
             []
+        );
+    }
+
+    #[test]
+    fn still_shown_spread_preuploads_next_spread_without_wrapping() {
+        let mode = ReadingMode::Normal;
+        let (mut reading, _) = reading_with_pages(6, None, mode);
+        let roles = |ready: usize| {
+            move |page: usize| {
+                if page == ready {
+                    roles_with(Role::Fit)
+                } else {
+                    Roles::default()
+                }
+            }
+        };
+
+        reading.shown = Some((mode, Spread::lone(0)));
+        assert!(reading.turn(Direction::Forward, mode, Instant::now()));
+        assert_eq!(
+            reading.update_requests(
+                mode,
+                Spread::lone(0),
+                None,
+                test_limits(),
+                roles(0),
+            ),
+            Some(vec![Request {
+                page: 1,
+                role: Role::Fit
+            }])
+        );
+
+        reading.shown = Some((mode, Spread::lone(1)));
+        assert_eq!(
+            reading.update_requests(
+                mode,
+                Spread::lone(1),
+                None,
+                test_limits(),
+                roles(1),
+            ),
+            Some(vec![Request {
+                page: 2,
+                role: Role::Fit
+            }])
+        );
+
+        reading.target = 5;
+        reading.shown = Some((mode, Spread::lone(5)));
+        assert_eq!(
+            reading.update_requests(
+                mode,
+                Spread::lone(5),
+                None,
+                test_limits(),
+                roles(5),
+            ),
+            Some(Vec::new())
         );
     }
 }

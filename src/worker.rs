@@ -56,7 +56,7 @@ use crate::protocol::WireImage;
 use crate::source;
 use crate::source::Source;
 
-const IDLE_PRELOAD: Duration = Duration::from_millis(300);
+const IDLE_PRELOAD: Duration = Duration::from_millis(1500);
 
 const PREFETCH_AHEAD_PAGES: usize = 64;
 const PREFETCH_BEHIND_PAGES: usize = 16;
@@ -68,19 +68,12 @@ const MEMORY_CACHE_CAP_BYTES: usize = 192 * 1024 * 1024;
 const DEFAULT_CPU_THREADS: usize = 2;
 const MIN_WORKERS: usize = 2;
 const MAX_WORKERS: usize = 6;
-const RESERVED_FOREGROUND_WORKERS: usize = 2;
-const MIN_PREFETCH_WORKERS: usize = 1;
-const MAX_PREFETCH_WORKERS: usize = 2;
+const MAX_PREFETCH_WORKERS: usize = 1;
+const PREFETCH_THREAD_DIVISOR: usize = 4;
 
 fn available_parallelism() -> usize {
     thread::available_parallelism()
         .map_or(DEFAULT_CPU_THREADS, NonZeroUsize::get)
-}
-
-fn max_prefetch_workers(workers: usize) -> usize {
-    workers
-        .saturating_sub(RESERVED_FOREGROUND_WORKERS)
-        .clamp(MIN_PREFETCH_WORKERS, MAX_PREFETCH_WORKERS)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -220,19 +213,8 @@ fn walk_spreads(
 ) -> Vec<Spread> {
     let mut spreads = Vec::new();
     let mut current = start;
-    loop {
-        let next = browse::advance(current, direction, mode, len);
-        let forward = direction == Direction::Forward;
-        let wrapped = if forward {
-            next <= current
-        } else {
-            next >= current
-        };
-        if wrapped {
-            break;
-        }
-        let distance = if forward { next - start } else { start - next };
-        if distance > limit {
+    while let Some(next) = browse::step(current, direction, mode, len) {
+        if next.abs_diff(start) > limit {
             break;
         }
         spreads.push(browse::spread_for(next, mode, len));
@@ -594,12 +576,12 @@ impl Shared {
             ParentMsg::SetLimits(limits) => {
                 match self.limits.set(limits) {
                     Ok(()) => tracing::debug!(
-                        fit_edge = limits.fit_edge(),
+                        fit_box = ?limits.fit_box(),
                         max_texture_edge = limits.max_texture_edge(),
                         "limits set"
                     ),
                     Err(existing) => tracing::debug!(
-                        fit_edge = existing.fit_edge(),
+                        fit_box = ?existing.fit_box(),
                         max_texture_edge = existing.max_texture_edge(),
                         "ignoring duplicate limits"
                     ),
@@ -674,11 +656,7 @@ impl Shared {
         clippy::significant_drop_tightening,
         reason = "condvar wait loop holds the mutex guard across iterations"
     )]
-    fn next_job(
-        &self,
-        source: &Source,
-        max_prefetch: usize,
-    ) -> Option<PageJob> {
+    fn next_job(&self, source: &Source) -> Option<PageJob> {
         let mut state = self.state.lock();
         loop {
             if state.stopped {
@@ -695,7 +673,7 @@ impl Shared {
                 self.wake.wait(&mut state);
                 continue;
             }
-            if state.in_flight_prefetch() >= max_prefetch {
+            if state.in_flight_prefetch() >= MAX_PREFETCH_WORKERS {
                 self.wake.wait(&mut state);
                 continue;
             }
@@ -772,7 +750,7 @@ impl Shared {
 
     fn load_stored(&self, hash: u128, role: Role) -> Option<Decoded> {
         let limits = self.limits()?;
-        let image = self.store.load(hash, role, limits.fit_edge())?;
+        let image = self.store.load(hash, role, limits.fit_box())?;
         self.state.lock().mark_stored(hash, role);
         Some(image)
     }
@@ -790,8 +768,7 @@ impl Shared {
         let Some(limits) = self.limits() else {
             return;
         };
-        let evicted =
-            self.store.save(hash, role, image, limits.fit_edge());
+        let evicted = self.store.save(hash, role, image, limits.fit_box());
         if evicted.is_none() {
             tracing::debug!(page, ?role, "preview not persisted");
         }
@@ -1289,14 +1266,10 @@ impl PlaybackRunner {
     }
 }
 
-fn worker_loop(
-    source: &Source,
-    shared: &Shared,
-    max_prefetch: usize,
-    cpu_threads: usize,
-) {
-    let prefetch_threads = cpu_threads.div_ceil(max_prefetch);
-    while let Some(job) = shared.next_job(source, max_prefetch) {
+fn worker_loop(source: &Source, shared: &Shared, cpu_threads: usize) {
+    let prefetch_threads =
+        cpu_threads.div_ceil(PREFETCH_THREAD_DIVISOR).max(1);
+    while let Some(job) = shared.next_job(source) {
         let _guard = InFlightGuard {
             shared,
             page: job.page,
@@ -1326,7 +1299,6 @@ fn run(
 ) {
     let cpu_threads = available_parallelism();
     let workers = cpu_threads.clamp(MIN_WORKERS, MAX_WORKERS);
-    let max_prefetch = max_prefetch_workers(workers);
     let shared = Arc::new(Shared::new(source.len(), store, to_parent));
     let wake_shared = Arc::clone(&shared);
     let _ready_guard = source.on_ready(move || wake_shared.wake_all());
@@ -1338,7 +1310,7 @@ fn run(
             let spawned = thread::Builder::new()
                 .name(format!("cy-worker-{index}"))
                 .spawn_scoped(scope, || {
-                    worker_loop(source, shared, max_prefetch, cpu_threads);
+                    worker_loop(source, shared, cpu_threads);
                 });
             if let Err(error) = spawned {
                 tracing::warn!(
@@ -1499,14 +1471,14 @@ mod tests {
     use crate::testkit;
 
     /// Page edge for the tests that check derived and full dimensions:
-    /// larger than the thumb edge, smaller than the fit edge, so the
+    /// larger than the thumb edge, smaller than the fit box, so the
     /// thumb is scaled and the fit image is the page itself.
     const BIG: u32 = 1400;
-    const TEST_FIT_EDGE: u32 = 2560;
+    const TEST_FIT_BOX: (u32, u32) = (2560, 1440);
 
     fn test_limits() -> ImageLimits {
         const MAX_TEXTURE_EDGE: u32 = 16_384;
-        ImageLimits::new(TEST_FIT_EDGE, MAX_TEXTURE_EDGE)
+        ImageLimits::new(TEST_FIT_BOX, MAX_TEXTURE_EDGE)
     }
 
     struct TestWorker {
@@ -1868,9 +1840,9 @@ mod tests {
         );
         assert_eq!(long_edge(&thumb), THUMB_EDGE);
         assert_eq!(
-            long_edge(&view),
-            TEST_FIT_EDGE.min(BIG),
-            "the fit image's long edge matches the target edge"
+            (view.meta.width, view.meta.height),
+            (BIG, BIG),
+            "the fit image stays unscaled inside the target box"
         );
         // `publish` runs before `persist`; join the worker so both files
         // finish persisting before inspecting the store.
@@ -1879,11 +1851,11 @@ mod tests {
         let store = Store::at(root.path());
         let hash = page_hash(&source, 0);
         assert!(
-            store.load(hash, Role::Thumb, TEST_FIT_EDGE).is_some(),
+            store.load(hash, Role::Thumb, TEST_FIT_BOX).is_some(),
             "the thumb was not persisted"
         );
         assert!(
-            store.load(hash, Role::Fit, TEST_FIT_EDGE).is_some(),
+            store.load(hash, Role::Fit, TEST_FIT_BOX).is_some(),
             "the fit image was not persisted"
         );
     }
@@ -1910,7 +1882,7 @@ mod tests {
                         .load(
                             page_hash(&source, page),
                             Role::Thumb,
-                            TEST_FIT_EDGE,
+                            TEST_FIT_BOX,
                         )
                         .is_some()
                         .then_some(())
@@ -1925,7 +1897,7 @@ mod tests {
                 .load(
                     page_hash(&source, PREFETCH_HEAD_SPREADS),
                     Role::Thumb,
-                    TEST_FIT_EDGE,
+                    TEST_FIT_BOX,
                 )
                 .is_some()
                 .then_some(())
@@ -1970,11 +1942,7 @@ mod tests {
             "the failure stalled the prefetch",
             || {
                 store
-                    .load(
-                        page_hash(&source, 4),
-                        Role::Thumb,
-                        TEST_FIT_EDGE,
-                    )
+                    .load(page_hash(&source, 4), Role::Thumb, TEST_FIT_BOX)
                     .is_some()
                     .then_some(())
             },
@@ -2004,7 +1972,7 @@ mod tests {
             "the prefetch never produced the head fit image",
             || {
                 store
-                    .load(page_hash(&source, 0), Role::Fit, TEST_FIT_EDGE)
+                    .load(page_hash(&source, 0), Role::Fit, TEST_FIT_BOX)
                     .is_some()
                     .then_some(())
             },
@@ -2181,20 +2149,20 @@ mod tests {
         );
         assert_eq!(long_edge(&thumb), THUMB_EDGE);
         assert_eq!(
-            long_edge(&view),
-            TEST_FIT_EDGE.min(BIG),
-            "the fit image's long edge matches the target edge"
+            (view.meta.width, view.meta.height),
+            (BIG, BIG),
+            "the fit image stays unscaled inside the target box"
         );
         drop(worker);
 
         let hash = page_hash(&source, 0);
         let store = Store::at(store_root);
         assert!(
-            store.load(hash, Role::Thumb, TEST_FIT_EDGE).is_some(),
+            store.load(hash, Role::Thumb, TEST_FIT_BOX).is_some(),
             "the thumb was not persisted"
         );
         assert!(
-            store.load(hash, Role::Fit, TEST_FIT_EDGE).is_some(),
+            store.load(hash, Role::Fit, TEST_FIT_BOX).is_some(),
             "the fit image was not persisted"
         );
 
@@ -2208,12 +2176,12 @@ mod tests {
         .expect("sentinel decodes");
         assert!(
             store
-                .save(hash, Role::Thumb, &sentinel, TEST_FIT_EDGE)
+                .save(hash, Role::Thumb, &sentinel, TEST_FIT_BOX)
                 .is_some()
         );
         assert!(
             store
-                .save(hash, Role::Fit, &sentinel, TEST_FIT_EDGE)
+                .save(hash, Role::Fit, &sentinel, TEST_FIT_BOX)
                 .is_some()
         );
         drop(store);
@@ -2248,7 +2216,7 @@ mod tests {
 
         // Loading leaves the roles it read unchanged.
         let kept = Store::at(store_root)
-            .load(hash, Role::Fit, TEST_FIT_EDGE)
+            .load(hash, Role::Fit, TEST_FIT_BOX)
             .expect("the sentinel fit stays");
         assert_eq!((kept.width(), kept.height()), (7, 7));
     }
@@ -2278,13 +2246,13 @@ mod tests {
             "warmed fit and thumb never persisted",
             || {
                 (store
-                    .load(requested_hash, Role::Fit, TEST_FIT_EDGE)
+                    .load(requested_hash, Role::Fit, TEST_FIT_BOX)
                     .is_some()
                     && store
-                        .load(requested_hash, Role::Thumb, TEST_FIT_EDGE)
+                        .load(requested_hash, Role::Thumb, TEST_FIT_BOX)
                         .is_some()
                     && store
-                        .load(prefetched_hash, Role::Fit, TEST_FIT_EDGE)
+                        .load(prefetched_hash, Role::Fit, TEST_FIT_BOX)
                         .is_some())
                 .then_some(())
             },
@@ -2334,7 +2302,7 @@ mod tests {
         let store = Store::at(root.path());
         assert!(
             store
-                .save(hash, Role::Fit, &landscape_fit, TEST_FIT_EDGE)
+                .save(hash, Role::Fit, &landscape_fit, TEST_FIT_BOX)
                 .is_some()
         );
         drop(store);
@@ -2357,7 +2325,7 @@ mod tests {
 
     #[test]
     fn fit_and_full_requested_together_serve_both() {
-        const PAGE_WIDTH: u32 = TEST_FIT_EDGE + 40;
+        const PAGE_WIDTH: u32 = TEST_FIT_BOX.0 + 40;
         const PAGE_HEIGHT: u32 = 16;
 
         let dir = TempDir::new().expect("create temp dir");
@@ -2393,7 +2361,7 @@ mod tests {
         });
         assert_eq!(
             (fit.meta.width, fit.meta.height),
-            (TEST_FIT_EDGE, PAGE_HEIGHT)
+            (TEST_FIT_BOX.0, PAGE_HEIGHT)
         );
         assert_eq!(
             (full.meta.width, full.meta.height),

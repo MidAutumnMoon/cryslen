@@ -59,11 +59,17 @@ use crate::protocol::TextureFault;
 pub const THUMB_CAP_BYTES: u64 = 512 * 1024 * 1024;
 pub const FIT_CAP_BYTES: u64 = 3 * 512 * 1024 * 1024;
 
-fn derivation(role: Role, limits: ImageLimits) -> (u32, FilterType) {
+fn derivation(
+    role: Role,
+    limits: ImageLimits,
+) -> ((u32, u32), FilterType) {
     match role {
-        Role::Thumb => (THUMB_EDGE, FilterType::Box),
-        Role::Fit => (limits.fit_edge(), FilterType::Lanczos3),
-        Role::Full => (limits.max_texture_edge(), FilterType::Lanczos3),
+        Role::Thumb => ((THUMB_EDGE, THUMB_EDGE), FilterType::Box),
+        Role::Fit => (limits.fit_box(), FilterType::Lanczos3),
+        Role::Full => {
+            let max_edge = limits.max_texture_edge();
+            ((max_edge, max_edge), FilterType::Lanczos3)
+        }
     }
 }
 
@@ -72,16 +78,16 @@ pub fn content_hash(bytes: &[u8]) -> u128 {
     xxh3_128(bytes)
 }
 
-/// Downsample to the role's long edge; borrows `page` unchanged when it
-/// fits or resampling fails within `max_texture_edge`, and returns
+/// Downsample to the role's bounding box; borrows `page` unchanged when
+/// it fits or resampling fails within `max_texture_edge`, and returns
 /// `TextureFault` past `max_texture_edge`.
 pub fn derive(
     page: &Decoded,
     role: Role,
     limits: ImageLimits,
 ) -> Result<Cow<'_, Decoded>, TextureFault> {
-    let (edge, filter) = derivation(role, limits);
-    let error = match derive_to_edge(page, edge, filter) {
+    let (bounds, filter) = derivation(role, limits);
+    let error = match derive_to_box(page, bounds, filter) {
         Ok(derived) => return Ok(derived),
         Err(error) => error,
     };
@@ -100,14 +106,14 @@ pub fn derive(
     Err(TextureFault { dims, max_edge })
 }
 
-fn derive_to_edge(
+fn derive_to_box(
     page: &Decoded,
-    edge: u32,
+    bounds: (u32, u32),
     filter: FilterType,
 ) -> eros::Result<Cow<'_, Decoded>> {
     let page_dims = page.page_dims();
     let dims = (page.width(), page.height());
-    let target = fit_dims(dims, edge);
+    let target = fit_dims(dims, bounds);
     if target == dims {
         return Ok(Cow::Borrowed(page));
     }
@@ -117,19 +123,27 @@ fn derive_to_edge(
 
 #[expect(
     clippy::integer_division,
-    reason = "edge scaling is integer pixel arithmetic"
+    reason = "box scaling is integer pixel arithmetic"
 )]
-fn fit_dims(dims: (u32, u32), edge: u32) -> (u32, u32) {
+pub fn fit_dims(dims: (u32, u32), bounds: (u32, u32)) -> (u32, u32) {
     let (width, height) = (u64::from(dims.0), u64::from(dims.1));
-    let long_edge = width.max(height);
-    if long_edge <= u64::from(edge) {
+    let (max_width, max_height) =
+        (u64::from(bounds.0), u64::from(bounds.1));
+    if width <= max_width && height <= max_height {
         return dims;
     }
-    let scaled = |axis: u64| {
-        let rounded = (axis * u64::from(edge) + long_edge / 2) / long_edge;
-        u32::try_from(rounded.max(1)).unwrap_or(u32::MAX)
-    };
-    (scaled(width), scaled(height))
+    if width * max_height >= height * max_width {
+        let scaled_height = (height * max_width + width / 2) / width;
+        let target_height =
+            u32::try_from(scaled_height.clamp(1, max_height))
+                .unwrap_or(bounds.1);
+        (bounds.0, target_height)
+    } else {
+        let scaled_width = (width * max_height + height / 2) / height;
+        let target_width = u32::try_from(scaled_width.clamp(1, max_width))
+            .unwrap_or(bounds.0);
+        (target_width, bounds.1)
+    }
 }
 
 fn resample_page(
@@ -321,28 +335,28 @@ impl Store {
     }
 
     /// Load `hash`, or `None` when absent, damaged, or cached for another
-    /// target edge; a hit refreshes the entry's mtime for LRU.
+    /// target box; a hit refreshes the entry's mtime for LRU.
     pub fn load(
         &self,
         hash: u128,
         role: Role,
-        fit_edge: u32,
+        fit_box: (u32, u32),
     ) -> Option<Decoded> {
         let started = Instant::now();
-        let loaded = self.role_target(role, fit_edge).and_then(
-            |(namespace, edge)| {
-                let file = File::open(namespace.path(hash)).ok()?;
-                #[expect(
-                    clippy::let_underscore_must_use,
-                    clippy::let_underscore_untyped,
-                    reason = "the recency touch is advisory; its failure changes nothing"
-                )]
-                let _ = file.set_times(
-                    FileTimes::new().set_modified(SystemTime::now()),
-                );
-                read_stored(file, edge)
-            },
-        );
+        let loaded =
+            self.role_target(role, fit_box)
+                .and_then(|(namespace, bounds)| {
+                    let file = File::open(namespace.path(hash)).ok()?;
+                    #[expect(
+                        clippy::let_underscore_must_use,
+                        clippy::let_underscore_untyped,
+                        reason = "the recency touch is advisory; its failure changes nothing"
+                    )]
+                    let _ = file.set_times(
+                        FileTimes::new().set_modified(SystemTime::now()),
+                    );
+                    read_stored(file, bounds)
+                });
         tracing::debug!(
             ?role,
             hit = loaded.is_some(),
@@ -358,12 +372,12 @@ impl Store {
         hash: u128,
         role: Role,
         page: &Decoded,
-        fit_edge: u32,
+        fit_box: (u32, u32),
     ) -> Option<Vec<u128>> {
-        let (namespace, edge) = self.role_target(role, fit_edge)?;
+        let (namespace, bounds) = self.role_target(role, fit_box)?;
         let started = Instant::now();
         let size =
-            write_encoded_atomic(namespace, hash, page, edge).ok()?;
+            write_encoded_atomic(namespace, hash, page, bounds).ok()?;
         let prev = namespace.total.fetch_add(size, Ordering::Relaxed);
         let over = prev.saturating_add(size) > namespace.cap;
         tracing::debug!(
@@ -378,12 +392,12 @@ impl Store {
     fn role_target(
         &self,
         role: Role,
-        fit_edge: u32,
-    ) -> Option<(&Namespace, u32)> {
+        fit_box: (u32, u32),
+    ) -> Option<(&Namespace, (u32, u32))> {
         let state = self.state.as_ref()?;
         match role {
-            Role::Thumb => Some((&state.thumb, THUMB_EDGE)),
-            Role::Fit => Some((&state.view, fit_edge)),
+            Role::Thumb => Some((&state.thumb, (THUMB_EDGE, THUMB_EDGE))),
+            Role::Fit => Some((&state.view, fit_box)),
             Role::Full => None,
         }
     }
@@ -689,14 +703,14 @@ fn write_atomic(
 }
 
 const MAGIC: [u8; 4] = *b"CYPV";
-const VERSION: u16 = 6;
+const VERSION: u16 = 7;
 const PREFIX_BYTES: usize =
     MAGIC.len() + size_of::<u16>() + size_of::<u8>();
 const MAX_META_BYTES: usize = u8::MAX as usize;
 
 #[derive(Deserialize, Serialize)]
 struct CacheMeta {
-    target_edge: u32,
+    target_box: (u32, u32),
     image: ImageMeta,
     pixels: PixelMeta,
 }
@@ -708,7 +722,7 @@ enum PixelMeta {
 }
 
 impl CacheMeta {
-    fn from_page(page: &Decoded, target_edge: u32) -> Self {
+    fn from_page(page: &Decoded, target_box: (u32, u32)) -> Self {
         let pixels = match page.pixels() {
             Pixels::Rgba8(_) => PixelMeta::Rgba8,
             Pixels::Yuv(yuv) => PixelMeta::Yuv {
@@ -717,7 +731,7 @@ impl CacheMeta {
             },
         };
         Self {
-            target_edge,
+            target_box,
             image: page.meta(),
             pixels,
         }
@@ -745,9 +759,9 @@ fn write_encoded_atomic(
     namespace: &Namespace,
     hash: u128,
     page: &Decoded,
-    target_edge: u32,
+    target_box: (u32, u32),
 ) -> io::Result<u64> {
-    let header = encode_header(&CacheMeta::from_page(page, target_edge))?;
+    let header = encode_header(&CacheMeta::from_page(page, target_box))?;
     match page.pixels() {
         Pixels::Rgba8(bytes) => {
             let mut slices = [IoSlice::new(&header), IoSlice::new(bytes)];
@@ -791,7 +805,7 @@ fn little_endian_plane_bytes(plane: &Plane) -> Cow<'_, [u8]> {
     }
 }
 
-fn read_stored(mut file: File, target_edge: u32) -> Option<Decoded> {
+fn read_stored(mut file: File, target_box: (u32, u32)) -> Option<Decoded> {
     let file_len = file.metadata().ok()?.len();
     if file_len < u64::try_from(PREFIX_BYTES).ok()? {
         return None;
@@ -817,7 +831,7 @@ fn read_stored(mut file: File, target_edge: u32) -> Option<Decoded> {
     let meta_bytes = meta_buf.get_mut(..meta_len)?;
     file.read_exact(meta_bytes).ok()?;
     let cached: CacheMeta = postcard::from_bytes(meta_bytes).ok()?;
-    if cached.target_edge != target_edge {
+    if cached.target_box != target_box {
         return None;
     }
     let meta = cached.image;
@@ -936,11 +950,11 @@ mod tests {
     use crate::decode::Subsampling;
     use crate::decode::Transfer;
 
-    const TEST_FIT_EDGE: u32 = 2560;
+    const TEST_FIT_BOX: (u32, u32) = (2560, 1440);
 
     fn test_limits() -> ImageLimits {
         const MAX_TEXTURE_EDGE: u32 = 16_384;
-        ImageLimits::new(TEST_FIT_EDGE, MAX_TEXTURE_EDGE)
+        ImageLimits::new(TEST_FIT_BOX, MAX_TEXTURE_EDGE)
     }
 
     fn count(width: u32, height: u32) -> usize {
@@ -1115,7 +1129,7 @@ mod tests {
                     for _ in 0..SAVES_PER_WRITER {
                         assert!(
                             store
-                                .save(hash, Role::Fit, page, TEST_FIT_EDGE)
+                                .save(hash, Role::Fit, page, TEST_FIT_BOX)
                                 .is_some()
                         );
                     }
@@ -1130,7 +1144,7 @@ mod tests {
         });
 
         let loaded = Store::at(root)
-            .load(hash, Role::Fit, TEST_FIT_EDGE)
+            .load(hash, Role::Fit, TEST_FIT_BOX)
             .expect("kept");
         assert_eq!((loaded.width(), loaded.height()), (8, 8));
     }
@@ -1143,20 +1157,18 @@ mod tests {
         let hash = content_hash(b"page-kept");
         let store = Store::at(&root);
         assert!(
-            store
-                .save(hash, Role::Thumb, &page, TEST_FIT_EDGE)
-                .is_some()
+            store.save(hash, Role::Thumb, &page, TEST_FIT_BOX).is_some()
         );
 
         // A dead writer leaves its temp unlocked.
         let stale_thumb = store
-            .role_target(Role::Thumb, TEST_FIT_EDGE)
+            .role_target(Role::Thumb, TEST_FIT_BOX)
             .expect("thumb")
             .0
             .temp_path(hash);
         fs::write(&stale_thumb, b"partial").expect("thumb temp");
         let stale_view = store
-            .role_target(Role::Fit, TEST_FIT_EDGE)
+            .role_target(Role::Fit, TEST_FIT_BOX)
             .expect("view")
             .0
             .temp_path(hash);
@@ -1164,7 +1176,7 @@ mod tests {
 
         // A live writer's temp stays while it holds the lock.
         let live_temp = store
-            .role_target(Role::Thumb, TEST_FIT_EDGE)
+            .role_target(Role::Thumb, TEST_FIT_BOX)
             .expect("thumb")
             .0
             .temp_path(hash);
@@ -1193,7 +1205,7 @@ mod tests {
         for name in malformed {
             assert!(root.join("thumb").join(name).exists(), "{name}");
         }
-        assert!(reopened.load(hash, Role::Thumb, TEST_FIT_EDGE).is_some());
+        assert!(reopened.load(hash, Role::Thumb, TEST_FIT_BOX).is_some());
 
         // Closing the handle releases the lock, so the next open claims
         // the temp.
@@ -1210,17 +1222,15 @@ mod tests {
         assert!(store.state.is_some());
         let hash = content_hash(b"page-a");
         assert!(
-            store
-                .save(hash, Role::Thumb, &page, TEST_FIT_EDGE)
-                .is_some()
+            store.save(hash, Role::Thumb, &page, TEST_FIT_BOX).is_some()
         );
         assert!(
-            store.save(hash, Role::Full, &page, TEST_FIT_EDGE).is_none()
+            store.save(hash, Role::Full, &page, TEST_FIT_BOX).is_none()
         );
-        assert!(store.load(hash, Role::Full, TEST_FIT_EDGE).is_none());
+        assert!(store.load(hash, Role::Full, TEST_FIT_BOX).is_none());
 
         let loaded = store
-            .load(hash, Role::Thumb, TEST_FIT_EDGE)
+            .load(hash, Role::Thumb, TEST_FIT_BOX)
             .expect("cached thumb");
         assert_eq!((loaded.width(), loaded.height()), (3, 2));
         assert_eq!(loaded.page_dims(), (9, 6));
@@ -1237,15 +1247,21 @@ mod tests {
         let store = Store::at(dir.path());
         let hash = content_hash(b"page-b");
         assert!(
-            store.save(hash, Role::Fit, &page, TEST_FIT_EDGE).is_some()
+            store.save(hash, Role::Fit, &page, TEST_FIT_BOX).is_some()
         );
         assert!(
-            store.load(hash, Role::Fit, TEST_FIT_EDGE + 1).is_none(),
-            "a fit entry saved for one target edge misses for another"
+            store
+                .load(
+                    hash,
+                    Role::Fit,
+                    (TEST_FIT_BOX.0, TEST_FIT_BOX.1 + 1)
+                )
+                .is_none(),
+            "a fit entry saved for one target box misses for another"
         );
 
         let loaded = store
-            .load(hash, Role::Fit, TEST_FIT_EDGE)
+            .load(hash, Role::Fit, TEST_FIT_BOX)
             .expect("cached view");
         assert_eq!((loaded.width(), loaded.height()), (5, 3));
         assert_eq!(loaded.page_dims(), (15, 9));
@@ -1269,13 +1285,11 @@ mod tests {
         let store = Store::at(dir.path());
         let hash = content_hash(b"page-e");
         assert!(
-            store
-                .save(hash, Role::Thumb, &page, TEST_FIT_EDGE)
-                .is_some()
+            store.save(hash, Role::Thumb, &page, TEST_FIT_BOX).is_some()
         );
 
         let loaded = store
-            .load(hash, Role::Thumb, TEST_FIT_EDGE)
+            .load(hash, Role::Thumb, TEST_FIT_BOX)
             .expect("cached thumb");
         let Pixels::Yuv(yuv) = loaded.pixels() else {
             panic!("expected yuv pixels");
@@ -1295,9 +1309,7 @@ mod tests {
         let store = Store::at(dir.path());
         let hash = content_hash(b"page-c");
         assert!(
-            store
-                .save(hash, Role::Thumb, &page, TEST_FIT_EDGE)
-                .is_some()
+            store.save(hash, Role::Thumb, &page, TEST_FIT_BOX).is_some()
         );
         let path = dir.path().join("thumb").join(format!("{hash:032x}"));
         let good = fs::read(&path).expect("read cache file");
@@ -1307,7 +1319,7 @@ mod tests {
             *byte = b'X';
         }
         fs::write(&path, &bad_magic).expect("write magic");
-        assert!(store.load(hash, Role::Thumb, TEST_FIT_EDGE).is_none());
+        assert!(store.load(hash, Role::Thumb, TEST_FIT_BOX).is_none());
 
         let mut bad_version = good.clone();
         if let Some(field) =
@@ -1316,7 +1328,7 @@ mod tests {
             field.copy_from_slice(&(VERSION + 1).to_le_bytes());
         }
         fs::write(&path, &bad_version).expect("write version");
-        assert!(store.load(hash, Role::Thumb, TEST_FIT_EDGE).is_none());
+        assert!(store.load(hash, Role::Thumb, TEST_FIT_BOX).is_none());
 
         for meta_len in [0_u8, u8::MAX] {
             let mut bad_meta_len = good.clone();
@@ -1324,41 +1336,42 @@ mod tests {
                 *byte = meta_len;
             }
             fs::write(&path, &bad_meta_len).expect("write meta length");
-            assert!(
-                store.load(hash, Role::Thumb, TEST_FIT_EDGE).is_none()
-            );
+            assert!(store.load(hash, Role::Thumb, TEST_FIT_BOX).is_none());
         }
 
-        // Different target edge on disk misses cleanly even with matching pixels.
-        let mut wrong_edge =
-            encode_header(&CacheMeta::from_page(&page, THUMB_EDGE + 1))
-                .expect("encode wrong-edge header");
-        wrong_edge.extend_from_slice(&rgba_bytes(&page));
-        fs::write(&path, &wrong_edge).expect("write wrong-edge entry");
-        assert!(store.load(hash, Role::Thumb, TEST_FIT_EDGE).is_none());
+        // Different target box on disk misses cleanly even with matching pixels.
+        let mut wrong_box = encode_header(&CacheMeta::from_page(
+            &page,
+            (THUMB_EDGE + 1, THUMB_EDGE),
+        ))
+        .expect("encode wrong-box header");
+        wrong_box.extend_from_slice(&rgba_bytes(&page));
+        fs::write(&path, &wrong_box).expect("write wrong-box entry");
+        assert!(store.load(hash, Role::Thumb, TEST_FIT_BOX).is_none());
 
         // Admissible dims whose byte size exceeds the file reject against
         // file length before allocating.
-        let mut forged_dims = CacheMeta::from_page(&page, THUMB_EDGE);
+        let mut forged_dims =
+            CacheMeta::from_page(&page, (THUMB_EDGE, THUMB_EDGE));
         forged_dims.image.width = 4_096;
         forged_dims.image.height = 4_096;
         let oversized =
             encode_header(&forged_dims).expect("encode oversized header");
         fs::write(&path, &oversized).expect("write oversized entry");
-        assert!(store.load(hash, Role::Thumb, TEST_FIT_EDGE).is_none());
+        assert!(store.load(hash, Role::Thumb, TEST_FIT_BOX).is_none());
 
         let mut truncated = good.clone();
         truncated.truncate(good.len() - 1);
         fs::write(&path, &truncated).expect("write truncated");
-        assert!(store.load(hash, Role::Thumb, TEST_FIT_EDGE).is_none());
+        assert!(store.load(hash, Role::Thumb, TEST_FIT_BOX).is_none());
 
         let mut trailing = good.clone();
         trailing.push(0);
         fs::write(&path, &trailing).expect("write trailing");
-        assert!(store.load(hash, Role::Thumb, TEST_FIT_EDGE).is_none());
+        assert!(store.load(hash, Role::Thumb, TEST_FIT_BOX).is_none());
 
         fs::write(&path, &good).expect("write intact");
-        assert!(store.load(hash, Role::Thumb, TEST_FIT_EDGE).is_some());
+        assert!(store.load(hash, Role::Thumb, TEST_FIT_BOX).is_some());
     }
 
     #[test]
@@ -1371,24 +1384,22 @@ mod tests {
         let page = rgba_page(2, 2);
         let hash = content_hash(b"page-d");
         assert!(
-            store
-                .save(hash, Role::Thumb, &page, TEST_FIT_EDGE)
-                .is_none()
+            store.save(hash, Role::Thumb, &page, TEST_FIT_BOX).is_none()
         );
-        assert!(store.load(hash, Role::Thumb, TEST_FIT_EDGE).is_none());
+        assert!(store.load(hash, Role::Thumb, TEST_FIT_BOX).is_none());
 
         let nested = Store::at(&dir.path().join("not-a-directory/file"));
         assert!(nested.state.is_none());
         assert!(
-            nested.save(hash, Role::Fit, &page, TEST_FIT_EDGE).is_none()
+            nested.save(hash, Role::Fit, &page, TEST_FIT_BOX).is_none()
         );
     }
 
     #[test]
-    fn derive_scales_to_the_edge() {
+    fn derive_scales_to_the_box() {
         let page = rgba_page(500, 200).with_page_dims((1500, 600));
-        let thumb =
-            derive_to_edge(&page, 200, FilterType::Box).expect("thumb");
+        let thumb = derive_to_box(&page, (200, 200), FilterType::Box)
+            .expect("thumb");
         assert_eq!((thumb.width(), thumb.height()), (200, 80));
         assert_eq!(thumb.page_dims(), (1500, 600));
         assert_eq!(thumb.format(), Format::Png);
@@ -1400,20 +1411,23 @@ mod tests {
         );
 
         let wide = rgba_page(1800, 900);
-        let wide_thumb = derive_to_edge(&wide, 200, FilterType::Box)
+        let wide_thumb = derive_to_box(&wide, (200, 200), FilterType::Box)
             .expect("wide thumb");
         assert_eq!((wide_thumb.width(), wide_thumb.height()), (200, 100));
 
         let exact = rgba_page(200, 100);
-        let kept = derive_to_edge(&exact, 200, FilterType::Box)
+        let kept = derive_to_box(&exact, (200, 200), FilterType::Box)
             .expect("exact kept");
         assert_eq!((kept.width(), kept.height()), (200, 100));
         assert_eq!(rgba_bytes(&kept), rgba_bytes(&exact));
 
         let small = rgba_page(40, 30);
-        let grown = derive_to_edge(&small, 1024, FilterType::Box)
+        let grown = derive_to_box(&small, (1024, 1024), FilterType::Box)
             .expect("small kept");
         assert_eq!((grown.width(), grown.height()), (40, 30));
+
+        assert_eq!(fit_dims((3628, 5148), TEST_FIT_BOX), (1015, 1440));
+        assert_eq!(fit_dims((4000, 100), TEST_FIT_BOX), (2560, 64));
     }
 
     #[test]
@@ -1447,7 +1461,7 @@ mod tests {
         let limits = test_limits();
         for (kind, edge, row_count) in [
             (Role::Thumb, THUMB_EDGE, 5_u32),
-            (Role::Fit, TEST_FIT_EDGE, 64),
+            (Role::Fit, TEST_FIT_BOX.0, 64),
         ] {
             let derived = derive(&page, kind, limits).expect("derives");
             let row_width = count(derived.width(), 1);
@@ -1495,8 +1509,8 @@ mod tests {
         let bytes = vec![255, 0, 0, 255, 0, 0, 0, 0].into_boxed_slice();
         let page = Decoded::rgba(2, 1, Format::Png, Transfer::Srgb, bytes)
             .expect("rgba page");
-        let derived =
-            derive_to_edge(&page, 1, FilterType::Box).expect("derives");
+        let derived = derive_to_box(&page, (1, 1), FilterType::Box)
+            .expect("derives");
         let pixel = rgba_bytes(&derived);
         let [red, green, blue, alpha] = pixel.as_slice() else {
             panic!("one pixel");
@@ -1518,7 +1532,7 @@ mod tests {
         let limits = test_limits();
         for (kind, edge, row_count) in [
             (Role::Thumb, THUMB_EDGE, 5_u32),
-            (Role::Fit, TEST_FIT_EDGE, 64),
+            (Role::Fit, TEST_FIT_BOX.0, 64),
         ] {
             let derived = derive(&page, kind, limits).expect("derives");
             assert_eq!(
@@ -1550,7 +1564,7 @@ mod tests {
     #[test]
     fn derive_keeps_yuv_plane_extents_valid() {
         let page = yuv_page(500, 200, Subsampling::Yuv420);
-        let thumb = derive_to_edge(&page, 200, FilterType::Hamming)
+        let thumb = derive_to_box(&page, (200, 200), FilterType::Hamming)
             .expect("thumb");
         assert_eq!((thumb.width(), thumb.height()), (200, 80));
         assert_eq!(thumb.page_dims(), (500, 200));
@@ -1568,7 +1582,7 @@ mod tests {
     fn derive_keeps_odd_yuv422_chroma_consistent() {
         let page = yuv_page(9, 10, Subsampling::Yuv422);
         let thumb =
-            derive_to_edge(&page, 7, FilterType::Box).expect("thumb");
+            derive_to_box(&page, (7, 7), FilterType::Box).expect("thumb");
         assert_eq!((thumb.width(), thumb.height()), (6, 7));
         let Pixels::Yuv(yuv) = thumb.pixels() else {
             panic!("expected yuv pixels");
@@ -1586,7 +1600,7 @@ mod tests {
         let probe_hash = content_hash(b"probe");
         assert!(
             Store::with_caps(&probe_root, THUMB_CAP_BYTES, FIT_CAP_BYTES)
-                .save(probe_hash, Role::Thumb, &page, TEST_FIT_EDGE)
+                .save(probe_hash, Role::Thumb, &page, TEST_FIT_BOX)
                 .is_some()
         );
         let size = fs::metadata(
@@ -1602,7 +1616,7 @@ mod tests {
         let mut evicted = Vec::new();
         for (age, hash) in [(10_u64, first), (11, second), (12, third)] {
             let batch = store
-                .save(hash, Role::Thumb, &page, TEST_FIT_EDGE)
+                .save(hash, Role::Thumb, &page, TEST_FIT_BOX)
                 .expect("thumb save persists");
             evicted.extend(batch);
             let path = root.join("thumb").join(format!("{hash:032x}"));
@@ -1612,23 +1626,23 @@ mod tests {
         // The cap fits one entry, so each save after the first evicted
         // the oldest, and the caller was told which ones.
         assert_eq!(evicted, vec![first, second]);
-        assert!(store.load(first, Role::Thumb, TEST_FIT_EDGE).is_none());
-        assert!(store.load(second, Role::Thumb, TEST_FIT_EDGE).is_none());
-        assert!(store.load(third, Role::Thumb, TEST_FIT_EDGE).is_some());
+        assert!(store.load(first, Role::Thumb, TEST_FIT_BOX).is_none());
+        assert!(store.load(second, Role::Thumb, TEST_FIT_BOX).is_none());
+        assert!(store.load(third, Role::Thumb, TEST_FIT_BOX).is_some());
 
         // The fit namespace has its own budget, so a fit save cannot
         // evict thumbnails and reports no evictions.
         let fit_evicted = store
-            .save(first, Role::Fit, &page, TEST_FIT_EDGE)
+            .save(first, Role::Fit, &page, TEST_FIT_BOX)
             .expect("fit save persists");
         assert_eq!(fit_evicted, []);
-        assert!(store.load(third, Role::Thumb, TEST_FIT_EDGE).is_some());
+        assert!(store.load(third, Role::Thumb, TEST_FIT_BOX).is_some());
     }
 
     #[test]
     fn derive_clamps_full_to_max_texture_edge() {
         let small = rgba_page(400, 200);
-        let limits = ImageLimits::new(300, 500);
+        let limits = ImageLimits::new((300, 300), 500);
         let fit = derive(&small, Role::Fit, limits).expect("fit");
         assert_eq!((fit.width(), fit.height()), (300, 150));
 

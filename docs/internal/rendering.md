@@ -1,12 +1,13 @@
 # Rendering: Wayland, GL, egui
 
-winit owns the window and events, glutin binds EGL, glow calls GL, egui-winit feeds events, and egui_glow paints egui. Page textures stay outside egui's paint list. The GUI crates are Wayland-only. Role policy and retention are in `docs/internal/cache.md`.
+winit owns the window and events, glutin binds EGL, glow calls GL, `App` feeds events directly and builds `RawInput` for `egui`, and `egui_glow::Painter` paints egui. Page textures stay outside egui's paint list. The GUI crates are Wayland-only. Role policy and retention are in `docs/internal/cache.md`.
 
 ## Frame loop
 
+- Two-phase loop: `about_to_wait` runs `reconcile()` (drains child events and GL uploads, resolves presentation, updates child requests, retains textures, ticks playback and status timers) and requests a redraw only when visible state changes; `RedrawRequested` runs `draw_frame()` (presents the current state and updates `view.last_viewport`).
+- Control flow (`ControlFlow::Wait` or `ControlFlow::WaitUntil`) is set only in `about_to_wait` from real future deadlines (`WaitUntil(now)` is never armed).
 - Present without blocking; a blocking swap would own the event loop. Notify the window before presenting so Wayland's frame callback paces frames.
-- Park the loop in a blocking wait; delayed work arms a deadline and the resume event redraws. Keep arming and firing separate, or a repaint clobbers the tighter deadline.
-- egui's repaint callback posts a user event through a proxy created before the loop runs.
+- Background book opens and reader threads wake the parked loop through a unit `Wake` user event created before the loop runs.
 - Arm the wait grace while opening a book, or while no seat of the on-screen spread has page info or a fault.
 
 ## GL rules
@@ -32,4 +33,4 @@ A seat rect is in page pixels and a texture's UV spans the page; each draw compa
 
 ## Page textures
 
-The cache maps each page to one slot per role, in `Role::VARIANTS` order; a seat keeps `Fit` while it covers the screen size (`best_texture`), otherwise draws the largest resident slot.
+The cache maps each page to one slot per role, in `Role::VARIANTS` order; a seat keeps `Fit` while both axes cover the screen size (`best_texture`), otherwise draws the largest resident slot.

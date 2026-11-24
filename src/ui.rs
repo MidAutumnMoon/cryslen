@@ -1,4 +1,4 @@
-//! Status bar, page interaction surface, and prompt rendering.
+//! Status bar, status timers, and page-jump prompt rendering.
 
 use std::time::Duration;
 use std::time::Instant;
@@ -6,7 +6,6 @@ use std::time::Instant;
 use egui::Color32;
 use egui::Context;
 use egui::Rect;
-use egui::Response;
 use egui::Style;
 use egui::TextFormat;
 use egui::Ui;
@@ -38,11 +37,25 @@ pub struct StatusLine<'fault> {
     pub fault: Option<&'fault str>,
 }
 
+#[derive(Clone, Copy, Default)]
+enum WaitTimer {
+    #[default]
+    Idle,
+    Grace(Instant),
+    Shown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimerTick {
+    pub next_deadline: Option<Instant>,
+    pub changed: bool,
+}
+
 /// Status-line timers, pure in the clock the caller passes.
 #[derive(Default)]
 pub struct Timers {
-    waiting_since: Option<Instant>,
-    toast_since: Option<Instant>,
+    wait: WaitTimer,
+    toast_until: Option<Instant>,
 }
 
 const WAIT_GRACE: Duration = Duration::from_millis(150);
@@ -51,46 +64,45 @@ const MODE_TOAST: Duration = Duration::from_millis(1500);
 
 impl Timers {
     pub fn toast(&mut self, now: Instant) {
-        self.toast_since = Some(now);
+        self.toast_until = Some(now + MODE_TOAST);
     }
 
-    /// Track the wait flag and return the grace's remaining delay for the
-    /// parked loop to arm.
-    pub fn tick_wait(
-        &mut self,
-        now: Instant,
-        waiting: bool,
-    ) -> Option<Duration> {
-        self.waiting_since =
-            waiting.then(|| self.waiting_since.unwrap_or(now));
-        // The checked subtraction is the grace boundary itself: some
-        // of the grace remains, or none does.
-        let since = self.waiting_since?;
-        WAIT_GRACE.checked_sub(now.saturating_duration_since(since))
-    }
-
-    /// Whether an active wait has passed the grace period.
-    pub fn waiting(&self, now: Instant) -> bool {
-        let Some(since) = self.waiting_since else {
-            return false;
+    pub fn tick(&mut self, now: Instant, waiting: bool) -> TimerTick {
+        let was_waiting = self.is_waiting();
+        self.wait = if waiting {
+            match self.wait {
+                WaitTimer::Idle => WaitTimer::Grace(now + WAIT_GRACE),
+                WaitTimer::Grace(due) if now >= due => WaitTimer::Shown,
+                state @ (WaitTimer::Grace(_) | WaitTimer::Shown) => state,
+            }
+        } else {
+            WaitTimer::Idle
         };
-        now.saturating_duration_since(since) >= WAIT_GRACE
-    }
+        let wait_deadline = match self.wait {
+            WaitTimer::Grace(due) => Some(due),
+            WaitTimer::Idle | WaitTimer::Shown => None,
+        };
 
-    /// Expire the toast and return the delay until it does.
-    pub fn tick_toast(&mut self, now: Instant) -> Option<Duration> {
-        let elapsed = now.saturating_duration_since(self.toast_since?);
-        let remaining = MODE_TOAST
-            .checked_sub(elapsed)
-            .filter(|remaining| !remaining.is_zero());
-        if remaining.is_none() {
-            self.toast_since = None;
+        let toast_expired = self.toast_until.is_some_and(|due| now >= due);
+        if toast_expired {
+            self.toast_until = None;
         }
-        remaining
+
+        TimerTick {
+            next_deadline: [wait_deadline, self.toast_until]
+                .into_iter()
+                .flatten()
+                .min(),
+            changed: self.is_waiting() != was_waiting || toast_expired,
+        }
     }
 
-    pub fn toasting(&self) -> bool {
-        self.toast_since.is_some()
+    pub fn is_waiting(&self) -> bool {
+        matches!(self.wait, WaitTimer::Shown)
+    }
+
+    pub fn is_toasting(&self) -> bool {
+        self.toast_until.is_some()
     }
 }
 
@@ -98,11 +110,9 @@ pub fn show(
     ui: &mut Ui,
     status: &StatusLine<'_>,
     show_status_bar: bool,
-) -> Response {
-    use egui::CursorIcon;
+) -> Rect {
     use egui::Label;
     use egui::Panel;
-    use egui::Sense;
     use egui::Sides;
 
     if show_status_bar {
@@ -120,22 +130,7 @@ pub fn show(
             );
         });
     }
-    let content = ui.available_rect_before_wrap();
-    let interactive = status.reading.is_some();
-    let sense = if interactive {
-        Sense::DRAG
-    } else {
-        Sense::hover()
-    };
-    let response = ui.interact(content, ui.scope_id().with("page"), sense);
-    // Set after the bar so a drag over it keeps the move icon.
-    if interactive
-        && response.is_pointer_button_down_on()
-        && ui.ctx().input(|i| i.pointer.primary_down())
-    {
-        ui.ctx().set_cursor_icon(CursorIcon::Move);
-    }
-    response
+    ui.available_rect_before_wrap()
 }
 
 const PAGE_DIM_ALPHA: u8 = 150;
@@ -346,48 +341,55 @@ mod tests {
         let start = Instant::now();
         let mut timers = Timers::default();
 
-        assert_eq!(timers.tick_wait(start, true), Some(WAIT_GRACE));
         assert_eq!(
-            timers.tick_wait(start + Duration::from_millis(100), true),
-            Some(Duration::from_millis(50))
+            timers.tick(start, true),
+            TimerTick {
+                next_deadline: Some(start + WAIT_GRACE),
+                changed: false,
+            }
         );
-        let almost_due = (start + WAIT_GRACE)
-            .checked_sub(Duration::from_millis(1))
-            .expect("time moves forward");
-        assert!(
-            !timers.waiting(almost_due),
-            "waiting becomes true only once the grace has fully elapsed"
-        );
+        assert!(!timers.is_waiting());
         assert_eq!(
-            timers.tick_wait(start + WAIT_GRACE, true),
-            Some(Duration::ZERO)
+            timers.tick(start + WAIT_GRACE, true),
+            TimerTick {
+                next_deadline: None,
+                changed: true,
+            }
         );
-        assert!(timers.waiting(start + WAIT_GRACE));
-        // A decided spread clears the wait and disarms its wake.
-        assert_eq!(timers.tick_wait(start + WAIT_GRACE * 2, false), None);
-        assert!(!timers.waiting(start + WAIT_GRACE * 3));
+        assert!(timers.is_waiting());
+        assert_eq!(
+            timers.tick(start + WAIT_GRACE * 2, false),
+            TimerTick {
+                next_deadline: None,
+                changed: true,
+            }
+        );
+        assert!(!timers.is_waiting());
 
-        // The toast expires on its own schedule.
         timers.toast(start);
-        assert!(timers.toasting());
-        let almost_expired = (start + MODE_TOAST)
-            .checked_sub(Duration::from_millis(1))
-            .expect("time moves forward");
+        assert!(timers.is_toasting());
         assert_eq!(
-            timers.tick_toast(almost_expired),
-            Some(Duration::from_millis(1))
+            timers.tick(start, true),
+            TimerTick {
+                next_deadline: Some(start + WAIT_GRACE),
+                changed: false,
+            }
         );
-        assert!(timers.toasting());
-        assert_eq!(timers.tick_toast(start + MODE_TOAST), None);
-        assert!(!timers.toasting());
-
-        // Non-monotonic clock: elapsed saturates to zero.
-        let later = start + Duration::from_millis(50);
-        assert_eq!(timers.tick_wait(later, true), Some(WAIT_GRACE));
-        assert_eq!(timers.tick_wait(start, true), Some(WAIT_GRACE));
-        assert!(!timers.waiting(start));
-        timers.toast(later);
-        assert_eq!(timers.tick_toast(start), Some(MODE_TOAST));
+        assert_eq!(
+            timers.tick(start, false),
+            TimerTick {
+                next_deadline: Some(start + MODE_TOAST),
+                changed: false,
+            }
+        );
+        assert_eq!(
+            timers.tick(start + MODE_TOAST, false),
+            TimerTick {
+                next_deadline: None,
+                changed: true,
+            }
+        );
+        assert!(!timers.is_toasting());
     }
 
     fn status() -> StatusLine<'static> {
@@ -471,7 +473,7 @@ mod tests {
         .drop_without_applying_deltas();
         let mut content = Rect::NOTHING;
         let mut out = ctx.run_ui(input(), |ui| {
-            content = show(ui, status, true).rect;
+            content = show(ui, status, true);
         });
         let shapes = mem::take(&mut out.shapes);
         out.drop_without_applying_deltas();

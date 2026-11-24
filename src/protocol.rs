@@ -38,26 +38,29 @@ pub use crate::decode::YuvSpec;
 
 pub const THUMB_EDGE: u32 = 192;
 
-/// Session-wide target edges clamped into the display and GPU ceiling.
+/// Session-wide target box and GPU texture ceiling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ImageLimits {
-    fit_edge: u32,
+    fit_box: (u32, u32),
     max_texture_edge: u32,
 }
 
 impl ImageLimits {
-    /// Clamps `max_texture_edge >= THUMB_EDGE` and `fit_edge` into
-    /// `[THUMB_EDGE, max_texture_edge]`.
-    pub fn new(fit_edge: u32, max_texture_edge: u32) -> Self {
+    /// Clamps `max_texture_edge >= THUMB_EDGE` and each `fit_box` axis
+    /// into `[THUMB_EDGE, max_texture_edge]`.
+    pub fn new(fit_box: (u32, u32), max_texture_edge: u32) -> Self {
         let max_texture_edge = max_texture_edge.max(THUMB_EDGE);
         Self {
-            fit_edge: fit_edge.clamp(THUMB_EDGE, max_texture_edge),
+            fit_box: (
+                fit_box.0.clamp(THUMB_EDGE, max_texture_edge),
+                fit_box.1.clamp(THUMB_EDGE, max_texture_edge),
+            ),
             max_texture_edge,
         }
     }
 
-    pub fn fit_edge(self) -> u32 {
-        self.fit_edge
+    pub fn fit_box(self) -> (u32, u32) {
+        self.fit_box
     }
 
     pub fn max_texture_edge(self) -> u32 {
