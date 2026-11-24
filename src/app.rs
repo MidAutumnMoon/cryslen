@@ -8,17 +8,13 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::time::Duration;
 use std::time::Instant;
 
 use egui::Color32;
 use egui::Context;
-use egui::Pos2;
-use egui::RawInput;
 use egui::Rect;
 use egui::TexturesDelta;
-use egui::ViewportId;
-use egui::ViewportInfo;
+use egui::Ui;
 use egui::epaint::ClippedShape;
 use egui_glow::Painter;
 use egui_glow::glow::Context as GlowContext;
@@ -27,28 +23,22 @@ use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::ElementState;
 use winit::event::KeyEvent;
-use winit::event::MouseButton;
 use winit::event::MouseScrollDelta;
 use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
-use winit::event_loop::ControlFlow;
 use winit::event_loop::EventLoopProxy;
 use winit::keyboard::KeyCode;
 use winit::keyboard::ModifiersState;
 use winit::keyboard::PhysicalKey;
-use winit::window::CursorIcon;
 use winit::window::WindowId;
 
-use crate::book::BookEvent;
 use crate::book::BookOpen;
 use crate::book::BookProcess;
 use crate::browse::Direction;
-use crate::browse::Motion;
 use crate::browse::ReadingMode;
 use crate::browse::Spread;
 use crate::catalog;
 use crate::catalog::PageName;
-use crate::decode;
 use crate::geometry;
 use crate::geometry::Fit;
 use crate::geometry::FitMode;
@@ -59,7 +49,6 @@ use crate::protocol::ImageLimits;
 use crate::protocol::ParentMsg;
 use crate::reading::Reading;
 use crate::render::Window;
-use crate::ui;
 use crate::ui::StatusLine;
 use crate::ui::Timers;
 
@@ -99,8 +88,14 @@ impl Egui {
         &self,
         size: PhysicalSize<u32>,
         scale_factor: f64,
-        run_ui: impl FnMut(&mut egui::Ui),
+        run_ui: impl FnMut(&mut Ui),
     ) -> EguiFrame {
+        use egui::Pos2;
+        use egui::RawInput;
+        use egui::ViewportId;
+        use egui::ViewportIdMap;
+        use egui::ViewportInfo;
+
         #[expect(
             clippy::cast_possible_truncation,
             reason = "egui pixels_per_point is f32"
@@ -114,7 +109,7 @@ impl Egui {
                     egui::vec2(logical.width, logical.height),
                 )
             });
-        let mut viewports = egui::ViewportIdMap::default();
+        let mut viewports = ViewportIdMap::default();
         viewports.insert(
             ViewportId::ROOT,
             ViewportInfo {
@@ -307,6 +302,8 @@ fn present_frame(
     spread: Option<(&SpreadLayout, Option<Spread>)>,
     jump_digits: Option<&str>,
 ) -> eros::Result<bool> {
+    use crate::ui;
+
     let show_status_bar = gl.window.winit().fullscreen().is_none();
     let jump = jump_digits.and_then(|digits| {
         let page_count = status.reading.as_ref()?.page_count;
@@ -481,6 +478,8 @@ impl App {
     }
 
     fn set_dragging(&mut self, dragging: bool) {
+        use winit::window::CursorIcon;
+
         if self.pointer.dragging == dragging {
             return;
         }
@@ -549,6 +548,8 @@ impl App {
     }
 
     fn poll_child(&mut self, limits: ImageLimits) {
+        use crate::book::BookEvent;
+
         match &mut self.child {
             ChildProcess::Opening { open, land_on } => {
                 let Some(opened) = open.try_take() else {
@@ -612,6 +613,8 @@ impl App {
     }
 
     fn reconcile(&mut self, event_loop: &ActiveEventLoop) {
+        use winit::event_loop::ControlFlow;
+
         let Some(limits) = self.gl.as_ref().map(|gl| gl.limits) else {
             return;
         };
@@ -724,6 +727,8 @@ impl App {
     }
 
     fn draw_frame(&mut self) -> eros::Result<()> {
+        use std::time::Duration;
+
         const SLOW_FRAME_THRESHOLD: Duration = Duration::from_millis(50);
 
         self.needs_redraw = false;
@@ -797,6 +802,8 @@ impl App {
     }
 
     fn sync_motion(&mut self) {
+        use crate::browse::Motion;
+
         let mode = self.view.mode;
         let Some(reading) = self.book.reading_mut() else {
             return;
@@ -1084,6 +1091,8 @@ fn wheel_zoom_factor(delta: MouseScrollDelta, scale_factor: f64) -> f64 {
 }
 
 fn drain_uploads(reading: &mut Reading, gl: &mut Gl) -> Vec<usize> {
+    use std::time::Duration;
+
     const SLOW_UPLOAD_THRESHOLD: Duration = Duration::from_millis(30);
 
     let pending = reading.take_pending_uploads();
@@ -1211,6 +1220,8 @@ impl ApplicationHandler<Wake> for App {
         _id: WindowId,
         event: WindowEvent,
     ) {
+        use winit::event::MouseButton;
+
         match event {
             WindowEvent::CloseRequested | WindowEvent::Destroyed => {
                 event_loop.exit();
@@ -1339,7 +1350,6 @@ fn apply_dark_theme(egui_ctx: &Context, panel_fill: Option<Color32>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use egui::Theme;
 
     #[test]
     fn clear_color_premultiplies_the_glass() {
@@ -1355,6 +1365,9 @@ mod tests {
 
     #[test]
     fn egui_stays_dark_when_the_desktop_is_light() {
+        use egui::RawInput;
+        use egui::Theme;
+
         let ctx = Context::default();
         apply_dark_theme(&ctx, Some(GLASS_FILL));
         ctx.run_ui(
@@ -1371,6 +1384,8 @@ mod tests {
 
     #[test]
     fn content_viewport_subtracts_the_bar_in_physical_px() {
+        use egui::Pos2;
+
         let content =
             Rect::from_min_max(Pos2::ZERO, egui::pos2(1280.0, 772.0));
         let integer =
@@ -1502,8 +1517,6 @@ impl Action {
 
 #[cfg(test)]
 mod input_tests {
-    use strum::VariantArray as _;
-
     use super::*;
 
     #[test]
@@ -1570,6 +1583,8 @@ mod input_tests {
 
     #[test]
     fn action_semantics() {
+        use strum::VariantArray as _;
+
         assert!(Action::Right.repeats());
         assert!(Action::Left.repeats());
         assert!(Action::Forward.repeats());
@@ -1646,6 +1661,8 @@ pub fn main(args: &[OsString]) -> ExitCode {
 }
 
 fn classify(path: &Path) -> eros::Result<(PathBuf, Option<String>)> {
+    use crate::decode;
+
     let normalized = catalog::normalize_path(path);
     let Some(name) = normalized.file_name() else {
         return Ok((normalized, None));
@@ -1685,13 +1702,13 @@ fn run(open_path: &Path, land_on: Option<&str>) -> eros::Result<()> {
 )]
 mod argv_tests {
     use super::*;
-    use tempfile::TempDir;
 
     #[test]
     fn classify_argument_kinds() {
         use std::env;
         use std::fs;
         use std::os::unix::fs as unix_fs;
+        use tempfile::TempDir;
 
         // classify never reads the content, only the extension.
         let dir = TempDir::new().expect("create temp dir");

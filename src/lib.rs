@@ -2,7 +2,6 @@
 //! The parent owns the window, the UI, and the GPU; each open book lives
 //! in a child process and talks to the parent over [`protocol`].
 
-use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::process::ExitCode;
 
@@ -25,6 +24,8 @@ mod worker;
 /// Run the mode the command line names: `cy --worker <ipc-server-name>
 /// <path>` serves one book, and anything else is the windowed parent.
 pub fn run(args: &[OsString]) -> ExitCode {
+    use std::ffi::OsStr;
+
     let worker_mode = args
         .get(1)
         .is_some_and(|arg| arg.as_os_str() == OsStr::new("--worker"));

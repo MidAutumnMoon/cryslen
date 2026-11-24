@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::ffi::OsString;
-use std::fmt;
+use std::fmt::Display;
 use std::num::NonZeroUsize;
 use std::panic;
 use std::panic::AssertUnwindSafe;
@@ -15,19 +15,16 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::thread;
+use std::thread::Builder;
 use std::time::Duration;
 use std::time::Instant;
 
 use bytes::Bytes;
-use ipc_channel::TryRecvError as IpcTryRecvError;
 use ipc_channel::ipc;
 use ipc_channel::ipc::IpcReceiver;
 use ipc_channel::ipc::IpcSender;
 use parking_lot::Condvar;
 use parking_lot::Mutex;
-use rustix::process;
-use rustix::process::Pid;
-use rustix::process::Signal;
 
 use crate::browse;
 use crate::browse::Direction;
@@ -43,10 +40,7 @@ use crate::decode;
 use crate::decode::Animation;
 use crate::decode::Decoded;
 use crate::decode::Frame;
-use crate::decode::Loops;
-use crate::protocol::BookInfo;
 use crate::protocol::ChildMsg;
-use crate::protocol::Hello;
 use crate::protocol::ImageLimits;
 use crate::protocol::ParentMsg;
 use crate::protocol::PlaybackCommand;
@@ -117,6 +111,8 @@ impl PlaybackSession {
     }
 
     fn should_repeat(&self) -> bool {
+        use crate::decode::Loops;
+
         match self.animation.loops() {
             Loops::Infinite => true,
             Loops::Finite(total) => self.passes < total,
@@ -639,6 +635,8 @@ impl Shared {
         commands: &IpcReceiver<ParentMsg>,
         playback: &mut PlaybackRunner,
     ) -> bool {
+        use ipc_channel::TryRecvError as IpcTryRecvError;
+
         loop {
             match commands.try_recv() {
                 Ok(message) => self.apply_message(message, playback),
@@ -849,7 +847,7 @@ impl Shared {
         true
     }
 
-    fn record_failure(&self, page: usize, error: &dyn fmt::Display) {
+    fn record_failure(&self, page: usize, error: &dyn Display) {
         if self.state.lock().failed.insert(page) {
             self.emit(ChildMsg::Failed {
                 page,
@@ -1307,7 +1305,7 @@ fn run(
     thread::scope(|scope| {
         let shared = shared.as_ref();
         for index in 0..workers {
-            let spawned = thread::Builder::new()
+            let spawned = Builder::new()
                 .name(format!("cy-worker-{index}"))
                 .spawn_scoped(scope, || {
                     worker_loop(source, shared, cpu_threads);
@@ -1363,6 +1361,13 @@ fn decode_page(
 }
 
 pub fn main(args: &[OsString]) -> ExitCode {
+    use rustix::process;
+    use rustix::process::Pid;
+    use rustix::process::Signal;
+
+    use crate::protocol::BookInfo;
+    use crate::protocol::Hello;
+
     let Some((server, path)) = parse(args) else {
         tracing::error!(
             "--worker needs an ipc server name and a book path"
@@ -1460,14 +1465,13 @@ fn parse(args: &[OsString]) -> Option<(&OsStr, &Path)> {
 )]
 mod tests {
     use std::fs;
+    use std::thread::JoinHandle;
 
-    use image::codecs::gif::Repeat;
     use tempfile::TempDir;
 
     use super::*;
     use crate::cache::Store;
     use crate::protocol::THUMB_EDGE;
-    use crate::protocol::WirePixels;
     use crate::testkit;
 
     /// Page edge for the tests that check derived and full dimensions:
@@ -1483,8 +1487,8 @@ mod tests {
 
     struct TestWorker {
         to_worker: Option<IpcSender<ParentMsg>>,
-        worker: Option<thread::JoinHandle<()>>,
-        drain: Option<thread::JoinHandle<()>>,
+        worker: Option<JoinHandle<()>>,
+        drain: Option<JoinHandle<()>>,
     }
 
     impl TestWorker {
@@ -1501,7 +1505,7 @@ mod tests {
                     let (event_sender, event_receiver) =
                         ipc::channel::<ChildMsg>()
                             .expect("child test channel");
-                    let drain = thread::Builder::new()
+                    let drain = Builder::new()
                         .name("test-worker-drain".into())
                         .spawn(
                             move || {
@@ -1514,7 +1518,7 @@ mod tests {
                 |sender| (sender, None),
             );
             let store = Store::at(store_root);
-            let worker = thread::Builder::new()
+            let worker = Builder::new()
                 .name("test-worker".into())
                 .spawn(move || {
                     run(&source, &commands, store, to_parent);
@@ -1622,6 +1626,8 @@ mod tests {
     }
 
     fn first_pixel(image: &WireImage) -> [u8; 4] {
+        use crate::protocol::WirePixels;
+
         let WirePixels::Rgba8(bytes) = &image.pixels else {
             panic!("a gif frame decodes to rgba");
         };
@@ -2047,6 +2053,8 @@ mod tests {
 
     #[test]
     fn animation_frames_stream_in_order() {
+        use image::codecs::gif::Repeat;
+
         let colors =
             [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]];
         let dir = TempDir::new().expect("create temp dir");
@@ -2089,6 +2097,8 @@ mod tests {
 
     #[test]
     fn a_finite_animation_finishes_after_its_last_pass() {
+        use image::codecs::gif::Repeat;
+
         let colors =
             [[255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255]];
         let dir = TempDir::new().expect("create temp dir");

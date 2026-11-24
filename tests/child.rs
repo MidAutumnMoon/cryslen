@@ -15,27 +15,10 @@
 use std::fs;
 use std::path::Path;
 use std::process::Child;
-use std::process::Command;
 use std::process::ExitStatus;
-use std::process::Stdio;
-use std::sync::mpsc;
-use std::sync::mpsc::RecvTimeoutError;
-use std::thread;
 use std::time::Duration;
-use std::time::Instant;
 
-use cryslen::protocol::ChildMsg;
-use cryslen::protocol::Direction;
-use cryslen::protocol::Format;
 use cryslen::protocol::Hello;
-use cryslen::protocol::ImageLimits;
-use cryslen::protocol::ParentMsg;
-use cryslen::protocol::ReadingMode;
-use cryslen::protocol::Request;
-use cryslen::protocol::Role;
-use cryslen::protocol::WirePixels;
-use ipc_channel::ipc::IpcOneShotServer;
-use tempfile::TempDir;
 
 /// The page is one solid color, so the decoded pixels prove a real
 /// decode.
@@ -111,6 +94,14 @@ fn accept_hello(
     book: &Path,
     store: &Path,
 ) -> (ChildGuard, Hello) {
+    use ipc_channel::ipc::IpcOneShotServer;
+    use std::process::Command;
+    use std::process::Stdio;
+    use std::sync::mpsc;
+    use std::sync::mpsc::RecvTimeoutError;
+    use std::thread;
+    use std::time::Instant;
+
     let (server, name) = IpcOneShotServer::<Hello>::new()
         .expect("start a one-shot ipc server");
 
@@ -176,6 +167,17 @@ fn accept_hello(
 
 #[test]
 fn child_serves_a_decoded_thumb() {
+    use cryslen::protocol::ChildMsg;
+    use cryslen::protocol::Direction;
+    use cryslen::protocol::Format;
+    use cryslen::protocol::ImageLimits;
+    use cryslen::protocol::ParentMsg;
+    use cryslen::protocol::ReadingMode;
+    use cryslen::protocol::Request;
+    use cryslen::protocol::Role;
+    use cryslen::protocol::WirePixels;
+    use tempfile::TempDir;
+
     const FIT_BOX: (u32, u32) = (2560, 1440);
     const MAX_TEXTURE_EDGE: u32 = 8192;
 
@@ -272,6 +274,8 @@ fn child_serves_a_decoded_thumb() {
 
 #[test]
 fn child_reports_open_failure_in_hello() {
+    use tempfile::TempDir;
+
     let binary = env!("CARGO_BIN_EXE_cy");
     let root = TempDir::new().expect("create the test's scratch root");
     let missing = root.path().join("missing-book");

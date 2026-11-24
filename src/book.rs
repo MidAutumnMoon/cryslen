@@ -1,19 +1,14 @@
-use std::env;
-use std::fmt;
+use std::fmt::Display;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Child;
-use std::process::Command;
-use std::process::Stdio;
 use std::sync::Arc;
-use std::thread;
+use std::thread::Builder;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crossbeam_channel::Receiver;
-use crossbeam_channel::RecvTimeoutError;
 use crossbeam_channel::Sender;
-use crossbeam_channel::TryRecvError;
 use eros::ErrorUnion;
 use ipc_channel::ipc::IpcOneShotServer;
 use ipc_channel::ipc::IpcReceiver;
@@ -85,7 +80,7 @@ pub struct BookOpen {
     results: Receiver<eros::Result<(PathBuf, BookInfo, BookProcess)>>,
 }
 
-fn spawn_error(error: impl fmt::Display) -> ErrorUnion {
+fn spawn_error(error: impl Display) -> ErrorUnion {
     eros::error!("cannot start the book process: {error}")
 }
 
@@ -96,6 +91,10 @@ impl BookOpen {
         path: &Path,
         wake: impl Fn() + Send + Sync + 'static,
     ) -> eros::Result<Self> {
+        use std::env;
+        use std::process::Command;
+        use std::process::Stdio;
+
         let wake: Arc<dyn Fn() + Send + Sync + 'static> = Arc::new(wake);
         let (server, server_name) =
             IpcOneShotServer::<Hello>::new().map_err(spawn_error)?;
@@ -111,7 +110,7 @@ impl BookOpen {
         let child = ChildGuard(Some(child));
         let path = path.to_path_buf();
         let (result_sender, results) = crossbeam_channel::bounded(1);
-        thread::Builder::new()
+        Builder::new()
             .name(String::from("cy-book-open"))
             .spawn(move || {
                 let opened = finish_open(
@@ -132,6 +131,8 @@ impl BookOpen {
     pub fn try_take(
         &self,
     ) -> Option<eros::Result<(PathBuf, BookInfo, BookProcess)>> {
+        use crossbeam_channel::TryRecvError;
+
         match self.results.try_recv() {
             Ok(opened) => Some(opened),
             Err(TryRecvError::Empty) => None,
@@ -151,8 +152,10 @@ fn finish_open(
     mut child: ChildGuard,
     wake: Arc<dyn Fn() + Send + Sync + 'static>,
 ) -> eros::Result<(PathBuf, BookInfo, BookProcess)> {
+    use crossbeam_channel::RecvTimeoutError;
+
     let (accept_tx, accept_rx) = crossbeam_channel::bounded(1);
-    let accept_thread = thread::Builder::new()
+    let accept_thread = Builder::new()
         .name(String::from("cy-book-accept"))
         .spawn(move || {
             let _sent = accept_tx.send(server.accept());
@@ -246,7 +249,7 @@ fn spawn_reader(
     wake: Arc<dyn Fn() + Send + Sync + 'static>,
 ) -> eros::Result<(Receiver<BookEvent>, JoinHandle<()>)> {
     let (event_sender, events) = crossbeam_channel::unbounded();
-    let handle = thread::Builder::new()
+    let handle = Builder::new()
         .name(String::from("cy-book-reader"))
         .spawn(move || read_events(&child_rx, &event_sender, &*wake))
         .map_err(spawn_error)?;
@@ -332,6 +335,8 @@ mod tests {
 
     #[test]
     fn wake_accept_unblocks_a_waiting_listener() {
+        use std::thread;
+
         let (server, name) =
             IpcOneShotServer::<Hello>::new().expect("server");
         let accept_thread = thread::spawn(move || {

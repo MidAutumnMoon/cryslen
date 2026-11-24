@@ -1,8 +1,5 @@
 use super::Decoded;
-use super::Depth;
 use super::Format;
-use super::Plane;
-use super::Transfer;
 
 /// Decode with a concrete decoder so EXIF orientation is readable, then
 /// apply it.
@@ -10,6 +7,9 @@ pub(super) fn decode(
     bytes: &[u8],
     format: Format,
 ) -> eros::Result<Decoded> {
+    use super::Depth;
+    use super::Plane;
+    use super::Transfer;
     use image::DynamicImage;
     use image::ImageDecoder as _;
     use image::ImageFormat;
@@ -77,13 +77,13 @@ mod tests {
 
     use crate::decode;
     use crate::decode::Pixels;
-    use crate::decode::Subsampling;
-    use crate::testkit;
 
     // The encoder cannot write EXIF orientation tags, so orientation
     // handling has no testable fixture.
     #[test]
     fn encoder_roundtrips() {
+        use crate::testkit;
+
         let png = testkit::tiny_png(4, 3, [10, 20, 30, 255]);
         let png_page = decode::decode(&png, "p.png").expect("png decodes");
         assert_eq!((png_page.width(), png_page.height()), (4, 3));
@@ -121,11 +121,14 @@ mod tests {
 
     #[test]
     fn opaque_grayscale_png_decodes_to_mono() {
-        use ::image::DynamicImage;
-        use ::image::GrayImage;
-        use ::image::ImageBuffer;
-        use ::image::ImageFormat;
-        use ::image::Luma;
+        use crate::decode::Depth;
+        use crate::decode::Plane;
+        use crate::decode::Subsampling;
+        use image::DynamicImage;
+        use image::GrayImage;
+        use image::ImageBuffer;
+        use image::ImageFormat;
+        use image::Luma;
         use std::io::Cursor;
 
         let mut png8 = Vec::new();

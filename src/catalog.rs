@@ -2,10 +2,8 @@
 //! natural order shared by listings and sibling walks.
 
 use std::cmp::Ordering;
-use std::ffi::OsString;
 use std::fs;
 use std::fs::DirEntry;
-use std::path;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -71,6 +69,8 @@ fn entry_is_dir(entry: &DirEntry) -> bool {
 
 /// Resolve relative paths against the working directory and strip `.` components, preserving symlinks.
 pub fn normalize_path(path: &Path) -> PathBuf {
+    use std::path;
+
     let absolute =
         path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
     absolute.components().collect()
@@ -83,6 +83,8 @@ pub fn sibling(
     archive: bool,
     forward: bool,
 ) -> Option<PathBuf> {
+    use std::ffi::OsString;
+
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())

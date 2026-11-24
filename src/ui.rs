@@ -10,7 +10,6 @@ use egui::Style;
 use egui::TextFormat;
 use egui::Ui;
 use egui::text::LayoutJob;
-use strum::VariantArray as _;
 
 use crate::browse::ReadingMode;
 use crate::browse::Spread;
@@ -231,6 +230,7 @@ fn page_jump_text(
 /// reverse.
 fn right_end(ui: &mut Ui, status: &StatusLine<'_>) {
     use egui::RichText;
+    use strum::VariantArray as _;
 
     for (mode_index, &mode) in
         ReadingMode::VARIANTS.iter().enumerate().rev()
@@ -330,8 +330,6 @@ fn line(style: &Style, status: &StatusLine<'_>) -> LayoutJob {
     reason = "a panic in test code is inconsequential"
 )]
 mod tests {
-    use egui::Pos2;
-    use egui::RawInput;
     use egui::Shape;
 
     use super::*;
@@ -458,6 +456,9 @@ mod tests {
         status: &StatusLine<'_>,
     ) -> (Vec<TextItem>, Rect) {
         use std::mem;
+
+        use egui::Pos2;
+        use egui::RawInput;
 
         let ctx = Context::default();
         let input = || RawInput {

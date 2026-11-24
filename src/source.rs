@@ -3,33 +3,30 @@
 //! thread; [`Source::bytes`] waits on the requested page's slot.
 
 use std::any::Any;
-use std::collections::HashMap;
 use std::fmt;
+use std::fmt::Debug;
+use std::fmt::Formatter;
 use std::fs;
 use std::fs::File;
 use std::io;
 use std::io::BufReader;
-use std::io::ErrorKind;
 use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
-use std::iter;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::time::Duration;
-use std::time::Instant;
 
 use bytes::Bytes;
 use eros::ErrorUnion;
 use parking_lot::Mutex;
-use rustfs_mimalloc::MiMalloc;
+use sevenz_rust2::Archive;
+use zip::ZipArchive;
 
 use crate::browse::PageNames;
 use crate::catalog;
-use crate::catalog::ArchiveKind;
 use crate::decode;
 
 const ARCHIVE_READ_BUFFER_BYTES: usize = 64 * 1024;
@@ -113,8 +110,8 @@ struct ArchiveSlots {
     on_ready: Mutex<Option<ReadyHook>>,
 }
 
-impl fmt::Debug for ArchiveSlots {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Debug for ArchiveSlots {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("ArchiveSlots")
             .field("count", &self.slots.len())
             .finish_non_exhaustive()
@@ -123,6 +120,8 @@ impl fmt::Debug for ArchiveSlots {
 
 impl ArchiveSlots {
     fn new(count: usize) -> Self {
+        use std::iter;
+
         let slots = iter::repeat_with(OnceLock::new).take(count).collect();
         Self {
             slots,
@@ -204,6 +203,10 @@ pub struct Source {
 
 impl Source {
     pub fn open(path: &Path) -> eros::Result<Self> {
+        use std::io::ErrorKind;
+
+        use crate::catalog::ArchiveKind;
+
         let metadata = match fs::metadata(path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == ErrorKind::NotFound => {
@@ -241,7 +244,7 @@ impl Source {
             File::open(path)?,
             ARCHIVE_READ_BUFFER_BYTES,
         );
-        let zip = zip::ZipArchive::new(reader)?;
+        let zip = ZipArchive::new(reader)?;
         let mut entries = Vec::new();
         for entry_index in 0..zip.len() {
             let entry = zip.by_index_data(entry_index)?;
@@ -269,14 +272,16 @@ impl Source {
     /// No password: a 7z with encrypted headers fails to open, and the
     /// first encrypted block ends the pass.
     fn open_sevenzip(path: &Path) -> eros::Result<Self> {
+        use sevenz_rust2::Password;
+
         let mut reader = SeekBufReader::new(
             File::open(path)?,
             ARCHIVE_READ_BUFFER_BYTES,
         );
-        let password = sevenz_rust2::Password::empty();
+        let password = Password::empty();
         let header_limit_kib =
             sevenzip_header_limit_kib(mem_available_bytes());
-        let archive = sevenz_rust2::Archive::read_with_memory_limit(
+        let archive = Archive::read_with_memory_limit(
             &mut reader,
             &password,
             header_limit_kib,
@@ -477,6 +482,9 @@ fn read_member(
     member: &mut (impl Read + ?Sized),
     expected_bytes: u64,
 ) -> eros::Result<Bytes> {
+    use std::time::Duration;
+    use std::time::Instant;
+
     let started = Instant::now();
     let capacity = usize::try_from(expected_bytes)
         .unwrap_or(MAX_PREALLOCATED_BYTES)
@@ -501,7 +509,7 @@ fn read_member(
 }
 
 fn spawn_zip_materialize(
-    mut zip: zip::ZipArchive<SeekBufReader<File>>,
+    mut zip: ZipArchive<SeekBufReader<File>>,
     entry_indices: Vec<usize>,
     slots: &Arc<ArchiveSlots>,
 ) {
@@ -532,6 +540,9 @@ fn spawn_materialize(
     use std::panic;
     use std::panic::AssertUnwindSafe;
     use std::thread::Builder;
+    use std::time::Instant;
+
+    use rustfs_mimalloc::MiMalloc;
 
     let thread_slots = Arc::clone(slots);
     let spawned =
@@ -622,7 +633,7 @@ impl SevenZipPlan {
         }
     }
 
-    fn decoder_peak_bytes(&self, archive: &sevenz_rust2::Archive) -> u64 {
+    fn decoder_peak_bytes(&self, archive: &Archive) -> u64 {
         let mut peak_bytes = 0_u64;
         for planned in &self.blocks {
             let Some(block) = archive.blocks.get(planned.index) else {
@@ -720,12 +731,17 @@ fn lzma_growth_peak_bytes(
 }
 
 fn spawn_sevenzip_materialize(
-    archive: sevenz_rust2::Archive,
+    archive: Archive,
     mut reader: SeekBufReader<File>,
     plan: SevenZipPlan,
     names: &[String],
     slots: &Arc<ArchiveSlots>,
 ) {
+    use std::collections::HashMap;
+
+    use sevenz_rust2::BlockDecoder;
+    use sevenz_rust2::Password;
+
     const BLOCK_DECODER_THREADS: u32 = 1;
 
     let page_by_name: HashMap<String, usize> = names
@@ -737,10 +753,10 @@ fn spawn_sevenzip_materialize(
         for page_index in plan.empty_pages {
             slots.fill(page_index, Ok(Bytes::new()));
         }
-        let password = sevenz_rust2::Password::empty();
+        let password = Password::empty();
         for planned in plan.blocks {
             let mut remaining_pages = planned.page_count.get();
-            let decoder = sevenz_rust2::BlockDecoder::new(
+            let decoder = BlockDecoder::new(
                 BLOCK_DECODER_THREADS,
                 planned.index,
                 &archive,
@@ -827,15 +843,13 @@ mod tests {
 
     use crate::catalog;
     use crate::catalog::PageName;
-    use crate::decode;
-    use crate::decode::Format;
     use crate::testkit;
 
     use std::cmp::Ordering;
-    use std::io::Error as IoError;
     use std::io::Write as _;
 
     use tempfile::TempDir;
+    use zip::ZipWriter;
 
     /// LZMA-compressed 7z with two small PNGs, built by 7zz. The crate's
     /// encoder features are trimmed, so the fixture is checked in.
@@ -852,7 +866,9 @@ mod tests {
     );
 
     fn failed_page(message: &'static str) -> Arc<ErrorUnion> {
-        Arc::new(ErrorUnion::new(eros::MsgError::from_static(message)))
+        use eros::MsgError;
+
+        Arc::new(ErrorUnion::new(MsgError::from_static(message)))
     }
 
     #[test]
@@ -1311,6 +1327,9 @@ mod tests {
 
     #[test]
     fn sevenz_materializes_once_and_drains_non_page_members() {
+        use crate::decode;
+        use crate::decode::Format;
+
         let source = Source::open(Path::new(MIXED_SEVENZ_FIXTURE))
             .expect("7z opens");
         assert_eq!(source.len().get(), 2);
@@ -1417,15 +1436,16 @@ mod tests {
 
     #[test]
     fn zip_listing_and_read() {
+        use zip::CompressionMethod;
         use zip::write::SimpleFileOptions;
 
         let dir = TempDir::new().expect("create temp dir");
         let zip_path = dir.path().join("book.cbz");
         {
             let file = File::create(&zip_path).unwrap();
-            let mut zip = zip::ZipWriter::new(file);
+            let mut zip = ZipWriter::new(file);
             let options = SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored);
+                .compression_method(CompressionMethod::Stored);
             for (name, color) in [
                 ("b/010.png", 1_u8),
                 ("b/002.png", 2),
@@ -1473,6 +1493,10 @@ mod tests {
 
     #[test]
     fn zip_corruption_stays_page_local() {
+        use std::io::Error as IoError;
+        use std::io::ErrorKind;
+
+        use zip::CompressionMethod;
         use zip::write::SimpleFileOptions;
 
         let dir = TempDir::new().expect("create temp dir");
@@ -1484,9 +1508,9 @@ mod tests {
         ];
         {
             let file = File::create(&zip_path).unwrap();
-            let mut zip = zip::ZipWriter::new(file);
+            let mut zip = ZipWriter::new(file);
             let options = SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Stored);
+                .compression_method(CompressionMethod::Stored);
             for (index, page) in pages.iter().enumerate() {
                 zip.start_file(format!("{index:03}.png"), options)
                     .unwrap();
@@ -1538,6 +1562,8 @@ mod tests {
 
     #[test]
     fn open_errors() {
+        use std::io::Error as IoError;
+
         let missing = Source::open(Path::new("/nonexistent-cryslen-dir"))
             .expect_err("a missing path must refuse");
         assert!(missing.to_string().contains("not found"));
@@ -1603,7 +1629,7 @@ mod tests {
 
             let path = shelf.path().join(name);
             let file = File::create(&path).expect("zip creates");
-            let mut zip = zip::ZipWriter::new(file);
+            let mut zip = ZipWriter::new(file);
             zip.start_file("p.png", SimpleFileOptions::default())
                 .expect("entry starts");
             zip.write_all(&testkit::tiny_png(1, 1, [0, 0, 0, 255]))

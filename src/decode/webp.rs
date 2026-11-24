@@ -11,32 +11,16 @@ use std::ptr;
 use libwebp_sys::VP8StatusCode;
 use libwebp_sys::WEBP_CSP_MODE;
 use libwebp_sys::WebPAnimDecoder;
-use libwebp_sys::WebPAnimDecoderDelete;
-use libwebp_sys::WebPAnimDecoderGetInfo;
-use libwebp_sys::WebPAnimDecoderGetNext;
-use libwebp_sys::WebPAnimDecoderNew;
 use libwebp_sys::WebPAnimDecoderOptions;
-use libwebp_sys::WebPAnimDecoderOptionsInit;
 use libwebp_sys::WebPAnimInfo;
 use libwebp_sys::WebPBitstreamFeatures;
 use libwebp_sys::WebPData;
-use libwebp_sys::WebPDecode;
 use libwebp_sys::WebPDecoderConfig;
-use libwebp_sys::WebPFreeDecBuffer;
-use libwebp_sys::WebPGetFeatures;
-use libwebp_sys::WebPRGBABuffer;
-use libwebp_sys::WebPYUVABuffer;
 
 use super::Decoded;
-use super::Depth;
 use super::DisplayTransform;
 use super::Format;
-use super::Matrix;
-use super::Plane;
 use super::Subsampling;
-use super::Transfer;
-use super::YuvImage;
-use super::YuvSpec;
 
 /// `features.format` value for lossy VP8 bitstreams (`decode.h`).
 const WEBP_FORMAT_LOSSY: i32 = 1;
@@ -67,6 +51,8 @@ pub(super) fn decode(
 }
 
 fn read_features(bytes: &[u8]) -> eros::Result<WebPBitstreamFeatures> {
+    use libwebp_sys::WebPGetFeatures;
+
     let mut features = WebPBitstreamFeatures {
         width: 0,
         height: 0,
@@ -104,6 +90,16 @@ fn decode_yuv(
     transform: DisplayTransform,
     use_threads: bool,
 ) -> eros::Result<Decoded> {
+    use libwebp_sys::WebPDecode;
+    use libwebp_sys::WebPYUVABuffer;
+
+    use super::Depth;
+    use super::Matrix;
+    use super::Plane;
+    use super::Transfer;
+    use super::YuvImage;
+    use super::YuvSpec;
+
     let ((luma_width, luma_height), (chroma_width, chroma_height)) =
         super::plane_dims(dims, Subsampling::Yuv420);
     let mut luma = vec![0_u8; luma_width as usize * luma_height as usize];
@@ -187,6 +183,9 @@ fn decode_rgba(
     transform: DisplayTransform,
     use_threads: bool,
 ) -> eros::Result<Decoded> {
+    use libwebp_sys::WebPDecode;
+    use libwebp_sys::WebPRGBABuffer;
+
     let byte_len = super::rgba_byte_len(dims.0, dims.1)?;
     let mut rgba = vec![0_u8; byte_len];
 
@@ -221,6 +220,8 @@ fn finish_rgba(
     dims: (u32, u32),
     transform: DisplayTransform,
 ) -> eros::Result<Decoded> {
+    use super::Transfer;
+
     let oriented = super::transform_rgba(rgba, dims, transform);
     let (out_width, out_height) = transform.out_dims(dims);
     Ok(Decoded::rgba(
@@ -239,6 +240,9 @@ fn decode_animated_first_frame(
 ) -> eros::Result<Decoded> {
     use std::mem::MaybeUninit;
     use std::slice;
+
+    use libwebp_sys::WebPAnimDecoderGetNext;
+    use libwebp_sys::WebPAnimDecoderOptionsInit;
 
     let mut options = MaybeUninit::<WebPAnimDecoderOptions>::uninit();
     // SAFETY: `options` points to aligned uninitialized `WebPAnimDecoderOptions`.
@@ -296,6 +300,8 @@ impl DecoderConfigGuard {
 
 impl Drop for DecoderConfigGuard {
     fn drop(&mut self) {
+        use libwebp_sys::WebPFreeDecBuffer;
+
         // SAFETY: `self.0.output` was initialized by `WebPDecoderConfig::new`.
         unsafe {
             WebPFreeDecBuffer(&raw mut self.0.output);
@@ -312,6 +318,8 @@ impl AnimDecoderGuard {
         data: &WebPData,
         options: &WebPAnimDecoderOptions,
     ) -> eros::Result<Self> {
+        use libwebp_sys::WebPAnimDecoderNew;
+
         // SAFETY: `data` (`bytes` outlives the guard) and `options` are initialized.
         let ptr = unsafe { WebPAnimDecoderNew(data, options) };
         if ptr.is_null() {
@@ -321,6 +329,8 @@ impl AnimDecoderGuard {
     }
 
     fn info(&self) -> eros::Result<WebPAnimInfo> {
+        use libwebp_sys::WebPAnimDecoderGetInfo;
+
         let mut info = WebPAnimInfo::default();
         // SAFETY: `self.ptr` is live (`AnimDecoderGuard::new`) and `info` is initialized.
         let ok =
@@ -334,6 +344,8 @@ impl AnimDecoderGuard {
 
 impl Drop for AnimDecoderGuard {
     fn drop(&mut self) {
+        use libwebp_sys::WebPAnimDecoderDelete;
+
         // SAFETY: `self.ptr` is uniquely owned from `WebPAnimDecoderNew`.
         unsafe {
             WebPAnimDecoderDelete(self.ptr);
@@ -551,12 +563,6 @@ fn transform_for_exif_orientation(orientation: u16) -> DisplayTransform {
     reason = "a panic in test code is inconsequential"
 )]
 mod tests {
-    use std::slice;
-
-    use libwebp_sys::WebPEncodeLosslessRGBA;
-    use libwebp_sys::WebPEncodeRGBA;
-    use libwebp_sys::WebPFree;
-
     use super::*;
     use crate::decode;
     use crate::decode::Pixels;
@@ -567,6 +573,12 @@ mod tests {
         rgba: &[u8],
         lossless: bool,
     ) -> Vec<u8> {
+        use std::slice;
+
+        use libwebp_sys::WebPEncodeLosslessRGBA;
+        use libwebp_sys::WebPEncodeRGBA;
+        use libwebp_sys::WebPFree;
+
         const LOSSY_QUALITY: f32 = 90.0;
 
         let stride = i32::try_from(width * 4).expect("stride fits i32");
@@ -728,6 +740,9 @@ mod tests {
 
     #[test]
     fn webp_decodes_yuv_rgba_and_animation() {
+        use crate::decode::Depth;
+        use crate::decode::Matrix;
+
         let lossy =
             encode_rgba(5, 3, &[200_u8, 120, 60, 255].repeat(15), false);
         let decoded_lossy =

@@ -7,7 +7,6 @@
 )]
 
 use core::num::NonZeroU32;
-use core::slice;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -30,12 +29,10 @@ use indoc::indoc;
 use winit::dpi::PhysicalSize;
 use winit::event_loop::ActiveEventLoop;
 use winit::event_loop::OwnedDisplayHandle;
-use winit::raw_window_handle::HasWindowHandle as _;
 use winit::window::Window as WinitWindow;
 
 use crate::browse::Role;
 use crate::browse::Roles;
-use crate::decode;
 use crate::decode::Depth;
 use crate::decode::Matrix;
 use crate::decode::Subsampling;
@@ -44,7 +41,6 @@ use crate::geometry::PageRect;
 use crate::geometry::Placement;
 use crate::geometry::SpreadLayout;
 use crate::geometry::Viewport;
-use crate::protocol::THUMB_EDGE;
 use crate::protocol::TextureFault;
 use crate::protocol::ValidatedImage;
 use crate::protocol::WirePixels;
@@ -668,6 +664,8 @@ fn check_texture_dims(
 
 impl PageTextures {
     fn new(gl: Arc<Context>) -> eros::Result<Self> {
+        use crate::protocol::THUMB_EDGE;
+
         // SAFETY: MAX_TEXTURE_SIZE is a pure query on the current context.
         let gl_max_edge =
             unsafe { gl.get_parameter_i32(glow::MAX_TEXTURE_SIZE) };
@@ -1682,6 +1680,8 @@ impl EwaResampler {
         seat: SeatGeometry,
         slice: VisibleSlice,
     ) -> bool {
+        use core::slice;
+
         const ONE_TEXEL_PER_STEP: (f64, f64) = (1.0, 1.0);
 
         let scratch_dims = (slice.visible_width, slice.source_row_count());
@@ -2263,6 +2263,8 @@ fn upload_page_texture(
     gl: Arc<Context>,
     image: &ValidatedImage,
 ) -> PageTexture {
+    use crate::decode;
+
     let dims = (image.meta.width, image.meta.height);
     let page_dims = image.meta.page_dims;
     let magnification_filter = magnification_filter(dims, page_dims);
@@ -2607,6 +2609,7 @@ impl Window {
         use std::ffi::CString;
         use winit::dpi::LogicalSize;
         use winit::raw_window_handle::HasDisplayHandle as _;
+        use winit::raw_window_handle::HasWindowHandle as _;
 
         use winit::platform::wayland::WindowAttributesExtWayland as _;
         use winit::window::WindowAttributes;

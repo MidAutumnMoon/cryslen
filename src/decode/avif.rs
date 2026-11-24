@@ -1,45 +1,15 @@
 //! AVIF decode through libavif. The FFI `unsafe` is confined to this
 //! module.
 
-use libavif_sys::AVIF_IMAGE_CONTENT_SAMPLE_TRANSFORMS;
-use libavif_sys::AVIF_MATRIX_COEFFICIENTS_BT470BG;
-use libavif_sys::AVIF_MATRIX_COEFFICIENTS_BT601;
-use libavif_sys::AVIF_MATRIX_COEFFICIENTS_BT709;
-use libavif_sys::AVIF_MATRIX_COEFFICIENTS_BT2020_NCL;
-use libavif_sys::AVIF_MATRIX_COEFFICIENTS_IDENTITY;
-use libavif_sys::AVIF_MATRIX_COEFFICIENTS_UNSPECIFIED;
-use libavif_sys::AVIF_PIXEL_FORMAT_YUV400;
-use libavif_sys::AVIF_PIXEL_FORMAT_YUV420;
-use libavif_sys::AVIF_PIXEL_FORMAT_YUV422;
-use libavif_sys::AVIF_PIXEL_FORMAT_YUV444;
-use libavif_sys::AVIF_RANGE_FULL;
-use libavif_sys::AVIF_RESULT_OK;
-use libavif_sys::AVIF_TRANSFER_CHARACTERISTICS_HLG;
-use libavif_sys::AVIF_TRANSFER_CHARACTERISTICS_SMPTE2084;
-use libavif_sys::AVIF_TRANSFORM_IMIR;
-use libavif_sys::AVIF_TRANSFORM_IROT;
-use libavif_sys::AVIF_TRUE;
 use libavif_sys::avifDecoder;
-use libavif_sys::avifDecoderCreate;
-use libavif_sys::avifDecoderDestroy;
-use libavif_sys::avifDecoderNextImage;
-use libavif_sys::avifDecoderParse;
-use libavif_sys::avifDecoderSetIOMemory;
 use libavif_sys::avifImage;
 use libavif_sys::avifResult;
-use libavif_sys::avifResultToString;
 use std::marker::PhantomData;
 
 use super::Decoded;
 use super::Depth;
 use super::DisplayTransform;
-use super::Format;
-use super::Matrix;
 use super::Plane;
-use super::Subsampling;
-use super::Transfer;
-use super::YuvImage;
-use super::YuvSpec;
 
 /// dav1d parallelism saturates quickly on stills, so the thread count
 /// is capped.
@@ -53,6 +23,27 @@ pub(super) fn decode(
     bytes: &[u8],
     max_threads: usize,
 ) -> eros::Result<Decoded> {
+    use libavif_sys::AVIF_MATRIX_COEFFICIENTS_BT470BG;
+    use libavif_sys::AVIF_MATRIX_COEFFICIENTS_BT601;
+    use libavif_sys::AVIF_MATRIX_COEFFICIENTS_BT709;
+    use libavif_sys::AVIF_MATRIX_COEFFICIENTS_BT2020_NCL;
+    use libavif_sys::AVIF_MATRIX_COEFFICIENTS_IDENTITY;
+    use libavif_sys::AVIF_MATRIX_COEFFICIENTS_UNSPECIFIED;
+    use libavif_sys::AVIF_PIXEL_FORMAT_YUV400;
+    use libavif_sys::AVIF_PIXEL_FORMAT_YUV420;
+    use libavif_sys::AVIF_PIXEL_FORMAT_YUV422;
+    use libavif_sys::AVIF_PIXEL_FORMAT_YUV444;
+    use libavif_sys::AVIF_RANGE_FULL;
+    use libavif_sys::AVIF_TRANSFER_CHARACTERISTICS_HLG;
+    use libavif_sys::AVIF_TRANSFER_CHARACTERISTICS_SMPTE2084;
+
+    use super::Format;
+    use super::Matrix;
+    use super::Subsampling;
+    use super::Transfer;
+    use super::YuvImage;
+    use super::YuvSpec;
+
     let decoder = DecoderGuard::new(bytes, max_threads)?;
     let frame = decoder.image()?;
 
@@ -193,6 +184,9 @@ pub(super) fn decode(
 }
 
 fn display_transform(frame: &avifImage) -> DisplayTransform {
+    use libavif_sys::AVIF_TRANSFORM_IMIR;
+    use libavif_sys::AVIF_TRANSFORM_IROT;
+
     let flags = frame.transformFlags;
     let quarters = if flags & AVIF_TRANSFORM_IROT != 0 {
         frame.irot.angle % 4
@@ -214,6 +208,8 @@ fn clamp_threads(max_threads: usize) -> i32 {
 }
 
 fn check(code: avifResult, what: &'static str) -> eros::Result<()> {
+    use libavif_sys::AVIF_RESULT_OK;
+    use libavif_sys::avifResultToString;
     use std::ffi::CStr;
 
     if code == AVIF_RESULT_OK {
@@ -323,6 +319,13 @@ struct DecoderGuard<'bytes> {
 
 impl<'bytes> DecoderGuard<'bytes> {
     fn new(bytes: &'bytes [u8], max_threads: usize) -> eros::Result<Self> {
+        use libavif_sys::AVIF_IMAGE_CONTENT_SAMPLE_TRANSFORMS;
+        use libavif_sys::AVIF_TRUE;
+        use libavif_sys::avifDecoderCreate;
+        use libavif_sys::avifDecoderNextImage;
+        use libavif_sys::avifDecoderParse;
+        use libavif_sys::avifDecoderSetIOMemory;
+
         const NO_DIMENSION_LIMIT: u32 = 0;
 
         // SAFETY: allocates an independent decoder instance.
@@ -385,6 +388,8 @@ impl<'bytes> DecoderGuard<'bytes> {
 
 impl Drop for DecoderGuard<'_> {
     fn drop(&mut self) {
+        use libavif_sys::avifDecoderDestroy;
+
         // SAFETY: the guard solely owns the decoder from
         // `avifDecoderCreate`, and drop runs exactly once.
         unsafe {

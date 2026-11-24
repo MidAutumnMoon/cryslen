@@ -1,21 +1,9 @@
-use jxl::api::Event;
-use jxl::api::ExtraChannel;
-use jxl::api::JxlColorType;
-use jxl::api::JxlDataFormat;
-use jxl::api::JxlDecoder;
-use jxl::api::JxlDecoderOptions;
-use jxl::api::JxlOutputBuffer;
 use jxl::api::JxlParallelRunner;
 use jxl::api::JxlParallelRunnerFun;
-use jxl::api::JxlPixelFormat;
 use jxl::error::Error as JxlError;
 use jxl::error::Result as JxlResult;
 
 use super::Decoded;
-use super::Depth;
-use super::Format;
-use super::Plane;
-use super::Transfer;
 
 const MAX_THREADS: usize = 16;
 
@@ -23,7 +11,20 @@ pub(super) fn decode(
     bytes: &[u8],
     max_threads: usize,
 ) -> eros::Result<Decoded> {
+    use jxl::api::Event;
+    use jxl::api::ExtraChannel;
+    use jxl::api::JxlColorType;
+    use jxl::api::JxlDataFormat;
+    use jxl::api::JxlDecoder;
+    use jxl::api::JxlDecoderOptions;
+    use jxl::api::JxlOutputBuffer;
+    use jxl::api::JxlPixelFormat;
     use std::slice;
+
+    use super::Depth;
+    use super::Format;
+    use super::Plane;
+    use super::Transfer;
 
     let mut runner = Pool(max_threads.clamp(1, MAX_THREADS));
     // The whole file is in memory, so `NeedMoreInput` means the file is
@@ -180,15 +181,15 @@ impl JxlParallelRunner for Pool {
     reason = "a panic in test code is inconsequential"
 )]
 mod tests {
-    use super::Pool;
-
-    use jxl::api::JxlParallelRunner as _;
-    use jxl::error::Error as JxlError;
-
     // The fixtures are single-group, so only this test exercises the
     // runner's parallel path.
     #[test]
     fn pool_reports_the_first_task_error() {
+        use jxl::api::JxlParallelRunner as _;
+        use jxl::error::Error as JxlError;
+
+        use super::Pool;
+
         let mut pool = Pool(4);
         let failing = |task: usize| {
             if task == 1 {

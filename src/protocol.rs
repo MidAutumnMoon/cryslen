@@ -7,6 +7,8 @@
 
 use std::error::Error;
 use std::fmt;
+use std::fmt::Display;
+use std::fmt::Formatter;
 use std::ops::Deref;
 use std::time::Duration;
 
@@ -19,7 +21,6 @@ use serde::Serialize;
 
 use crate::decode;
 use crate::decode::Decoded;
-use crate::decode::Pixels;
 use crate::decode::Plane;
 
 pub use crate::browse::Direction;
@@ -74,8 +75,8 @@ pub struct TextureFault {
     pub max_edge: u32,
 }
 
-impl fmt::Display for TextureFault {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Display for TextureFault {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(
             f,
             "{}x{} exceeds this GPU's {}-texel texture edge limit",
@@ -160,6 +161,8 @@ impl Deref for ValidatedImage {
 
 impl WireImage {
     pub fn from_decoded(image: &Decoded) -> Self {
+        use crate::decode::Pixels;
+
         let pixels = match image.pixels() {
             Pixels::Rgba8(bytes) => {
                 WirePixels::Rgba8(IpcSharedMemory::from_bytes(bytes))

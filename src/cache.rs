@@ -8,41 +8,31 @@
 )]
 
 use std::borrow::Cow;
-use std::env;
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fs;
 use std::fs::File;
-use std::fs::FileTimes;
-use std::fs::TryLockError;
+use std::fs::Metadata;
 use std::io;
+use std::io::Error;
+use std::io::ErrorKind;
 use std::io::IoSlice;
 use std::io::Read as _;
-use std::io::Write as _;
 use std::mem::DropGuard;
-use std::os::unix::fs::DirBuilderExt as _;
-use std::os::unix::fs::MetadataExt as _;
-use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::time::Instant;
 use std::time::SystemTime;
 
+use bytemuck::Pod;
 use fast_image_resize::FilterType;
 use fast_image_resize::PixelTrait;
-use fast_image_resize::ResizeAlg;
-use fast_image_resize::ResizeOptions;
 use fast_image_resize::Resizer;
-use fast_image_resize::images::TypedImage;
-use fast_image_resize::images::TypedImageRef;
 use fast_image_resize::pixels::Pixel;
 use fast_image_resize::pixels::PixelComponent;
 use serde::Deserialize;
 use serde::Serialize;
-use xxhash_rust::xxh3::xxh3_128;
 
 use crate::browse::Role;
 use crate::decode;
@@ -75,6 +65,8 @@ fn derivation(
 
 /// Content address of a page: xxh3-128 over its encoded bytes.
 pub fn content_hash(bytes: &[u8]) -> u128 {
+    use xxhash_rust::xxh3::xxh3_128;
+
     xxh3_128(bytes)
 }
 
@@ -264,10 +256,15 @@ fn resize_typed<S, C, const N: usize>(
     filter: FilterType,
 ) -> eros::Result<Vec<S>>
 where
-    S: Default + PartialEq + bytemuck::Pod,
+    S: Default + PartialEq + Pod,
     C: PixelComponent,
     Pixel<S, C, N>: PixelTrait,
 {
+    use fast_image_resize::ResizeAlg;
+    use fast_image_resize::ResizeOptions;
+    use fast_image_resize::images::TypedImage;
+    use fast_image_resize::images::TypedImageRef;
+
     let Ok(count) = usize::try_from(
         u64::from(target_dims.0) * u64::from(target_dims.1),
     ) else {
@@ -316,6 +313,8 @@ struct Namespace {
 impl Store {
     /// Open the shared store under `env::temp_dir()/cryslen-cache`.
     pub fn open() -> Self {
+        use std::env;
+
         Self::at(&env::temp_dir().join("cryslen-cache"))
     }
 
@@ -342,6 +341,9 @@ impl Store {
         role: Role,
         fit_box: (u32, u32),
     ) -> Option<Decoded> {
+        use std::fs::FileTimes;
+        use std::time::Instant;
+
         let started = Instant::now();
         let loaded =
             self.role_target(role, fit_box)
@@ -374,6 +376,8 @@ impl Store {
         page: &Decoded,
         fit_box: (u32, u32),
     ) -> Option<Vec<u128>> {
+        use std::time::Instant;
+
         let (namespace, bounds) = self.role_target(role, fit_box)?;
         let started = Instant::now();
         let size =
@@ -427,6 +431,8 @@ impl Namespace {
     /// save into one namespace, so pid plus sequence keeps each
     /// in-progress file distinct.
     fn temp_path(&self, hash: u128) -> PathBuf {
+        use std::process;
+
         let sequence = NEXT_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         self.dir
             .join(format!("{hash:032x}.{}-{sequence}.tmp", process::id()))
@@ -548,6 +554,8 @@ fn clean_temps(dir: &Path) {
 }
 
 fn remove_if_unlocked(path: &Path) -> bool {
+    use std::fs::TryLockError;
+
     let Ok(file) = File::open(path) else {
         return false;
     };
@@ -609,6 +617,9 @@ fn prepare(root: &Path) -> Option<(PathBuf, PathBuf)> {
 }
 
 fn make_dir(path: &Path) -> Option<()> {
+    use std::fs::DirBuilder;
+    use std::os::unix::fs::DirBuilderExt as _;
+
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
             let usable =
@@ -616,12 +627,12 @@ fn make_dir(path: &Path) -> Option<()> {
             return usable.then_some(());
         }
         Err(error) => {
-            if error.kind() != io::ErrorKind::NotFound {
+            if error.kind() != ErrorKind::NotFound {
                 return None;
             }
         }
     }
-    fs::DirBuilder::new()
+    DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(path)
@@ -638,7 +649,9 @@ fn remove_temp(path: PathBuf) {
     }
 }
 
-fn file_identity(metadata: &fs::Metadata) -> (u64, u64) {
+fn file_identity(metadata: &Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt as _;
+
     (metadata.dev(), metadata.ino())
 }
 
@@ -648,11 +661,14 @@ fn open_locked_temp(
     namespace: &Namespace,
     hash: u128,
 ) -> io::Result<(File, TempGuard)> {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
     const MAX_ATTEMPTS: usize = 8;
 
     for _ in 0..MAX_ATTEMPTS {
         let temp = namespace.temp_path(hash);
-        let file = fs::OpenOptions::new()
+        let file = OpenOptions::new()
             .write(true)
             .create_new(true)
             .mode(0o600)
@@ -662,7 +678,7 @@ fn open_locked_temp(
         let opened = file_identity(&file.metadata()?);
         let on_disk = match fs::symlink_metadata(&*guard) {
             Ok(metadata) => Some(file_identity(&metadata)),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) if error.kind() == ErrorKind::NotFound => None,
             Err(error) => return Err(error),
         };
         if on_disk == Some(opened) {
@@ -671,8 +687,8 @@ fn open_locked_temp(
         // Disarm before retrying so a replaced path's inode stays intact.
         drop(DropGuard::dismiss(guard));
     }
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
+    Err(Error::new(
+        ErrorKind::NotFound,
         "temp file was swept before it could be locked",
     ))
 }
@@ -682,18 +698,20 @@ fn write_atomic(
     hash: u128,
     mut slices: &mut [IoSlice<'_>],
 ) -> io::Result<u64> {
+    use std::io::Write as _;
+
     let (mut file, guard) = open_locked_temp(namespace, hash)?;
     let total: usize = slices.iter().map(|slice| slice.len()).sum();
     while !slices.is_empty() {
         match file.write_vectored(slices) {
             Ok(0) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
+                return Err(Error::new(
+                    ErrorKind::WriteZero,
                     "short vectored write",
                 ));
             }
             Ok(written) => IoSlice::advance_slices(&mut slices, written),
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
             Err(error) => return Err(error),
         }
     }
@@ -740,10 +758,10 @@ impl CacheMeta {
 
 fn encode_header(meta: &CacheMeta) -> io::Result<Vec<u8>> {
     let mut meta_buf = [0_u8; MAX_META_BYTES];
-    let encoded = postcard::to_slice(meta, &mut meta_buf)
-        .map_err(io::Error::other)?;
+    let encoded =
+        postcard::to_slice(meta, &mut meta_buf).map_err(Error::other)?;
     let Ok(meta_len) = u8::try_from(encoded.len()) else {
-        return Err(io::Error::other(format!(
+        return Err(Error::other(format!(
             "cache metadata exceeds {MAX_META_BYTES} bytes"
         )));
     };
@@ -938,9 +956,6 @@ fn read_plane(
     reason = "a panic in test code is inconsequential"
 )]
 mod tests {
-    use std::thread;
-    use std::time::Duration;
-
     use tempfile::TempDir;
 
     use super::*;
@@ -1100,6 +1115,9 @@ mod tests {
     }
 
     fn set_modified(path: &Path, seconds: u64) {
+        use std::fs::FileTimes;
+        use std::time::Duration;
+
         let modified =
             SystemTime::UNIX_EPOCH + Duration::from_secs(seconds);
         fs::set_times(path, FileTimes::new().set_modified(modified))
@@ -1109,6 +1127,7 @@ mod tests {
     #[test]
     fn concurrent_saves_do_not_collide() {
         use std::sync::atomic::AtomicUsize;
+        use std::thread;
 
         const WRITER_COUNT: usize = 2;
         const SAVES_PER_WRITER: usize = 20;

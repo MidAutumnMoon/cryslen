@@ -5,6 +5,7 @@ use enum_map::Enum;
 use enum_map::EnumMap;
 use serde::Deserialize;
 use serde::Serialize;
+use serde::Serializer;
 use strum::Display;
 use strum::IntoStaticStr;
 use strum::VariantArray;
@@ -53,7 +54,7 @@ impl TryFrom<Vec<String>> for PageNames {
 impl Serialize for PageNames {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
-        S: serde::Serializer,
+        S: Serializer,
     {
         self.names.serialize(serializer)
     }

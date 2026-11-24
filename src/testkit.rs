@@ -2,14 +2,10 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use eros::ErrorUnion;
-use image::Delay;
 use image::DynamicImage;
-use image::Frame;
 use image::ImageFormat;
 use image::Rgb;
 use image::RgbImage;
-use image::Rgba;
-use image::RgbaImage;
 use image::codecs::gif::Repeat;
 
 use crate::source::Source;
@@ -24,6 +20,9 @@ fn encode(img: &DynamicImage, format: ImageFormat) -> Vec<u8> {
 }
 
 pub fn tiny_png(width: u32, height: u32, rgba: [u8; 4]) -> Vec<u8> {
+    use image::Rgba;
+    use image::RgbaImage;
+
     let img = RgbaImage::from_pixel(width, height, Rgba(rgba));
     encode(&DynamicImage::ImageRgba8(img), ImageFormat::Png)
 }
@@ -46,6 +45,10 @@ pub fn tiny_animated_gif(
     delay_ms: u32,
     repeat: Repeat,
 ) -> Vec<u8> {
+    use image::Delay;
+    use image::Frame;
+    use image::Rgba;
+    use image::RgbaImage;
     use image::codecs::gif::GifEncoder;
 
     let mut bytes = Vec::new();

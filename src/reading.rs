@@ -1,14 +1,10 @@
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
-use std::iter;
-use std::mem;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::path::PathBuf;
-use std::time::Duration;
 use std::time::Instant;
 
-use crate::animation::Due;
 use crate::animation::Player;
 use crate::book::BookEvent;
 use crate::browse;
@@ -20,10 +16,8 @@ use crate::browse::Request;
 use crate::browse::Role;
 use crate::browse::Roles;
 use crate::browse::Spread;
-use crate::cache;
 use crate::catalog;
 use crate::catalog::PageName;
-use crate::decode;
 use crate::decode::Format;
 use crate::protocol::BookInfo;
 use crate::protocol::ImageLimits;
@@ -32,7 +26,6 @@ use crate::protocol::PlaybackEvent;
 use crate::protocol::PlaybackId;
 use crate::protocol::TextureFault;
 use crate::protocol::ValidatedImage;
-use crate::ui::ReadingStatus;
 use crate::ui::StatusLine;
 
 const FIT_KEEP_SPREADS: usize = 2;
@@ -183,6 +176,8 @@ impl Reading {
     }
 
     pub fn take_pending_uploads(&mut self) -> VecDeque<PendingUpload> {
+        use std::mem;
+
         mem::take(&mut self.pending_uploads)
     }
 
@@ -697,6 +692,8 @@ impl Reading {
     }
 
     pub fn note_hold(&mut self, mode: ReadingMode, now: Instant) {
+        use std::time::Duration;
+
         const HOLD_LOG_THRESHOLD: Duration = Duration::from_millis(250);
 
         let target = self.target_spread(mode);
@@ -817,6 +814,8 @@ impl Reading {
             &ValidatedImage,
         ) -> Result<(), TextureFault>,
     ) -> PlaybackTick {
+        use crate::animation::Due;
+
         let mut next_deadline: Option<Instant> = None;
         let mut commands = Vec::new();
         let mut updated = false;
@@ -873,6 +872,8 @@ impl Reading {
         on_screen: Spread,
         has_texture: impl Fn(usize) -> bool,
     ) -> bool {
+        use std::iter;
+
         iter::once(on_screen.first)
             .chain(on_screen.second)
             .all(|page| {
@@ -895,6 +896,10 @@ impl Reading {
         book_fault: Option<&'fault str>,
         has_texture: impl Fn(usize) -> bool,
     ) -> StatusLine<'fault> {
+        use crate::decode;
+        use crate::ui::ReadingStatus;
+        use std::iter;
+
         let mut failure: Option<(usize, &'fault str)> = None;
         let mut first_decoded: Option<(usize, PageInfo)> = None;
         for page in iter::once(on_screen.first).chain(on_screen.second) {
@@ -984,6 +989,8 @@ fn full_wanted(
     page_dims: (u32, u32),
     limits: ImageLimits,
 ) -> bool {
+    use crate::cache;
+
     const ROUNDING_MARGIN_PX: f64 = 1.0;
 
     let fit = cache::fit_dims(page_dims, limits.fit_box());
@@ -1003,9 +1010,6 @@ fn full_wanted(
 )]
 mod tests {
     use super::*;
-    use crate::decode::Decoded;
-    use crate::decode::Transfer;
-    use crate::protocol::WireImage;
 
     fn test_limits() -> ImageLimits {
         const FIT_BOX: (u32, u32) = (2560, 1440);
@@ -1049,6 +1053,10 @@ mod tests {
         height: u32,
         format: Format,
     ) -> Box<ValidatedImage> {
+        use crate::decode::Decoded;
+        use crate::decode::Transfer;
+        use crate::protocol::WireImage;
+
         const RGBA_BYTES_PER_PIXEL: usize = 4;
         let bytes =
             vec![
@@ -1650,6 +1658,8 @@ mod tests {
 
     #[test]
     fn playback_lifecycle_handles_restarts_refusals_and_page_faults() {
+        use std::time::Duration;
+
         const MAX_EDGE: u32 = 100;
         const FITTING_EDGE: u32 = 20;
         const OVERSIZED_EDGE: u32 = 200;
