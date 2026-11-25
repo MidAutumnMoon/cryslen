@@ -48,6 +48,7 @@ use crate::protocol::BookInfo;
 use crate::protocol::ImageLimits;
 use crate::protocol::ParentMsg;
 use crate::reading::Reading;
+use crate::reading::ReconcileView;
 use crate::render::Window;
 use crate::ui::StatusLine;
 use crate::ui::Timers;
@@ -361,7 +362,7 @@ struct App {
     gl: Option<Gl>,
     fatal_error: Option<ErrorUnion>,
     view: ViewState,
-    skimming_keys: BTreeSet<KeyCode>,
+    skimming_turn_keys: BTreeSet<KeyCode>,
     input_mode: InputMode,
     pointer: PointerState,
     needs_redraw: bool,
@@ -386,7 +387,7 @@ impl App {
             gl: None,
             fatal_error: None,
             view: ViewState::default(),
-            skimming_keys: BTreeSet::new(),
+            skimming_turn_keys: BTreeSet::new(),
             input_mode: InputMode::Browse,
             pointer: PointerState::default(),
             needs_redraw: false,
@@ -435,7 +436,7 @@ impl App {
         process: BookProcess,
         limits: ImageLimits,
     ) {
-        self.skimming_keys.clear();
+        self.skimming_turn_keys.clear();
         self.input_mode = InputMode::Browse;
         self.set_dragging(false);
         self.view.fit.refit();
@@ -443,14 +444,9 @@ impl App {
             gl.window.pages_mut().clear_all();
         }
         let mode = self.view.mode;
-        let (reading, requests) = Reading::open(path, info, land_on, mode);
+        let (reading, work) = Reading::open(path, info, land_on, mode);
         process.send(ParentMsg::SetLimits(limits));
-        process.send(ParentMsg::SetView {
-            page: reading.target(),
-            mode,
-            direction: reading.direction(),
-        });
-        process.send(ParentMsg::SetRequests(requests));
+        process.send(ParentMsg::SetWork(work));
         tracing::debug!(
             path = %reading.path().display(),
             count = reading.page_count().get(),
@@ -545,69 +541,41 @@ impl App {
         });
     }
 
-    fn poll_child(&mut self, limits: ImageLimits) {
-        use crate::book::BookEvent;
-
-        match &mut self.child {
-            ChildProcess::Opening { open, land_on } => {
-                let Some(opened) = open.try_take() else {
-                    return;
-                };
-                let land_on = land_on.take();
-                match opened {
-                    Ok((path, info, process)) => {
-                        self.adopt_book(
-                            path,
-                            info,
-                            land_on.as_deref(),
-                            process,
-                            limits,
-                        );
-                    }
-                    Err(fault) => {
-                        tracing::warn!(%fault, "book open failed");
-                        self.child =
-                            ChildProcess::Faulted(fault.to_string());
-                        self.needs_redraw = true;
-                    }
-                }
+    fn poll_open(&mut self, limits: ImageLimits) {
+        let ChildProcess::Opening { open, land_on } = &mut self.child else {
+            return;
+        };
+        let Some(opened) = open.try_take() else {
+            return;
+        };
+        let land_on = land_on.take();
+        match opened {
+            Ok((path, info, process)) => {
+                self.adopt_book(
+                    path,
+                    info,
+                    land_on.as_deref(),
+                    process,
+                    limits,
+                );
             }
-            ChildProcess::Live(process) => {
-                let Some(reading) = self.book.reading_mut() else {
-                    return;
-                };
-                let mut died = None;
-                for event in process.drain() {
-                    match event {
-                        BookEvent::Died(detail) => died = Some(detail),
-                        BookEvent::Page(page_event) => {
-                            let effect = reading.apply_event(page_event);
-                            if effect.redraw {
-                                self.needs_redraw = true;
-                            }
-                            if let Some(command) = effect.command {
-                                process.send(ParentMsg::Playback(command));
-                            }
-                        }
-                    }
-                }
-                if let Some(detail) = died {
-                    tracing::warn!(%detail, "the book process failed");
-                    self.child = ChildProcess::Faulted(detail);
-                    self.needs_redraw = true;
-                }
+            Err(fault) => {
+                tracing::warn!(%fault, "book open failed");
+                self.child = ChildProcess::Faulted(fault.to_string());
+                self.needs_redraw = true;
             }
-            ChildProcess::Faulted(_) | ChildProcess::Stopped => {}
         }
     }
 
     fn reconcile(&mut self, event_loop: &ActiveEventLoop) {
         use winit::event_loop::ControlFlow;
 
+        use crate::book::BookEvent;
+
         let Some(limits) = self.gl.as_ref().map(|gl| gl.limits) else {
             return;
         };
-        self.poll_child(limits);
+        self.poll_open(limits);
         let now = Instant::now();
 
         let Self {
@@ -615,92 +583,61 @@ impl App {
             child,
             gl,
             view,
+            skimming_turn_keys,
             needs_redraw,
             ..
         } = self;
         let Some(gl) = gl.as_mut() else {
             return;
         };
+        let is_skimming = !skimming_turn_keys.is_empty();
 
-        let (waiting, playback_deadline) = match book {
+        let (waiting, reconcile_deadline) = match book {
             BookSlot::Initial(_) => (child.is_opening(), None),
             BookSlot::Loaded(reading) => {
-                let touched = drain_uploads(reading, gl);
-                let (shown, changed) =
-                    reading.resolve_shown(view.mode, now, |page| {
-                        gl.window.pages().roles(page)
-                    });
-                if changed {
-                    view.fit.commit();
-                    *needs_redraw = true;
+                let mut page_events = Vec::new();
+                if let ChildProcess::Live(process) = child {
+                    let mut died = None;
+                    for event in process.drain() {
+                        match event {
+                            BookEvent::Died(detail) => died = Some(detail),
+                            BookEvent::Page(page_event) => {
+                                page_events.push(page_event);
+                            }
+                        }
+                    }
+                    if let Some(detail) = died {
+                        tracing::warn!(%detail, "the book process failed");
+                        *child = ChildProcess::Faulted(detail);
+                        *needs_redraw = true;
+                    }
                 }
-                let on_screen = reading.on_screen(view.mode);
-                if touched.iter().any(|&page| on_screen.contains(page)) {
-                    *needs_redraw = true;
-                }
-                let dims = reading.seat_dims(view.mode);
-                let layout = geometry::layout(dims);
-                let spread_size = layout.total();
-                let placement =
-                    view.fit.resolve(spread_size, view.last_viewport);
-                if changed {
-                    tracing::debug!(
-                        ?on_screen,
-                        ?shown,
-                        total = ?spread_size,
-                        ?dims,
-                        scale = placement.scale,
-                        "placement"
-                    );
-                }
-
-                let (viewport_width, viewport_height) =
-                    view.last_viewport.size();
-                let on_screen_scale = (viewport_width > 0
-                    && viewport_height > 0)
-                    .then_some(placement.scale);
-                if let Some(requests) = reading.update_requests(
-                    view.mode,
-                    on_screen_scale,
-                    gl.limits,
-                    |page| gl.window.pages().roles(page),
-                ) {
-                    child.send(ParentMsg::SetRequests(requests));
-                }
-                reading.note_hold(view.mode, now);
-
-                for command in reading.sync_playback(view.mode, |page| {
-                    gl.window.pages().roles(page)
-                }) {
-                    child.send(ParentMsg::Playback(command));
-                }
-                gl.window.pages_mut().retain(
-                    |page, role| {
-                        reading.retains_texture(view.mode, page, role)
+                let outcome = reading.reconcile(
+                    page_events,
+                    &mut view.fit,
+                    ReconcileView {
+                        mode: view.mode,
+                        viewport: view.last_viewport,
+                        limits: gl.limits,
+                        is_skimming,
+                        now,
                     },
-                    |page| reading.retains_playback(page),
+                    gl.window.pages_mut(),
                 );
-                let playback = reading.tick_playback(now, |page, image| {
-                    gl.window.pages_mut().update_playback(page, image)
-                });
-                for command in playback.commands {
-                    child.send(ParentMsg::Playback(command));
+                for message in outcome.messages {
+                    child.send(message);
                 }
-                if playback.updated {
+                if outcome.redraw {
                     *needs_redraw = true;
                 }
-
-                let waiting = reading.is_waiting(view.mode, |page| {
-                    gl.window.pages().has_any(page)
-                });
-                (waiting && child.is_live(), playback.next_deadline)
+                (outcome.waiting && child.is_live(), outcome.next_deadline)
             }
         };
         let timers = view.timers.tick(now, waiting);
         if timers.changed {
             *needs_redraw = true;
         }
-        let deadline = [playback_deadline, timers.next_deadline]
+        let deadline = [reconcile_deadline, timers.next_deadline]
             .into_iter()
             .flatten()
             .min();
@@ -751,7 +688,7 @@ impl App {
                 let book_status = reading.book_status(
                     view.mode,
                     placement.scale,
-                    |page| gl.window.pages().has_any(page),
+                    gl.window.pages(),
                 );
                 (
                     Some((layout, reading.shown())),
@@ -792,33 +729,6 @@ impl App {
             );
         }
         Ok(())
-    }
-
-    fn sync_motion(&mut self) {
-        use crate::browse::Motion;
-
-        let mode = self.view.mode;
-        let Some(reading) = self.book.reading_mut() else {
-            return;
-        };
-        let motion = if self.skimming_keys.is_empty() {
-            Motion::Still
-        } else {
-            Motion::Skimming
-        };
-        let before = reading.target();
-        if !reading.set_motion(motion, mode) {
-            return;
-        }
-        if reading.target() != before {
-            self.set_view();
-        }
-        self.child.send(ParentMsg::SetMotion(motion));
-    }
-
-    fn clear_skimming_keys(&mut self) {
-        self.skimming_keys.clear();
-        self.sync_motion();
     }
 
     fn on_key(
@@ -862,7 +772,7 @@ impl App {
                                     Instant::now(),
                                 )
                             {
-                                self.after_page_change();
+                                self.view.fit.begin_turn();
                             }
                             self.needs_redraw = true;
                         }
@@ -876,7 +786,7 @@ impl App {
                     && key.text.as_deref() == Some(":")
                 {
                     if self.book.reading().is_some() {
-                        self.clear_skimming_keys();
+                        self.skimming_turn_keys.clear();
                         self.set_dragging(false);
                         self.input_mode = InputMode::Jump(String::new());
                         self.needs_redraw = true;
@@ -890,27 +800,29 @@ impl App {
                 else {
                     return;
                 };
-                if key.repeat {
-                    if !matches!(action, Action::Turn(_)) {
-                        return;
-                    }
-                    self.skimming_keys.insert(code);
-                    self.sync_motion();
+                if key.repeat && !matches!(action, Action::Turn(_)) {
+                    return;
                 }
-                self.dispatch(action, event_loop);
+                if key.repeat && matches!(action, Action::Turn(_)) {
+                    self.skimming_turn_keys.insert(code);
+                }
+                self.dispatch(action, key.repeat, event_loop);
             }
             ElementState::Released => {
                 let PhysicalKey::Code(code) = key.physical_key else {
                     return;
                 };
-                if self.skimming_keys.remove(&code) {
-                    self.sync_motion();
-                }
+                self.skimming_turn_keys.remove(&code);
             }
         }
     }
 
-    fn dispatch(&mut self, action: Action, event_loop: &ActiveEventLoop) {
+    fn dispatch(
+        &mut self,
+        action: Action,
+        is_repeat: bool,
+        event_loop: &ActiveEventLoop,
+    ) {
         match action {
             Action::Quit => event_loop.exit(),
             Action::Escape => {
@@ -941,13 +853,12 @@ impl App {
                 let previous = self.view.mode;
                 self.view.mode = mode;
                 self.view.timers.toast(Instant::now());
-                if let Some(reading) = self.book.reading_mut() {
-                    if reading.switch_mode(previous, mode) {
-                        // The fit begins the new pairing; a mode switch
-                        // skips the skim.
-                        self.view.fit.begin_turn();
-                    }
-                    self.set_view();
+                if let Some(reading) = self.book.reading_mut()
+                    && reading.switch_mode(previous, mode)
+                {
+                    // The fit begins the new pairing; a mode switch skips
+                    // the hold.
+                    self.view.fit.begin_turn();
                 }
                 self.needs_redraw = true;
             }
@@ -961,7 +872,7 @@ impl App {
                 } else {
                     reading.jump_to_last(mode, Instant::now());
                 }
-                self.after_page_change();
+                self.view.fit.begin_turn();
             }
             Action::SwitchBook(direction) => {
                 // Switch runs off the event loop; the old book's view and
@@ -985,27 +896,11 @@ impl App {
                 let Some(reading) = self.book.reading_mut() else {
                     return;
                 };
-                if reading.turn(direction, mode, Instant::now()) {
-                    self.after_page_change();
+                if reading.turn(direction, mode, is_repeat, Instant::now()) {
+                    self.view.fit.begin_turn();
                 }
             }
         }
-    }
-
-    fn set_view(&self) {
-        let Some(reading) = self.book.reading() else {
-            return;
-        };
-        self.child.send(ParentMsg::SetView {
-            page: reading.target(),
-            mode: self.view.mode,
-            direction: reading.direction(),
-        });
-    }
-
-    fn after_page_change(&mut self) {
-        self.set_view();
-        self.view.fit.begin_turn();
     }
 }
 
@@ -1079,79 +974,6 @@ fn wheel_zoom_factor(delta: MouseScrollDelta, scale_factor: f64) -> f64 {
     (wheel_lines * WHEEL_ZOOM_PER_LINE).exp()
 }
 
-fn drain_uploads(reading: &mut Reading, gl: &mut Gl) -> Vec<usize> {
-    use std::time::Duration;
-
-    const SLOW_UPLOAD_THRESHOLD: Duration = Duration::from_millis(30);
-
-    let pending = reading.take_pending_uploads();
-    if pending.is_empty() {
-        return Vec::new();
-    }
-    let started = Instant::now();
-    let mut uploaded_count = 0_usize;
-    let mut uploaded_bytes = 0_usize;
-    let mut touched = Vec::with_capacity(pending.len());
-    let textures = gl.window.pages_mut();
-    for upload in pending {
-        let image_bytes = upload.image.resident_bytes();
-        let upload_started = Instant::now();
-        touched.push(upload.page);
-        match textures.insert(upload.page, upload.role, &upload.image) {
-            Ok(()) => {
-                let elapsed = upload_started.elapsed();
-                reading.record_uploaded(upload.page, &upload.image);
-                tracing::debug!(
-                    page = upload.page,
-                    role = ?upload.role,
-                    width = upload.image.meta.width,
-                    height = upload.image.meta.height,
-                    elapsed = ?elapsed,
-                    "uploaded"
-                );
-                if elapsed >= SLOW_UPLOAD_THRESHOLD {
-                    tracing::info!(
-                        page = upload.page,
-                        role = ?upload.role,
-                        width = upload.image.meta.width,
-                        height = upload.image.meta.height,
-                        elapsed = ?elapsed,
-                        "slow upload"
-                    );
-                }
-                uploaded_count += 1;
-                uploaded_bytes =
-                    uploaded_bytes.saturating_add(image_bytes);
-            }
-            Err(fault) => {
-                tracing::warn!(
-                    page = upload.page,
-                    role = ?upload.role,
-                    %fault,
-                    "texture upload refused"
-                );
-                let has_settled_image =
-                    textures.roles(upload.page).has_settled_image();
-                reading.record_upload_refused(
-                    upload.page,
-                    upload.role,
-                    has_settled_image,
-                    fault,
-                );
-            }
-        }
-    }
-    if uploaded_count > 0 {
-        tracing::debug!(
-            count = uploaded_count,
-            bytes = uploaded_bytes,
-            elapsed = ?started.elapsed(),
-            "drained"
-        );
-    }
-    touched
-}
-
 impl ApplicationHandler<Wake> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let window = match Window::new(event_loop) {
@@ -1168,7 +990,7 @@ impl ApplicationHandler<Wake> for App {
         );
         // Adopt an already-ready book before egui and system font scanning
         // so page 0 decodes concurrently.
-        self.poll_child(limits);
+        self.poll_open(limits);
         let panel_fill = window.translucent().then_some(GLASS_FILL);
         let egui = match Egui::new(window.glow(), panel_fill) {
             Ok(egui) => egui,
@@ -1282,7 +1104,7 @@ impl ApplicationHandler<Wake> for App {
                 }
             }
             WindowEvent::Focused(false) => {
-                self.clear_skimming_keys();
+                self.skimming_turn_keys.clear();
                 self.set_dragging(false);
                 self.modifiers = ModifiersState::empty();
             }

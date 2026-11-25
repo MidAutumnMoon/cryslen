@@ -166,16 +166,16 @@ fn accept_hello(
 }
 
 #[test]
-fn child_serves_a_decoded_thumb() {
+fn child_serves_a_decoded_fit_with_thumb() {
     use cryslen::protocol::ChildMsg;
-    use cryslen::protocol::Direction;
     use cryslen::protocol::Format;
     use cryslen::protocol::ImageLimits;
     use cryslen::protocol::ParentMsg;
-    use cryslen::protocol::ReadingMode;
     use cryslen::protocol::Request;
-    use cryslen::protocol::Role;
+    use cryslen::protocol::ThumbFormat;
     use cryslen::protocol::WirePixels;
+    use cryslen::protocol::WorkPlan;
+    use cryslen::protocol::WorkRole;
     use tempfile::TempDir;
 
     const FIT_BOX: (u32, u32) = (2560, 1440);
@@ -216,27 +216,24 @@ fn child_serves_a_decoded_thumb() {
         )))
         .expect("send SetLimits");
     commands
-        .send(ParentMsg::SetView {
-            page: 0,
-            mode: ReadingMode::Normal,
-            direction: Direction::Forward,
-        })
-        .expect("send SetView");
-    commands
-        .send(ParentMsg::SetRequests(vec![Request {
-            page: 0,
-            role: Role::Thumb,
-        }]))
-        .expect("send SetRequests");
+        .send(ParentMsg::SetWork(WorkPlan {
+            current: vec![Request {
+                page: 0,
+                role: WorkRole::Fit,
+            }],
+            ..WorkPlan::default()
+        }))
+        .expect("send SetWork");
 
-    let image = match messages.try_recv_timeout(STEP_TIMEOUT) {
+    let (image, thumb) = match messages.try_recv_timeout(STEP_TIMEOUT) {
         Ok(ChildMsg::Ready {
             page: 0,
-            role: Role::Thumb,
+            role: WorkRole::Fit,
             image,
-        }) => image,
+            thumb,
+        }) => (image, thumb),
         Ok(message) => {
-            panic!("expected a page 0 thumb, got {message:?}")
+            panic!("expected a page 0 fit, got {message:?}")
         }
         Err(error) => panic!("no Ready from the child: {error}"),
     };
@@ -244,12 +241,12 @@ fn child_serves_a_decoded_thumb() {
     assert_eq!(
         (image.meta.width, image.meta.height),
         (PAGE_EDGE, PAGE_EDGE),
-        "the thumb is the page's own size",
+        "the fit image is the page's own size",
     );
     assert_eq!(
         image.meta.page_dims,
         (PAGE_EDGE, PAGE_EDGE),
-        "the thumb reports the page's dimensions",
+        "the fit image reports the page's dimensions",
     );
     assert_eq!(
         image.meta.format,
@@ -262,14 +259,21 @@ fn child_serves_a_decoded_thumb() {
     assert_eq!(
         bytes.len(),
         PAGE_BYTES,
-        "the thumb holds one rgba per pixel",
+        "the fit image holds one rgba per pixel",
     );
     let expected = [PIXEL; 4].concat();
     assert_eq!(
         bytes.to_vec(),
         expected,
-        "the thumb holds the page's color",
+        "the fit image holds the page's color",
     );
+
+    let thumb = thumb.expect("fit delivery includes an 8-bit thumb");
+    assert_eq!((thumb.width, thumb.height), (PAGE_EDGE, PAGE_EDGE));
+    assert_eq!(thumb.page_dims, (PAGE_EDGE, PAGE_EDGE));
+    assert_eq!(thumb.format, Format::Png);
+    assert_eq!(thumb.pixels, ThumbFormat::Rgba8);
+    assert_eq!(thumb.bytes, expected);
 }
 
 #[test]

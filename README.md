@@ -8,7 +8,7 @@
 
 I built it from scratch because I want:
 
-- Minimal, config-less, stateless viewer. This thing draws raw OpenGL. Knobs and shortcuts are all baked in. They fit my habit but maybe not yours.
+- Minimal, config-less, stateless (except a throwaways thumbnail cache) viewer. This thing draws raw OpenGL. Knobs and shortcuts are all baked in. They fit my habit but maybe not yours.
 - Support enough file formats. I use JXL and AVIF heavily, so support for these two is very good.
 - Manga mode: right to left, double page. Of course it also has left to right mode like a normal image viewer.
 - Read manga directly from archives: 7z, cb7, zip, cbz.

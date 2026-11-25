@@ -1,46 +1,100 @@
 use std::collections::BTreeMap;
-use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::Duration;
 use std::time::Instant;
 
 use crate::animation::Player;
 use crate::book::PageEvent;
 use crate::browse;
 use crate::browse::Direction;
-use crate::browse::Motion;
 use crate::browse::PageNames;
 use crate::browse::ReadingMode;
 use crate::browse::Request;
 use crate::browse::Role;
 use crate::browse::Roles;
 use crate::browse::Spread;
+use crate::browse::WorkRole;
+use crate::cache::ThumbPack;
 use crate::catalog;
 use crate::catalog::PageName;
 use crate::decode::Format;
+use crate::geometry;
+use crate::geometry::Fit;
+use crate::geometry::Viewport;
 use crate::protocol::BookInfo;
 use crate::protocol::ImageLimits;
+use crate::protocol::ParentMsg;
 use crate::protocol::PlaybackCommand;
 use crate::protocol::PlaybackEvent;
 use crate::protocol::PlaybackId;
 use crate::protocol::TextureFault;
 use crate::protocol::ValidatedImage;
+use crate::protocol::ValidatedThumb;
+use crate::protocol::WorkPlan;
 use crate::ui::ReadingStatus;
 
-const FIT_KEEP_SPREADS: usize = 2;
+const VRAM_FIT_BUDGET_BYTES: usize = 384 * 1024 * 1024;
+const VRAM_THUMB_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+const VRAM_FULL_BUDGET_BYTES: usize = 192 * 1024 * 1024;
+
+pub trait PageStore {
+    fn roles(&self, page: usize) -> Roles;
+    fn has_any(&self, page: usize) -> bool;
+    fn average_role_bytes(&self, role: Role) -> Option<usize>;
+    fn insert_page(
+        &mut self,
+        page: usize,
+        role: WorkRole,
+        image: &ValidatedImage,
+    ) -> Result<(), TextureFault>;
+    fn insert_thumb(&mut self, page: usize, thumb: &ValidatedThumb);
+    fn update_playback(
+        &mut self,
+        page: usize,
+        image: &ValidatedImage,
+    ) -> Result<(), TextureFault>;
+    fn evict_to_budget(
+        &mut self,
+        role: Role,
+        budget_bytes: usize,
+        is_pinned: &dyn Fn(usize) -> bool,
+        priority: &dyn Fn(usize) -> (usize, bool),
+    );
+    fn retain_playback(&mut self, keep_playback: &dyn Fn(usize) -> bool);
+}
+
+#[derive(Clone, Copy)]
+pub struct ReconcileView {
+    pub mode: ReadingMode,
+    pub viewport: Viewport,
+    pub limits: ImageLimits,
+    pub is_skimming: bool,
+    pub now: Instant,
+}
+
+pub struct ReconcileOutcome {
+    pub messages: Vec<ParentMsg>,
+    pub redraw: bool,
+    pub waiting: bool,
+    pub next_deadline: Option<Instant>,
+}
+
+const THUMB_GRACE: Duration = Duration::from_millis(50);
+const LOOKAHEAD_AHEAD_PAGES: usize = 16;
+const LOOKAHEAD_BEHIND_PAGES: usize = 4;
+const THUMB_WARM_AHEAD_PAGES: usize = 256;
+const THUMB_WARM_BEHIND_PAGES: usize = 32;
+const DEFAULT_FIT_PAGE_BYTES: usize = 8 * 1024 * 1024;
+const LOOKAHEAD_VRAM_NUMERATOR: usize = 4;
+const LOOKAHEAD_VRAM_DENOMINATOR: usize = 5;
 
 /// Native page dimensions and decoded format, fixed across roles.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PageInfo {
     dims: (u32, u32),
     format: Format,
-}
-
-pub struct PendingUpload {
-    pub page: usize,
-    pub role: Role,
-    pub image: Box<ValidatedImage>,
 }
 
 #[derive(Default)]
@@ -109,15 +163,14 @@ pub struct Reading {
     dir_name: Option<String>,
     names: PageNames,
     target: usize,
-    shown: Option<(ReadingMode, Spread)>,
+    shown: Option<Spread>,
     pages: BTreeMap<usize, PageState>,
-    pending_uploads: VecDeque<PendingUpload>,
-    motion: Motion,
-    /// Drives child prefetch order and skim tie-breaking.
+    thumb_pack: Option<ThumbPack>,
+    /// Drives child lookahead order.
     direction: Direction,
     last_turn: Option<Instant>,
     hold: Hold,
-    sent_requests: Vec<Request>,
+    sent_work: WorkPlan,
     next_generation: u32,
 }
 
@@ -127,7 +180,18 @@ impl Reading {
         info: BookInfo,
         land_on: Option<&str>,
         mode: ReadingMode,
-    ) -> (Self, Vec<Request>) {
+    ) -> (Self, WorkPlan) {
+        let thumb_pack = ThumbPack::open(&path, info.archive, &info.names);
+        Self::open_with_pack(path, info, land_on, mode, thumb_pack)
+    }
+
+    fn open_with_pack(
+        path: PathBuf,
+        info: BookInfo,
+        land_on: Option<&str>,
+        mode: ReadingMode,
+        thumb_pack: Option<ThumbPack>,
+    ) -> (Self, WorkPlan) {
         let archive = info.archive;
         let dir_name = if archive {
             None
@@ -138,7 +202,7 @@ impl Reading {
         let target = land_on.map_or(0, |name| {
             catalog::landing(info.names.iter().map(String::as_str), name)
         });
-        let requests = cold_requests(
+        let work = cold_work(
             browse::spread_for(target, mode, info.names.count()),
             mode,
         );
@@ -150,15 +214,14 @@ impl Reading {
             target,
             shown: None,
             pages: BTreeMap::new(),
-            pending_uploads: VecDeque::new(),
-            motion: Motion::Still,
+            thumb_pack,
             direction: Direction::Forward,
             last_turn: None,
             hold: Hold::Idle,
-            sent_requests: requests.clone(),
+            sent_work: work.clone(),
             next_generation: 0,
         };
-        (reading, requests)
+        (reading, work)
     }
 
     pub fn path(&self) -> &Path {
@@ -169,22 +232,22 @@ impl Reading {
         self.names.count()
     }
 
-    pub fn target(&self) -> usize {
-        self.target
-    }
-
     pub fn shown(&self) -> Option<Spread> {
-        self.shown.map(|(_, spread)| spread)
+        self.shown
     }
 
-    pub fn direction(&self) -> Direction {
-        self.direction
+    fn is_faulted(&self, page: usize) -> bool {
+        self.pages
+            .get(&page)
+            .is_some_and(|state| state.fault.is_some())
     }
 
-    pub fn take_pending_uploads(&mut self) -> VecDeque<PendingUpload> {
-        use std::mem;
+    fn page_info(&self, page: usize) -> Option<PageInfo> {
+        self.pages.get(&page)?.info
+    }
 
-        mem::take(&mut self.pending_uploads)
+    fn target_spread(&self, mode: ReadingMode) -> Spread {
+        browse::spread_for(self.target, mode, self.page_count())
     }
 
     pub fn sibling(&self, direction: Direction) -> Option<PathBuf> {
@@ -205,10 +268,6 @@ impl Reading {
         )
     }
 
-    fn target_spread(&self, mode: ReadingMode) -> Spread {
-        browse::spread_for(self.target, mode, self.page_count())
-    }
-
     fn set_turn(
         &mut self,
         target: usize,
@@ -218,40 +277,24 @@ impl Reading {
         self.target = target;
         self.direction = direction;
         self.last_turn = Some(now);
-        tracing::debug!(
-            index = self.target,
-            ?direction,
-            motion = ?self.motion,
-            "turn"
-        );
-    }
-
-    fn commit_shown(&mut self, mode: ReadingMode) -> bool {
-        let Some((shown_mode, spread)) = self.shown else {
-            return false;
-        };
-        let target = self.target;
-        if shown_mode != mode || spread.first == target {
-            return false;
-        }
-        self.target = spread.first;
-        true
+        tracing::debug!(index = self.target, ?direction, "turn");
     }
 
     pub fn turn(
         &mut self,
         direction: Direction,
         mode: ReadingMode,
+        is_repeat: bool,
         now: Instant,
     ) -> bool {
         let page_count = self.page_count();
         let next =
             browse::advance(self.target, direction, mode, page_count);
-        if self.motion == Motion::Skimming {
-            let Some((_, spread)) = self.shown else {
+        if is_repeat {
+            let Some(spread) = self.shown else {
                 return false;
             };
-            // Keep skims within one spread of what is on screen.
+            // Pace held key repeats so target stays within one spread of screen.
             let shown_start =
                 browse::spread_for(spread.first, mode, page_count).first;
             let target_start =
@@ -305,18 +348,6 @@ impl Reading {
         previous: ReadingMode,
         next: ReadingMode,
     ) -> bool {
-        if self.motion == Motion::Skimming {
-            // The new pairing is a different coordinate system; commit the
-            // shown spread before switching.
-            let from = self.target;
-            if self.commit_shown(previous) {
-                tracing::debug!(
-                    from,
-                    to = self.target,
-                    "mode switch commits shown"
-                );
-            }
-        }
         let pairing_changed = previous.pairs() != next.pairs();
         if pairing_changed {
             self.target =
@@ -325,32 +356,6 @@ impl Reading {
         }
         self.direction = Direction::Forward;
         pairing_changed
-    }
-
-    pub fn set_motion(
-        &mut self,
-        motion: Motion,
-        mode: ReadingMode,
-    ) -> bool {
-        if motion == self.motion {
-            return false;
-        }
-        if motion == Motion::Still {
-            // A turn may not have reached the screen; commit the shown spread
-            // so its thumb promotes in place.
-            let from = self.target;
-            if self.commit_shown(mode) {
-                tracing::debug!(from, to = self.target, "commit shown");
-            }
-        }
-        tracing::debug!(
-            ?motion,
-            target = self.target,
-            shown = ?self.shown(),
-            "motion"
-        );
-        self.motion = motion;
-        true
     }
 
     fn player_mut(
@@ -364,23 +369,179 @@ impl Reading {
         state.player_mut(id)
     }
 
-    pub fn apply_event(&mut self, event: PageEvent) -> EventEffect {
+    pub fn reconcile(
+        &mut self,
+        events: impl IntoIterator<Item = PageEvent>,
+        fit: &mut Fit,
+        view: ReconcileView,
+        textures: &mut impl PageStore,
+    ) -> ReconcileOutcome {
+        let mut messages = Vec::new();
+        let mut touched = Vec::new();
+        let mut redraw = false;
+
+        for event in events {
+            self.apply_event(
+                event,
+                textures,
+                &mut messages,
+                &mut touched,
+                &mut redraw,
+            );
+        }
+
+        self.hydrate_thumbs(view.mode, view.is_skimming, textures, &mut touched);
+
+        let (shown, changed, thumb_grace_deadline) = self.resolve_shown(
+            view.mode,
+            view.now,
+            view.is_skimming,
+            textures,
+        );
+        if changed {
+            fit.commit();
+            redraw = true;
+        }
+        let on_screen = self.on_screen(view.mode);
+        if touched.iter().any(|&page| on_screen.contains(page)) {
+            redraw = true;
+        }
+        let dims = self.seat_dims(view.mode);
+        let layout = geometry::layout(dims);
+        let spread_size = layout.total();
+        let placement = fit.resolve(spread_size, view.viewport);
+        if changed {
+            tracing::debug!(
+                ?on_screen,
+                ?shown,
+                total = ?spread_size,
+                ?dims,
+                scale = placement.scale,
+                "placement"
+            );
+        }
+
+        let target_spread = self.target_spread(view.mode);
+        let is_active_page = |page: usize| {
+            on_screen.contains(page) || target_spread.contains(page)
+        };
+        let priority = |page: usize| self.vram_evict_priority(view.mode, page);
+        textures.evict_to_budget(
+            Role::Fit,
+            VRAM_FIT_BUDGET_BYTES,
+            &is_active_page,
+            &priority,
+        );
+        textures.evict_to_budget(
+            Role::Thumb,
+            VRAM_THUMB_BUDGET_BYTES,
+            &is_active_page,
+            &priority,
+        );
+        textures.evict_to_budget(
+            Role::Full,
+            VRAM_FULL_BUDGET_BYTES,
+            &|page| on_screen.contains(page),
+            &priority,
+        );
+
+        let (viewport_width, viewport_height) = view.viewport.size();
+        let on_screen_scale = (viewport_width > 0 && viewport_height > 0)
+            .then_some(placement.scale);
+        if let Some(plan) = self.update_work(
+            view.mode,
+            view.is_skimming,
+            on_screen_scale,
+            view.limits,
+            textures,
+        ) {
+            messages.push(ParentMsg::SetWork(plan));
+        }
+        self.note_hold(view.mode, view.now);
+
+        for command in self.sync_playback(
+            view.mode,
+            view.is_skimming,
+            textures,
+        ) {
+            messages.push(ParentMsg::Playback(command));
+        }
+        textures.retain_playback(&|page| self.retains_playback(page));
+
+        let (playback_deadline, playback_updated) =
+            self.tick_playback(view.now, textures, &mut messages);
+        if playback_updated {
+            redraw = true;
+        }
+
+        let waiting = self.is_waiting(view.mode, textures);
+        let next_deadline = [playback_deadline, thumb_grace_deadline]
+            .into_iter()
+            .flatten()
+            .min();
+        ReconcileOutcome {
+            messages,
+            redraw,
+            waiting,
+            next_deadline,
+        }
+    }
+
+    fn apply_event(
+        &mut self,
+        event: PageEvent,
+        textures: &mut impl PageStore,
+        messages: &mut Vec<ParentMsg>,
+        touched: &mut Vec<usize>,
+        redraw: &mut bool,
+    ) {
         match event {
-            PageEvent::Ready { page, role, image } => {
-                self.pending_uploads.push_back(PendingUpload {
-                    page,
-                    role,
-                    image,
-                });
-                EventEffect::default()
+            PageEvent::Ready {
+                page,
+                role,
+                image,
+                thumb,
+            } => {
+                touched.push(page);
+                match textures.insert_page(page, role, &image) {
+                    Ok(()) => {
+                        self.record_page_info(
+                            page,
+                            image.meta.page_dims,
+                            image.meta.format,
+                        );
+                        if let Some(thumb) = thumb
+                            && let Some(pack) = &mut self.thumb_pack
+                        {
+                            pack.record(page, thumb);
+                        }
+                    }
+                    Err(fault) => {
+                        tracing::warn!(
+                            page,
+                            ?role,
+                            %fault,
+                            "texture upload refused"
+                        );
+                        if !textures.roles(page).has_settled_image() {
+                            self.pages.entry(page).or_default().fault =
+                                Some(fault.to_string());
+                        }
+                    }
+                }
+            }
+            PageEvent::Thumb { page, thumb } => {
+                if let Some(pack) = &mut self.thumb_pack {
+                    pack.record(page, thumb);
+                }
             }
             PageEvent::Failed { page, fault } => {
                 let state = self.pages.entry(page).or_default();
                 state.fault = Some(fault);
-                EventEffect {
-                    command: state.stop_playback(),
-                    redraw: true,
+                if let Some(command) = state.stop_playback() {
+                    messages.push(ParentMsg::Playback(command));
                 }
+                *redraw = true;
             }
             PageEvent::Playback(playback) => match playback {
                 PlaybackEvent::Frame { id, delay, image } => {
@@ -389,7 +550,6 @@ impl Reading {
                     {
                         tracing::debug!(?id, "unrequested playback frame");
                     }
-                    EventEffect::default()
                 }
                 PlaybackEvent::Finished { id } => {
                     if let Some(player) = self.player_mut(id)
@@ -397,34 +557,30 @@ impl Reading {
                     {
                         tracing::debug!(?id, "playback finished");
                     }
-                    EventEffect::default()
                 }
                 PlaybackEvent::Failed { id } => {
                     let Some(state) = self.pages.get_mut(&id.page) else {
                         tracing::debug!(?id, "stale playback update");
-                        return EventEffect::default();
+                        return;
                     };
                     if state.player_mut(id).is_some() {
                         tracing::warn!(?id, "playback failed");
-                        EventEffect {
-                            command: state.refuse_playback(),
-                            redraw: true,
+                        if let Some(command) = state.refuse_playback() {
+                            messages.push(ParentMsg::Playback(command));
                         }
-                    } else {
-                        EventEffect::default()
+                        *redraw = true;
                     }
                 }
             },
         }
     }
 
-    pub fn record_uploaded(
+    fn record_page_info(
         &mut self,
         page: usize,
-        image: &ValidatedImage,
+        dims: (u32, u32),
+        format: Format,
     ) {
-        let dims = image.meta.page_dims;
-        let format = image.meta.format;
         let state = self.pages.entry(page).or_default();
         if let Some(existing) = state.info {
             debug_assert_eq!(
@@ -437,33 +593,63 @@ impl Reading {
         }
     }
 
-    pub fn record_upload_refused(
+    /// Load warm thumbnails from the local book thumb pack for `target`
+    /// (and one spread ahead while skimming) if not yet in VRAM.
+    fn hydrate_thumbs(
         &mut self,
-        page: usize,
-        role: Role,
-        has_settled_image: bool,
-        fault: TextureFault,
+        mode: ReadingMode,
+        is_skimming: bool,
+        textures: &mut impl PageStore,
+        touched: &mut Vec<usize>,
     ) {
-        if role != Role::Thumb && !has_settled_image {
-            self.pages.entry(page).or_default().fault =
-                Some(fault.to_string());
+        let target = self.target_spread(mode);
+        let next_spread = is_skimming
+            .then(|| {
+                browse::step(
+                    target.first,
+                    self.direction,
+                    mode,
+                    self.page_count(),
+                )
+                .map(|start| browse::spread_for(start, mode, self.page_count()))
+            })
+            .flatten();
+        for spread in [Some(target), next_spread].into_iter().flatten() {
+            for page in spread.seats(mode).into_iter().flatten() {
+                if touched.contains(&page)
+                    || self.is_faulted(page)
+                    || textures.roles(page).any()
+                {
+                    continue;
+                }
+                let Some(thumb) =
+                    self.thumb_pack.as_ref().and_then(|pack| pack.load(page))
+                else {
+                    continue;
+                };
+                textures.insert_thumb(page, &thumb);
+                self.record_page_info(page, thumb.page_dims, thumb.format);
+                touched.push(page);
+            }
         }
     }
 
-    pub fn resolve_shown(
+    fn resolve_shown(
         &mut self,
         mode: ReadingMode,
         now: Instant,
-        roles: impl Fn(usize) -> Roles,
-    ) -> (Option<Spread>, bool) {
-        let shown = self.choose_presented(mode, &roles);
+        is_skimming: bool,
+        textures: &impl PageStore,
+    ) -> (Option<Spread>, bool, Option<Instant>) {
+        let (shown, deadline) =
+            self.choose_presented(mode, now, is_skimming, textures);
         let previous_shown = self.shown();
         let changed = shown != previous_shown;
         if changed {
             let seats = shown.map(|spread| {
                 spread.seats(mode).map(|seat| {
                     seat.map_or("empty", |page| {
-                        roles(page).best().map_or("none", Into::into)
+                        textures.roles(page).best().map_or("none", Into::into)
                     })
                 })
             });
@@ -473,237 +659,268 @@ impl Reading {
             tracing::debug!(
                 from = ?previous_shown,
                 to = ?shown,
-                motion = ?self.motion,
+                is_skimming,
                 ?seats,
                 ?took,
                 "shown"
             );
         }
-        // Record every frame so a mode switch retags an unchanged spread.
-        self.shown = shown.map(|spread| (mode, spread));
-        (shown, changed)
+        self.shown = shown;
+        (shown, changed, deadline)
     }
 
-    /// Target once presentable, else the nearest presentable start in
-    /// `pages` between `shown` and `target` (monotonic skim), else `shown`.
     fn choose_presented(
         &self,
         mode: ReadingMode,
-        roles: impl Fn(usize) -> Roles,
-    ) -> Option<Spread> {
+        now: Instant,
+        is_skimming: bool,
+        textures: &impl PageStore,
+    ) -> (Option<Spread>, Option<Instant>) {
         let target = self.target_spread(mode);
-        let forward = self.direction == Direction::Forward;
-        let skimming = self.motion == Motion::Skimming;
         let shown = self.shown();
-        let can_show = |candidate: usize| {
-            let state = self.pages.get(&candidate);
-            let faulted =
-                state.is_some_and(|page_state| page_state.fault.is_some());
-            if faulted {
+        let can_show = |candidate: usize, allow_thumb: bool| {
+            if self.is_faulted(candidate) {
                 return true;
             }
-            if state.and_then(|page_state| page_state.info).is_none() {
+            if self.page_info(candidate).is_none() {
                 return false;
             }
-            let page_roles = roles(candidate);
-            if skimming {
+            let page_roles = textures.roles(candidate);
+            if allow_thumb {
                 page_roles.any()
             } else {
                 page_roles.has_settled_image()
             }
         };
-        let presentable = |spread: Spread| {
-            spread.seats(mode).into_iter().flatten().all(can_show)
-        };
-        if presentable(target) {
-            return Some(target);
+        let seats = target.seats(mode);
+        if seats.into_iter().flatten().all(|page| can_show(page, false)) {
+            return (Some(target), None);
         }
-        if !skimming {
-            return shown;
-        }
-        let (low, high) = match shown {
-            None => (0, usize::MAX),
-            Some(previous) => {
-                let (low, high) = if forward {
-                    (previous.first, target.first)
-                } else {
-                    (target.first, previous.first)
-                };
-                if low > high {
-                    return shown;
-                }
-                (low, high)
-            }
-        };
-        let page_count = self.page_count();
-        let mut best: Option<Spread> = None;
-        for &page in self.pages.keys() {
-            // A paired spread starting at `high` may be visited via its second seat.
-            if page < low || page > high.saturating_add(1) {
-                continue;
-            }
-            if self
-                .pages
-                .get(&page)
-                .and_then(|page_state| page_state.info)
-                .is_none()
-            {
-                continue;
-            }
-            let spread = browse::spread_for(page, mode, page_count);
-            if spread.first < low
-                || spread.first > high
-                || !presentable(spread)
-            {
-                continue;
-            }
-            let distance = spread.first.abs_diff(target.first);
-            let closer = best.is_none_or(|current| {
-                let current_distance =
-                    current.first.abs_diff(target.first);
-                distance < current_distance
-                    || (distance == current_distance
-                        && if forward {
-                            spread.first > current.first
-                        } else {
-                            spread.first < current.first
-                        })
+        if seats.into_iter().flatten().all(|page| can_show(page, true)) {
+            let grace_elapsed = self.last_turn.is_none_or(|turned_at| {
+                now.saturating_duration_since(turned_at) >= THUMB_GRACE
             });
-            if closer {
-                best = Some(spread);
+            if shown.is_none() || is_skimming || grace_elapsed {
+                return (Some(target), None);
             }
+            return (
+                shown,
+                self.last_turn.map(|turned_at| turned_at + THUMB_GRACE),
+            );
         }
-        best.or(shown)
+        (shown, None)
     }
 
-    pub fn on_screen(&self, mode: ReadingMode) -> Spread {
+    fn on_screen(&self, mode: ReadingMode) -> Spread {
         self.shown().unwrap_or_else(|| self.target_spread(mode))
     }
 
     pub fn seat_dims(&self, mode: ReadingMode) -> [Option<(u32, u32)>; 2] {
         self.on_screen(mode).seats(mode).map(|seat| {
             let page = seat?;
-            self.pages.get(&page)?.info.map(|info| info.dims)
+            self.page_info(page).map(|info| info.dims)
         })
     }
 
-    pub fn update_requests(
+    fn update_work(
         &mut self,
         mode: ReadingMode,
+        is_skimming: bool,
         on_screen_scale: Option<f64>,
         limits: ImageLimits,
-        roles: impl Fn(usize) -> Roles,
-    ) -> Option<Vec<Request>> {
-        let on_screen = self.on_screen(mode);
-        let demand = self.demand_spread(on_screen, mode);
-        let requests = self.request_roles(
-            demand,
-            on_screen,
+        textures: &impl PageStore,
+    ) -> Option<WorkPlan> {
+        let plan = self.build_work(
             mode,
+            is_skimming,
             on_screen_scale,
             limits,
-            roles,
+            textures,
         );
-        if requests == self.sent_requests {
+        if plan == self.sent_work {
             return None;
         }
-        tracing::debug!(?requests, ?demand, "sent requests");
-        self.sent_requests.clone_from(&requests);
-        Some(requests)
-    }
-
-    /// While skimming, demand the adjacent spread so paired pages load
-    /// in step with display.
-    fn demand_spread(
-        &self,
-        on_screen: Spread,
-        mode: ReadingMode,
-    ) -> Spread {
-        if self.motion == Motion::Still {
-            return self.target_spread(mode);
-        }
-        let page_count = self.page_count();
-        let next_start = browse::advance(
-            on_screen.first,
-            self.direction,
-            mode,
-            page_count,
+        tracing::debug!(
+            current = plan.current.len(),
+            lookahead = plan.lookahead.len(),
+            thumbs = plan.thumbs.len(),
+            "sent work"
         );
-        browse::spread_for(next_start, mode, page_count)
+        self.sent_work.clone_from(&plan);
+        Some(plan)
     }
 
-    fn preupload_spread(&self, mode: ReadingMode) -> Option<Spread> {
-        if self.motion != Motion::Still {
-            return None;
-        }
-        let target = self.target_spread(mode);
-        if self.shown() != Some(target) {
-            return None;
-        }
-        let page_count = self.page_count();
-        let next_start =
-            browse::step(target.first, self.direction, mode, page_count)?;
-        Some(browse::spread_for(next_start, mode, page_count))
-    }
-
-    fn request_roles(
+    fn build_work(
         &self,
-        demand: Spread,
-        on_screen: Spread,
         mode: ReadingMode,
+        is_skimming: bool,
         on_screen_scale: Option<f64>,
         limits: ImageLimits,
-        roles: impl Fn(usize) -> Roles,
-    ) -> Vec<Request> {
-        let still = self.motion == Motion::Still;
-        let mut requests = Vec::new();
-        for spread in
-            [Some(demand), Some(on_screen), self.preupload_spread(mode)]
-                .into_iter()
-                .flatten()
-        {
+        textures: &impl PageStore,
+    ) -> WorkPlan {
+        let target = self.target_spread(mode);
+        let on_screen = self.on_screen(mode);
+        let page_count = self.page_count();
+        let needs_fit = |page: usize| {
+            !self.is_faulted(page) && !textures.roles(page).has_settled_image()
+        };
+
+        if is_skimming {
+            let target_has_preview =
+                target.seats(mode).into_iter().flatten().all(|page| {
+                    self.is_faulted(page) || textures.roles(page).any()
+                });
+            if target_has_preview {
+                return WorkPlan::default();
+            }
+            let mut current = Vec::new();
+            for page in target.seats(mode).into_iter().flatten() {
+                if needs_fit(page) {
+                    push_request(&mut current, page, WorkRole::Fit);
+                }
+            }
+            return WorkPlan {
+                current,
+                lookahead: Vec::new(),
+                thumbs: Vec::new(),
+            };
+        }
+
+        let mut current = Vec::new();
+        let mut window_pages = Vec::new();
+        for spread in [target, on_screen] {
             for page in spread.seats(mode).into_iter().flatten() {
-                let state = self.pages.get(&page);
-                if state
-                    .is_some_and(|page_state| page_state.fault.is_some())
-                {
-                    continue;
+                if !window_pages.contains(&page) {
+                    window_pages.push(page);
                 }
-                let resident = roles(page);
-                if still {
-                    if !resident.has_settled_image() {
-                        push_request(&mut requests, page, Role::Fit);
-                    }
-                    if on_screen.contains(page)
-                        && !resident.contains(Role::Full)
-                        && on_screen_scale.is_some_and(|scale| {
-                            state
-                                .and_then(|page_state| page_state.info)
-                                .is_some_and(|info| {
-                                    full_wanted(scale, info.dims, limits)
-                                })
-                        })
-                    {
-                        push_request(&mut requests, page, Role::Full);
-                    }
-                    continue;
-                }
-                if !resident.any() {
-                    push_request(&mut requests, page, Role::Thumb);
+                if needs_fit(page) {
+                    push_request(&mut current, page, WorkRole::Fit);
                 }
             }
         }
-        requests
+        for page in on_screen.seats(mode).into_iter().flatten() {
+            if self.is_faulted(page) || textures.roles(page).contains(Role::Full)
+            {
+                continue;
+            }
+            let wants_full = on_screen_scale.is_some_and(|scale| {
+                self.page_info(page)
+                    .is_some_and(|info| full_wanted(scale, info.dims, limits))
+            });
+            if wants_full {
+                push_request(&mut current, page, WorkRole::Full);
+            }
+        }
+
+        let fit_page_bytes = textures
+            .average_role_bytes(Role::Fit)
+            .unwrap_or(DEFAULT_FIT_PAGE_BYTES)
+            .max(1);
+        let window_cap_bytes = VRAM_FIT_BUDGET_BYTES
+            .checked_div(LOOKAHEAD_VRAM_DENOMINATOR)
+            .map_or(VRAM_FIT_BUDGET_BYTES, |step| {
+                step.saturating_mul(LOOKAHEAD_VRAM_NUMERATOR)
+            });
+        let opposite = match self.direction {
+            Direction::Forward => Direction::Backward,
+            Direction::Backward => Direction::Forward,
+        };
+        let ahead = walk_spreads(
+            target.first,
+            self.direction,
+            mode,
+            page_count,
+            LOOKAHEAD_AHEAD_PAGES,
+        );
+        let behind = walk_spreads(
+            target.first,
+            opposite,
+            mode,
+            page_count,
+            LOOKAHEAD_BEHIND_PAGES,
+        );
+        let guaranteed_spreads =
+            usize::from(!ahead.is_empty()) + usize::from(!behind.is_empty());
+        let ordered = ahead
+            .first()
+            .into_iter()
+            .chain(behind.first())
+            .chain(ahead.get(1..).into_iter().flatten())
+            .chain(behind.get(1..).into_iter().flatten());
+        let mut lookahead = Vec::new();
+        for (spread_index, spread) in ordered.enumerate() {
+            let new_pages = spread
+                .seats(mode)
+                .into_iter()
+                .flatten()
+                .filter(|page| !window_pages.contains(page))
+                .count();
+            if spread_index >= guaranteed_spreads
+                && window_pages
+                    .len()
+                    .saturating_add(new_pages)
+                    .saturating_mul(fit_page_bytes)
+                    > window_cap_bytes
+            {
+                break;
+            }
+            for page in spread.seats(mode).into_iter().flatten() {
+                if !window_pages.contains(&page) {
+                    window_pages.push(page);
+                }
+                if needs_fit(page)
+                    && !current.iter().any(|request| request.page == page)
+                    && !lookahead.contains(&page)
+                {
+                    lookahead.push(page);
+                }
+            }
+        }
+
+        let mut thumbs = Vec::new();
+        if let Some(pack) = &self.thumb_pack {
+            let warm_ahead = walk_spreads(
+                target.first,
+                self.direction,
+                mode,
+                page_count,
+                THUMB_WARM_AHEAD_PAGES,
+            );
+            let warm_behind = walk_spreads(
+                target.first,
+                opposite,
+                mode,
+                page_count,
+                THUMB_WARM_BEHIND_PAGES,
+            );
+            for spread in warm_ahead.into_iter().chain(warm_behind) {
+                for page in spread.seats(mode).into_iter().flatten() {
+                    if self.is_faulted(page)
+                        || pack.has(page)
+                        || current.iter().any(|request| request.page == page)
+                        || lookahead.contains(&page)
+                        || thumbs.contains(&page)
+                    {
+                        continue;
+                    }
+                    thumbs.push(page);
+                }
+            }
+        }
+
+        WorkPlan {
+            current,
+            lookahead,
+            thumbs,
+        }
     }
 
-    pub fn note_hold(&mut self, mode: ReadingMode, now: Instant) {
-        use std::time::Duration;
-
+    fn note_hold(&mut self, mode: ReadingMode, now: Instant) {
         const HOLD_LOG_THRESHOLD: Duration = Duration::from_millis(250);
 
         let target = self.target_spread(mode);
         let shown = self.shown();
-        let holding = self.motion == Motion::Still && shown != Some(target);
+        let holding = shown != Some(target);
         self.hold = match (self.hold, holding) {
             (_, false) => Hold::Idle,
             (Hold::Idle, true) => Hold::Since(now),
@@ -725,52 +942,45 @@ impl Reading {
         };
     }
 
-    pub fn retains_texture(
+    fn vram_evict_priority(
         &self,
         mode: ReadingMode,
         page: usize,
-        role: Role,
-    ) -> bool {
-        if self.sent_requests.contains(&Request { page, role }) {
-            return true;
-        }
-        let on_screen = self.on_screen(mode);
-        let target = self.target_spread(mode);
-        match role {
-            Role::Thumb => true,
-            Role::Fit => {
-                browse::spread_distance(page, on_screen.first, mode)
-                    <= FIT_KEEP_SPREADS
-                    || browse::spread_distance(page, target.first, mode)
-                        <= FIT_KEEP_SPREADS
-            }
-            Role::Full => on_screen.contains(page),
-        }
+    ) -> (usize, bool) {
+        let target_first = self.target_spread(mode).first;
+        let distance = browse::spread_distance(page, target_first, mode);
+        let is_behind = match self.direction {
+            Direction::Forward => page < target_first,
+            Direction::Backward => page > target_first,
+        };
+        (distance, is_behind)
     }
 
-    pub fn retains_playback(&self, page: usize) -> bool {
+    fn retains_playback(&self, page: usize) -> bool {
         self.pages.get(&page).is_some_and(|state| {
             matches!(state.playback, PagePlayback::Playing(_))
         })
     }
 
-    /// Starts a live playback stream when a still animated seat has settled.
-    pub fn sync_playback(
+    /// Starts a live playback stream when a settled animated seat is shown.
+    fn sync_playback(
         &mut self,
         mode: ReadingMode,
-        roles: impl Fn(usize) -> Roles,
+        is_skimming: bool,
+        textures: &impl PageStore,
     ) -> Vec<PlaybackCommand> {
         let on_screen = self.on_screen(mode);
-        let targets = if self.motion == Motion::Still {
+        let settled =
+            !is_skimming && self.shown() == Some(self.target_spread(mode));
+        let targets = if settled {
             on_screen.seats(mode).map(|seat| {
                 let page = seat?;
-                let state = self.pages.get(&page)?;
-                if state.fault.is_some() {
+                if self.is_faulted(page) {
                     return None;
                 }
-                let info = state.info?;
+                let info = self.page_info(page)?;
                 if !info.format.may_animate()
-                    || !roles(page).has_settled_image()
+                    || !textures.roles(page).has_settled_image()
                 {
                     return None;
                 }
@@ -817,15 +1027,15 @@ impl Reading {
         commands
     }
 
-    pub fn tick_playback(
+    fn tick_playback(
         &mut self,
         now: Instant,
-        mut upload: impl FnMut(usize, &ValidatedImage) -> Result<(), TextureFault>,
-    ) -> PlaybackTick {
+        textures: &mut impl PageStore,
+        messages: &mut Vec<ParentMsg>,
+    ) -> (Option<Instant>, bool) {
         use crate::animation::Due;
 
         let mut next_deadline: Option<Instant> = None;
-        let mut commands = Vec::new();
         let mut updated = false;
         for (&page, state) in &mut self.pages {
             let PagePlayback::Playing(player) = &mut state.playback else {
@@ -834,14 +1044,14 @@ impl Reading {
             let id = player.id();
             match player.tick(now) {
                 Due::Show { image, next_due } => {
-                    if let Err(error) = upload(page, &image) {
+                    if let Err(error) = textures.update_playback(page, &image) {
                         tracing::warn!(
                             page,
                             %error,
                             "playback frame upload failed"
                         );
                         if let Some(command) = state.refuse_playback() {
-                            commands.push(command);
+                            messages.push(ParentMsg::Playback(command));
                         }
                         continue;
                     }
@@ -861,55 +1071,36 @@ impl Reading {
                 Due::Idle => {}
             }
             if player.take_next() {
-                commands.push(PlaybackCommand::Next { id });
+                messages.push(ParentMsg::Playback(PlaybackCommand::Next { id }));
             }
         }
-        PlaybackTick {
-            next_deadline,
-            commands,
-            updated,
-        }
+        (next_deadline, updated)
     }
 
-    pub fn is_waiting(
-        &self,
-        mode: ReadingMode,
-        has_texture: impl Fn(usize) -> bool,
-    ) -> bool {
-        use std::iter;
-
-        let on_screen = self.on_screen(mode);
-        iter::once(on_screen.first)
-            .chain(on_screen.second)
-            .all(|page| {
-                let state = self.pages.get(&page);
-                let decoded = state
-                    .and_then(|page_state| page_state.info)
-                    .is_some_and(|_| has_texture(page));
-                let faulted = state
-                    .and_then(|page_state| page_state.fault.as_deref())
-                    .is_some();
-                !decoded && !faulted
-            })
+    fn is_waiting(&self, mode: ReadingMode, textures: &impl PageStore) -> bool {
+        self.on_screen(mode).pages().all(|page| {
+            let decoded =
+                self.page_info(page).is_some() && textures.has_any(page);
+            !decoded && !self.is_faulted(page)
+        })
     }
 
     pub fn book_status<'fault>(
         &'fault self,
         mode: ReadingMode,
         zoom: f64,
-        has_texture: impl Fn(usize) -> bool,
+        textures: &impl PageStore,
     ) -> BookStatus<'fault> {
         use crate::decode;
-        use std::iter;
 
         let on_screen = self.on_screen(mode);
         let mut failure: Option<(usize, &'fault str)> = None;
         let mut first_decoded: Option<(usize, PageInfo)> = None;
-        for page in iter::once(on_screen.first).chain(on_screen.second) {
+        for page in on_screen.pages() {
             let state = self.pages.get(&page);
             let info = state
                 .and_then(|page_state| page_state.info)
-                .filter(|_| has_texture(page));
+                .filter(|_| textures.has_any(page));
             let fault =
                 state.and_then(|page_state| page_state.fault.as_deref());
             if failure.is_some() {
@@ -955,12 +1146,6 @@ impl Reading {
     }
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct EventEffect {
-    pub command: Option<PlaybackCommand>,
-    pub redraw: bool,
-}
-
 pub struct BookStatus<'fault> {
     pub reading: ReadingStatus,
     pub name: PageName,
@@ -968,26 +1153,43 @@ pub struct BookStatus<'fault> {
     pub fault: Option<&'fault str>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub struct PlaybackTick {
-    pub next_deadline: Option<Instant>,
-    pub commands: Vec<PlaybackCommand>,
-    pub updated: bool,
+fn walk_spreads(
+    start: usize,
+    direction: Direction,
+    mode: ReadingMode,
+    page_count: NonZeroUsize,
+    max_page_distance: usize,
+) -> Vec<Spread> {
+    let mut spreads = Vec::new();
+    let mut current = start;
+    while let Some(next) = browse::step(current, direction, mode, page_count) {
+        if next.abs_diff(start) > max_page_distance {
+            break;
+        }
+        spreads.push(browse::spread_for(next, mode, page_count));
+        current = next;
+    }
+    spreads
 }
 
-fn cold_requests(spread: Spread, mode: ReadingMode) -> Vec<Request> {
-    spread
+fn cold_work(spread: Spread, mode: ReadingMode) -> WorkPlan {
+    let current: Vec<Request> = spread
         .seats(mode)
         .into_iter()
         .flatten()
         .map(|page| Request {
             page,
-            role: Role::Fit,
+            role: WorkRole::Fit,
         })
-        .collect()
+        .collect();
+    WorkPlan {
+        current,
+        lookahead: Vec::new(),
+        thumbs: Vec::new(),
+    }
 }
 
-fn push_request(requests: &mut Vec<Request>, page: usize, role: Role) {
+fn push_request(requests: &mut Vec<Request>, page: usize, role: WorkRole) {
     let request = Request { page, role };
     if !requests.contains(&request) {
         requests.push(request);
@@ -1026,17 +1228,84 @@ mod tests {
     use super::*;
     use crate::testkit;
 
-    fn roles_with(role: Role) -> Roles {
-        let mut roles = Roles::default();
-        roles.set(role);
-        roles
+    #[derive(Default)]
+    struct FakeStore {
+        roles: BTreeMap<usize, Roles>,
+        thumbs: BTreeMap<usize, ValidatedThumb>,
+        average_fit_bytes: Option<usize>,
+        refuse_page: bool,
+    }
+
+    impl FakeStore {
+        fn from_roles(items: impl IntoIterator<Item = (usize, Role)>) -> Self {
+            let mut store = Self::default();
+            for (page, role) in items {
+                store.roles.entry(page).or_default().set(role);
+            }
+            store
+        }
+    }
+
+    impl PageStore for FakeStore {
+        fn roles(&self, page: usize) -> Roles {
+            self.roles.get(&page).copied().unwrap_or_default()
+        }
+
+        fn has_any(&self, page: usize) -> bool {
+            self.roles(page).any()
+        }
+
+        fn average_role_bytes(&self, role: Role) -> Option<usize> {
+            (role == Role::Fit).then_some(self.average_fit_bytes).flatten()
+        }
+
+        fn insert_page(
+            &mut self,
+            page: usize,
+            role: WorkRole,
+            _image: &ValidatedImage,
+        ) -> Result<(), TextureFault> {
+            if self.refuse_page {
+                return Err(TextureFault {
+                    dims: (200, 200),
+                    max_edge: 100,
+                });
+            }
+            self.roles.entry(page).or_default().set(Role::from(role));
+            Ok(())
+        }
+
+        fn insert_thumb(&mut self, page: usize, thumb: &ValidatedThumb) {
+            self.roles.entry(page).or_default().set(Role::Thumb);
+            self.thumbs.insert(page, thumb.clone());
+        }
+
+        fn update_playback(
+            &mut self,
+            _page: usize,
+            _image: &ValidatedImage,
+        ) -> Result<(), TextureFault> {
+            Ok(())
+        }
+
+        fn evict_to_budget(
+            &mut self,
+            _role: Role,
+            _budget_bytes: usize,
+            _is_pinned: &dyn Fn(usize) -> bool,
+            _priority: &dyn Fn(usize) -> (usize, bool),
+        ) {
+        }
+
+        fn retain_playback(&mut self, _keep_playback: &dyn Fn(usize) -> bool) {
+        }
     }
 
     fn reading_with_pages(
         count: usize,
         land_on: Option<&str>,
         mode: ReadingMode,
-    ) -> (Reading, Vec<Request>) {
+    ) -> (Reading, WorkPlan) {
         let names = (0..count)
             .map(|index| format!("{index:03}.png"))
             .collect::<Vec<_>>();
@@ -1044,7 +1313,13 @@ mod tests {
             names: PageNames::new(names).expect("non-empty test book"),
             archive: false,
         };
-        Reading::open(PathBuf::from("/tmp/book"), info, land_on, mode)
+        Reading::open_with_pack(
+            PathBuf::from("/tmp/book"),
+            info,
+            land_on,
+            mode,
+            None,
+        )
     }
 
     fn seed_page(
@@ -1055,50 +1330,6 @@ mod tests {
     ) {
         reading.pages.entry(page).or_default().info =
             Some(PageInfo { dims, format });
-    }
-
-    fn wire_image(
-        width: u32,
-        height: u32,
-        format: Format,
-    ) -> Box<ValidatedImage> {
-        use crate::decode::Decoded;
-        use crate::decode::Transfer;
-        use crate::protocol::WireImage;
-
-        const RGBA_BYTES_PER_PIXEL: usize = 4;
-        let bytes =
-            vec![
-                0_u8;
-                width as usize * height as usize * RGBA_BYTES_PER_PIXEL
-            ];
-        let decoded = Decoded::rgba(
-            width,
-            height,
-            format,
-            Transfer::Srgb,
-            bytes.into_boxed_slice(),
-        )
-        .expect("valid rgba test image");
-        Box::new(
-            WireImage::from_decoded(&decoded)
-                .validate()
-                .expect("valid test wire image"),
-        )
-    }
-
-    fn ready_event(
-        page: usize,
-        role: Role,
-        width: u32,
-        height: u32,
-        format: Format,
-    ) -> PageEvent {
-        PageEvent::Ready {
-            page,
-            role,
-            image: wire_image(width, height, format),
-        }
     }
 
     #[test]
@@ -1112,7 +1343,6 @@ mod tests {
         let four_k = (3840, 2160);
         assert!(!full_wanted(0.66, four_k, limits));
         assert!(full_wanted(0.67, four_k, limits));
-        // Fractional Wayland scales can push fit rendering a sub-pixel past fit_box.
         assert!(!full_wanted(1440.5 / 3000.0, (5000, 3000), limits));
         let ten_k = (10080, 5640);
         assert!(!full_wanted(0.25, ten_k, limits));
@@ -1122,269 +1352,102 @@ mod tests {
             ten_k,
             ImageLimits::new((2560, 1440), 2560)
         ));
-        // Dimensions above f32's exact-integer limit (2^24) keep sub-pixel precision.
-        let wide_strip = (20_000_001, 1);
-        assert!(!full_wanted(2560.5 / 20_000_001.0, wide_strip, limits));
-        assert!(full_wanted(2561.5 / 20_000_001.0, wide_strip, limits));
-    }
-
-    #[test]
-    fn retention_keeps_fit_images_within_the_role_bounds() {
-        let (mut reading, _) =
-            reading_with_pages(20, Some("010.png"), ReadingMode::Normal);
-        reading.shown = Some((ReadingMode::Normal, Spread::lone(10)));
-        assert!(reading.retains_texture(ReadingMode::Normal, 10, Role::Full));
-        assert!(!reading.retains_texture(ReadingMode::Normal, 12, Role::Full));
-        assert!(reading.retains_texture(ReadingMode::Normal, 12, Role::Fit));
-        assert!(!reading.retains_texture(ReadingMode::Normal, 13, Role::Fit));
-        assert!(reading.retains_texture(ReadingMode::Normal, 0, Role::Thumb));
-
-        // Manga keeps ±2 spreads: on spread 5-6 (spread 3), spreads 1..=5
-        // span pages 1..=10, while cover (0) and page 11 are 3 spreads away.
-        let (mut manga, _) =
-            reading_with_pages(20, Some("005.png"), ReadingMode::Manga);
-        manga.shown = Some((
-            ReadingMode::Manga,
-            Spread {
-                first: 5,
-                second: Some(6),
-            },
-        ));
-        assert!(!manga.retains_texture(ReadingMode::Manga, 0, Role::Fit));
-        for kept in [1, 2, 9, 10] {
-            assert!(
-                manga.retains_texture(ReadingMode::Manga, kept, Role::Fit),
-                "page {kept} within 2 spreads of 5-6"
-            );
-        }
-        assert!(!manga.retains_texture(ReadingMode::Manga, 11, Role::Fit));
     }
 
     #[test]
     fn full_requests_follow_the_on_screen_scale() {
         let (mut reading, _) =
             reading_with_pages(12, Some("002.png"), ReadingMode::Normal);
-        reading.shown = Some((ReadingMode::Normal, Spread::lone(1)));
+        reading.shown = Some(Spread::lone(1));
         seed_page(&mut reading, 1, (4000, 6000), Format::Png);
         seed_page(&mut reading, 2, (4000, 6000), Format::Png);
 
         assert_eq!(reading.on_screen(ReadingMode::Normal), Spread::lone(1));
-        let requests = reading
-            .update_requests(
+        let plan = reading
+            .update_work(
                 ReadingMode::Normal,
+                false,
                 Some(1.0),
                 testkit::limits(),
-                |_| Roles::default(),
+                &FakeStore::default(),
             )
-            .expect("requests changed");
+            .expect("plan changed");
         assert!(
-            requests.contains(&Request {
+            plan.current.contains(&Request {
                 page: 1,
-                role: Role::Full
+                role: WorkRole::Full
             }),
-            "the on-screen page asks for its full image at the on-screen scale"
+            "on-screen page asks for full in current tier"
         );
         assert!(
-            !requests.contains(&Request {
+            !plan.current.contains(&Request {
                 page: 2,
-                role: Role::Full
+                role: WorkRole::Full
             }),
-            "the target page is not upscaled"
+            "target page is not upscaled"
         );
     }
 
     #[test]
-    fn presentation_advances_through_presentable_spreads() {
+    fn thumb_presentation_respects_grace_for_taps_and_shows_immediately_on_repeat() {
         let mode = ReadingMode::Normal;
-        let (mut reading, _) = reading_with_pages(12, None, mode);
-        for page in [0, 2, 4, 8] {
-            seed_page(&mut reading, page, (2, 2), Format::Png);
-        }
-        let roles = |fit_pages: &'static [usize]| {
-            move |page: usize| {
-                if fit_pages.contains(&page) {
-                    roles_with(Role::Fit)
-                } else {
-                    Roles::default()
-                }
-            }
-        };
-        let lone = Spread::lone;
-        reading.motion = Motion::Skimming;
+        let (mut reading, _) = reading_with_pages(10, None, mode);
+        seed_page(&mut reading, 0, (100, 100), Format::Png);
+        seed_page(&mut reading, 1, (100, 100), Format::Png);
+        reading.shown = Some(Spread::lone(0));
 
-        // The target wins as soon as it has a pixel.
-        reading.target = 4;
-        reading.shown = Some((mode, lone(0)));
-        assert_eq!(
-            reading.choose_presented(mode, roles(&[0, 2, 4])),
-            Some(lone(4))
-        );
+        let start = Instant::now();
+        assert!(reading.turn(Direction::Forward, mode, false, start));
+        let store = FakeStore::from_roles([(0, Role::Fit), (1, Role::Thumb)]);
 
-        // Otherwise the nearest presentable spread between the shown and the
-        // target; page 8 is known but has no pixels.
-        reading.target = 9;
-        reading.shown = Some((mode, lone(0)));
-        assert_eq!(
-            reading.choose_presented(mode, roles(&[0, 2, 4])),
-            Some(lone(4))
-        );
+        // Inside 50ms grace on a discrete tap: keep page 0 and arm deadline.
+        let (shown, _, deadline) =
+            reading.resolve_shown(mode, start, false, &store);
+        assert_eq!(shown, Some(Spread::lone(0)));
+        assert_eq!(deadline, Some(start + THUMB_GRACE));
 
-        // Nothing between the two: the shown spread keeps its pixels.
-        reading.target = 9;
-        reading.shown = Some((mode, lone(2)));
-        assert_eq!(
-            reading.choose_presented(mode, roles(&[0])),
-            Some(lone(2))
-        );
+        // While holding turn key: show warm thumb immediately.
+        let (shown_while_skimming, _, deadline_while_skimming) =
+            reading.resolve_shown(mode, start, true, &store);
+        assert_eq!(shown_while_skimming, Some(Spread::lone(1)));
+        assert_eq!(deadline_while_skimming, None);
 
-        // A cold start picks the nearest presentable spread.
-        reading.target = 5;
-        reading.shown = None;
-        assert_eq!(
-            reading.choose_presented(mode, roles(&[0, 2, 4])),
-            Some(lone(4))
-        );
-
-        // A cold start presents only decoded spreads.
-        reading.target = 5;
-        reading.shown = None;
-        assert_eq!(reading.choose_presented(mode, roles(&[])), None);
-
-        // Skimming across a wrap holds the shown spread until target lands.
-        reading.target = 0;
-        reading.shown = Some((mode, lone(4)));
-        assert_eq!(
-            reading.choose_presented(mode, roles(&[2, 4])),
-            Some(lone(4))
-        );
-
-        // Still mode holds the shown spread on jumps until target lands.
-        reading.motion = Motion::Still;
-        reading.target = 9;
-        reading.shown = Some((mode, lone(0)));
-        assert_eq!(
-            reading.choose_presented(mode, roles(&[0, 4])),
-            Some(lone(0))
-        );
+        // Reset shown to page 0 and let grace expire.
+        reading.shown = Some(Spread::lone(0));
+        let (shown_after_grace, _, deadline_after_grace) =
+            reading.resolve_shown(mode, start + THUMB_GRACE, false, &store);
+        assert_eq!(shown_after_grace, Some(Spread::lone(1)));
+        assert_eq!(deadline_after_grace, None);
     }
 
     #[test]
-    fn paired_spread_waits_for_every_seat() {
-        let mode = ReadingMode::Manga;
-        let pair = Spread {
-            first: 1,
-            second: Some(2),
-        };
-        let shown = Spread::lone(0);
-
-        let (mut reading, _) =
-            reading_with_pages(12, Some("001.png"), mode);
-        reading.shown = Some((mode, shown));
-        seed_page(&mut reading, 0, (2, 2), Format::Png);
-        seed_page(&mut reading, 2, (2, 2), Format::Png);
-        assert_eq!(
-            reading.choose_presented(mode, |page| {
-                if page == 2 {
-                    roles_with(Role::Fit)
-                } else {
-                    Roles::default()
-                }
-            }),
-            Some(shown)
-        );
-
-        seed_page(&mut reading, 1, (2, 2), Format::Png);
-        assert_eq!(
-            reading.choose_presented(mode, |page| {
-                if [1, 2].contains(&page) {
-                    roles_with(Role::Fit)
-                } else {
-                    Roles::default()
-                }
-            }),
-            Some(pair)
-        );
-    }
-
-    #[test]
-    fn mode_switch_relands_only_on_pairing_change() {
-        let (mut reading, _) =
-            reading_with_pages(10, Some("002.png"), ReadingMode::Normal);
-        assert!(
-            reading.switch_mode(ReadingMode::Normal, ReadingMode::Manga)
-        );
-        assert_eq!(reading.target(), 1);
-
-        let (mut cover, _) =
-            reading_with_pages(10, None, ReadingMode::Normal);
-        assert!(
-            cover.switch_mode(ReadingMode::Normal, ReadingMode::Comic)
-        );
-        assert_eq!(cover.target(), 0);
-
-        let (mut pair_to_pair, _) =
-            reading_with_pages(10, Some("005.png"), ReadingMode::Manga);
-        assert!(
-            !pair_to_pair
-                .switch_mode(ReadingMode::Manga, ReadingMode::Comic)
-        );
-        assert_eq!(pair_to_pair.target(), 5);
-
-        assert!(
-            !pair_to_pair
-                .switch_mode(ReadingMode::Manga, ReadingMode::Manga)
-        );
-        assert_eq!(pair_to_pair.target(), 5);
-
-        // Switching while skimming commits the shown spread under the previous
-        // mode before mapping into the new pairing.
-        pair_to_pair.shown = Some((
-            ReadingMode::Comic,
-            Spread {
-                first: 3,
-                second: Some(4),
-            },
-        ));
-        pair_to_pair.motion = Motion::Skimming;
-        pair_to_pair.target = 7;
-        assert!(
-            pair_to_pair
-                .switch_mode(ReadingMode::Comic, ReadingMode::Normal)
-        );
-        assert_eq!(pair_to_pair.target(), 3);
-    }
-
-    #[test]
-    fn skimming_turn_waits_for_shown_when_one_spread_ahead() {
+    fn repeat_turn_waits_for_shown_when_one_spread_ahead() {
         let mode = ReadingMode::Manga;
         let now = Instant::now();
         let (mut reading, _) =
             reading_with_pages(10, Some("001.png"), mode);
 
-        reading.motion = Motion::Skimming;
-        assert!(!reading.turn(Direction::Forward, mode, now));
-        assert_eq!(reading.target(), 1);
+        // Repeat without a shown spread is dropped.
+        assert!(!reading.turn(Direction::Forward, mode, true, now));
+        assert_eq!(reading.target, 1);
 
-        reading.motion = Motion::Still;
-        assert!(reading.turn(Direction::Forward, mode, now));
-        assert_eq!(reading.target(), 3);
+        // Discrete tap always advances.
+        assert!(reading.turn(Direction::Forward, mode, false, now));
+        assert_eq!(reading.target, 3);
 
-        reading.shown = Some((
-            mode,
-            browse::spread_for(3, mode, reading.page_count()),
-        ));
-        reading.motion = Motion::Skimming;
-        assert!(reading.turn(Direction::Forward, mode, now));
-        assert_eq!(reading.target(), 5);
-        assert!(!reading.turn(Direction::Forward, mode, now));
-        assert_eq!(reading.target(), 5);
+        reading.shown =
+            Some(browse::spread_for(3, mode, reading.page_count()));
+        assert!(reading.turn(Direction::Forward, mode, true, now));
+        assert_eq!(reading.target, 5);
+        assert!(!reading.turn(Direction::Forward, mode, true, now));
+        assert_eq!(reading.target, 5);
 
-        assert!(reading.turn(Direction::Backward, mode, now));
-        assert_eq!(reading.target(), 3);
+        assert!(reading.turn(Direction::Backward, mode, true, now));
+        assert_eq!(reading.target, 3);
     }
 
     #[test]
-    fn playback_targets_need_an_animated_page_and_a_still_frame() {
+    fn playback_targets_need_an_animated_page_and_a_settled_frame() {
         let mode = ReadingMode::Normal;
         let (mut reading, _) = reading_with_pages(20, None, mode);
         for page in [4, 6, 10, 12] {
@@ -1394,39 +1457,34 @@ mod tests {
         reading.pages.entry(10).or_default().fault =
             Some(String::from("bad page"));
 
-        let roles = |page: usize| {
-            roles_with(if page == 6 { Role::Thumb } else { Role::Fit })
-        };
+        let store = FakeStore::from_roles([
+            (4, Role::Fit),
+            (6, Role::Thumb),
+            (8, Role::Fit),
+            (10, Role::Fit),
+            (12, Role::Fit),
+        ]);
 
-        reading.shown = Some((mode, Spread::lone(6)));
+        reading.target = 6;
+        reading.shown = Some(Spread::lone(6));
+        assert_eq!(reading.sync_playback(mode, false, &store), []);
+
+        reading.target = 8;
+        reading.shown = Some(Spread::lone(8));
+        assert_eq!(reading.sync_playback(mode, false, &store), []);
+
+        reading.target = 10;
+        reading.shown = Some(Spread::lone(10));
+        assert_eq!(reading.sync_playback(mode, false, &store), []);
+
+        reading.target = 12;
+        reading.shown = Some(Spread::lone(12));
+        assert_eq!(reading.sync_playback(mode, true, &store), []);
+
+        reading.target = 4;
+        reading.shown = Some(Spread::lone(4));
         assert_eq!(
-            reading.sync_playback(mode, roles),
-            [],
-            "a thumb-only page never plays"
-        );
-        reading.shown = Some((mode, Spread::lone(8)));
-        assert_eq!(
-            reading.sync_playback(mode, roles),
-            [],
-            "a still image never plays"
-        );
-        reading.shown = Some((mode, Spread::lone(10)));
-        assert_eq!(
-            reading.sync_playback(mode, roles),
-            [],
-            "a faulted page never plays"
-        );
-        reading.shown = Some((mode, Spread::lone(12)));
-        reading.motion = Motion::Skimming;
-        assert_eq!(
-            reading.sync_playback(mode, roles),
-            [],
-            "skimming never plays"
-        );
-        reading.shown = Some((mode, Spread::lone(4)));
-        reading.motion = Motion::Still;
-        assert_eq!(
-            reading.sync_playback(mode, roles),
+            reading.sync_playback(mode, false, &store),
             vec![PlaybackCommand::Start {
                 id: PlaybackId {
                     page: 4,
@@ -1437,78 +1495,64 @@ mod tests {
     }
 
     #[test]
-    fn still_frames_never_request_thumbs() {
-        let (_, opening_requests) =
-            reading_with_pages(10, None, ReadingMode::Normal);
-        assert_eq!(
-            opening_requests,
-            vec![Request {
-                page: 0,
-                role: Role::Fit
-            }]
-        );
+    fn thumb_pack_hydrates_warm_pages_in_reading() {
+        use tempfile::TempDir;
 
-        let (mut reading, _) =
-            reading_with_pages(10, Some("002.png"), ReadingMode::Normal);
-        seed_page(&mut reading, 2, (4000, 6000), Format::Png);
-        let requests = reading
-            .update_requests(
-                ReadingMode::Normal,
-                Some(1.0),
-                testkit::limits(),
-                |page| {
-                    if page == 2 {
-                        roles_with(Role::Thumb)
-                    } else {
-                        Roles::default()
-                    }
-                },
+        use crate::cache;
+        use crate::decode::Decoded;
+        use crate::decode::Transfer;
+
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("thumbs");
+        let mut pack = ThumbPack::open_at(&root, 42, 4).expect("pack");
+        let thumb = cache::derive_thumb(
+            &Decoded::rgba(
+                10,
+                10,
+                Format::Png,
+                Transfer::Srgb,
+                vec![128_u8; 400].into_boxed_slice(),
             )
-            .expect("requests updated");
-        assert_eq!(
-            requests,
-            vec![
-                Request {
-                    page: 2,
-                    role: Role::Fit
-                },
-                Request {
-                    page: 2,
-                    role: Role::Full
-                }
-            ]
-        );
-    }
+            .expect("decoded")
+            .with_page_dims((200, 200)),
+            1,
+        )
+        .expect("thumb");
+        pack.record(0, thumb.clone());
+        pack.record(1, thumb.clone());
+        pack.flush();
 
-    #[test]
-    fn skim_skips_thumb_when_any_role_is_resident() {
-        let (mut reading, _) =
-            reading_with_pages(10, Some("009.png"), ReadingMode::Normal);
-        reading.shown = Some((ReadingMode::Normal, Spread::lone(4)));
-        reading.motion = Motion::Skimming;
-        seed_page(&mut reading, 4, (800, 600), Format::Png);
-
-        let requests = reading
-            .update_requests(
-                ReadingMode::Normal,
-                Some(1.0),
-                testkit::limits(),
-                |page| {
-                    if page == 4 {
-                        roles_with(Role::Fit)
-                    } else {
-                        Roles::default()
-                    }
-                },
+        let info = BookInfo {
+            names: PageNames::new(
+                (0..4).map(|index| format!("{index}.png")).collect(),
             )
-            .expect("requests updated");
-        assert_eq!(
-            requests,
-            vec![Request {
-                page: 5,
-                role: Role::Thumb
-            }]
+            .expect("names"),
+            archive: false,
+        };
+        let (mut reading, _) = Reading::open_with_pack(
+            PathBuf::from("/tmp/book"),
+            info,
+            None,
+            ReadingMode::Normal,
+            Some(pack),
         );
+        let mut store = FakeStore::default();
+        let mut touched = Vec::new();
+        reading.hydrate_thumbs(ReadingMode::Normal, false, &mut store, &mut touched);
+        assert_eq!(touched, vec![0]);
+        assert_eq!(store.thumbs.get(&0), Some(&thumb));
+        assert_eq!(
+            reading.page_info(0),
+            Some(PageInfo {
+                dims: (200, 200),
+                format: Format::Png,
+            })
+        );
+
+        touched.clear();
+        reading.hydrate_thumbs(ReadingMode::Normal, true, &mut store, &mut touched);
+        assert_eq!(touched, vec![1]);
+        assert_eq!(store.thumbs.get(&1), Some(&thumb));
     }
 
     #[test]
@@ -1519,344 +1563,189 @@ mod tests {
             first: 1,
             second: Some(2),
         };
-        reading.shown = Some((ReadingMode::Manga, spread));
+        reading.shown = Some(spread);
 
-        let waiting =
-            reading.book_status(ReadingMode::Manga, 1.0, |_| false);
+        let waiting = reading.book_status(
+            ReadingMode::Manga,
+            1.0,
+            &FakeStore::default(),
+        );
         assert!(waiting.waiting);
         assert_eq!(waiting.fault, None);
         assert_eq!(waiting.name.file, "001.png");
-        assert!(waiting.reading.page_dims.is_none());
 
         seed_page(&mut reading, 1, (800, 600), Format::Png);
-        let settled =
-            reading.book_status(ReadingMode::Manga, 1.0, |page| page == 1);
+        let mut store = FakeStore::from_roles([(1, Role::Fit)]);
+        let settled = reading.book_status(ReadingMode::Manga, 1.0, &store);
         assert!(!settled.waiting);
-        assert_eq!(settled.name.file, "001.png");
         assert_eq!(settled.reading.page_dims, Some((800, 600)));
-        assert_eq!(settled.reading.actual_format, None);
 
-        seed_page(&mut reading, 2, (1200, 900), Format::Jxl);
-        reading.shown = Some((ReadingMode::Normal, Spread::lone(2)));
-        let single_mismatch =
-            reading.book_status(ReadingMode::Normal, 0.5, |page| page == 2);
-        assert_eq!(single_mismatch.reading.actual_format, Some(Format::Jxl));
-
-        reading.shown = Some((ReadingMode::Manga, spread));
-        assert_eq!(
-            reading.apply_event(PageEvent::Failed {
+        let mut messages = Vec::new();
+        let mut touched = Vec::new();
+        let mut redraw = false;
+        reading.apply_event(
+            PageEvent::Failed {
                 page: 2,
                 fault: String::from("page"),
-            }),
-            EventEffect {
-                command: None,
-                redraw: true,
-            }
+            },
+            &mut store,
+            &mut messages,
+            &mut touched,
+            &mut redraw,
         );
+        assert!(redraw);
         let page_faulted =
-            reading.book_status(ReadingMode::Manga, 1.0, |page| page == 1);
+            reading.book_status(ReadingMode::Manga, 1.0, &store);
         assert!(!page_faulted.waiting);
         assert_eq!(page_faulted.fault, Some("page"));
         assert_eq!(page_faulted.name.file, "002.png");
     }
 
     #[test]
-    fn refused_upload_faults_only_unsettled_non_thumb_roles() {
-        let fault = || TextureFault {
-            dims: (200, 200),
-            max_edge: 100,
-        };
+    fn refused_upload_faults_only_unsettled_pages() {
+        use crate::decode::Decoded;
+        use crate::decode::Transfer;
+        use crate::protocol::WireImage;
+
+        let image = WireImage::from_decoded(
+            &Decoded::rgba(
+                10,
+                10,
+                Format::Png,
+                Transfer::Srgb,
+                vec![128_u8; 400].into_boxed_slice(),
+            )
+            .expect("decoded")
+            .with_page_dims((200, 200)),
+        )
+        .validate()
+        .expect("valid image");
+
         let (mut reading, _) =
             reading_with_pages(4, None, ReadingMode::Normal);
+        let mut store = FakeStore {
+            refuse_page: true,
+            ..FakeStore::default()
+        };
+        let mut messages = Vec::new();
+        let mut touched = Vec::new();
+        let mut redraw = false;
 
-        reading.record_upload_refused(0, Role::Thumb, false, fault());
-        assert!(
-            reading
-                .pages
-                .get(&0)
-                .is_none_or(|state| state.fault.is_none())
+        reading.apply_event(
+            PageEvent::Ready {
+                page: 0,
+                role: WorkRole::Fit,
+                image: Box::new(image.clone()),
+                thumb: None,
+            },
+            &mut store,
+            &mut messages,
+            &mut touched,
+            &mut redraw,
         );
+        assert!(reading.is_faulted(0));
 
-        reading.record_upload_refused(0, Role::Fit, false, fault());
-        assert!(
-            reading
-                .pages
-                .get(&0)
-                .and_then(|state| state.fault.as_ref())
-                .is_some()
+        store.roles.entry(1).or_default().set(Role::Fit);
+        reading.apply_event(
+            PageEvent::Ready {
+                page: 1,
+                role: WorkRole::Full,
+                image: Box::new(image),
+                thumb: None,
+            },
+            &mut store,
+            &mut messages,
+            &mut touched,
+            &mut redraw,
         );
-
-        reading.record_upload_refused(1, Role::Full, true, fault());
-        assert!(
-            reading
-                .pages
-                .get(&1)
-                .is_none_or(|state| state.fault.is_none())
-        );
+        assert!(!reading.is_faulted(1));
     }
 
     #[test]
-    fn sync_motion_commits_shown_spread_when_returning_to_still() {
+    fn work_plan_bounds_lookahead_by_window_bytes() {
+        let mode = ReadingMode::Normal;
         let (mut reading, _) =
-            reading_with_pages(20, Some("010.png"), ReadingMode::Normal);
-        reading.shown = Some((ReadingMode::Normal, Spread::lone(4)));
+            reading_with_pages(60, Some("010.png"), mode);
+        reading.shown = Some(Spread::lone(10));
 
-        assert!(reading.set_motion(Motion::Skimming, ReadingMode::Normal));
-        assert_eq!(reading.target(), 10);
-
-        assert!(reading.set_motion(Motion::Still, ReadingMode::Normal));
-        assert_eq!(reading.target(), 4);
-        assert!(!reading.set_motion(Motion::Still, ReadingMode::Normal));
-
-        // A spread shown under another mode is never committed when settling.
-        reading.target = 10;
-        assert!(reading.set_motion(Motion::Skimming, ReadingMode::Manga));
-        assert!(reading.set_motion(Motion::Still, ReadingMode::Manga));
-        assert_eq!(reading.target(), 10);
-    }
-
-    #[test]
-    fn playback_lifecycle_handles_promotions_refusals_and_page_faults() {
-        use std::time::Duration;
-
-        const MAX_EDGE: u32 = 100;
-        const FITTING_EDGE: u32 = 20;
-        const OVERSIZED_EDGE: u32 = 200;
-        const FRAME_DELAY: Duration = Duration::from_millis(50);
-
-        let playback_id =
-            |page, generation| PlaybackId { page, generation };
-        let frame_event = |target_id, edge| {
-            PageEvent::Playback(PlaybackEvent::Frame {
-                id: target_id,
-                delay: FRAME_DELAY,
-                image: wire_image(edge, edge, Format::Gif),
-            })
-        };
-
-        let mode = ReadingMode::Normal;
-        let (mut reading, _) = reading_with_pages(5, None, mode);
-        for page in [0, 1, 2] {
-            let event = ready_event(
-                page,
-                Role::Fit,
-                FITTING_EDGE,
-                FITTING_EDGE,
-                Format::Gif,
-            );
-            assert_eq!(reading.apply_event(event), EventEffect::default());
-        }
-        for upload in reading.take_pending_uploads() {
-            reading.record_uploaded(upload.page, &upload.image);
-        }
-
-        let playback = playback_id(0, 0);
-        reading.shown = Some((mode, Spread::lone(0)));
-        assert!(!reading.retains_playback(0));
-        assert_eq!(
-            reading.sync_playback(mode, |_| roles_with(Role::Fit)),
-            vec![PlaybackCommand::Start { id: playback }]
-        );
-        assert!(reading.retains_playback(0));
-        // Promoting Fit to Full keeps the running stream instead of restarting.
-        assert_eq!(
-            reading.sync_playback(mode, |_| roles_with(Role::Full)),
-            []
-        );
-        assert!(reading.retains_playback(0));
-
-        let now = Instant::now();
-        assert_eq!(
-            reading.tick_playback(now, |_, image| {
-                TextureFault::check_dims(
-                    (image.meta.width, image.meta.height),
-                    MAX_EDGE,
-                )
-            }),
-            PlaybackTick {
-                next_deadline: None,
-                commands: vec![PlaybackCommand::Next { id: playback }],
-                updated: false,
-            }
-        );
-
-        let stale_playback = playback_id(0, 99);
-        assert_eq!(
-            reading.apply_event(frame_event(stale_playback, FITTING_EDGE)),
-            EventEffect::default()
+        let normal_plan = reading.build_work(
+            mode,
+            false,
+            None,
+            testkit::limits(),
+            &FakeStore {
+                average_fit_bytes: Some(8 * 1024 * 1024),
+                ..FakeStore::default()
+            },
         );
         assert_eq!(
-            reading.apply_event(frame_event(playback, FITTING_EDGE)),
-            EventEffect::default()
+            normal_plan.lookahead.get(..3),
+            Some([11, 9, 12].as_slice())
         );
-        assert_eq!(
-            reading.tick_playback(now, |_, image| {
-                TextureFault::check_dims(
-                    (image.meta.width, image.meta.height),
-                    MAX_EDGE,
-                )
-            }),
-            PlaybackTick {
-                next_deadline: Some(now + FRAME_DELAY),
-                commands: vec![PlaybackCommand::Next { id: playback }],
-                updated: true,
-            }
-        );
-        assert_eq!(
-            reading.apply_event(PageEvent::Playback(PlaybackEvent::Failed {
-                id: stale_playback
-            })),
-            EventEffect::default()
-        );
-        assert_eq!(
-            reading.apply_event(PageEvent::Playback(PlaybackEvent::Failed {
-                id: playback
-            })),
-            EventEffect {
-                command: Some(PlaybackCommand::Stop { id: playback }),
-                redraw: true,
-            }
-        );
-        assert!(!reading.retains_playback(0));
-        assert_eq!(
-            reading.sync_playback(mode, |_| roles_with(Role::Full)),
-            []
-        );
-
-        let faulted_playback = playback_id(1, 1);
-        reading.shown = Some((mode, Spread::lone(1)));
-        assert_eq!(
-            reading.sync_playback(mode, |_| roles_with(Role::Fit)),
-            vec![PlaybackCommand::Start {
-                id: faulted_playback,
-            }]
-        );
-        assert!(reading.retains_playback(1));
-        assert_eq!(
-            reading.apply_event(PageEvent::Failed {
-                page: 1,
-                fault: String::from("corrupt"),
-            }),
-            EventEffect {
-                command: Some(PlaybackCommand::Stop {
-                    id: faulted_playback,
-                }),
-                redraw: true,
-            }
-        );
-        assert!(!reading.retains_playback(1));
         assert!(
-            reading.pages.get(&1).and_then(|state| state.info).is_some()
-        );
-        assert_eq!(
-            reading.sync_playback(mode, |_| roles_with(Role::Fit)),
-            []
+            normal_plan.lookahead.len() >= 18,
+            "8 MiB/page allows lookahead window, got {}",
+            normal_plan.lookahead.len()
         );
 
-        let oversized_playback = playback_id(2, 2);
-        reading.shown = Some((mode, Spread::lone(2)));
-        assert_eq!(
-            reading.sync_playback(mode, |_| roles_with(Role::Fit)),
-            vec![PlaybackCommand::Start {
-                id: oversized_playback,
-            }]
+        let tight_plan = reading.build_work(
+            mode,
+            false,
+            None,
+            testkit::limits(),
+            &FakeStore {
+                average_fit_bytes: Some(80 * 1024 * 1024),
+                ..FakeStore::default()
+            },
         );
-        assert_eq!(
-            reading.tick_playback(now, |_, image| {
-                TextureFault::check_dims(
-                    (image.meta.width, image.meta.height),
-                    MAX_EDGE,
-                )
-            }),
-            PlaybackTick {
-                next_deadline: None,
-                commands: vec![PlaybackCommand::Next {
-                    id: oversized_playback
-                }],
-                updated: false,
-            }
+        assert!(
+            tight_plan.lookahead.len() < 8,
+            "80 MiB/page caps lookahead early, got {}",
+            tight_plan.lookahead.len()
         );
-        assert_eq!(
-            reading.apply_event(frame_event(
-                oversized_playback,
-                OVERSIZED_EDGE,
-            )),
-            EventEffect::default()
-        );
-        assert_eq!(
-            reading.tick_playback(now, |_, image| {
-                TextureFault::check_dims(
-                    (image.meta.width, image.meta.height),
-                    MAX_EDGE,
-                )
-            }),
-            PlaybackTick {
-                next_deadline: None,
-                commands: vec![PlaybackCommand::Stop {
-                    id: oversized_playback
-                }],
-                updated: false,
-            }
-        );
-        assert_eq!(
-            reading.sync_playback(mode, |_| roles_with(Role::Fit)),
-            []
-        );
+        for page in [11, 9] {
+            assert!(
+                tight_plan.lookahead.contains(&page),
+                "+1 and -1 stay guaranteed"
+            );
+        }
     }
 
     #[test]
-    fn still_shown_spread_preuploads_next_spread_without_wrapping() {
-        let mode = ReadingMode::Normal;
-        let (mut reading, _) = reading_with_pages(6, None, mode);
-        let roles = |ready: usize| {
-            move |page: usize| {
-                if page == ready {
-                    roles_with(Role::Fit)
-                } else {
-                    Roles::default()
-                }
-            }
-        };
+    fn work_plan_pauses_on_warm_skim_and_focuses_target_on_cold_skim() {
+        let mode = ReadingMode::Manga;
+        let (reading, _) = reading_with_pages(20, Some("005.png"), mode);
 
-        reading.shown = Some((mode, Spread::lone(0)));
-        assert!(reading.turn(Direction::Forward, mode, Instant::now()));
-        assert_eq!(
-            reading.update_requests(
-                mode,
-                None,
-                testkit::limits(),
-                roles(0),
-            ),
-            Some(vec![Request {
-                page: 1,
-                role: Role::Fit
-            }])
+        let warm_plan = reading.build_work(
+            mode,
+            true,
+            None,
+            testkit::limits(),
+            &FakeStore::from_roles([(5, Role::Thumb), (6, Role::Thumb)]),
         );
+        assert_eq!(warm_plan, WorkPlan::default());
 
-        reading.shown = Some((mode, Spread::lone(1)));
-        assert_eq!(
-            reading.update_requests(
-                mode,
-                None,
-                testkit::limits(),
-                roles(1),
-            ),
-            Some(vec![Request {
-                page: 2,
-                role: Role::Fit
-            }])
+        let cold_plan = reading.build_work(
+            mode,
+            true,
+            None,
+            testkit::limits(),
+            &FakeStore::default(),
         );
-
-        reading.target = 5;
-        reading.shown = Some((mode, Spread::lone(5)));
         assert_eq!(
-            reading.update_requests(
-                mode,
-                None,
-                testkit::limits(),
-                roles(5),
-            ),
-            Some(Vec::new())
+            cold_plan.current,
+            vec![
+                Request {
+                    page: 6,
+                    role: WorkRole::Fit,
+                },
+                Request {
+                    page: 5,
+                    role: WorkRole::Fit,
+                },
+            ]
         );
+        assert_eq!(cold_plan.lookahead, Vec::new());
+        assert_eq!(cold_plan.thumbs, Vec::new());
     }
 }

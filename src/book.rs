@@ -14,13 +14,14 @@ use ipc_channel::ipc::IpcOneShotServer;
 use ipc_channel::ipc::IpcReceiver;
 use ipc_channel::ipc::IpcSender;
 
-use crate::browse::Role;
+use crate::browse::WorkRole;
 use crate::protocol::BookInfo;
 use crate::protocol::ChildMsg;
 use crate::protocol::Hello;
 use crate::protocol::ParentMsg;
 use crate::protocol::PlaybackEvent;
 use crate::protocol::ValidatedImage;
+use crate::protocol::ValidatedThumb;
 use crate::protocol::WireImage;
 
 /// A child that has not answered by now is wedged; the parent reports a
@@ -30,8 +31,13 @@ const OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 pub enum PageEvent {
     Ready {
         page: usize,
-        role: Role,
+        role: WorkRole,
         image: Box<ValidatedImage>,
+        thumb: Option<ValidatedThumb>,
+    },
+    Thumb {
+        page: usize,
+        thumb: ValidatedThumb,
     },
     Playback(PlaybackEvent<Box<ValidatedImage>>),
     Failed {
@@ -279,7 +285,12 @@ fn read_events(
 
     loop {
         let event = match child_rx.recv() {
-            Ok(message) => BookEvent::Page(event_from_message(message)),
+            Ok(message) => {
+                let Some(page_event) = event_from_message(message) else {
+                    continue;
+                };
+                BookEvent::Page(page_event)
+            }
             Err(IpcError::Disconnected) => {
                 BookEvent::Died(String::from("the book process exited"))
             }
@@ -303,24 +314,55 @@ fn read_events(
     }
 }
 
-fn event_from_message(message: ChildMsg) -> PageEvent {
+fn event_from_message(message: ChildMsg) -> Option<PageEvent> {
     match message {
-        ChildMsg::Ready { page, role, image } => match image.validate() {
-            Ok(image) => PageEvent::Ready {
-                page,
-                role,
-                image: Box::new(image),
-            },
-            Err(refusal) => PageEvent::Failed {
+        ChildMsg::Ready {
+            page,
+            role,
+            image,
+            thumb,
+        } => match image.validate() {
+            Ok(image) => {
+                let thumb = thumb.and_then(|wire_thumb| {
+                    wire_thumb
+                        .validate()
+                        .inspect_err(|error| {
+                            tracing::warn!(
+                                page,
+                                %error,
+                                "ignoring invalid thumbnail from worker"
+                            );
+                        })
+                        .ok()
+                });
+                Some(PageEvent::Ready {
+                    page,
+                    role,
+                    image: Box::new(image),
+                    thumb,
+                })
+            }
+            Err(refusal) => Some(PageEvent::Failed {
                 page,
                 fault: refusal.to_string(),
-            },
+            }),
         },
+        ChildMsg::Thumb { page, thumb } => thumb
+            .validate()
+            .inspect_err(|error| {
+                tracing::warn!(
+                    page,
+                    %error,
+                    "ignoring invalid background thumbnail from worker"
+                );
+            })
+            .ok()
+            .map(|thumb| PageEvent::Thumb { page, thumb }),
         ChildMsg::Playback(event) => {
-            PageEvent::Playback(validated_event(event))
+            Some(PageEvent::Playback(validated_event(event)))
         }
         ChildMsg::Failed { page, fault } => {
-            PageEvent::Failed { page, fault }
+            Some(PageEvent::Failed { page, fault })
         }
     }
 }

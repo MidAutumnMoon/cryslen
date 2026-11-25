@@ -1,29 +1,24 @@
-# Cache: representations, prefetch, store
+# Cache: roles, thumb pack, worker pool
 
 ## Roles and layout
 
-- Role selection (`Thumb`, `Fit`, `Full`), demand requests, 1-spread forward VRAM pre-upload, and texture retention live in `src/reading.rs`.
-- `Thumb` serves skims, `Fit` serves settled reading within the session `fit_box`, and `Full` bypasses persistent caches for zoom (`src/cache.rs`, `src/reading.rs`).
-- Layout and status use page dimensions, so role promotion keeps spread pairing unchanged.
-- Animated pages persist only frame 0.
+- Role selection (`Thumb`, `Fit`, `Full`), `WorkPlan` construction, and VRAM budget eviction live in `src/reading.rs` and `src/render.rs`; derivation lives in `src/cache.rs`.
+- Layout and status use native page dimensions, so role promotion keeps spread pairing unchanged.
+- Only thumbnails persist to disk (frame 0 for animated pages).
 
-## Store
+## Thumb pack (parent-owned)
 
-`$TMPDIR/cryslen-cache/{thumb,view}/<xxh3-128 of encoded page bytes>`, implemented in `src/cache.rs`. `view` stores `Role::Fit`.
+- One append-only pack per book at `$XDG_CACHE_HOME/cryslen/thumbs/<book-key>.cyth` (`src/cache.rs`).
+- Indexed from book metadata so warm thumbnails show before archive unpacking finishes; torn tails truncate on append, and directory pruning is LRU across books.
 
-- Entries are little-endian and versioned by format version (`8`), page hash, role, and target bounding box (`target_box`); the resampling kernel is outside the key, so existing entries keep their look until pruned.
-- Writes lock a unique temp file until atomic rename, allowing store open to sweep orphaned temps; loading refreshes mtime for shared per-namespace LRU caps across child processes. Failures degrade to re-deriving.
+## Worker pool (child-owned)
 
-## Prefetch and worker
-
-- Spread warm-up ordering (`Prefetch::build`), the priority worker pool (`1` background prefetch worker using `cpu_threads / 4` threads after `1500 ms` idle), `MemoryCache` (process RAM `Fit` LRU), and `Store` coordination live in `src/worker.rs`.
-- Resampling (`src/cache.rs`) averages straight-alpha RGBA because the renderer premultiplies at draw; alpha-aware resampling would avoid edge color bleed at roughly double memory and time.
+- Fixed worker pool (`src/worker.rs`) over a strict 3-tier `WorkPlan`: `current` preempts `lookahead`, which preempts background `thumbs`.
+- Preemption cancels lower-tier decodes cooperatively (`src/decode/jxl.rs`), leaving canceled pages unfaulted.
+- A bounded child native cache lets zoom (`Full`) skip re-decoding recent pages; background `thumbs` bypass it.
 
 ## Presentation and input
 
-- Presentable spread resolution, fallback order, and GPU upload/retention live in `src/reading.rs` and `src/render.rs`.
-- Skim vs. still motion triggers live in `src/app.rs` (platform key auto-repeat starts a skim; key release or focus loss ends it).
-
-## Limits
-
-A cold page without a cached `Fit` image costs a source decode (`decoding.md`) before display. Slow frames, slow uploads, and long waits log at `info`; cache and worker traces require `RUST_LOG=debug`.
+- VRAM holds per-role byte-budgeted caches (`src/reading.rs`, `src/render.rs`).
+- Key-repeat skims (`src/app.rs`, `src/reading.rs`) pace turns to one spread ahead of screen, show warm thumbnails immediately, and pause `Fit` work while every seat has a preview so stopping sharpens on an idle CPU.
+- Discrete turns wait a brief grace window for `Fit` before falling back to a warm thumbnail, then sharpen in place.

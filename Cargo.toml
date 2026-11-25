@@ -26,7 +26,6 @@ winit = { version = "0.30", default-features = false, features = ["rwh_06", "way
 crossbeam-channel = "0.5"
 enum-map = "3.1"
 ipc-channel = "0.23"
-postcard = { version = "1.1", default-features = false }
 rustix = { version = "1", features = ["process"] }
 serde = { version = "1", features = ["derive"] }
 strum = { version = "0.28", features = ["derive"] }

@@ -1,8 +1,12 @@
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+
 use jxl::api::JxlParallelRunner;
 use jxl::api::JxlParallelRunnerFun;
 use jxl::error::Error as JxlError;
 use jxl::error::Result as JxlResult;
 
+use super::DecodeOutcome;
 use super::Decoded;
 
 const MAX_THREADS: usize = 16;
@@ -10,7 +14,8 @@ const MAX_THREADS: usize = 16;
 pub(super) fn decode(
     bytes: &[u8],
     max_threads: usize,
-) -> eros::Result<Decoded> {
+    cancel: &AtomicBool,
+) -> eros::Result<DecodeOutcome> {
     use jxl::api::Event;
     use jxl::api::ExtraChannel;
     use jxl::api::JxlColorType;
@@ -25,15 +30,28 @@ pub(super) fn decode(
     use super::Format;
     use super::Transfer;
 
-    let mut runner = Pool(max_threads.clamp(1, MAX_THREADS));
+    if cancel.load(Ordering::Relaxed) {
+        return Ok(DecodeOutcome::Canceled);
+    }
+
+    let mut runner = Pool {
+        threads: max_threads.clamp(1, MAX_THREADS),
+        cancel,
+    };
     // The whole file is in memory, so `NeedMoreInput` means the file is
     // truncated.
     let mut input: &[u8] = bytes;
     let mut decoder = JxlDecoder::new(JxlDecoderOptions::default());
 
     loop {
-        let event =
-            decoder.process(&mut input, None, Some(&mut runner))?;
+        let event = match decoder.process(&mut input, None, Some(&mut runner))
+        {
+            Ok(event) => event,
+            Err(_) if cancel.load(Ordering::Relaxed) => {
+                return Ok(DecodeOutcome::Canceled);
+            }
+            Err(error) => return Err(error.into()),
+        };
         if event == Event::BasicInfo {
             break;
         }
@@ -84,11 +102,18 @@ pub(super) fn decode(
     loop {
         let mut output =
             JxlOutputBuffer::new(&mut pixels, height as usize, stride);
-        match decoder.process(
+        let event = match decoder.process(
             &mut input,
             Some(slice::from_mut(&mut output)),
             Some(&mut runner),
-        )? {
+        ) {
+            Ok(event) => event,
+            Err(_) if cancel.load(Ordering::Relaxed) => {
+                return Ok(DecodeOutcome::Canceled);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        match event {
             Event::FrameComplete { has_more_frames } => {
                 if has_more_frames {
                     tracing::debug!(
@@ -107,7 +132,7 @@ pub(super) fn decode(
 
     // The crate either converts to sRGB or emits simple PQ values its
     // API does not distinguish, so jxl pages ride the sRGB path.
-    Ok(if mono {
+    let page = if mono {
         Decoded::gray_u8(
             width,
             height,
@@ -123,14 +148,25 @@ pub(super) fn decode(
             Transfer::Srgb,
             pixels.into_boxed_slice(),
         )?
-    })
+    };
+    Ok(DecodeOutcome::Ready(page))
+}
+
+fn canceled_error() -> JxlError {
+    use std::io;
+    use std::io::ErrorKind;
+
+    JxlError::IOError(io::Error::new(ErrorKind::Interrupted, "canceled"))
 }
 
 /// Scoped-thread runner. A failing task fails the whole run, which is
 /// how the crate's driver expects a broken codestream to be reported.
-struct Pool(usize);
+struct Pool<'cancel> {
+    threads: usize,
+    cancel: &'cancel AtomicBool,
+}
 
-impl JxlParallelRunner for Pool {
+impl JxlParallelRunner for Pool<'_> {
     fn run(
         &mut self,
         num: usize,
@@ -139,9 +175,15 @@ impl JxlParallelRunner for Pool {
         use std::sync::OnceLock;
         use std::thread;
 
-        let thread_count = self.0.min(num);
+        if self.cancel.load(Ordering::Relaxed) {
+            return Err(canceled_error());
+        }
+        let thread_count = self.threads.min(num);
         if thread_count <= 1 {
             for task_index in 0..num {
+                if self.cancel.load(Ordering::Relaxed) {
+                    return Err(canceled_error());
+                }
                 fun(task_index)?;
             }
             return Ok(());
@@ -152,10 +194,15 @@ impl JxlParallelRunner for Pool {
             for thread_index in 0..thread_count {
                 let fun: &JxlParallelRunnerFun = fun;
                 let failure = &failure;
+                let cancel = self.cancel;
                 scope.spawn(move || {
                     for task_index in thread_index * chunk
                         ..((thread_index + 1) * chunk).min(num)
                     {
+                        if cancel.load(Ordering::Relaxed) {
+                            failure.get_or_init(canceled_error);
+                            break;
+                        }
                         if let Err(task_error) = fun(task_index) {
                             // The first failure wins; a later one has
                             // nothing to add.
@@ -168,8 +215,44 @@ impl JxlParallelRunner for Pool {
         });
         failure.into_inner().map_or(Ok(()), Err)
     }
+
+    fn run_ordered(
+        &mut self,
+        num: usize,
+        max_threads: Option<usize>,
+        fun: &JxlParallelRunnerFun<'_>,
+    ) -> JxlResult<()> {
+        use std::sync::atomic::AtomicUsize;
+
+        let max_threads = max_threads
+            .unwrap_or(usize::MAX)
+            .min(self.num_threads())
+            .min(num);
+        if max_threads <= 1 {
+            for task_index in 0..num {
+                if self.cancel.load(Ordering::Relaxed) {
+                    return Err(canceled_error());
+                }
+                fun(task_index)?;
+            }
+            return Ok(());
+        }
+        let next_index = AtomicUsize::new(0);
+        let cancel = self.cancel;
+        self.run(max_threads, &|_| loop {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(canceled_error());
+            }
+            let task_index = next_index.fetch_add(1, Ordering::Relaxed);
+            if task_index >= num {
+                return Ok(());
+            }
+            fun(task_index)?;
+        })
+    }
+
     fn num_threads(&self) -> usize {
-        self.0
+        self.threads
     }
 }
 
@@ -183,12 +266,22 @@ mod tests {
     // runner's parallel path.
     #[test]
     fn pool_reports_the_first_task_error() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+
         use jxl::api::JxlParallelRunner as _;
         use jxl::error::Error as JxlError;
 
         use super::Pool;
 
-        let mut pool = Pool(4);
+        const TOTAL_TASKS: usize = 100;
+
+        let never_cancel = AtomicBool::new(false);
+        let mut pool = Pool {
+            threads: 4,
+            cancel: &never_cancel,
+        };
         let failing = |task: usize| {
             if task == 1 {
                 Err(JxlError::InvalidSignature)
@@ -206,7 +299,10 @@ mod tests {
 
         // Two threads over four tasks pin the chunk partition. A range
         // that drops the last task would leave the failure unreported.
-        let mut two_threads = Pool(2);
+        let mut two_threads = Pool {
+            threads: 2,
+            cancel: &never_cancel,
+        };
         let failing_last = |task: usize| {
             if task == 3 {
                 Err(JxlError::InvalidSignature)
@@ -218,5 +314,23 @@ mod tests {
             two_threads.run(4, &failing_last),
             Err(JxlError::InvalidSignature)
         ));
+
+        // Setting cancel aborts ordered execution before visiting all tasks.
+        let cancel = AtomicBool::new(false);
+        let completed_tasks = AtomicUsize::new(0);
+        let mut cancellable = Pool {
+            threads: 2,
+            cancel: &cancel,
+        };
+        let abort_after_first = |_: usize| {
+            completed_tasks.fetch_add(1, Ordering::Relaxed);
+            cancel.store(true, Ordering::Relaxed);
+            Ok(())
+        };
+        assert!(matches!(
+            cancellable.run_ordered(TOTAL_TASKS, None, &abort_after_first),
+            Err(JxlError::IOError(_))
+        ));
+        assert!(completed_tasks.load(Ordering::Relaxed) < TOTAL_TASKS);
     }
 }

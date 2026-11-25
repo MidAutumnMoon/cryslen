@@ -33,16 +33,20 @@ use winit::window::Window as WinitWindow;
 
 use crate::browse::Role;
 use crate::browse::Roles;
+use crate::browse::WorkRole;
+use crate::decode::ColorConversion;
 use crate::decode::Depth;
-use crate::decode::Matrix;
 use crate::decode::Transfer;
 use crate::geometry::PageRect;
 use crate::geometry::Placement;
 use crate::geometry::SpreadLayout;
 use crate::geometry::Viewport;
 use crate::protocol::TextureFault;
+use crate::protocol::ThumbFormat;
 use crate::protocol::ValidatedImage;
+use crate::protocol::ValidatedThumb;
 use crate::protocol::WirePixels;
+use crate::reading::PageStore;
 
 // The quad is a fixed -1..1 strip generated from gl_VertexID; uniforms
 // place it at the seat rect. Clip space is bottom-origin; winit coords
@@ -397,6 +401,7 @@ pub struct PageTextures {
     pipeline: Pipeline,
     ewa: EwaResampler,
     pages: HashMap<usize, PageSlots>,
+    role_bytes: EnumMap<Role, usize>,
     max_texture_edge: u32,
 }
 
@@ -492,6 +497,7 @@ struct PageTexture {
     page_dims: (u32, u32),
     transfer: Transfer,
     needs_dither: bool,
+    resident_bytes: usize,
     layout: PixelLayout,
 }
 
@@ -567,24 +573,6 @@ impl DrawTarget {
 struct SeatGeometry {
     origin: (f64, f64),
     size: (f64, f64),
-}
-
-/// Fold storage samples to gamma RGB at upload: `matrix * samples - offset`.
-/// Samples are 0..1 storage units; R16 sampling already divides by 65535.
-#[derive(Debug, Clone, Copy)]
-struct ColorConversion {
-    /// Column-major 3x3.
-    matrix: [f32; 9],
-    offset: [f32; 3],
-}
-
-impl ColorConversion {
-    const fn gray(gain: f32, offset: f32) -> Self {
-        Self {
-            matrix: [gain, gain, gain, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-            offset: [offset; 3],
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -708,6 +696,7 @@ impl PageTextures {
             pipeline,
             ewa,
             pages: HashMap::new(),
+            role_bytes: EnumMap::default(),
             max_texture_edge,
         })
     }
@@ -716,55 +705,11 @@ impl PageTextures {
         self.max_texture_edge
     }
 
-    /// Upload `image` as `page`'s `role`; no-op if present, never evicts.
-    pub fn insert(
-        &mut self,
-        page: usize,
-        role: Role,
-        image: &ValidatedImage,
-    ) -> Result<(), TextureFault> {
-        if self.has(page, role) {
-            return Ok(());
-        }
-        let dims = (image.meta.width, image.meta.height);
-        TextureFault::check_dims(dims, self.max_texture_edge)?;
-        let texture = upload_page_texture(Arc::clone(&self.gl), image);
+    fn store_role(&mut self, page: usize, role: Role, texture: PageTexture) {
         label_entry(&self.gl, page, role.into(), &texture);
+        self.role_bytes[role] =
+            self.role_bytes[role].saturating_add(texture.resident_bytes);
         self.pages.entry(page).or_default().roles[role] = Some(texture);
-        Ok(())
-    }
-
-    /// Updates `page`'s live playback slot in place when dimensions and format match.
-    pub fn update_playback(
-        &mut self,
-        page: usize,
-        image: &ValidatedImage,
-    ) -> Result<(), TextureFault> {
-        let dims = (image.meta.width, image.meta.height);
-        TextureFault::check_dims(dims, self.max_texture_edge)?;
-        if let Some(PageTexture {
-            dims: present_dims,
-            layout: PixelLayout::Rgba { texture },
-            transfer,
-            ..
-        }) = self.pages.get(&page).and_then(|slots| slots.playback.as_ref())
-            && *present_dims == dims
-            && *transfer == image.meta.transfer
-            && let WirePixels::Rgba8(bytes) = &image.pixels
-        {
-            update_rgba(&self.gl, *texture, bytes, dims);
-            return Ok(());
-        }
-        let texture = upload_page_texture(Arc::clone(&self.gl), image);
-        label_entry(&self.gl, page, "playback", &texture);
-        self.pages.entry(page).or_default().playback = Some(texture);
-        Ok(())
-    }
-
-    pub fn roles(&self, page: usize) -> Roles {
-        self.pages
-            .get(&page)
-            .map_or_else(Roles::default, PageSlots::roles)
     }
 
     fn has(&self, page: usize, role: Role) -> bool {
@@ -773,30 +718,9 @@ impl PageTextures {
             .is_some_and(|slots| slots.roles[role].is_some())
     }
 
-    pub fn has_any(&self, page: usize) -> bool {
-        self.pages.get(&page).is_some_and(PageSlots::has_any)
-    }
-
-    pub fn retain(
-        &mut self,
-        keep_role: impl Fn(usize, Role) -> bool,
-        keep_playback: impl Fn(usize) -> bool,
-    ) {
-        self.pages.retain(|&page, slots| {
-            for (role, slot) in &mut slots.roles {
-                if slot.is_some() && !keep_role(page, role) {
-                    *slot = None;
-                }
-            }
-            if slots.playback.is_some() && !keep_playback(page) {
-                slots.playback = None;
-            }
-            slots.has_any()
-        });
-    }
-
     pub fn clear_all(&mut self) {
         self.pages.clear();
+        self.role_bytes = EnumMap::default();
     }
 
     /// Does not clear the framebuffer.
@@ -872,6 +796,152 @@ impl PageTextures {
             self.gl.disable(glow::SCISSOR_TEST);
             self.gl.active_texture(glow::TEXTURE0);
         }
+    }
+}
+
+impl PageStore for PageTextures {
+    fn roles(&self, page: usize) -> Roles {
+        self.pages
+            .get(&page)
+            .map_or_else(Roles::default, PageSlots::roles)
+    }
+
+    fn has_any(&self, page: usize) -> bool {
+        self.pages.get(&page).is_some_and(PageSlots::has_any)
+    }
+
+    fn average_role_bytes(&self, role: Role) -> Option<usize> {
+        let count = self
+            .pages
+            .values()
+            .filter(|slots| slots.roles[role].is_some())
+            .count();
+        self.role_bytes[role].checked_div(count)
+    }
+
+    /// Upload `image` as `page`'s `role`; no-op if present, never evicts.
+    fn insert_page(
+        &mut self,
+        page: usize,
+        role: WorkRole,
+        image: &ValidatedImage,
+    ) -> Result<(), TextureFault> {
+        use std::time::Duration;
+        use std::time::Instant;
+
+        const SLOW_UPLOAD_THRESHOLD: Duration = Duration::from_millis(30);
+
+        let slot_role = Role::from(role);
+        if self.has(page, slot_role) {
+            return Ok(());
+        }
+        let dims = (image.meta.width, image.meta.height);
+        TextureFault::check_dims(dims, self.max_texture_edge)?;
+        let upload_started = Instant::now();
+        let texture = upload_page_texture(Arc::clone(&self.gl), image);
+        let elapsed = upload_started.elapsed();
+        tracing::debug!(
+            page,
+            role = ?slot_role,
+            width = dims.0,
+            height = dims.1,
+            ?elapsed,
+            "uploaded"
+        );
+        if elapsed >= SLOW_UPLOAD_THRESHOLD {
+            tracing::info!(
+                page,
+                role = ?slot_role,
+                width = dims.0,
+                height = dims.1,
+                ?elapsed,
+                "slow upload"
+            );
+        }
+        self.store_role(page, slot_role, texture);
+        Ok(())
+    }
+
+    /// Upload an 8-bit sRGB thumbnail to `page`'s `Role::Thumb` slot.
+    fn insert_thumb(&mut self, page: usize, thumb: &ValidatedThumb) {
+        if self.has(page, Role::Thumb) {
+            return;
+        }
+        let dims = (thumb.width, thumb.height);
+        debug_assert!(
+            TextureFault::check_dims(dims, self.max_texture_edge).is_ok(),
+            "ValidatedThumb ({dims:?}) must fit max_texture_edge ({})",
+            self.max_texture_edge
+        );
+        let texture = upload_thumb_texture(Arc::clone(&self.gl), thumb);
+        self.store_role(page, Role::Thumb, texture);
+    }
+
+    /// Updates `page`'s live playback slot in place when dimensions and format match.
+    fn update_playback(
+        &mut self,
+        page: usize,
+        image: &ValidatedImage,
+    ) -> Result<(), TextureFault> {
+        let dims = (image.meta.width, image.meta.height);
+        TextureFault::check_dims(dims, self.max_texture_edge)?;
+        if let Some(PageTexture {
+            dims: present_dims,
+            layout: PixelLayout::Rgba { texture },
+            transfer,
+            ..
+        }) = self.pages.get(&page).and_then(|slots| slots.playback.as_ref())
+            && *present_dims == dims
+            && *transfer == image.meta.transfer
+            && let WirePixels::Rgba8(bytes) = &image.pixels
+        {
+            update_rgba(&self.gl, *texture, bytes, dims);
+            return Ok(());
+        }
+        let texture = upload_page_texture(Arc::clone(&self.gl), image);
+        label_entry(&self.gl, page, "playback", &texture);
+        self.pages.entry(page).or_default().playback = Some(texture);
+        Ok(())
+    }
+
+    fn evict_to_budget(
+        &mut self,
+        role: Role,
+        budget_bytes: usize,
+        is_pinned: &dyn Fn(usize) -> bool,
+        priority: &dyn Fn(usize) -> (usize, bool),
+    ) {
+        while self.role_bytes[role] > budget_bytes {
+            let victim = self
+                .pages
+                .iter()
+                .filter(|&(&page, slots)| {
+                    slots.roles[role].is_some() && !is_pinned(page)
+                })
+                .max_by_key(|&(&page, _)| (priority(page), page))
+                .map(|(&page, _)| page);
+            let Some(page) = victim else {
+                break;
+            };
+            if let Some(slots) = self.pages.get_mut(&page) {
+                if let Some(removed) = slots.roles[role].take() {
+                    self.role_bytes[role] = self.role_bytes[role]
+                        .saturating_sub(removed.resident_bytes);
+                }
+                if !slots.has_any() {
+                    self.pages.remove(&page);
+                }
+            }
+        }
+    }
+
+    fn retain_playback(&mut self, keep_playback: &dyn Fn(usize) -> bool) {
+        self.pages.retain(|&page, slots| {
+            if slots.playback.is_some() && !keep_playback(page) {
+                slots.playback = None;
+            }
+            slots.has_any()
+        });
     }
 }
 
@@ -2295,7 +2365,8 @@ fn upload_page_texture(
                 wide,
                 magnification_filter,
             );
-            let (gain, offset) = gray_gain_offset(depth, spec.full_range);
+            let (gain, offset) =
+                decode::gray_gain_offset(depth, spec.full_range);
             let layout = alpha.as_ref().map_or_else(
                 || PixelLayout::Mono {
                     luma: luma_texture,
@@ -2307,8 +2378,8 @@ fn upload_page_texture(
                     // so gray+alpha rides the YUV path with neutral chroma stubs.
                     PixelLayout::Yuv(YuvTexture {
                         luma: luma_texture,
-                        cb: stub_plane(&gl, CHROMA_NEUTRAL_8BIT),
-                        cr: stub_plane(&gl, CHROMA_NEUTRAL_8BIT),
+                        cb: stub_plane(&gl, decode::CHROMA_NEUTRAL_8BIT),
+                        cr: stub_plane(&gl, decode::CHROMA_NEUTRAL_8BIT),
                         alpha: upload_plane(
                             &gl,
                             alpha,
@@ -2318,7 +2389,7 @@ fn upload_page_texture(
                         ),
                         chroma_uv_per_texel: (1.0, 1.0),
                         color_conversion: ColorConversion::gray(gain, offset),
-                        alpha_normalization: depth_normalization(depth),
+                        alpha_normalization: decode::depth_normalization(depth),
                     })
                 },
             );
@@ -2342,7 +2413,7 @@ fn upload_page_texture(
                 wide,
                 magnification_filter,
             );
-            let color_conversion = yuv_color_conversion(
+            let color_conversion = decode::yuv_color_conversion(
                 depth,
                 spec.full_range,
                 spec.matrix,
@@ -2352,7 +2423,7 @@ fn upload_page_texture(
                     || {
                         (
                             stub_plane(&gl, OPAQUE_ALPHA_8BIT),
-                            depth_normalization(Depth::D8),
+                            decode::depth_normalization(Depth::D8),
                         )
                     },
                     |alpha| {
@@ -2364,7 +2435,7 @@ fn upload_page_texture(
                                 wide,
                                 MagnificationFilter::Linear,
                             ),
-                            depth_normalization(depth),
+                            decode::depth_normalization(depth),
                         )
                     },
                 );
@@ -2403,6 +2474,51 @@ fn upload_page_texture(
         page_dims,
         transfer: image.meta.transfer,
         needs_dither: needs_dither(image.meta.transfer, depth),
+        resident_bytes: image.resident_bytes(),
+        layout,
+    }
+}
+
+fn upload_thumb_texture(
+    gl: Arc<Context>,
+    thumb: &ValidatedThumb,
+) -> PageTexture {
+    use crate::decode;
+
+    let dims = (thumb.width, thumb.height);
+    let page_dims = thumb.page_dims;
+    let magnification_filter = magnification_filter(dims, page_dims);
+    let layout = match thumb.pixels {
+        ThumbFormat::Gray8 => {
+            let (gain, offset) = decode::gray_gain_offset(Depth::D8, true);
+            PixelLayout::Mono {
+                luma: upload_plane(
+                    &gl,
+                    &thumb.bytes,
+                    dims,
+                    false,
+                    magnification_filter,
+                ),
+                gain,
+                offset,
+            }
+        }
+        ThumbFormat::Rgba8 => PixelLayout::Rgba {
+            texture: upload_rgba(
+                &gl,
+                &thumb.bytes,
+                dims,
+                magnification_filter,
+            ),
+        },
+    };
+    PageTexture {
+        gl,
+        dims,
+        page_dims,
+        transfer: Transfer::Srgb,
+        needs_dither: false,
+        resident_bytes: thumb.bytes.len(),
         layout,
     }
 }
@@ -2416,165 +2532,6 @@ fn transfer_code(transfer: Transfer) -> i32 {
         Transfer::Pq => TRANSFER_PQ,
     }
 }
-
-const R8_STORAGE_MAX: f32 = 255.0;
-const R16_STORAGE_MAX: f32 = 65535.0;
-const CHROMA_NEUTRAL_8BIT: u8 = 128;
-
-fn max_storage_code(depth: Depth) -> f32 {
-    if depth.is_wide() {
-        R16_STORAGE_MAX
-    } else {
-        R8_STORAGE_MAX
-    }
-}
-
-fn max_sample_code(depth: Depth) -> u16 {
-    u16::MAX >> (Depth::D16.bits() - depth.bits())
-}
-
-/// Compensate for GL `R16` normalization: sampling divides by
-/// [`R16_STORAGE_MAX`] even when only `depth` bits are used.
-fn depth_normalization(depth: Depth) -> f32 {
-    max_storage_code(depth) / f32::from(max_sample_code(depth))
-}
-
-struct RangeQuantization {
-    luma_black: f32,
-    luma_scale: f32,
-    chroma_scale: f32,
-    chroma_neutral: f32,
-}
-
-fn range_quantization(depth: Depth, full_range: bool) -> RangeQuantization {
-    const STUDIO_LUMA_BLACK_8BIT: u16 = 16;
-    const STUDIO_LUMA_SWING_8BIT: u16 = 219;
-    const STUDIO_CHROMA_SWING_8BIT: u16 = 224;
-
-    let depth_scale = 1_u16 << (depth.bits() - Depth::D8.bits());
-    let chroma_neutral =
-        f32::from(u16::from(CHROMA_NEUTRAL_8BIT) * depth_scale);
-    let (luma_black, luma_scale, chroma_scale) = if full_range {
-        (0.0, 1.0, 1.0)
-    } else {
-        let max_code = f32::from(max_sample_code(depth));
-        (
-            f32::from(STUDIO_LUMA_BLACK_8BIT * depth_scale),
-            max_code / f32::from(STUDIO_LUMA_SWING_8BIT * depth_scale),
-            max_code / f32::from(STUDIO_CHROMA_SWING_8BIT * depth_scale),
-        )
-    };
-    RangeQuantization {
-        luma_black,
-        luma_scale,
-        chroma_scale,
-        chroma_neutral,
-    }
-}
-
-fn gray_gain_offset(depth: Depth, full_range: bool) -> (f32, f32) {
-    let range = range_quantization(depth, full_range);
-    let gain = range.luma_scale * depth_normalization(depth);
-    let offset = gain * (range.luma_black / max_storage_code(depth));
-    (gain, offset)
-}
-
-/// Fold storage samples to gamma RGB: depth normalization, quantization,
-/// and the KR/KB matrix (or GBR permutation). The offset is the matrix
-/// times the anchor codes.
-fn yuv_color_conversion(
-    depth: Depth,
-    full_range: bool,
-    color_matrix: Matrix,
-) -> ColorConversion {
-    const GBR_TO_RGB_MATRIX: [f32; 9] =
-        [0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0];
-
-    let range = range_quantization(depth, full_range);
-    let (mut matrix, luma_scale, chroma_scale, luma_black, chroma_neutral) =
-        if color_matrix == Matrix::Identity {
-            // H.273 identity planes are GBR in the (Y, Cb, Cr) slots,
-            // quantized as luma on all three axes: permute into RGB and
-            // anchor every axis at luma black.
-            (
-                GBR_TO_RGB_MATRIX,
-                range.luma_scale,
-                range.luma_scale,
-                range.luma_black,
-                range.luma_black,
-            )
-        } else {
-            (
-                yuv_to_rgb_matrix(color_matrix),
-                range.luma_scale,
-                range.chroma_scale,
-                range.luma_black,
-                range.chroma_neutral,
-            )
-        };
-    let storage_max = max_storage_code(depth);
-    let normalization = depth_normalization(depth);
-    for (column, matrix_column) in
-        matrix.as_chunks_mut::<3>().0.iter_mut().enumerate()
-    {
-        let scale = if column == 0 {
-            luma_scale
-        } else {
-            chroma_scale
-        } * normalization;
-        for cell in matrix_column {
-            *cell *= scale;
-        }
-    }
-    let anchors = [
-        luma_black / storage_max,
-        chroma_neutral / storage_max,
-        chroma_neutral / storage_max,
-    ];
-    let mut offset = [0.0_f32; 3];
-    for (matrix_column, anchor) in
-        matrix.as_chunks::<3>().0.iter().zip(anchors)
-    {
-        for (&cell, slot) in matrix_column.iter().zip(&mut offset) {
-            *slot = cell.mul_add(anchor, *slot);
-        }
-    }
-    ColorConversion { matrix, offset }
-}
-
-/// Full-range YUV→RGB from the exact KR/KB of each standard.
-/// KG = 1 - KR - KB. Identity pages never reach here;
-/// `yuv_color_conversion` routes them through the GBR permutation.
-#[expect(
-    clippy::similar_names,
-    reason = "the green coefficients are the Cb and Cr terms of the BT matrix derivation"
-)]
-fn yuv_to_rgb_matrix(matrix: Matrix) -> [f32; 9] {
-    let (k_red, k_blue) = match matrix {
-        Matrix::Bt601 => BT601_KR_KB,
-        Matrix::Bt709 => BT709_KR_KB,
-        Matrix::Bt2020 => BT2020_KR_KB,
-        Matrix::Identity => (0.0, 0.0),
-    };
-    let k_green = 1.0 - k_red - k_blue;
-    let green_from_cb = 2.0 * k_blue * (1.0 - k_blue) / k_green;
-    let green_from_cr = 2.0 * k_red * (1.0 - k_red) / k_green;
-    [
-        1.0,
-        1.0,
-        1.0, //
-        0.0,
-        -green_from_cb,
-        2.0 * (1.0 - k_blue), //
-        2.0 * (1.0 - k_red),
-        -green_from_cr,
-        0.0,
-    ]
-}
-
-const BT601_KR_KB: (f32, f32) = (0.299, 0.114);
-const BT709_KR_KB: (f32, f32) = (0.2126, 0.0722);
-const BT2020_KR_KB: (f32, f32) = (0.2627, 0.0593);
 
 /// Window, EGL context, and page texture store. vsync is `DontWait`, so
 /// the app must call `pre_present_and_swap()` to present.
@@ -2809,6 +2766,7 @@ const INITIAL_WINDOW_HEIGHT: f64 = 750.0;
 )]
 mod tests {
     use super::*;
+    use crate::decode;
 
     // GL needs a context; these tests pin the CPU-side values it consumes.
 
@@ -2819,28 +2777,6 @@ mod tests {
     )]
     fn element(matrix: &[f32; 9], row: usize, col: usize) -> f32 {
         matrix[col * 3 + row]
-    }
-
-    /// The folded conversion through one row: `matrix * samples - offset`.
-    fn convert(
-        conversion: &ColorConversion,
-        samples: [f32; 3],
-    ) -> [f32; 3] {
-        let mut out = [0.0_f32; 3];
-        for (row, slot) in out.iter_mut().enumerate() {
-            #[expect(
-                clippy::indexing_slicing,
-                reason = "row and col are 0..3 coordinates into the fixed 3-vectors under test"
-            )]
-            let converted = (0..3)
-                .map(|col| {
-                    element(&conversion.matrix, row, col) * samples[col]
-                })
-                .sum::<f32>()
-                - conversion.offset[row];
-            *slot = converted;
-        }
-        out
     }
 
     /// Code values of one depth's quantization (black, white, neutral) in
@@ -2867,13 +2803,19 @@ mod tests {
 
     #[test]
     fn color_conversion_anchors_black_and_white_at_every_depth() {
+        use crate::decode::Matrix;
+
         for depth in [Depth::D8, Depth::D10, Depth::D12, Depth::D16] {
             for full_range in [true, false] {
                 for conversion in [
-                    yuv_color_conversion(depth, full_range, Matrix::Bt601),
+                    decode::yuv_color_conversion(
+                        depth,
+                        full_range,
+                        Matrix::Bt601,
+                    ),
                     {
                         let (gain, offset) =
-                            gray_gain_offset(depth, full_range);
+                            decode::gray_gain_offset(depth, full_range);
                         ColorConversion::gray(gain, offset)
                     },
                 ] {
@@ -2881,14 +2823,11 @@ mod tests {
                         code_quantization_codes(depth, full_range);
                     for (code, expected) in [(black, 0.0), (white, 1.0)] {
                         // Chroma at its neutral code contributes nothing.
-                        let rgb = convert(
-                            &conversion,
-                            [
-                                code / storage_max,
-                                neutral / storage_max,
-                                neutral / storage_max,
-                            ],
-                        );
+                        let rgb = conversion.apply([
+                            code / storage_max,
+                            neutral / storage_max,
+                            neutral / storage_max,
+                        ]);
                         for (row, channel) in rgb.into_iter().enumerate() {
                             assert!(
                                 (channel - expected).abs() < 1e-4,
@@ -2903,7 +2842,10 @@ mod tests {
 
     #[test]
     fn identity_pages_permute_gbr() {
-        let color = yuv_color_conversion(Depth::D8, true, Matrix::Identity);
+        use crate::decode::Matrix;
+
+        let color =
+            decode::yuv_color_conversion(Depth::D8, true, Matrix::Identity);
         // Column j is plane j's contribution: Y->G, U->B, V->R.
         for (col, row) in [(0, 1), (1, 2), (2, 0)] {
             for probe in 0..3 {

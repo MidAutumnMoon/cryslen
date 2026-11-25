@@ -368,6 +368,7 @@ impl Source {
         Ok(Self { names, backend })
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> NonZeroUsize {
         self.names.count()
     }

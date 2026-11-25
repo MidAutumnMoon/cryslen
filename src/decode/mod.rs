@@ -5,6 +5,8 @@
     reason = "the decode tree's shared vocabulary lives in its module root by design"
 )]
 
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -372,19 +374,6 @@ pub const RGBA_BYTES_PER_PIXEL: usize = 4;
 pub struct YuvLayout {
     pub luma_samples: usize,
     pub chroma_samples: usize,
-    pub depth: Depth,
-}
-
-impl YuvLayout {
-    #[must_use]
-    pub fn total_bytes(self, has_alpha: bool) -> Option<usize> {
-        let alpha = if has_alpha { self.luma_samples } else { 0 };
-        self.luma_samples
-            .checked_add(self.chroma_samples)?
-            .checked_add(self.chroma_samples)?
-            .checked_add(alpha)?
-            .checked_mul(self.depth.sample_bytes())
-    }
 }
 
 pub fn rgba_byte_len(width: u32, height: u32) -> Result<usize, MsgError> {
@@ -426,7 +415,6 @@ pub fn validate_gray_extents(
 
 pub fn yuv_layout(
     dims: (u32, u32),
-    depth: Depth,
     subsampling: Subsampling,
 ) -> Result<YuvLayout, MsgError> {
     let luma_samples =
@@ -437,7 +425,6 @@ pub fn yuv_layout(
     Ok(YuvLayout {
         luma_samples,
         chroma_samples,
-        depth,
     })
 }
 
@@ -448,7 +435,7 @@ pub fn validate_yuv_extents(
     [luma_bytes, chroma_blue_bytes, chroma_red_bytes]: [usize; 3],
     alpha_bytes: Option<usize>,
 ) -> Result<(), MsgError> {
-    let layout = yuv_layout(dims, depth, subsampling)?;
+    let layout = yuv_layout(dims, subsampling)?;
     let sample_bytes = depth.sample_bytes();
     let expected_luma_bytes = layout
         .luma_samples
@@ -825,34 +812,274 @@ where
     out.into_boxed_slice()
 }
 
+pub const R8_STORAGE_MAX: f32 = 255.0;
+pub const R16_STORAGE_MAX: f32 = 65535.0;
+pub const CHROMA_NEUTRAL_8BIT: u8 = 128;
+
+/// Fold storage samples to gamma RGB: `matrix * samples - offset`.
+/// Samples are `0..1` storage units; `R16` sampling divides by `65535`.
+#[derive(Debug, Clone, Copy)]
+pub struct ColorConversion {
+    /// Column-major 3x3.
+    pub matrix: [f32; 9],
+    pub offset: [f32; 3],
+}
+
+impl ColorConversion {
+    #[must_use]
+    pub const fn gray(gain: f32, offset: f32) -> Self {
+        Self {
+            matrix: [gain, gain, gain, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            offset: [offset; 3],
+        }
+    }
+
+    #[must_use]
+    pub fn apply(&self, samples: [f32; 3]) -> [f32; 3] {
+        let mut rgb = [0.0_f32; 3];
+        for (column, sample) in
+            self.matrix.as_chunks::<3>().0.iter().zip(samples)
+        {
+            for (&cell, slot) in column.iter().zip(&mut rgb) {
+                *slot = cell.mul_add(sample, *slot);
+            }
+        }
+        for (slot, offset) in rgb.iter_mut().zip(self.offset) {
+            *slot -= offset;
+        }
+        rgb
+    }
+}
+
+#[must_use]
+pub fn max_storage_code(depth: Depth) -> f32 {
+    if depth.is_wide() {
+        R16_STORAGE_MAX
+    } else {
+        R8_STORAGE_MAX
+    }
+}
+
+fn max_sample_code(depth: Depth) -> u16 {
+    u16::MAX >> (Depth::D16.bits() - depth.bits())
+}
+
+/// Compensate for GL `R16` normalization: sampling divides by
+/// [`R16_STORAGE_MAX`] even when only `depth` bits are used.
+#[must_use]
+pub fn depth_normalization(depth: Depth) -> f32 {
+    max_storage_code(depth) / f32::from(max_sample_code(depth))
+}
+
+struct RangeQuantization {
+    luma_black: f32,
+    luma_scale: f32,
+    chroma_scale: f32,
+    chroma_neutral: f32,
+}
+
+fn range_quantization(depth: Depth, full_range: bool) -> RangeQuantization {
+    const STUDIO_LUMA_BLACK_8BIT: u16 = 16;
+    const STUDIO_LUMA_SWING_8BIT: u16 = 219;
+    const STUDIO_CHROMA_SWING_8BIT: u16 = 224;
+
+    let depth_scale = 1_u16 << (depth.bits() - Depth::D8.bits());
+    let chroma_neutral =
+        f32::from(u16::from(CHROMA_NEUTRAL_8BIT) * depth_scale);
+    let (luma_black, luma_scale, chroma_scale) = if full_range {
+        (0.0, 1.0, 1.0)
+    } else {
+        let max_code = f32::from(max_sample_code(depth));
+        (
+            f32::from(STUDIO_LUMA_BLACK_8BIT * depth_scale),
+            max_code / f32::from(STUDIO_LUMA_SWING_8BIT * depth_scale),
+            max_code / f32::from(STUDIO_CHROMA_SWING_8BIT * depth_scale),
+        )
+    };
+    RangeQuantization {
+        luma_black,
+        luma_scale,
+        chroma_scale,
+        chroma_neutral,
+    }
+}
+
+#[must_use]
+pub fn gray_gain_offset(depth: Depth, full_range: bool) -> (f32, f32) {
+    let range = range_quantization(depth, full_range);
+    let gain = range.luma_scale * depth_normalization(depth);
+    let offset = gain * (range.luma_black / max_storage_code(depth));
+    (gain, offset)
+}
+
+/// Fold storage samples to gamma RGB: depth normalization, quantization,
+/// and the KR/KB matrix (or GBR permutation). The offset is the matrix
+/// times the anchor codes.
+#[must_use]
+pub fn yuv_color_conversion(
+    depth: Depth,
+    full_range: bool,
+    color_matrix: Matrix,
+) -> ColorConversion {
+    const GBR_TO_RGB_MATRIX: [f32; 9] =
+        [0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0];
+
+    let range = range_quantization(depth, full_range);
+    let (mut matrix, luma_scale, chroma_scale, luma_black, chroma_neutral) =
+        if color_matrix == Matrix::Identity {
+            // H.273 identity planes are GBR in the (Y, Cb, Cr) slots,
+            // quantized as luma on all three axes: permute into RGB and
+            // anchor every axis at luma black.
+            (
+                GBR_TO_RGB_MATRIX,
+                range.luma_scale,
+                range.luma_scale,
+                range.luma_black,
+                range.luma_black,
+            )
+        } else {
+            (
+                yuv_to_rgb_matrix(color_matrix),
+                range.luma_scale,
+                range.chroma_scale,
+                range.luma_black,
+                range.chroma_neutral,
+            )
+        };
+    let storage_max = max_storage_code(depth);
+    let normalization = depth_normalization(depth);
+    for (column, matrix_column) in
+        matrix.as_chunks_mut::<3>().0.iter_mut().enumerate()
+    {
+        let scale = if column == 0 {
+            luma_scale
+        } else {
+            chroma_scale
+        } * normalization;
+        for cell in matrix_column {
+            *cell *= scale;
+        }
+    }
+    let anchors = [
+        luma_black / storage_max,
+        chroma_neutral / storage_max,
+        chroma_neutral / storage_max,
+    ];
+    let mut offset = [0.0_f32; 3];
+    for (matrix_column, anchor) in
+        matrix.as_chunks::<3>().0.iter().zip(anchors)
+    {
+        for (&cell, slot) in matrix_column.iter().zip(&mut offset) {
+            *slot = cell.mul_add(anchor, *slot);
+        }
+    }
+    ColorConversion { matrix, offset }
+}
+
+/// Full-range YUV->RGB from the exact KR/KB of each standard.
+/// KG = 1 - KR - KB. Identity pages never reach here;
+/// `yuv_color_conversion` routes them through the GBR permutation.
+#[expect(
+    clippy::similar_names,
+    reason = "the green coefficients are the Cb and Cr terms of the BT matrix derivation"
+)]
+fn yuv_to_rgb_matrix(matrix: Matrix) -> [f32; 9] {
+    const BT601_KR_KB: (f32, f32) = (0.299, 0.114);
+    const BT709_KR_KB: (f32, f32) = (0.2126, 0.0722);
+    const BT2020_KR_KB: (f32, f32) = (0.2627, 0.0593);
+
+    let (k_red, k_blue) = match matrix {
+        Matrix::Bt601 => BT601_KR_KB,
+        Matrix::Bt709 => BT709_KR_KB,
+        Matrix::Bt2020 => BT2020_KR_KB,
+        Matrix::Identity => (0.0, 0.0),
+    };
+    let k_green = 1.0 - k_red - k_blue;
+    let green_from_cb = 2.0 * k_blue * (1.0 - k_blue) / k_green;
+    let green_from_cr = 2.0 * k_red * (1.0 - k_red) / k_green;
+    [
+        1.0,
+        1.0,
+        1.0, //
+        0.0,
+        -green_from_cb,
+        2.0 * (1.0 - k_blue), //
+        2.0 * (1.0 - k_red),
+        -green_from_cr,
+        0.0,
+    ]
+}
+
+/// Map a normalized `[0, 1]` PQ channel value to sRGB `[0, 1]` using the
+/// same 203-nit diffuse-white clip as `GLSL_TRANSFER_HEADER`.
+#[must_use]
+pub fn pq_to_srgb_channel(value: f32) -> f32 {
+    const PQ_M1: f32 = 2610.0 / 16384.0;
+    const PQ_M2: f32 = 2523.0 / 4096.0 * 128.0;
+    const PQ_C1: f32 = 3424.0 / 4096.0;
+    const PQ_C2: f32 = 2413.0 / 4096.0 * 32.0;
+    const PQ_C3: f32 = 2392.0 / 4096.0 * 32.0;
+    const PQ_DIFFUSE_WHITE_NITS: f32 = 203.0;
+    const PQ_PEAK_NITS: f32 = 10_000.0;
+    const SRGB_LINEAR_THRESHOLD: f32 = 0.003_130_8;
+    const SRGB_LINEAR_SLOPE: f32 = 12.92;
+    const SRGB_GAMMA_SCALE: f32 = 1.055;
+    const SRGB_GAMMA_OFFSET: f32 = 0.055;
+    const SRGB_GAMMA_EXPONENT: f32 = 2.4;
+
+    let pq_scaled = value.clamp(0.0, 1.0).powf(1.0 / PQ_M2);
+    let luminance_nits = PQ_PEAK_NITS
+        * ((pq_scaled - PQ_C1).max(0.0) / PQ_C3.mul_add(-pq_scaled, PQ_C2))
+            .powf(1.0 / PQ_M1);
+    let sdr_linear = (luminance_nits / PQ_DIFFUSE_WHITE_NITS).clamp(0.0, 1.0);
+    if sdr_linear <= SRGB_LINEAR_THRESHOLD {
+        sdr_linear * SRGB_LINEAR_SLOPE
+    } else {
+        SRGB_GAMMA_SCALE
+            .mul_add(sdr_linear.powf(1.0 / SRGB_GAMMA_EXPONENT), -SRGB_GAMMA_OFFSET)
+    }
+}
+
+pub enum DecodeOutcome {
+    Ready(Decoded),
+    Canceled,
+}
+
 #[cfg(test)]
 pub fn decode(bytes: &[u8], name: &str) -> eros::Result<Decoded> {
     const TEST_MAX_THREADS: usize = 2;
-    decode_with_threads(bytes, name, TEST_MAX_THREADS)
+    let cancel = AtomicBool::new(false);
+    match decode_cancellable(bytes, name, TEST_MAX_THREADS, &cancel)? {
+        DecodeOutcome::Ready(decoded) => Ok(decoded),
+        DecodeOutcome::Canceled => eros::bail!("decode canceled"),
+    }
 }
 
-/// Decode one page's first raster; animated frames stream through
-/// [`open_animation`]. Internal decoder threads are capped to `max_threads`
-/// where supported.
-pub fn decode_with_threads(
+/// Decode one page's first raster, aborting cooperatively when `cancel`
+/// flips during JXL decoding.
+pub fn decode_cancellable(
     bytes: &[u8],
     name: &str,
     max_threads: usize,
-) -> eros::Result<Decoded> {
+    cancel: &AtomicBool,
+) -> eros::Result<DecodeOutcome> {
+    if cancel.load(Ordering::Relaxed) {
+        return Ok(DecodeOutcome::Canceled);
+    }
     let Some(format) = sniff(bytes).or_else(|| format_from_name(name))
     else {
         eros::bail!("not an image");
     };
     let max_threads = max_threads.max(1);
     match format {
-        Format::Avif => avif::decode(bytes, max_threads),
-        Format::Jxl => jxl::decode(bytes, max_threads),
-        Format::Webp => webp::decode(bytes, max_threads),
+        Format::Avif => avif::decode(bytes, max_threads).map(DecodeOutcome::Ready),
+        Format::Jxl => jxl::decode(bytes, max_threads, cancel),
+        Format::Webp => webp::decode(bytes, max_threads).map(DecodeOutcome::Ready),
         Format::Jpeg
         | Format::Png
         | Format::Gif
         | Format::Bmp
-        | Format::Tiff => raster::decode(bytes, format),
+        | Format::Tiff => raster::decode(bytes, format).map(DecodeOutcome::Ready),
     }
 }
 

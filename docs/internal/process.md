@@ -1,31 +1,27 @@
 # Processes: one child per book
 
-`cy` is the windowed parent; `cy --worker` serves one book over shared wire types.
+`cy` is the windowed parent; `cy --worker` serves one book over `src/protocol.rs`.
 
-The parent owns the window, UI, GL, app state, request set, and textures; the child owns the book's source, store, decode, derivation, and archive unpacking. A child crash becomes a book fault.
+The parent owns the window, UI, GL, app state, VRAM textures, and the per-book thumb pack; the child owns the book source, archive unpacking, decode, and derivation. A child crash becomes a book fault.
 
-## Reading order
+## Lifecycle
 
-- Open: fork on the event-loop thread so the child's parent-death signal stays bound to it, then finish the handshake off the loop.
-- Archive: list pages immediately, unpack entries into per-page slots in the background, and serve each page as its slot fills. Per-page failures stay page-local; an aborted pass fills empty slots with its error. A directory is ready immediately.
-- Switch: kill the old child, start a new open, and adopt its view when it lands; the app keeps the last frame on screen meanwhile.
-- Child: priority worker pool serving requests and warming caches alongside the IPC and playback loop (`src/worker.rs`).
-- A page fault is text; a book fault is the process.
-- The store, prefetch, and retention are in `docs/internal/cache.md`.
+- Open (`src/book.rs`, `src/worker.rs`): fork on the event-loop thread so Linux's parent-death signal stays bound to a long-lived thread. Because `accept(2)` cannot unblock if the child exits early, the child connects before opening the source and the parent accepts on a helper thread under a timeout.
+- Archive (`src/source.rs`): list pages up front, unpack into per-page slots in the background, and serve each page as its slot fills. Per-page failures stay page-local; an aborted pass fills remaining empty slots with its error. Directories are ready immediately.
+- Switch (`src/app.rs`): kill the old child, start the new open, and keep the previous frame on screen until the new book adopts.
+- Worker (`src/worker.rs`): runs the decode pool alongside the IPC and playback loop (scheduling and caches in `docs/internal/cache.md`).
 
 ## Playback
 
-- The parent owns display timing and the session lifecycle; the child owns decode and the loop policy.
-- One frame request is in flight. `generation` rejects a stopped session's answers.
-- A playback failure keeps the page's last raster.
+- Parent (`src/reading.rs`, `src/animation.rs`) owns display timing and session lifecycle; child (`src/worker.rs`) owns decode and loop policy.
+- One frame request is in flight per session; a monotonic generation rejects stale frames. A playback failure keeps the page's last raster.
 
-## Invariants
+## Wire invariants
 
-- Page identity is the index in the book the child was spawned with; no message carries a path.
-- The app sends the whole request set and uses its texture maps as the authority; the child acknowledges nothing.
-- Pixels cross as a wire image (metadata plus one shared-memory block per plane), avoiding serialization; the parent validates extents and uploads directly to GL.
-- A child that never connects cannot be woken from `accept(2)`, so the child connects before opening the source and the parent accepts on its own thread under the open timeout.
+- Page identity is the spawn-time book index; messages carry no paths.
+- The parent sends the whole `WorkPlan` and is the authority for resident state; the child sends only deliveries and failures.
+- Full and fit planes cross via shared memory per plane (`src/protocol.rs`); the parent validates extents before GL upload.
 
-## Limits
+## Trust boundary and limits
 
-The child has the user's full filesystem access. Every image is copied once into shared memory. Child and parent share stderr. A page request in an archive waits only until its own entry unpacks or fails; switches and quit stop running unpacks and decodes by killing the child.
+The child runs with the user's filesystem access and shares stderr with the parent. Each transferred image copies once into shared memory. Switches and quit cancel running unpacks and decodes by killing the child.

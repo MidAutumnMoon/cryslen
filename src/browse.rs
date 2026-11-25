@@ -67,8 +67,6 @@ impl Serialize for PageNames {
     Default,
     PartialEq,
     Eq,
-    Deserialize,
-    Serialize,
     Display,
     VariantArray
 )]
@@ -134,6 +132,10 @@ impl Spread {
         }
     }
 
+    pub fn pages(self) -> impl Iterator<Item = usize> {
+        [Some(self.first), self.second].into_iter().flatten()
+    }
+
     pub fn contains(&self, page: usize) -> bool {
         self.first == page || self.second == Some(page)
     }
@@ -145,8 +147,6 @@ impl Spread {
     Copy,
     PartialEq,
     Eq,
-    Deserialize,
-    Serialize,
     VariantArray
 )]
 pub enum Direction {
@@ -154,15 +154,6 @@ pub enum Direction {
     Backward,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-pub enum Motion {
-    /// Settled reading: the prefetch head is worth fit images.
-    Still,
-    /// Turning faster than a fit image can arrive: only thumbs can show.
-    Skimming,
-}
-
-/// Page image resolution tier.
 #[derive(
     Debug,
     Clone,
@@ -170,8 +161,6 @@ pub enum Motion {
     PartialEq,
     Eq,
     Hash,
-    Deserialize,
-    Serialize,
     Display,
     Enum,
     IntoStaticStr,
@@ -186,6 +175,26 @@ pub enum Role {
     Full,
 }
 
+/// Resolution tier produced by the child decode worker.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize, Display
+)]
+pub enum WorkRole {
+    #[strum(serialize = "view")]
+    Fit,
+    #[strum(serialize = "native")]
+    Full,
+}
+
+impl From<WorkRole> for Role {
+    fn from(role: WorkRole) -> Self {
+        match role {
+            WorkRole::Fit => Self::Fit,
+            WorkRole::Full => Self::Full,
+        }
+    }
+}
+
 /// The roles present for one page.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Roles {
@@ -195,10 +204,6 @@ pub struct Roles {
 impl Roles {
     pub fn set(&mut self, role: Role) {
         self.present[role] = true;
-    }
-
-    pub fn clear(&mut self, role: Role) {
-        self.present[role] = false;
     }
 
     #[must_use]
@@ -211,7 +216,7 @@ impl Roles {
         self.present.values().any(|present| *present)
     }
 
-    /// A fit or full image can fill a still seat.
+    /// A fit or full image can fill a settled seat.
     #[must_use]
     pub fn has_settled_image(self) -> bool {
         self.contains(Role::Fit) || self.contains(Role::Full)
@@ -230,12 +235,13 @@ impl Roles {
     }
 }
 
-/// One missing role. The app sends the whole set and the child sends no
-/// acknowledgement: a request leaving the set means the app got it.
+/// One missing worker role. The app sends the whole priority plan and the
+/// child sends no acknowledgement: an item leaving the plan means the app
+/// no longer needs it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 pub struct Request {
     pub page: usize,
-    pub role: Role,
+    pub role: WorkRole,
 }
 
 /// Spread containing `index` under `mode`, clamped to the book. An
@@ -500,6 +506,9 @@ mod tests {
     #[test]
     fn roles_prefer_the_largest_role() {
         let mut roles = Roles::default();
+        assert_eq!(roles.best(), None);
+        assert!(!roles.any());
+
         roles.set(Role::Thumb);
         assert_eq!(roles.best(), Some(Role::Thumb));
         assert!(roles.contains(Role::Thumb));
@@ -512,18 +521,6 @@ mod tests {
 
         roles.set(Role::Full);
         assert_eq!(roles.best(), Some(Role::Full));
-
-        roles.clear(Role::Full);
-        assert_eq!(roles.best(), Some(Role::Fit));
-        assert!(!roles.contains(Role::Full));
-
-        roles.clear(Role::Fit);
-        assert_eq!(roles.best(), Some(Role::Thumb));
-        assert!(!roles.has_settled_image());
-        assert!(roles.any());
-
-        roles.clear(Role::Thumb);
-        assert_eq!(roles.best(), None);
-        assert!(!roles.any());
+        assert!(roles.contains(Role::Full));
     }
 }

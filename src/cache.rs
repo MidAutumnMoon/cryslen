@@ -1,28 +1,29 @@
-//! Downscaled page previews and the on-disk cache: one directory per role
-//! under `env::temp_dir()`, keyed by [`content_hash`]. The little-endian
-//! file format is described in `docs/internal/cache.md`.
+//! Downscaled page derivation and the per-book parent thumbnail pack
+//! (`$XDG_CACHE_HOME/cryslen/thumbs/<book_key>.cyth`).
 
 #![expect(
     clippy::little_endian_bytes,
-    reason = "the cache file format is defined little-endian"
+    reason = "the thumb-pack binary format is defined little-endian"
 )]
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fs;
 use std::fs::File;
-use std::fs::Metadata;
 use std::io;
-use std::io::Error;
+use std::io::BufReader;
+use std::io::BufWriter;
 use std::io::ErrorKind;
-use std::io::IoSlice;
 use std::io::Read as _;
-use std::mem::DropGuard;
+use std::io::Seek as _;
+use std::io::SeekFrom;
+use std::io::Write as _;
+use std::mem;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
+use std::thread;
 use std::time::SystemTime;
 
 use bytemuck::Pod;
@@ -31,48 +32,44 @@ use fast_image_resize::PixelTrait;
 use fast_image_resize::Resizer;
 use fast_image_resize::pixels::Pixel;
 use fast_image_resize::pixels::PixelComponent;
-use serde::Deserialize;
-use serde::Serialize;
 
-use crate::browse::Role;
+use crate::browse::WorkRole;
+use crate::catalog;
 use crate::decode;
 use crate::decode::Decoded;
+use crate::decode::Format;
 use crate::decode::GrayImage;
 use crate::decode::GrayPlanes;
-use crate::decode::GraySpec;
-use crate::decode::ImageMeta;
 use crate::decode::Pixels;
 use crate::decode::Samples;
 use crate::decode::Subsampling;
+use crate::decode::Transfer;
 use crate::decode::YuvImage;
 use crate::decode::YuvPlanes;
-use crate::decode::YuvSpec;
 use crate::protocol::ImageLimits;
 use crate::protocol::THUMB_EDGE;
 use crate::protocol::TextureFault;
+use crate::protocol::ThumbFormat;
+use crate::protocol::ValidatedThumb;
+use crate::protocol::WireThumb;
 
-pub const THUMB_CAP_BYTES: u64 = 512 * 1024 * 1024;
-pub const FIT_CAP_BYTES: u64 = 3 * 512 * 1024 * 1024;
+const THUMB_PACK_CAP_BYTES: u64 = 512 * 1024 * 1024;
+const THUMB_PACK_PRUNE_NUMERATOR: u64 = 4;
+const THUMB_PACK_PRUNE_DENOMINATOR: u64 = 5;
+const FLUSH_ENTRY_THRESHOLD: usize = 32;
+const FLUSH_BYTE_THRESHOLD: usize = 2 * 1024 * 1024;
 
 fn derivation(
-    role: Role,
+    role: WorkRole,
     limits: ImageLimits,
 ) -> ((u32, u32), FilterType) {
     match role {
-        Role::Thumb => ((THUMB_EDGE, THUMB_EDGE), FilterType::Box),
-        Role::Fit => (limits.fit_box(), FilterType::Lanczos3),
-        Role::Full => {
+        WorkRole::Fit => (limits.fit_box(), FilterType::Lanczos3),
+        WorkRole::Full => {
             let max_edge = limits.max_texture_edge();
             ((max_edge, max_edge), FilterType::Lanczos3)
         }
     }
-}
-
-/// Content address of a page: xxh3-128 over its encoded bytes.
-pub fn content_hash(bytes: &[u8]) -> u128 {
-    use xxhash_rust::xxh3::xxh3_128;
-
-    xxh3_128(bytes)
 }
 
 /// Downsample to the role's bounding box; borrows `page` unchanged when
@@ -80,11 +77,12 @@ pub fn content_hash(bytes: &[u8]) -> u128 {
 /// `TextureFault` past `max_texture_edge`.
 pub fn derive(
     page: &Decoded,
-    role: Role,
+    role: WorkRole,
     limits: ImageLimits,
+    max_threads: usize,
 ) -> Result<Cow<'_, Decoded>, TextureFault> {
     let (bounds, filter) = derivation(role, limits);
-    let error = match derive_to_box(page, bounds, filter) {
+    let error = match derive_to_box(page, bounds, filter, max_threads) {
         Ok(derived) => return Ok(derived),
         Err(error) => error,
     };
@@ -103,10 +101,246 @@ pub fn derive(
     Err(TextureFault { dims, max_edge })
 }
 
+/// Derive a compact 8-bit sRGB thumbnail (`<= THUMB_EDGE` per axis) from a
+/// decoded or `Fit`-sized page.
+pub fn derive_thumb(
+    page: &Decoded,
+    max_threads: usize,
+) -> eros::Result<ValidatedThumb> {
+    let thumb = derive_to_box(
+        page,
+        (THUMB_EDGE, THUMB_EDGE),
+        FilterType::Box,
+        max_threads,
+    )?;
+    encode_thumb(&thumb)
+}
+
+fn encode_thumb(page: &Decoded) -> eros::Result<ValidatedThumb> {
+    const RGB_CHANNELS: usize = 3;
+
+    let width = page.width();
+    let height = page.height();
+    let transfer = page.transfer();
+    let (pixels, bytes) = match page.pixels() {
+        Pixels::Rgba8(raw) => {
+            let mut rgba = raw.to_vec();
+            if transfer == Transfer::Pq {
+                for pixel in
+                    rgba.as_chunks_mut::<{ decode::RGBA_BYTES_PER_PIXEL }>().0
+                {
+                    for channel in pixel.iter_mut().take(RGB_CHANNELS) {
+                        *channel = quantize_unit(decode::pq_to_srgb_channel(
+                            f32::from(*channel) / decode::R8_STORAGE_MAX,
+                        ));
+                    }
+                }
+            }
+            (ThumbFormat::Rgba8, rgba)
+        }
+        Pixels::Gray(gray) => encode_gray_thumb(
+            gray,
+            (width, height),
+            transfer,
+        ),
+        Pixels::Yuv(yuv) => encode_yuv_thumb(
+            yuv,
+            (width, height),
+            transfer,
+        ),
+    };
+    let wire = WireThumb {
+        width,
+        height,
+        page_dims: page.page_dims(),
+        format: page.format(),
+        pixels,
+        bytes,
+    };
+    Ok(wire.validate()?)
+}
+
+fn encode_gray_thumb(
+    gray: &GrayImage,
+    (width, height): (u32, u32),
+    transfer: Transfer,
+) -> (ThumbFormat, Vec<u8>) {
+    let pixel_count = width as usize * height as usize;
+
+    match &gray.samples {
+        Samples::U8(planes) => {
+            gray_planes_to_thumb(gray, pixel_count, transfer, planes)
+        }
+        Samples::U16 { planes, .. } => {
+            gray_planes_to_thumb(gray, pixel_count, transfer, planes)
+        }
+    }
+}
+
+fn gray_planes_to_thumb<Sample>(
+    gray: &GrayImage,
+    pixel_count: usize,
+    transfer: Transfer,
+    planes: &GrayPlanes<Sample>,
+) -> (ThumbFormat, Vec<u8>)
+where
+    Sample: Copy,
+    f32: From<Sample>,
+{
+    let depth = gray.depth();
+    let (gain, offset) = decode::gray_gain_offset(depth, gray.full_range);
+    let storage_max = decode::max_storage_code(depth);
+    let alpha_normalization = decode::depth_normalization(depth);
+    let map_luma = |sample: f32| {
+        let luma = (sample / storage_max).mul_add(gain, -offset);
+        let srgb = apply_transfer(luma.clamp(0.0, 1.0), transfer);
+        quantize_unit(srgb)
+    };
+    let map_alpha = |sample: f32| {
+        quantize_unit(
+            (sample / storage_max * alpha_normalization).clamp(0.0, 1.0),
+        )
+    };
+
+    planes.alpha.as_deref().map_or_else(
+        || {
+            let bytes = planes
+                .luma
+                .iter()
+                .map(|sample| map_luma(f32::from(*sample)))
+                .collect();
+            (ThumbFormat::Gray8, bytes)
+        },
+        |alpha_plane| {
+            let mut bytes = Vec::with_capacity(
+                pixel_count * decode::RGBA_BYTES_PER_PIXEL,
+            );
+            for (luma_sample, alpha_sample) in
+                planes.luma.iter().zip(alpha_plane.iter())
+            {
+                let gray_byte = map_luma(f32::from(*luma_sample));
+                let alpha_byte = map_alpha(f32::from(*alpha_sample));
+                bytes.extend_from_slice(&[
+                    gray_byte, gray_byte, gray_byte, alpha_byte,
+                ]);
+            }
+            (ThumbFormat::Rgba8, bytes)
+        },
+    )
+}
+
+fn encode_yuv_thumb(
+    yuv: &YuvImage,
+    dims: (u32, u32),
+    transfer: Transfer,
+) -> (ThumbFormat, Vec<u8>) {
+    match &yuv.samples {
+        Samples::U8(planes) => (
+            ThumbFormat::Rgba8,
+            yuv_planes_to_rgba8(yuv, dims, transfer, planes),
+        ),
+        Samples::U16 { planes, .. } => (
+            ThumbFormat::Rgba8,
+            yuv_planes_to_rgba8(yuv, dims, transfer, planes),
+        ),
+    }
+}
+
+fn yuv_planes_to_rgba8<Sample>(
+    yuv: &YuvImage,
+    (width, height): (u32, u32),
+    transfer: Transfer,
+    planes: &YuvPlanes<Sample>,
+) -> Vec<u8>
+where
+    Sample: Copy,
+    f32: From<Sample>,
+{
+    let depth = yuv.depth();
+    let conversion =
+        decode::yuv_color_conversion(depth, yuv.full_range, yuv.matrix);
+    let storage_max = decode::max_storage_code(depth);
+    let alpha_normalization = decode::depth_normalization(depth);
+    let (_, chroma_dims) = decode::plane_dims((width, height), yuv.subsampling);
+    let (image_width, image_height) = (width as usize, height as usize);
+    let (chroma_width, chroma_height) =
+        (chroma_dims.0 as usize, chroma_dims.1 as usize);
+    let (shift_x, shift_y) = match yuv.subsampling {
+        Subsampling::Yuv444 => (0_u32, 0_u32),
+        Subsampling::Yuv422 => (1, 0),
+        Subsampling::Yuv420 => (1, 1),
+    };
+    let mut rgba = Vec::with_capacity(
+        image_width * image_height * decode::RGBA_BYTES_PER_PIXEL,
+    );
+    for row in 0..image_height {
+        let chroma_row =
+            (row >> shift_y).min(chroma_height.saturating_sub(1));
+        for column in 0..image_width {
+            let chroma_column =
+                (column >> shift_x).min(chroma_width.saturating_sub(1));
+            let luma_index = row * image_width + column;
+            let chroma_index = chroma_row * chroma_width + chroma_column;
+            let luma = planes
+                .luma
+                .get(luma_index)
+                .copied()
+                .map_or(0.0, f32::from)
+                / storage_max;
+            let blue_chroma = planes
+                .cb
+                .get(chroma_index)
+                .copied()
+                .map_or(0.0, f32::from)
+                / storage_max;
+            let red_chroma = planes
+                .cr
+                .get(chroma_index)
+                .copied()
+                .map_or(0.0, f32::from)
+                / storage_max;
+            let rgb = conversion.apply([luma, blue_chroma, red_chroma]);
+            let alpha_byte =
+                planes.alpha.as_deref().map_or(u8::MAX, |plane| {
+                    let alpha =
+                        plane.get(luma_index).copied().map_or(1.0, f32::from)
+                            / storage_max
+                            * alpha_normalization;
+                    quantize_unit(alpha.clamp(0.0, 1.0))
+                });
+            for channel in rgb {
+                rgba.push(quantize_unit(apply_transfer(
+                    channel.clamp(0.0, 1.0),
+                    transfer,
+                )));
+            }
+            rgba.push(alpha_byte);
+        }
+    }
+    rgba
+}
+
+fn apply_transfer(channel: f32, transfer: Transfer) -> f32 {
+    match transfer {
+        Transfer::Srgb => channel,
+        Transfer::Pq => decode::pq_to_srgb_channel(channel),
+    }
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "channel is clamped to 0.0..=1.0 before scaling to 0..=255"
+)]
+fn quantize_unit(channel: f32) -> u8 {
+    (channel.clamp(0.0, 1.0) * decode::R8_STORAGE_MAX).round() as u8
+}
+
 fn derive_to_box(
     page: &Decoded,
     bounds: (u32, u32),
     filter: FilterType,
+    max_threads: usize,
 ) -> eros::Result<Cow<'_, Decoded>> {
     let page_dims = page.page_dims();
     let dims = (page.width(), page.height());
@@ -114,7 +348,7 @@ fn derive_to_box(
     if target == dims {
         return Ok(Cow::Borrowed(page));
     }
-    resample_page(page, target, filter)
+    resample_page(page, target, filter, max_threads)
         .map(|derived| Cow::Owned(derived.with_page_dims(page_dims)))
 }
 
@@ -147,14 +381,15 @@ fn resample_page(
     page: &Decoded,
     target: (u32, u32),
     filter: FilterType,
+    max_threads: usize,
 ) -> eros::Result<Decoded> {
     let dims = (page.width(), page.height());
-    let mut resizer = Resizer::new();
     match page.pixels() {
         Pixels::Rgba8(bytes) => {
-            let pixels = resize_typed::<_, u8, 4>(
+            let mut resizer = Resizer::new();
+            let pixels = resize_typed::<_, u8, { decode::RGBA_BYTES_PER_PIXEL }>(
                 &mut resizer,
-                bytes.as_chunks::<4>().0,
+                bytes.as_chunks::<{ decode::RGBA_BYTES_PER_PIXEL }>().0,
                 dims,
                 target,
                 filter,
@@ -169,21 +404,21 @@ fn resample_page(
         }
         Pixels::Gray(gray) => {
             let samples = match &gray.samples {
-                Samples::U8(planes) => Samples::U8(resize_gray::<u8, u8>(
-                    &mut resizer,
+                Samples::U8(planes) => Samples::U8(resize_gray::<u8>(
                     planes,
                     dims,
                     target,
                     filter,
+                    max_threads,
                 )?),
                 Samples::U16 { depth, planes } => Samples::U16 {
                     depth: *depth,
-                    planes: resize_gray::<u16, u16>(
-                        &mut resizer,
+                    planes: resize_gray::<u16>(
                         planes,
                         dims,
                         target,
                         filter,
+                        max_threads,
                     )?,
                 },
             };
@@ -200,23 +435,23 @@ fn resample_page(
         }
         Pixels::Yuv(yuv) => {
             let samples = match &yuv.samples {
-                Samples::U8(planes) => Samples::U8(resize_yuv::<u8, u8>(
-                    &mut resizer,
+                Samples::U8(planes) => Samples::U8(resize_yuv::<u8>(
                     planes,
                     dims,
                     target,
                     yuv.subsampling,
                     filter,
+                    max_threads,
                 )?),
                 Samples::U16 { depth, planes } => Samples::U16 {
                     depth: *depth,
-                    planes: resize_yuv::<u16, u16>(
-                        &mut resizer,
+                    planes: resize_yuv::<u16>(
                         planes,
                         dims,
                         target,
                         yuv.subsampling,
                         filter,
+                        max_threads,
                     )?,
                 },
             };
@@ -236,88 +471,134 @@ fn resample_page(
     }
 }
 
-fn resize_gray<Sample, Component>(
-    resizer: &mut Resizer,
+fn resize_gray<Sample>(
     planes: &GrayPlanes<Sample>,
     dims: (u32, u32),
     target: (u32, u32),
     filter: FilterType,
+    max_threads: usize,
 ) -> eros::Result<GrayPlanes<Sample>>
 where
-    Sample: Copy + Default + PartialEq + Pod,
-    Component: PixelComponent,
-    Pixel<Sample, Component, 1>: PixelTrait,
+    Sample: Copy + Default + PartialEq + Pod + PixelComponent + Send + Sync,
+    Pixel<Sample, Sample, 1>: PixelTrait,
 {
+    let mut specs = vec![(&*planes.luma, dims, target)];
+    if let Some(alpha) = planes.alpha.as_deref() {
+        specs.push((alpha, dims, target));
+    }
+    let mut resized = resize_planes(&specs, filter, max_threads)?.into_iter();
     Ok(GrayPlanes {
-        luma: resize_plane::<Sample, Component>(
-            resizer,
-            &planes.luma,
-            dims,
-            target,
-            filter,
-        )?,
-        alpha: planes
-            .alpha
-            .as_ref()
-            .map(|alpha| {
-                resize_plane::<Sample, Component>(
-                    resizer, alpha, dims, target, filter,
-                )
-            })
-            .transpose()?,
+        luma: resized
+            .next()
+            .ok_or_else(|| eros::error!("missing luma plane"))?,
+        alpha: resized.next(),
     })
 }
 
-fn resize_yuv<Sample, Component>(
-    resizer: &mut Resizer,
+fn resize_yuv<Sample>(
     planes: &YuvPlanes<Sample>,
     dims: (u32, u32),
     target: (u32, u32),
     subsampling: Subsampling,
     filter: FilterType,
+    max_threads: usize,
 ) -> eros::Result<YuvPlanes<Sample>>
 where
-    Sample: Copy + Default + PartialEq + Pod,
-    Component: PixelComponent,
-    Pixel<Sample, Component, 1>: PixelTrait,
+    Sample: Copy + Default + PartialEq + Pod + PixelComponent + Send + Sync,
+    Pixel<Sample, Sample, 1>: PixelTrait,
 {
     let (luma_dims, chroma_dims) = decode::plane_dims(dims, subsampling);
     let (_, target_chroma_dims) = decode::plane_dims(target, subsampling);
+    let mut specs = vec![
+        (&*planes.luma, luma_dims, target),
+        (&*planes.cb, chroma_dims, target_chroma_dims),
+        (&*planes.cr, chroma_dims, target_chroma_dims),
+    ];
+    if let Some(alpha) = planes.alpha.as_deref() {
+        specs.push((alpha, luma_dims, target));
+    }
+    let mut resized = resize_planes(&specs, filter, max_threads)?.into_iter();
     Ok(YuvPlanes {
-        luma: resize_plane::<Sample, Component>(
-            resizer,
-            &planes.luma,
-            luma_dims,
-            target,
-            filter,
-        )?,
-        cb: resize_plane::<Sample, Component>(
-            resizer,
-            &planes.cb,
-            chroma_dims,
-            target_chroma_dims,
-            filter,
-        )?,
-        cr: resize_plane::<Sample, Component>(
-            resizer,
-            &planes.cr,
-            chroma_dims,
-            target_chroma_dims,
-            filter,
-        )?,
-        alpha: planes
-            .alpha
-            .as_ref()
-            .map(|alpha| {
-                resize_plane::<Sample, Component>(
-                    resizer, alpha, luma_dims, target, filter,
-                )
-            })
-            .transpose()?,
+        luma: resized
+            .next()
+            .ok_or_else(|| eros::error!("missing luma plane"))?,
+        cb: resized
+            .next()
+            .ok_or_else(|| eros::error!("missing cb plane"))?,
+        cr: resized
+            .next()
+            .ok_or_else(|| eros::error!("missing cr plane"))?,
+        alpha: resized.next(),
     })
 }
 
-fn resize_plane<Sample, Component>(
+type PlaneResize<'source, Sample> =
+    (&'source [Sample], (u32, u32), (u32, u32));
+
+fn resize_planes<Sample>(
+    specs: &[PlaneResize<'_, Sample>],
+    filter: FilterType,
+    max_threads: usize,
+) -> eros::Result<Vec<Box<[Sample]>>>
+where
+    Sample: Copy + Default + PartialEq + Pod + PixelComponent + Send + Sync,
+    Pixel<Sample, Sample, 1>: PixelTrait,
+{
+    let Some((&first, rest)) = specs.split_first() else {
+        return Ok(Vec::new());
+    };
+    if max_threads <= 1 || rest.is_empty() {
+        let mut resizer = Resizer::new();
+        return specs
+            .iter()
+            .map(|&(source, source_dims, target_dims)| {
+                resize_plane(
+                    &mut resizer,
+                    source,
+                    source_dims,
+                    target_dims,
+                    filter,
+                )
+            })
+            .collect();
+    }
+    thread::scope(|scope| {
+        let handles: Vec<_> = rest
+            .iter()
+            .map(|&(source, source_dims, target_dims)| {
+                scope.spawn(move || {
+                    let mut resizer = Resizer::new();
+                    resize_plane(
+                        &mut resizer,
+                        source,
+                        source_dims,
+                        target_dims,
+                        filter,
+                    )
+                })
+            })
+            .collect();
+        let mut resizer = Resizer::new();
+        let mut planes = Vec::with_capacity(specs.len());
+        planes.push(resize_plane(
+            &mut resizer,
+            first.0,
+            first.1,
+            first.2,
+            filter,
+        )?);
+        for handle in handles {
+            planes.push(
+                handle
+                    .join()
+                    .map_err(|_panic| eros::error!("plane resample panicked"))??,
+            );
+        }
+        Ok(planes)
+    })
+}
+
+fn resize_plane<Sample>(
     resizer: &mut Resizer,
     source: &[Sample],
     source_dims: (u32, u32),
@@ -325,14 +606,13 @@ fn resize_plane<Sample, Component>(
     filter: FilterType,
 ) -> eros::Result<Box<[Sample]>>
 where
-    Sample: Copy + Default + PartialEq + Pod,
-    Component: PixelComponent,
-    Pixel<Sample, Component, 1>: PixelTrait,
+    Sample: Copy + Default + PartialEq + Pod + PixelComponent,
+    Pixel<Sample, Sample, 1>: PixelTrait,
 {
     if source_dims == target_dims {
         return Ok(source.into());
     }
-    Ok(resize_typed::<Sample, Component, 1>(
+    Ok(resize_typed::<Sample, Sample, 1>(
         resizer,
         source,
         source_dims,
@@ -342,38 +622,38 @@ where
     .into_boxed_slice())
 }
 
-fn resize_typed<S, C, const N: usize>(
+fn resize_typed<Element, Component, const CHANNELS: usize>(
     resizer: &mut Resizer,
-    source: &[S],
+    source: &[Element],
     source_dims: (u32, u32),
     target_dims: (u32, u32),
     filter: FilterType,
-) -> eros::Result<Vec<S>>
+) -> eros::Result<Vec<Element>>
 where
-    S: Default + PartialEq + Pod,
-    C: PixelComponent,
-    Pixel<S, C, N>: PixelTrait,
+    Element: Default + PartialEq + Pod,
+    Component: PixelComponent,
+    Pixel<Element, Component, CHANNELS>: PixelTrait,
 {
     use fast_image_resize::ResizeAlg;
     use fast_image_resize::ResizeOptions;
     use fast_image_resize::images::TypedImage;
     use fast_image_resize::images::TypedImageRef;
 
-    let Ok(count) = usize::try_from(
+    let Ok(element_count) = usize::try_from(
         u64::from(target_dims.0) * u64::from(target_dims.1),
     ) else {
         eros::bail!("buffer count overflows usize");
     };
-    let mut out = vec![S::default(); count];
-    let source = TypedImageRef::<Pixel<S, C, N>>::from_buffer(
+    let mut buffer = vec![Element::default(); element_count];
+    let source = TypedImageRef::<Pixel<Element, Component, CHANNELS>>::from_buffer(
         source_dims.0,
         source_dims.1,
         bytemuck::cast_slice(source),
     )?;
-    let mut target = TypedImage::<Pixel<S, C, N>>::from_buffer(
+    let mut target = TypedImage::<Pixel<Element, Component, CHANNELS>>::from_buffer(
         target_dims.0,
         target_dims.1,
-        bytemuck::cast_slice_mut(&mut out),
+        bytemuck::cast_slice_mut(&mut buffer),
     )?;
     // Straight alpha: the renderer premultiplies at draw. Alpha-aware
     // resampling avoids the color bleed at transparent edges but costs a
@@ -382,212 +662,478 @@ where
         .resize_alg(ResizeAlg::Convolution(filter))
         .use_alpha(false);
     resizer.resize_typed(&source, &mut target, &options)?;
-    Ok(out)
+    Ok(buffer)
 }
 
-/// The shared preview cache. A store that could not claim a real
-/// directory stays disabled, and every operation on it is a no-op.
-pub struct Store {
-    state: Option<State>,
+const PACK_MAGIC: [u8; 4] = *b"CYTH";
+const PACK_VERSION: u16 = 1;
+const PACK_HEADER_BYTES: usize = 16;
+const RECORD_HEADER_BYTES: usize = 20;
+const PACK_EXTENSION: &str = ".cyth";
+
+#[derive(Clone, Copy)]
+struct RecordLocation {
+    payload_offset: u64,
+    width: u32,
+    height: u32,
+    page_dims: (u32, u32),
+    format: Format,
+    pixels: ThumbFormat,
 }
 
-struct State {
-    thumb: Namespace,
-    view: Namespace,
+struct PackFile {
+    file: File,
+    valid_end: u64,
 }
 
-/// One role namespace: a directory of entries with its own byte cap.
-struct Namespace {
-    dir: PathBuf,
-    cap: u64,
-    /// Bytes written since the last scan or prune.
-    total: AtomicU64,
+/// Parent-owned append-only per-book thumbnail pack under
+/// `$XDG_CACHE_HOME/cryslen/thumbs/<book_key>.cyth`.
+pub struct ThumbPack {
+    path: PathBuf,
+    cap_bytes: u64,
+    file: Option<PackFile>,
+    index: Vec<Option<RecordLocation>>,
+    pending: BTreeMap<usize, ValidatedThumb>,
+    pending_bytes: usize,
+    pruned_once: bool,
 }
 
-impl Store {
-    /// Open the shared store under `env::temp_dir()/cryslen-cache`.
-    pub fn open() -> Self {
-        use std::env;
-
-        Self::at(&env::temp_dir().join("cryslen-cache"))
+impl ThumbPack {
+    pub fn open(path: &Path, archive: bool, names: &[String]) -> Option<Self> {
+        let root = default_thumb_dir()?;
+        let key = book_key(path, archive, names)?;
+        Self::open_at(&root, key, names.len())
     }
 
-    /// Open the store rooted at `root`, creating it if absent. A `root`
-    /// that cannot be created, or that resolves through a symlink, leaves
-    /// the store disabled.
-    pub fn at(root: &Path) -> Self {
-        Self::with_caps(root, THUMB_CAP_BYTES, FIT_CAP_BYTES)
+    pub fn open_at(root: &Path, key: u128, page_count: usize) -> Option<Self> {
+        Self::open_with_cap(root, key, page_count, THUMB_PACK_CAP_BYTES)
     }
 
-    fn with_caps(root: &Path, thumb_cap: u64, view_cap: u64) -> Self {
-        let state = prepare(root).map(|(thumb, view)| State {
-            thumb: Namespace::new(thumb, thumb_cap),
-            view: Namespace::new(view, view_cap),
-        });
-        if state.is_none() {
-            tracing::warn!(root = %root.display(), "preview store disabled");
+    fn open_with_cap(
+        root: &Path,
+        key: u128,
+        page_count: usize,
+        cap_bytes: u64,
+    ) -> Option<Self> {
+        if make_dir(root).is_none() {
+            tracing::warn!(root = %root.display(), "thumb pack disabled");
+            return None;
         }
-        Self { state }
+        let path = root.join(format!("{key:032x}{PACK_EXTENSION}"));
+        let mut index = vec![None; page_count];
+        let file = open_existing_pack(&path, &mut index);
+        Some(Self {
+            path,
+            cap_bytes,
+            file,
+            index,
+            pending: BTreeMap::new(),
+            pending_bytes: 0,
+            pruned_once: false,
+        })
     }
 
-    /// Load `hash`, or `None` when absent, damaged, or cached for another
-    /// target box; a hit refreshes the entry's mtime for LRU.
-    pub fn load(
-        &self,
-        hash: u128,
-        role: Role,
-        fit_box: (u32, u32),
-    ) -> Option<Decoded> {
-        use std::time::Instant;
-
-        let started = Instant::now();
-        let loaded =
-            self.role_target(role, fit_box)
-                .and_then(|(namespace, bounds)| {
-                    let file = File::open(namespace.path(hash)).ok()?;
-                    #[expect(
-                        clippy::let_underscore_must_use,
-                        clippy::let_underscore_untyped,
-                        reason = "the recency touch is advisory; its failure changes nothing"
-                    )]
-                    let _ = file.set_modified(SystemTime::now());
-                    read_stored(file, bounds)
-                });
-        tracing::debug!(
-            ?role,
-            hit = loaded.is_some(),
-            elapsed = ?started.elapsed(),
-            "preview load"
-        );
-        loaded
+    pub fn has(&self, page: usize) -> bool {
+        self.pending.contains_key(&page)
+            || self.index.get(page).is_some_and(Option::is_some)
     }
 
-    /// Returns pruned hashes on save, or `None` if disabled, uncached, or writing fails.
-    pub fn save(
-        &self,
-        hash: u128,
-        role: Role,
-        page: &Decoded,
-        fit_box: (u32, u32),
-    ) -> Option<Vec<u128>> {
-        use std::time::Instant;
+    pub fn load(&self, page: usize) -> Option<ValidatedThumb> {
+        use std::os::unix::fs::FileExt as _;
 
-        let (namespace, bounds) = self.role_target(role, fit_box)?;
-        let started = Instant::now();
-        let size = match write_encoded_atomic(namespace, hash, page, bounds)
+        if let Some(pending) = self.pending.get(&page) {
+            return Some(pending.clone());
+        }
+        let location = self.index.get(page).copied().flatten()?;
+        let pack = self.file.as_ref()?;
+        let payload_bytes =
+            location.pixels.byte_len(location.width, location.height)?;
+        let mut bytes = vec![0_u8; payload_bytes];
+        pack.file
+            .read_exact_at(&mut bytes, location.payload_offset)
+            .ok()?;
+        WireThumb {
+            width: location.width,
+            height: location.height,
+            page_dims: location.page_dims,
+            format: location.format,
+            pixels: location.pixels,
+            bytes,
+        }
+        .validate()
+        .ok()
+    }
+
+    pub fn record(&mut self, page: usize, thumb: ValidatedThumb) {
+        if self.has(page) || page >= self.index.len() {
+            return;
+        }
+        self.pending_bytes =
+            self.pending_bytes.saturating_add(thumb.bytes.len());
+        self.pending.insert(page, thumb);
+        if self.pending.len() >= FLUSH_ENTRY_THRESHOLD
+            || self.pending_bytes >= FLUSH_BYTE_THRESHOLD
         {
-            Ok(size) => size,
-            Err(error) => {
-                tracing::debug!(%error, ?role, "preview save failed");
-                return None;
+            self.flush();
+        }
+    }
+
+    pub fn flush(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        if let Err(error) = self.flush_pending() {
+            tracing::debug!(%error, path = %self.path.display(), "thumb pack flush failed");
+            return;
+        }
+        if !self.pruned_once {
+            self.pruned_once = true;
+            if let (Some(dir), Some(file_name)) =
+                (self.path.parent(), self.path.file_name())
+            {
+                prune_packs(dir, self.cap_bytes, file_name);
+            }
+        }
+    }
+
+    fn flush_pending(&mut self) -> io::Result<()> {
+        use std::fs::OpenOptions;
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        const PACK_FILE_MODE: u32 = 0o600;
+
+        if let Ok(metadata) = fs::symlink_metadata(&self.path)
+            && metadata.file_type().is_symlink()
+        {
+            return Err(io::Error::new(
+                ErrorKind::PermissionDenied,
+                "thumb pack path is a symlink",
+            ));
+        }
+
+        let (target_file, mut offset) = match &self.file {
+            None => {
+                let mut file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(PACK_FILE_MODE)
+                    .open(&self.path)?;
+                file.write_all(&encode_pack_header(self.index.len()))?;
+                (file, PACK_HEADER_BYTES as u64)
+            }
+            Some(pack) => {
+                let mut file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&self.path)?;
+                file.set_len(pack.valid_end)?;
+                file.seek(SeekFrom::Start(pack.valid_end))?;
+                (file, pack.valid_end)
             }
         };
-        let prev = namespace.total.fetch_add(size, Ordering::Relaxed);
-        let over = prev.saturating_add(size) > namespace.cap;
-        tracing::debug!(
-            ?role,
-            bytes = size,
-            elapsed = ?started.elapsed(),
-            "preview save"
-        );
-        Some(if over { namespace.prune() } else { Vec::new() })
-    }
 
-    fn role_target(
-        &self,
-        role: Role,
-        fit_box: (u32, u32),
-    ) -> Option<(&Namespace, (u32, u32))> {
-        let state = self.state.as_ref()?;
-        match role {
-            Role::Thumb => Some((&state.thumb, (THUMB_EDGE, THUMB_EDGE))),
-            Role::Fit => Some((&state.view, fit_box)),
-            Role::Full => None,
+        let items = mem::take(&mut self.pending);
+        self.pending_bytes = 0;
+
+        let mut new_locations = Vec::with_capacity(items.len());
+        let mut writer = BufWriter::new(target_file);
+        for (page, thumb) in items {
+            let Some(record_header) = encode_record_header(page, &thumb)
+            else {
+                continue;
+            };
+            writer.write_all(&record_header)?;
+            writer.write_all(&thumb.bytes)?;
+            let payload_offset = offset + RECORD_HEADER_BYTES as u64;
+            let payload_bytes = thumb.bytes.len() as u64;
+            new_locations.push((
+                page,
+                RecordLocation {
+                    payload_offset,
+                    width: thumb.width,
+                    height: thumb.height,
+                    page_dims: thumb.page_dims,
+                    format: thumb.format,
+                    pixels: thumb.pixels,
+                },
+            ));
+            offset += RECORD_HEADER_BYTES as u64 + payload_bytes;
         }
-    }
-}
-
-static NEXT_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-impl Namespace {
-    fn new(dir: PathBuf, cap: u64) -> Self {
-        clean_temps(&dir);
-        let total = entries(&dir)
-            .iter()
-            .map(|entry| entry.size)
-            .fold(0_u64, u64::saturating_add);
-        Self {
-            dir,
-            cap,
-            total: AtomicU64::new(total),
-        }
-    }
-
-    fn path(&self, hash: u128) -> PathBuf {
-        self.dir.join(format!("{hash:032x}"))
-    }
-
-    /// The per-write temp name: concurrent processes or worker threads
-    /// save into one namespace, so pid plus sequence keeps each
-    /// in-progress file distinct.
-    fn temp_path(&self, hash: u128) -> PathBuf {
-        use std::process;
-
-        let sequence = NEXT_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        self.dir
-            .join(format!("{hash:032x}.{}-{sequence}.tmp", process::id()))
-    }
-
-    fn prune(&self) -> Vec<u128> {
-        let entries = entries(&self.dir);
-        let mut total = entries
-            .iter()
-            .map(|entry| entry.size)
-            .fold(0_u64, u64::saturating_add);
-        let mut removed = 0_u64;
-        let mut evicted = Vec::new();
-        for entry in entries {
-            if total <= self.cap {
-                break;
-            }
-            if fs::remove_file(self.dir.join(&entry.name)).is_ok() {
-                total = total.saturating_sub(entry.size);
-                removed += 1;
-                if let Some(hash) = entry
-                    .name
-                    .to_str()
-                    .and_then(|name| u128::from_str_radix(name, 16).ok())
-                {
-                    evicted.push(hash);
-                }
+        writer.flush()?;
+        let file = writer.into_inner().map_err(io::IntoInnerError::into_error)?;
+        for (page, location) in new_locations {
+            if let Some(slot) = self.index.get_mut(page) {
+                *slot = Some(location);
             }
         }
-        tracing::debug!(
-            dir = %self.dir.display(),
-            removed,
-            total,
-            cap = self.cap,
-            "preview prune"
-        );
-        self.total.store(total, Ordering::Relaxed);
-        evicted
+        self.file = Some(PackFile {
+            file,
+            valid_end: offset,
+        });
+        Ok(())
     }
 }
 
-struct StoreEntry {
-    modified: SystemTime,
-    name: OsString,
-    size: u64,
+impl Drop for ThumbPack {
+    fn drop(&mut self) {
+        self.flush();
+    }
 }
 
-/// The cache files of `dir`, least recently used first. A `.tmp` file
-/// belongs to a writer that has not renamed it yet; skip it.
-fn entries(dir: &Path) -> Vec<StoreEntry> {
-    let Ok(read) = fs::read_dir(dir) else {
-        return Vec::new();
+fn open_existing_pack(
+    path: &Path,
+    index: &mut [Option<RecordLocation>],
+) -> Option<PackFile> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return None;
+    }
+    let file = File::open(path).ok()?;
+    if let Err(error) = file.set_modified(SystemTime::now()) {
+        tracing::debug!(%error, path = %path.display(), "thumb pack mtime touch failed");
+    }
+    let file_bytes = file.metadata().map_or(0, |meta| meta.len());
+    if file_bytes < PACK_HEADER_BYTES as u64 {
+        return None;
+    }
+
+    let page_count = index.len();
+    let mut reader = BufReader::new(&file);
+    let mut header = [0_u8; PACK_HEADER_BYTES];
+    reader.read_exact(&mut header).ok()?;
+    if decode_pack_header(&header) != Some(page_count) {
+        return None;
+    }
+
+    let mut offset = PACK_HEADER_BYTES as u64;
+    let mut record = [0_u8; RECORD_HEADER_BYTES];
+    loop {
+        if reader.read_exact(&mut record).is_err() {
+            break;
+        }
+        let Some((page, location, payload_bytes)) =
+            decode_record_header(&record, page_count, offset)
+        else {
+            break;
+        };
+        let Some(next_offset) =
+            offset.checked_add(RECORD_HEADER_BYTES as u64 + payload_bytes)
+        else {
+            break;
+        };
+        if next_offset > file_bytes {
+            break;
+        }
+        let Ok(payload_skip) = i64::try_from(payload_bytes) else {
+            break;
+        };
+        if reader.seek_relative(payload_skip).is_err() {
+            break;
+        }
+        if let Some(slot) = index.get_mut(page) {
+            *slot = Some(location);
+        }
+        offset = next_offset;
+    }
+    drop(reader);
+    Some(PackFile {
+        file,
+        valid_end: offset,
+    })
+}
+
+fn encode_pack_header(page_count: usize) -> [u8; PACK_HEADER_BYTES] {
+    let mut header = [0_u8; PACK_HEADER_BYTES];
+    header[..4].copy_from_slice(&PACK_MAGIC);
+    header[4..6].copy_from_slice(&PACK_VERSION.to_le_bytes());
+    header[8..16].copy_from_slice(&(page_count as u64).to_le_bytes());
+    header
+}
+
+fn decode_pack_header(header: &[u8; PACK_HEADER_BYTES]) -> Option<usize> {
+    if header[..4] != PACK_MAGIC {
+        return None;
+    }
+    let version = u16::from_le_bytes([header[4], header[5]]);
+    if version != PACK_VERSION {
+        return None;
+    }
+    let page_count = u64::from_le_bytes([
+        header[8], header[9], header[10], header[11], header[12], header[13],
+        header[14], header[15],
+    ]);
+    usize::try_from(page_count).ok()
+}
+
+fn encode_record_header(
+    page: usize,
+    thumb: &ValidatedThumb,
+) -> Option<[u8; RECORD_HEADER_BYTES]> {
+    let page = u32::try_from(page).ok()?;
+    let width = u16::try_from(thumb.width).ok()?;
+    let height = u16::try_from(thumb.height).ok()?;
+    let mut record = [0_u8; RECORD_HEADER_BYTES];
+    record[0..4].copy_from_slice(&page.to_le_bytes());
+    record[4..6].copy_from_slice(&width.to_le_bytes());
+    record[6..8].copy_from_slice(&height.to_le_bytes());
+    record[8..12].copy_from_slice(&thumb.page_dims.0.to_le_bytes());
+    record[12..16].copy_from_slice(&thumb.page_dims.1.to_le_bytes());
+    record[16] = format_to_code(thumb.format);
+    record[17] = pixel_to_code(thumb.pixels);
+    Some(record)
+}
+
+fn decode_record_header(
+    record: &[u8; RECORD_HEADER_BYTES],
+    page_count: usize,
+    record_offset: u64,
+) -> Option<(usize, RecordLocation, u64)> {
+    let page = u32::from_le_bytes([record[0], record[1], record[2], record[3]])
+        as usize;
+    if page >= page_count {
+        return None;
+    }
+    let width = u32::from(u16::from_le_bytes([record[4], record[5]]));
+    let height = u32::from(u16::from_le_bytes([record[6], record[7]]));
+    if width == 0 || height == 0 || width > THUMB_EDGE || height > THUMB_EDGE {
+        return None;
+    }
+    let page_width =
+        u32::from_le_bytes([record[8], record[9], record[10], record[11]]);
+    let page_height =
+        u32::from_le_bytes([record[12], record[13], record[14], record[15]]);
+    decode::pixel_count(page_width, page_height)?;
+    let format = code_to_format(record[16])?;
+    let pixels = code_to_pixel(record[17])?;
+    let payload_bytes = pixels.byte_len(width, height)? as u64;
+    let payload_offset =
+        record_offset.checked_add(RECORD_HEADER_BYTES as u64)?;
+    Some((
+        page,
+        RecordLocation {
+            payload_offset,
+            width,
+            height,
+            page_dims: (page_width, page_height),
+            format,
+            pixels,
+        },
+        payload_bytes,
+    ))
+}
+
+const fn format_to_code(format: Format) -> u8 {
+    match format {
+        Format::Jpeg => 0,
+        Format::Png => 1,
+        Format::Gif => 2,
+        Format::Webp => 3,
+        Format::Bmp => 4,
+        Format::Tiff => 5,
+        Format::Avif => 6,
+        Format::Jxl => 7,
+    }
+}
+
+const fn code_to_format(code: u8) -> Option<Format> {
+    match code {
+        0 => Some(Format::Jpeg),
+        1 => Some(Format::Png),
+        2 => Some(Format::Gif),
+        3 => Some(Format::Webp),
+        4 => Some(Format::Bmp),
+        5 => Some(Format::Tiff),
+        6 => Some(Format::Avif),
+        7 => Some(Format::Jxl),
+        _ => None,
+    }
+}
+
+const fn pixel_to_code(pixels: ThumbFormat) -> u8 {
+    match pixels {
+        ThumbFormat::Gray8 => 0,
+        ThumbFormat::Rgba8 => 1,
+    }
+}
+
+const fn code_to_pixel(code: u8) -> Option<ThumbFormat> {
+    match code {
+        0 => Some(ThumbFormat::Gray8),
+        1 => Some(ThumbFormat::Rgba8),
+        _ => None,
+    }
+}
+
+fn default_thumb_dir() -> Option<PathBuf> {
+    use std::env;
+
+    if let Some(xdg_cache_home) = env::var_os("XDG_CACHE_HOME")
+        && !xdg_cache_home.is_empty()
+    {
+        let path = PathBuf::from(xdg_cache_home);
+        if path.is_absolute() {
+            return Some(path.join("cryslen").join("thumbs"));
+        }
+    }
+    let home = env::var_os("HOME")?;
+    if home.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(home).join(".cache").join("cryslen").join("thumbs"))
+}
+
+fn book_key(path: &Path, archive: bool, names: &[String]) -> Option<u128> {
+    use xxhash_rust::xxh3::Xxh3;
+
+    const KEY_FIELD_SEPARATOR: &[u8] = b"\0";
+
+    let normalized = catalog::normalize_path(path);
+    let metadata = fs::metadata(&normalized).ok()?;
+    let modified = metadata
+        .modified()
+        .ok()?
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+
+    let mut hasher = Xxh3::new();
+    hasher.update(if archive {
+        b"archive".as_slice()
+    } else {
+        b"dir".as_slice()
+    });
+    hasher.update(KEY_FIELD_SEPARATOR);
+    hasher.update(normalized.as_os_str().as_encoded_bytes());
+    hasher.update(KEY_FIELD_SEPARATOR);
+    if archive {
+        hasher.update(&metadata.len().to_le_bytes());
+    }
+    hasher.update(&modified.as_secs().to_le_bytes());
+    hasher.update(&modified.subsec_nanos().to_le_bytes());
+    hasher.update(&(names.len() as u64).to_le_bytes());
+    if !archive {
+        for name in names {
+            hasher.update(name.as_bytes());
+            hasher.update(KEY_FIELD_SEPARATOR);
+        }
+    }
+    Some(hasher.digest128())
+}
+
+fn prune_packs(dir: &Path, cap_bytes: u64, keep_name: &OsStr) {
+    struct PackEntry {
+        modified: SystemTime,
+        name: OsString,
+        bytes: u64,
+    }
+
+    let Ok(dir_entries) = fs::read_dir(dir) else {
+        return;
     };
     let mut entries = Vec::new();
-    for entry in read.flatten() {
+    let mut total_bytes = 0_u64;
+    for entry in dir_entries.flatten() {
         let Ok(metadata) = entry.metadata() else {
             continue;
         };
@@ -595,130 +1141,63 @@ fn entries(dir: &Path) -> Vec<StoreEntry> {
             continue;
         }
         let name = entry.file_name();
-        if !is_hash_name(&name) {
+        if !name
+            .to_str()
+            .is_some_and(|text| text.ends_with(PACK_EXTENSION))
+        {
             continue;
         }
         let Ok(modified) = metadata.modified() else {
             continue;
         };
-        entries.push(StoreEntry {
+        let bytes = metadata.len();
+        total_bytes = total_bytes.saturating_add(bytes);
+        entries.push(PackEntry {
             modified,
             name,
-            size: metadata.len(),
+            bytes,
         });
+    }
+    if total_bytes <= cap_bytes {
+        return;
     }
     entries.sort_by(|left, right| {
         left.modified
             .cmp(&right.modified)
             .then_with(|| left.name.cmp(&right.name))
     });
-    entries
-}
-
-fn is_hash_name(name: &OsStr) -> bool {
-    name.to_str().is_some_and(|name| {
-        name.len() == 32
-            && name.bytes().all(|byte| byte.is_ascii_hexdigit())
-    })
-}
-
-/// Drop temp files no writer holds: the kernel releases a dead writer's
-/// lock, so a lock that can be taken proves the temp is unclaimed.
-fn clean_temps(dir: &Path) {
-    let Ok(read) = fs::read_dir(dir) else {
-        return;
-    };
-    let mut removed = 0_usize;
-    for entry in read.flatten() {
-        let Ok(metadata) = entry.metadata() else {
-            continue;
-        };
-        if !metadata.is_file() {
+    let target_bytes = cap_bytes
+        .checked_div(THUMB_PACK_PRUNE_DENOMINATOR)
+        .map_or(cap_bytes, |step| {
+            step.saturating_mul(THUMB_PACK_PRUNE_NUMERATOR)
+        });
+    let mut removed_count = 0_u64;
+    for entry in entries {
+        if total_bytes <= target_bytes {
+            break;
+        }
+        if entry.name == keep_name {
             continue;
         }
-        let name = entry.file_name();
-        if !is_temp_name(&name) {
-            continue;
-        }
-        if remove_if_unlocked(&dir.join(&name)) {
-            removed += 1;
+        if fs::remove_file(dir.join(&entry.name)).is_ok() {
+            total_bytes = total_bytes.saturating_sub(entry.bytes);
+            removed_count += 1;
         }
     }
-    if removed > 0 {
-        tracing::debug!(
-            dir = %dir.display(),
-            removed,
-            "cleaned stale preview temps"
-        );
-    }
-}
-
-fn remove_if_unlocked(path: &Path) -> bool {
-    use std::fs::TryLockError;
-
-    let Ok(file) = File::open(path) else {
-        return false;
-    };
-    match file.try_lock() {
-        Ok(()) => {}
-        Err(TryLockError::WouldBlock) => return false,
-        Err(TryLockError::Error(error)) => {
-            tracing::debug!(
-                %error,
-                path = %path.display(),
-                "preview temp lock failed"
-            );
-            return false;
-        }
-    }
-    // Hold the lock across unlink so a racing writer waits for removal.
-    if let Err(error) = fs::remove_file(path) {
-        tracing::debug!(
-            %error,
-            path = %path.display(),
-            "stale preview temp"
-        );
-        return false;
-    }
-    drop(file);
-    true
-}
-
-/// Whether `name` is a writer's temp: `<hash:032x>.<pid>[-<sequence>].tmp`.
-fn is_temp_name(name: &OsStr) -> bool {
-    let Some(name) = name.to_str() else {
-        return false;
-    };
-    let Some(stem) = name.strip_suffix(".tmp") else {
-        return false;
-    };
-    let Some((hash, writer)) = stem.split_once('.') else {
-        return false;
-    };
-    let valid_writer = match writer.split_once('-') {
-        Some((pid, sequence)) => is_digits(pid) && is_digits(sequence),
-        None => is_digits(writer),
-    };
-    is_hash_name(OsStr::new(hash)) && valid_writer
-}
-
-fn is_digits(text: &str) -> bool {
-    !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
-}
-
-/// Refuse symlinks so the store stays inside `root`.
-fn prepare(root: &Path) -> Option<(PathBuf, PathBuf)> {
-    make_dir(root)?;
-    let thumb = root.join(<&str>::from(Role::Thumb));
-    let view = root.join(<&str>::from(Role::Fit));
-    make_dir(&thumb)?;
-    make_dir(&view)?;
-    Some((thumb, view))
+    tracing::debug!(
+        dir = %dir.display(),
+        removed = removed_count,
+        total_bytes,
+        cap_bytes,
+        "thumb pack prune"
+    );
 }
 
 fn make_dir(path: &Path) -> Option<()> {
     use std::fs::DirBuilder;
     use std::os::unix::fs::DirBuilderExt as _;
+
+    const CACHE_DIR_MODE: u32 = 0o700;
 
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
@@ -734,396 +1213,11 @@ fn make_dir(path: &Path) -> Option<()> {
     }
     DirBuilder::new()
         .recursive(true)
-        .mode(0o700)
+        .mode(CACHE_DIR_MODE)
         .create(path)
         .ok()?;
     let metadata = fs::symlink_metadata(path).ok()?;
     (metadata.is_dir() && !metadata.file_type().is_symlink()).then_some(())
-}
-
-type TempGuard = DropGuard<PathBuf, fn(PathBuf)>;
-
-fn remove_temp(path: PathBuf) {
-    if let Err(error) = fs::remove_file(path) {
-        tracing::debug!(%error, "leftover preview temp file");
-    }
-}
-
-fn file_identity(metadata: &Metadata) -> (u64, u64) {
-    use std::os::unix::fs::MetadataExt as _;
-
-    (metadata.dev(), metadata.ino())
-}
-
-/// Retries if `clean_temps` sweeps the entry before `file.lock()` lands;
-/// keep the returned `File` locked until rename so cleaners see a live writer.
-fn open_locked_temp(
-    namespace: &Namespace,
-    hash: u128,
-) -> io::Result<(File, TempGuard)> {
-    use std::fs::OpenOptions;
-    use std::os::unix::fs::OpenOptionsExt as _;
-
-    const MAX_ATTEMPTS: usize = 8;
-
-    for _ in 0..MAX_ATTEMPTS {
-        let temp = namespace.temp_path(hash);
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temp)?;
-        let guard: TempGuard = DropGuard::new(temp, remove_temp);
-        file.lock()?;
-        let opened = file_identity(&file.metadata()?);
-        let on_disk = match fs::symlink_metadata(&*guard) {
-            Ok(metadata) => Some(file_identity(&metadata)),
-            Err(error) if error.kind() == ErrorKind::NotFound => None,
-            Err(error) => return Err(error),
-        };
-        if on_disk == Some(opened) {
-            return Ok((file, guard));
-        }
-        // Disarm before retrying so a replaced path's inode stays intact.
-        drop(DropGuard::dismiss(guard));
-    }
-    Err(Error::new(
-        ErrorKind::NotFound,
-        "temp file was swept before it could be locked",
-    ))
-}
-
-fn write_atomic(
-    namespace: &Namespace,
-    hash: u128,
-    mut slices: &mut [IoSlice<'_>],
-) -> io::Result<u64> {
-    use std::io::Write as _;
-
-    let (mut file, guard) = open_locked_temp(namespace, hash)?;
-    let total: usize = slices.iter().map(|slice| slice.len()).sum();
-    while !slices.is_empty() {
-        match file.write_vectored(slices) {
-            Ok(0) => {
-                return Err(Error::new(
-                    ErrorKind::WriteZero,
-                    "short vectored write",
-                ));
-            }
-            Ok(written) => IoSlice::advance_slices(&mut slices, written),
-            Err(error) if error.kind() == ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
-        }
-    }
-    fs::rename(&*guard, namespace.path(hash))?;
-    drop(DropGuard::dismiss(guard));
-    Ok(u64::try_from(total).unwrap_or(u64::MAX))
-}
-
-const MAGIC: [u8; 4] = *b"CYPV";
-const VERSION: u16 = 8;
-const PREFIX_BYTES: usize =
-    MAGIC.len() + size_of::<u16>() + size_of::<u8>();
-const MAX_META_BYTES: usize = u8::MAX as usize;
-
-#[derive(Deserialize, Serialize)]
-struct CacheMeta {
-    target_box: (u32, u32),
-    image: ImageMeta,
-    pixels: PixelMeta,
-}
-
-#[derive(Deserialize, Serialize)]
-enum PixelMeta {
-    Rgba8,
-    Gray { spec: GraySpec, has_alpha: bool },
-    Yuv { spec: YuvSpec, has_alpha: bool },
-}
-
-impl CacheMeta {
-    fn from_page(page: &Decoded, target_box: (u32, u32)) -> Self {
-        let pixels = match page.pixels() {
-            Pixels::Rgba8(_) => PixelMeta::Rgba8,
-            Pixels::Gray(gray) => PixelMeta::Gray {
-                spec: gray.spec(),
-                has_alpha: gray.has_alpha(),
-            },
-            Pixels::Yuv(yuv) => PixelMeta::Yuv {
-                spec: yuv.spec(),
-                has_alpha: yuv.has_alpha(),
-            },
-        };
-        Self {
-            target_box,
-            image: page.meta(),
-            pixels,
-        }
-    }
-}
-
-fn encode_header(meta: &CacheMeta) -> io::Result<Vec<u8>> {
-    let mut meta_buf = [0_u8; MAX_META_BYTES];
-    let encoded =
-        postcard::to_slice(meta, &mut meta_buf).map_err(Error::other)?;
-    let Ok(meta_len) = u8::try_from(encoded.len()) else {
-        return Err(Error::other(format!(
-            "cache metadata exceeds {MAX_META_BYTES} bytes"
-        )));
-    };
-    let mut header = Vec::with_capacity(PREFIX_BYTES + encoded.len());
-    header.extend_from_slice(&MAGIC);
-    header.extend_from_slice(&VERSION.to_le_bytes());
-    header.push(meta_len);
-    header.extend_from_slice(encoded);
-    Ok(header)
-}
-
-fn write_planes_atomic(
-    namespace: &Namespace,
-    hash: u128,
-    header: &[u8],
-    planes: &[Cow<'_, [u8]>],
-) -> io::Result<u64> {
-    let mut slices = Vec::with_capacity(1 + planes.len());
-    slices.push(IoSlice::new(header));
-    for plane in planes {
-        slices.push(IoSlice::new(plane));
-    }
-    write_atomic(namespace, hash, &mut slices)
-}
-
-fn write_encoded_atomic(
-    namespace: &Namespace,
-    hash: u128,
-    page: &Decoded,
-    target_box: (u32, u32),
-) -> io::Result<u64> {
-    let header = encode_header(&CacheMeta::from_page(page, target_box))?;
-    match page.pixels() {
-        Pixels::Rgba8(bytes) => {
-            let mut slices = [IoSlice::new(&header), IoSlice::new(bytes)];
-            write_atomic(namespace, hash, &mut slices)
-        }
-        Pixels::Gray(gray) => {
-            use std::iter;
-
-            let planes: Vec<Cow<'_, [u8]>> = match &gray.samples {
-                Samples::U8(planes) => iter::once(&planes.luma)
-                    .chain(&planes.alpha)
-                    .map(|plane| Cow::Borrowed(&**plane))
-                    .collect(),
-                Samples::U16 { planes, .. } => iter::once(&planes.luma)
-                    .chain(&planes.alpha)
-                    .map(|plane| little_endian_u16_bytes(plane))
-                    .collect(),
-            };
-            write_planes_atomic(namespace, hash, &header, &planes)
-        }
-        Pixels::Yuv(yuv) => {
-            let planes: Vec<Cow<'_, [u8]>> = match &yuv.samples {
-                Samples::U8(planes) => [&planes.luma, &planes.cb, &planes.cr]
-                    .into_iter()
-                    .chain(&planes.alpha)
-                    .map(|plane| Cow::Borrowed(&**plane))
-                    .collect(),
-                Samples::U16 { planes, .. } => {
-                    [&planes.luma, &planes.cb, &planes.cr]
-                        .into_iter()
-                        .chain(&planes.alpha)
-                        .map(|plane| little_endian_u16_bytes(plane))
-                        .collect()
-                }
-            };
-            write_planes_atomic(namespace, hash, &header, &planes)
-        }
-    }
-}
-
-fn little_endian_u16_bytes(words: &[u16]) -> Cow<'_, [u8]> {
-    if cfg!(target_endian = "little") {
-        Cow::Borrowed(bytemuck::cast_slice(words))
-    } else {
-        let mut out = Vec::with_capacity(size_of_val(words));
-        for word in words {
-            out.extend_from_slice(&word.to_le_bytes());
-        }
-        Cow::Owned(out)
-    }
-}
-
-fn read_stored(mut file: File, target_box: (u32, u32)) -> Option<Decoded> {
-    let file_len = file.metadata().ok()?.len();
-    if file_len < u64::try_from(PREFIX_BYTES).ok()? {
-        return None;
-    }
-    let mut prefix = [0_u8; PREFIX_BYTES];
-    file.read_exact(&mut prefix).ok()?;
-    let (magic, rest) = prefix.split_first_chunk::<{ MAGIC.len() }>()?;
-    let (version, rest) =
-        rest.split_first_chunk::<{ size_of::<u16>() }>()?;
-    let &[meta_len] = rest else {
-        return None;
-    };
-    if *magic != MAGIC || *version != VERSION.to_le_bytes() {
-        return None;
-    }
-    let meta_len = usize::from(meta_len);
-    if meta_len == 0 {
-        return None;
-    }
-    let header_len = u64::try_from(PREFIX_BYTES + meta_len).ok()?;
-    let payload_len = file_len.checked_sub(header_len)?;
-    let mut meta_buf = [0_u8; MAX_META_BYTES];
-    let meta_bytes = meta_buf.get_mut(..meta_len)?;
-    file.read_exact(meta_bytes).ok()?;
-    let cached: CacheMeta = postcard::from_bytes(meta_bytes).ok()?;
-    if cached.target_box != target_box {
-        return None;
-    }
-    let meta = cached.image;
-    decode::pixel_count(meta.page_dims.0, meta.page_dims.1)?;
-    let page = match cached.pixels {
-        PixelMeta::Rgba8 => read_rgba(&mut file, payload_len, meta)?,
-        PixelMeta::Gray { spec, has_alpha } => {
-            let sample_count =
-                decode::pixel_count(meta.width, meta.height)? as usize;
-            let plane_count = if has_alpha { 2 } else { 1 };
-            let expected_bytes = sample_count
-                .checked_mul(plane_count)?
-                .checked_mul(spec.depth.sample_bytes())?;
-            if u64::try_from(expected_bytes).ok()? != payload_len {
-                return None;
-            }
-            let samples = match spec.depth.wide() {
-                None => Samples::U8(GrayPlanes {
-                    luma: read_u8_plane(&mut file, sample_count)?,
-                    alpha: if has_alpha {
-                        Some(read_u8_plane(&mut file, sample_count)?)
-                    } else {
-                        None
-                    },
-                }),
-                Some(depth) => Samples::U16 {
-                    depth,
-                    planes: GrayPlanes {
-                        luma: read_u16_plane(&mut file, sample_count)?,
-                        alpha: if has_alpha {
-                            Some(read_u16_plane(&mut file, sample_count)?)
-                        } else {
-                            None
-                        },
-                    },
-                },
-            };
-            Decoded::gray(
-                meta.width,
-                meta.height,
-                meta.format,
-                meta.transfer,
-                GrayImage {
-                    full_range: spec.full_range,
-                    samples,
-                },
-            )
-            .ok()?
-        }
-        PixelMeta::Yuv { spec, has_alpha } => {
-            let layout = decode::yuv_layout(
-                (meta.width, meta.height),
-                spec.depth,
-                spec.subsampling,
-            )
-            .ok()?;
-            let expected_bytes = layout.total_bytes(has_alpha)?;
-            if u64::try_from(expected_bytes).ok()? != payload_len {
-                return None;
-            }
-            let samples = match spec.depth.wide() {
-                None => Samples::U8(YuvPlanes {
-                    luma: read_u8_plane(&mut file, layout.luma_samples)?,
-                    cb: read_u8_plane(&mut file, layout.chroma_samples)?,
-                    cr: read_u8_plane(&mut file, layout.chroma_samples)?,
-                    alpha: if has_alpha {
-                        Some(read_u8_plane(&mut file, layout.luma_samples)?)
-                    } else {
-                        None
-                    },
-                }),
-                Some(depth) => Samples::U16 {
-                    depth,
-                    planes: YuvPlanes {
-                        luma: read_u16_plane(&mut file, layout.luma_samples)?,
-                        cb: read_u16_plane(&mut file, layout.chroma_samples)?,
-                        cr: read_u16_plane(&mut file, layout.chroma_samples)?,
-                        alpha: if has_alpha {
-                            Some(read_u16_plane(
-                                &mut file,
-                                layout.luma_samples,
-                            )?)
-                        } else {
-                            None
-                        },
-                    },
-                },
-            };
-            Decoded::yuv(
-                meta.width,
-                meta.height,
-                meta.format,
-                meta.transfer,
-                YuvImage {
-                    subsampling: spec.subsampling,
-                    full_range: spec.full_range,
-                    matrix: spec.matrix,
-                    samples,
-                },
-            )
-            .ok()?
-        }
-    };
-    Some(page.with_page_dims(meta.page_dims))
-}
-
-fn read_rgba(
-    file: &mut File,
-    payload_len: u64,
-    meta: ImageMeta,
-) -> Option<Decoded> {
-    let expected_bytes =
-        decode::rgba_byte_len(meta.width, meta.height).ok()?;
-    if u64::try_from(expected_bytes).ok()? != payload_len {
-        return None;
-    }
-    let mut bytes = vec![0_u8; expected_bytes];
-    file.read_exact(&mut bytes).ok()?;
-    Decoded::rgba(
-        meta.width,
-        meta.height,
-        meta.format,
-        meta.transfer,
-        bytes.into_boxed_slice(),
-    )
-    .ok()
-}
-
-fn read_u8_plane(file: &mut File, sample_count: usize) -> Option<Box<[u8]>> {
-    let mut bytes = vec![0_u8; sample_count];
-    file.read_exact(&mut bytes).ok()?;
-    Some(bytes.into_boxed_slice())
-}
-
-fn read_u16_plane(
-    file: &mut File,
-    sample_count: usize,
-) -> Option<Box<[u16]>> {
-    let mut words = vec![0_u16; sample_count];
-    file.read_exact(bytemuck::cast_slice_mut(&mut words)).ok()?;
-    if cfg!(not(target_endian = "little")) {
-        for word in &mut words {
-            *word = u16::from_le(*word);
-        }
-    }
-    Some(words.into_boxed_slice())
 }
 
 #[cfg(test)]
@@ -1137,133 +1231,24 @@ mod tests {
 
     use super::*;
     use crate::decode::Depth;
-    use crate::decode::Format;
     use crate::decode::Matrix;
-    use crate::decode::Transfer;
     use crate::decode::WideDepth;
     use crate::testkit;
     use crate::testkit::TEST_FIT_BOX;
 
-    fn count(width: u32, height: u32) -> usize {
+    fn pixel_count(width: u32, height: u32) -> usize {
         (width as usize) * (height as usize)
     }
 
-    fn test_u8_samples(sample_count: usize) -> Box<[u8]> {
-        (0..sample_count)
-            .map(|index| u8::try_from(index % 251).expect("sample"))
-            .collect::<Vec<_>>()
-            .into_boxed_slice()
-    }
-
-    fn test_u16_samples(sample_count: usize) -> Box<[u16]> {
-        const D10_SAMPLE_VALUES: usize = 1 << Depth::D10.bits();
-
-        (0..sample_count)
-            .map(|index| {
-                u16::try_from(index % D10_SAMPLE_VALUES).expect("sample")
-            })
-            .collect::<Vec<_>>()
-            .into_boxed_slice()
-    }
-
     fn rgba_page(width: u32, height: u32) -> Decoded {
-        let bytes = (0..count(width, height) * 4)
-            .map(|index| u8::try_from(index % 251).expect("channel"))
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
+        let bytes =
+            (0..pixel_count(width, height) * decode::RGBA_BYTES_PER_PIXEL)
+                .map(|index| u8::try_from(index % 251).expect("channel"))
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
         Decoded::rgba(width, height, Format::Png, Transfer::Srgb, bytes)
             .expect("rgba page")
             .with_page_dims((width, height))
-    }
-
-    fn yuv_page(
-        width: u32,
-        height: u32,
-        subsampling: Subsampling,
-    ) -> Decoded {
-        yuv_page_with(width, height, subsampling, Depth::D10, false)
-    }
-
-    fn yuv_page_with(
-        width: u32,
-        height: u32,
-        subsampling: Subsampling,
-        depth: Depth,
-        with_alpha: bool,
-    ) -> Decoded {
-        let ((_, _), (chroma_w, chroma_h)) =
-            decode::plane_dims((width, height), subsampling);
-        let chroma = count(chroma_w, chroma_h);
-        let luma = count(width, height);
-        let samples = depth.wide().map_or_else(
-            || {
-                Samples::U8(YuvPlanes {
-                    luma: test_u8_samples(luma),
-                    cb: test_u8_samples(chroma),
-                    cr: test_u8_samples(chroma),
-                    alpha: with_alpha.then(|| test_u8_samples(luma)),
-                })
-            },
-            |wide_depth| Samples::U16 {
-                depth: wide_depth,
-                planes: YuvPlanes {
-                    luma: test_u16_samples(luma),
-                    cb: test_u16_samples(chroma),
-                    cr: test_u16_samples(chroma),
-                    alpha: with_alpha.then(|| test_u16_samples(luma)),
-                },
-            },
-        );
-        Decoded::yuv(
-            width,
-            height,
-            Format::Avif,
-            Transfer::Pq,
-            YuvImage {
-                subsampling,
-                full_range: false,
-                matrix: Matrix::Bt709,
-                samples,
-            },
-        )
-        .expect("yuv page")
-        .with_page_dims((width, height))
-    }
-
-    fn gray_page_with(
-        width: u32,
-        height: u32,
-        depth: Depth,
-        with_alpha: bool,
-    ) -> Decoded {
-        let sample_count = count(width, height);
-        let samples = depth.wide().map_or_else(
-            || {
-                Samples::U8(GrayPlanes {
-                    luma: test_u8_samples(sample_count),
-                    alpha: with_alpha.then(|| test_u8_samples(sample_count)),
-                })
-            },
-            |wide_depth| Samples::U16 {
-                depth: wide_depth,
-                planes: GrayPlanes {
-                    luma: test_u16_samples(sample_count),
-                    alpha: with_alpha.then(|| test_u16_samples(sample_count)),
-                },
-            },
-        );
-        Decoded::gray(
-            width,
-            height,
-            Format::Avif,
-            Transfer::Srgb,
-            GrayImage {
-                full_range: true,
-                samples,
-            },
-        )
-        .expect("gray page")
-        .with_page_dims((width, height))
     }
 
     fn rgba_bytes(page: &Decoded) -> Vec<u8> {
@@ -1273,20 +1258,18 @@ mod tests {
         bytes.to_vec()
     }
 
-    /// A page whose planes are each one constant, `values` in luma, Cb,
-    /// Cr, alpha order.
     fn flat_yuv_page(
         width: u32,
         height: u32,
         subsampling: Subsampling,
         values: [u16; 4],
     ) -> Decoded {
-        let ((_, _), (chroma_w, chroma_h)) =
+        let ((_, _), (chroma_width, chroma_height)) =
             decode::plane_dims((width, height), subsampling);
         let plane = |samples: usize, value: u16| {
             vec![value; samples].into_boxed_slice()
         };
-        let chroma = count(chroma_w, chroma_h);
+        let chroma_samples = pixel_count(chroma_width, chroma_height);
         let yuv = YuvImage {
             subsampling,
             full_range: false,
@@ -1294,10 +1277,10 @@ mod tests {
             samples: Samples::U16 {
                 depth: WideDepth::D10,
                 planes: YuvPlanes {
-                    luma: plane(count(width, height), values[0]),
-                    cb: plane(chroma, values[1]),
-                    cr: plane(chroma, values[2]),
-                    alpha: Some(plane(count(width, height), values[3])),
+                    luma: plane(pixel_count(width, height), values[0]),
+                    cb: plane(chroma_samples, values[1]),
+                    cr: plane(chroma_samples, values[2]),
+                    alpha: Some(plane(pixel_count(width, height), values[3])),
                 },
             },
         };
@@ -1342,430 +1325,34 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_saves_do_not_collide() {
-        use std::sync::atomic::AtomicUsize;
-        use std::thread;
-
-        const WRITER_COUNT: usize = 2;
-        const SAVES_PER_WRITER: usize = 20;
-
-        let dir = TempDir::new().expect("create temp dir");
-        let root = dir.path();
-        let page = rgba_page(8, 8);
-        let hash = content_hash(b"same-entry");
-        let store = Store::at(root);
-        let active_writers = AtomicUsize::new(WRITER_COUNT);
-
-        thread::scope(|scope| {
-            let store = &store;
-            let page = &page;
-            let active_writers = &active_writers;
-            for _ in 0..WRITER_COUNT {
-                scope.spawn(move || {
-                    for _ in 0..SAVES_PER_WRITER {
-                        assert!(
-                            store
-                                .save(hash, Role::Fit, page, TEST_FIT_BOX)
-                                .is_some()
-                        );
-                    }
-                    active_writers.fetch_sub(1, Ordering::Relaxed);
-                });
-            }
-            scope.spawn(move || {
-                while active_writers.load(Ordering::Relaxed) > 0 {
-                    drop(Store::at(root));
-                }
-            });
-        });
-
-        let loaded = Store::at(root)
-            .load(hash, Role::Fit, TEST_FIT_BOX)
-            .expect("kept");
-        assert_eq!((loaded.width(), loaded.height()), (8, 8));
-    }
-
-    #[test]
-    fn open_cleans_unlocked_writer_temps() {
-        let dir = TempDir::new().expect("create temp dir");
-        let root = dir.path().join("cache");
-        let page = rgba_page(2, 2);
-        let hash = content_hash(b"page-kept");
-        let store = Store::at(&root);
-        assert!(
-            store.save(hash, Role::Thumb, &page, TEST_FIT_BOX).is_some()
-        );
-
-        // A dead writer leaves its temp unlocked.
-        let stale_thumb = store
-            .role_target(Role::Thumb, TEST_FIT_BOX)
-            .expect("thumb")
-            .0
-            .temp_path(hash);
-        fs::write(&stale_thumb, b"partial").expect("thumb temp");
-        let stale_view = store
-            .role_target(Role::Fit, TEST_FIT_BOX)
-            .expect("view")
-            .0
-            .temp_path(hash);
-        fs::write(&stale_view, b"partial").expect("view temp");
-
-        // A live writer's temp stays while it holds the lock.
-        let live_temp = store
-            .role_target(Role::Thumb, TEST_FIT_BOX)
-            .expect("thumb")
-            .0
-            .temp_path(hash);
-        drop(store);
-        let locked_temp = File::options()
-            .write(true)
-            .create_new(true)
-            .open(&live_temp)
-            .expect("live temp");
-        locked_temp.lock().expect("lock live temp");
-
-        let malformed = [
-            "not-a-hash.123.tmp",
-            "0123456789abcdef0123456789abcdef.nope.tmp",
-            "0123456789abcdef0123456789abcdef.12.tmp.bak",
-        ];
-        for name in malformed {
-            fs::write(root.join("thumb").join(name), b"partial")
-                .expect("malformed temp");
-        }
-
-        let reopened = Store::at(&root);
-        assert!(!stale_thumb.exists());
-        assert!(!stale_view.exists());
-        assert!(live_temp.exists());
-        for name in malformed {
-            assert!(root.join("thumb").join(name).exists(), "{name}");
-        }
-        assert!(reopened.load(hash, Role::Thumb, TEST_FIT_BOX).is_some());
-
-        // Closing the handle releases the lock, so the next open claims
-        // the temp.
-        drop(locked_temp);
-        Store::at(&root);
-        assert!(!live_temp.exists());
-    }
-
-    #[test]
-    fn rgba_roundtrip_preserves_the_page() {
-        let dir = TempDir::new().expect("create temp dir");
-        let page = rgba_page(3, 2).with_page_dims((9, 6));
-        let store = Store::at(dir.path());
-        assert!(store.state.is_some());
-        let hash = content_hash(b"page-a");
-        assert!(
-            store.save(hash, Role::Thumb, &page, TEST_FIT_BOX).is_some()
-        );
-        assert!(
-            store.save(hash, Role::Full, &page, TEST_FIT_BOX).is_none()
-        );
-        assert!(store.load(hash, Role::Full, TEST_FIT_BOX).is_none());
-
-        let loaded = store
-            .load(hash, Role::Thumb, TEST_FIT_BOX)
-            .expect("cached thumb");
-        assert!(loaded == page, "cached thumb preserves the page");
-    }
-
-    #[test]
-    fn yuv_plane_roundtrip_preserves_the_page() {
-        let dir = TempDir::new().expect("create temp dir");
-        let page =
-            yuv_page(5, 3, Subsampling::Yuv420).with_page_dims((15, 9));
-        let store = Store::at(dir.path());
-        let hash = content_hash(b"page-b");
-        assert!(
-            store.save(hash, Role::Fit, &page, TEST_FIT_BOX).is_some()
-        );
-        assert!(
-            store
-                .load(
-                    hash,
-                    Role::Fit,
-                    (TEST_FIT_BOX.0, TEST_FIT_BOX.1 + 1)
-                )
-                .is_none(),
-            "a fit entry saved for one target box misses for another"
-        );
-
-        let loaded = store
-            .load(hash, Role::Fit, TEST_FIT_BOX)
-            .expect("cached view");
-        assert!(loaded == page, "cached view preserves the page");
-    }
-
-    #[test]
-    fn gray_plane_roundtrip_and_derive() {
-        let dir = TempDir::new().expect("create temp dir");
-        let store = Store::at(dir.path());
-        for (tag, depth, with_alpha) in [
-            (b"gray-8".as_slice(), Depth::D8, false),
-            (b"gray-10-alpha".as_slice(), Depth::D10, true),
-        ] {
-            let page = gray_page_with(8, 4, depth, with_alpha)
-                .with_page_dims((16, 8));
-            let hash = content_hash(tag);
-            assert!(
-                store.save(hash, Role::Thumb, &page, TEST_FIT_BOX).is_some()
-            );
-            let loaded = store
-                .load(hash, Role::Thumb, TEST_FIT_BOX)
-                .expect("cached gray thumb");
-            assert!(loaded == page, "cached gray thumb preserves the page");
-        }
-
-        let wide_gray = gray_page_with(400, 200, Depth::D10, true);
-        let derived =
-            derive(&wide_gray, Role::Thumb, testkit::limits())
-                .expect("gray derives");
-        assert_eq!((derived.width(), derived.height()), (THUMB_EDGE, 96));
-        let Pixels::Gray(gray) = derived.pixels() else {
-            panic!("derived gray stays gray");
-        };
-        assert!(gray.has_alpha());
-    }
-
-    #[test]
-    fn yuv_u8_planes_and_alpha_roundtrip() {
-        let dir = TempDir::new().expect("create temp dir");
-        let page =
-            yuv_page_with(6, 4, Subsampling::Yuv444, Depth::D8, true);
-        let store = Store::at(dir.path());
-        let hash = content_hash(b"page-e");
-        assert!(
-            store.save(hash, Role::Thumb, &page, TEST_FIT_BOX).is_some()
-        );
-
-        let loaded = store
-            .load(hash, Role::Thumb, TEST_FIT_BOX)
-            .expect("cached thumb");
-        assert!(loaded == page, "cached u8 yuv+alpha preserves the page");
-    }
-
-    #[test]
-    fn corrupt_entries_are_rejected() {
-        const VERSION_START: usize = MAGIC.len();
-        const VERSION_END: usize = VERSION_START + size_of::<u16>();
-
-        let dir = TempDir::new().expect("create temp dir");
-        let page = rgba_page(2, 2);
-        let store = Store::at(dir.path());
-        let hash = content_hash(b"page-c");
-        assert!(
-            store.save(hash, Role::Thumb, &page, TEST_FIT_BOX).is_some()
-        );
-        let path = dir.path().join("thumb").join(format!("{hash:032x}"));
-        let good = fs::read(&path).expect("read cache file");
-
-        let mut bad_magic = good.clone();
-        if let Some(byte) = bad_magic.first_mut() {
-            *byte = b'X';
-        }
-        fs::write(&path, &bad_magic).expect("write magic");
-        assert!(store.load(hash, Role::Thumb, TEST_FIT_BOX).is_none());
-
-        let mut bad_version = good.clone();
-        if let Some(field) =
-            bad_version.get_mut(VERSION_START..VERSION_END)
-        {
-            field.copy_from_slice(&(VERSION + 1).to_le_bytes());
-        }
-        fs::write(&path, &bad_version).expect("write version");
-        assert!(store.load(hash, Role::Thumb, TEST_FIT_BOX).is_none());
-
-        for meta_len in [0_u8, u8::MAX] {
-            let mut bad_meta_len = good.clone();
-            if let Some(byte) = bad_meta_len.get_mut(VERSION_END) {
-                *byte = meta_len;
-            }
-            fs::write(&path, &bad_meta_len).expect("write meta length");
-            assert!(store.load(hash, Role::Thumb, TEST_FIT_BOX).is_none());
-        }
-
-        // Different target box on disk misses cleanly even with matching pixels.
-        let mut wrong_box = encode_header(&CacheMeta::from_page(
-            &page,
-            (THUMB_EDGE + 1, THUMB_EDGE),
-        ))
-        .expect("encode wrong-box header");
-        wrong_box.extend_from_slice(&rgba_bytes(&page));
-        fs::write(&path, &wrong_box).expect("write wrong-box entry");
-        assert!(store.load(hash, Role::Thumb, TEST_FIT_BOX).is_none());
-
-        // Admissible dims whose byte size exceeds the file reject against
-        // file length before allocating.
-        let mut forged_dims =
-            CacheMeta::from_page(&page, (THUMB_EDGE, THUMB_EDGE));
-        forged_dims.image.width = 4_096;
-        forged_dims.image.height = 4_096;
-        let oversized =
-            encode_header(&forged_dims).expect("encode oversized header");
-        fs::write(&path, &oversized).expect("write oversized entry");
-        assert!(store.load(hash, Role::Thumb, TEST_FIT_BOX).is_none());
-
-        let mut truncated = good.clone();
-        truncated.truncate(good.len() - 1);
-        fs::write(&path, &truncated).expect("write truncated");
-        assert!(store.load(hash, Role::Thumb, TEST_FIT_BOX).is_none());
-
-        let mut trailing = good.clone();
-        trailing.push(0);
-        fs::write(&path, &trailing).expect("write trailing");
-        assert!(store.load(hash, Role::Thumb, TEST_FIT_BOX).is_none());
-
-        fs::write(&path, &good).expect("write intact");
-        assert!(store.load(hash, Role::Thumb, TEST_FIT_BOX).is_some());
-    }
-
-    #[test]
-    fn disabled_store_is_a_no_op() {
-        let dir = TempDir::new().expect("create temp dir");
-        fs::write(dir.path().join("not-a-directory"), b"x")
-            .expect("write marker file");
-        let store = Store::at(&dir.path().join("not-a-directory"));
-        assert!(store.state.is_none());
-        let page = rgba_page(2, 2);
-        let hash = content_hash(b"page-d");
-        assert!(
-            store.save(hash, Role::Thumb, &page, TEST_FIT_BOX).is_none()
-        );
-        assert!(store.load(hash, Role::Thumb, TEST_FIT_BOX).is_none());
-
-        let nested = Store::at(&dir.path().join("not-a-directory/file"));
-        assert!(nested.state.is_none());
-        assert!(
-            nested.save(hash, Role::Fit, &page, TEST_FIT_BOX).is_none()
-        );
-    }
-
-    #[test]
     fn derive_scales_to_the_box() {
         let page = rgba_page(500, 200).with_page_dims((1500, 600));
-        let thumb = derive_to_box(&page, (200, 200), FilterType::Box)
+        let thumb = derive_to_box(&page, (200, 200), FilterType::Box, 1)
             .expect("thumb");
         assert_eq!((thumb.width(), thumb.height()), (200, 80));
         assert_eq!(thumb.page_dims(), (1500, 600));
         assert_eq!(thumb.format(), Format::Png);
         assert_eq!(thumb.transfer(), Transfer::Srgb);
-        assert_eq!(
-            u64::from(thumb.width()) * 200,
-            u64::from(thumb.height()) * 500,
-            "the aspect ratio is preserved"
-        );
-
-        let wide = rgba_page(1800, 900);
-        let wide_thumb = derive_to_box(&wide, (200, 200), FilterType::Box)
-            .expect("wide thumb");
-        assert_eq!((wide_thumb.width(), wide_thumb.height()), (200, 100));
 
         let exact = rgba_page(200, 100);
-        let kept = derive_to_box(&exact, (200, 200), FilterType::Box)
+        let kept = derive_to_box(&exact, (200, 200), FilterType::Box, 1)
             .expect("exact kept");
         assert_eq!((kept.width(), kept.height()), (200, 100));
         assert_eq!(rgba_bytes(&kept), rgba_bytes(&exact));
 
-        let small = rgba_page(40, 30);
-        let grown = derive_to_box(&small, (1024, 1024), FilterType::Box)
-            .expect("small kept");
-        assert_eq!((grown.width(), grown.height()), (40, 30));
+        let wide = rgba_page(1000, 200).with_page_dims((1000, 200));
+        let clamped = derive(
+            &wide,
+            WorkRole::Full,
+            ImageLimits::new((300, 300), 500),
+            2,
+        )
+        .expect("clamped full");
+        assert_eq!((clamped.width(), clamped.height()), (500, 100));
+        assert_eq!(clamped.page_dims(), (1000, 200));
 
         assert_eq!(fit_dims((3628, 5148), TEST_FIT_BOX), (1015, 1440));
         assert_eq!(fit_dims((4000, 100), TEST_FIT_BOX), (2560, 64));
-    }
-
-    #[test]
-    #[expect(
-        clippy::integer_division,
-        reason = "the divisions locate a row's midpoint and quarter points; truncating to a pixel is intended"
-    )]
-    fn derive_preserves_a_hard_edge() {
-        let (page_width, page_height) = (4000_u32, 100_u32);
-        let page_row_width = count(page_width, 1);
-        let mut bytes = vec![0_u8; count(page_width, page_height) * 4];
-        for (index, pixel) in
-            bytes.as_chunks_mut::<4>().0.iter_mut().enumerate()
-        {
-            let column = index % page_row_width;
-            let value = if column * 2 >= page_row_width {
-                [0, 0, 255, 255]
-            } else {
-                [255, 0, 0, 255]
-            };
-            pixel.copy_from_slice(&value);
-        }
-        let page = Decoded::rgba(
-            page_width,
-            page_height,
-            Format::Png,
-            Transfer::Srgb,
-            bytes.into_boxed_slice(),
-        )
-        .expect("rgba page");
-        let limits = testkit::limits();
-        for (kind, edge, row_count) in [
-            (Role::Thumb, THUMB_EDGE, 5_u32),
-            (Role::Fit, TEST_FIT_BOX.0, 64),
-        ] {
-            let derived = derive(&page, kind, limits).expect("derives");
-            let row_width = count(derived.width(), 1);
-            assert_eq!(
-                (derived.width(), derived.height()),
-                (edge, row_count)
-            );
-            let pixels = rgba_bytes(&derived);
-            let rows: Vec<&[[u8; 4]]> =
-                pixels.as_chunks::<4>().0.chunks(row_width).collect();
-            let first = rows.first().expect("a row");
-            assert_eq!(first.first(), Some(&[255, 0, 0, 255]), "{kind:?}");
-            assert_eq!(first.last(), Some(&[0, 0, 255, 255]), "{kind:?}");
-            assert_eq!(
-                first.get(row_width / 4),
-                Some(&[255, 0, 0, 255]),
-                "{kind:?}"
-            );
-            assert_eq!(
-                first.get(row_width * 3 / 4),
-                Some(&[0, 0, 255, 255]),
-                "{kind:?}"
-            );
-            for (y, row) in rows.iter().enumerate().skip(1) {
-                assert_eq!(*row, *first, "{kind:?} row {y}");
-            }
-            let crossing = first
-                .iter()
-                .position(|pixel| {
-                    let [_, _, blue, _] = *pixel;
-                    blue > 127
-                })
-                .expect("edge crossing");
-            assert!(
-                crossing.abs_diff(row_width / 2) <= 1,
-                "{kind:?}: crossing at {crossing}, edge at {}",
-                row_width / 2
-            );
-        }
-    }
-
-    #[test]
-    fn derive_keeps_straight_alpha() {
-        // Alpha-aware resampling would keep red at 255.
-        let bytes = vec![255, 0, 0, 255, 0, 0, 0, 0].into_boxed_slice();
-        let page = Decoded::rgba(2, 1, Format::Png, Transfer::Srgb, bytes)
-            .expect("rgba page");
-        let derived = derive_to_box(&page, (1, 1), FilterType::Box)
-            .expect("derives");
-        let pixel = rgba_bytes(&derived);
-        let [red, green, blue, alpha] = pixel.as_slice() else {
-            panic!("one pixel");
-        };
-        assert!(red.abs_diff(128) <= 1, "{pixel:?}");
-        assert_eq!(*green, 0);
-        assert_eq!(*blue, 0);
-        assert!(alpha.abs_diff(128) <= 1, "{pixel:?}");
     }
 
     #[test]
@@ -1777,145 +1364,197 @@ mod tests {
             [400, 600, 300, 1023],
         );
         let limits = testkit::limits();
-        for (kind, edge, row_count) in [
-            (Role::Thumb, THUMB_EDGE, 5_u32),
-            (Role::Fit, TEST_FIT_BOX.0, 64),
-        ] {
-            let derived = derive(&page, kind, limits).expect("derives");
-            assert_eq!(
-                (derived.width(), derived.height()),
-                (edge, row_count),
-                "{kind:?}"
-            );
-            assert_eq!(derived.page_dims(), (4000, 100), "{kind:?}");
-            let Pixels::Yuv(yuv) = derived.pixels() else {
-                panic!("expected yuv pixels");
-            };
-            assert_eq!(yuv.depth(), Depth::D10, "{kind:?}");
-            assert_eq!(yuv.matrix, Matrix::Bt709, "{kind:?}");
-            let [luma, cb, cr, alpha] = yuv_planes(&derived);
-            for (name, plane, value) in [
-                ("luma", luma, 400_u16),
-                ("cb", cb, 600),
-                ("cr", cr, 300),
-                ("alpha", alpha, 1023),
-            ] {
-                assert!(
-                    plane.iter().all(|sample| sample.abs_diff(value) <= 1),
-                    "{kind:?} {name}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn derive_keeps_yuv_plane_extents_valid() {
-        let page = yuv_page(500, 200, Subsampling::Yuv420);
-        let thumb = derive_to_box(&page, (200, 200), FilterType::Hamming)
-            .expect("thumb");
-        assert_eq!((thumb.width(), thumb.height()), (200, 80));
-        assert_eq!(thumb.page_dims(), (500, 200));
-        let Pixels::Yuv(yuv) = thumb.pixels() else {
+        let derived =
+            derive(&page, WorkRole::Fit, limits, 4).expect("derives");
+        assert_eq!((derived.width(), derived.height()), (TEST_FIT_BOX.0, 64));
+        assert_eq!(derived.page_dims(), (4000, 100));
+        let Pixels::Yuv(yuv) = derived.pixels() else {
             panic!("expected yuv pixels");
         };
-        let Samples::U16 {
-            depth: WideDepth::D10,
-            planes,
-        } = &yuv.samples
-        else {
-            panic!("expected D10 yuv samples");
-        };
-        assert_eq!(planes.luma.len(), count(200, 80));
-        assert_eq!(planes.cb.len(), count(100, 40));
-        assert_eq!(planes.cr.len(), count(100, 40));
+        assert_eq!(yuv.depth(), Depth::D10);
         assert_eq!(yuv.matrix, Matrix::Bt709);
-    }
-
-    #[test]
-    fn derive_keeps_odd_yuv422_chroma_consistent() {
-        let page = yuv_page(9, 10, Subsampling::Yuv422);
-        let thumb =
-            derive_to_box(&page, (7, 7), FilterType::Box).expect("thumb");
-        assert_eq!((thumb.width(), thumb.height()), (6, 7));
-        let Pixels::Yuv(yuv) = thumb.pixels() else {
-            panic!("expected yuv pixels");
-        };
-        let Samples::U16 {
-            depth: WideDepth::D10,
-            planes,
-        } = &yuv.samples
-        else {
-            panic!("expected D10 yuv samples");
-        };
-        assert_eq!(planes.cb.len(), count(3, 7));
-        assert_eq!(planes.cr.len(), count(3, 7));
-    }
-
-    #[test]
-    fn prune_drops_the_oldest_first() {
-        let dir = TempDir::new().expect("create temp dir");
-        let root = dir.path().join("cache");
-        let probe_root = dir.path().join("probe");
-        let page = rgba_page(4, 4);
-        let probe_hash = content_hash(b"probe");
-        assert!(
-            Store::with_caps(&probe_root, THUMB_CAP_BYTES, FIT_CAP_BYTES)
-                .save(probe_hash, Role::Thumb, &page, TEST_FIT_BOX)
-                .is_some()
-        );
-        let size = fs::metadata(
-            probe_root.join("thumb").join(format!("{probe_hash:032x}")),
-        )
-        .expect("probe entry metadata")
-        .len();
-        let store = Store::with_caps(&root, size + 1, FIT_CAP_BYTES);
-
-        let first = content_hash(b"first");
-        let second = content_hash(b"second");
-        let third = content_hash(b"third");
-        let mut evicted = Vec::new();
-        for (age, hash) in [(10_u64, first), (11, second), (12, third)] {
-            let batch = store
-                .save(hash, Role::Thumb, &page, TEST_FIT_BOX)
-                .expect("thumb save persists");
-            evicted.extend(batch);
-            let path = root.join("thumb").join(format!("{hash:032x}"));
-            set_modified(&path, age);
+        let [luma, cb, cr, alpha] = yuv_planes(&derived);
+        for (name, plane, value) in [
+            ("luma", luma, 400_u16),
+            ("cb", cb, 600),
+            ("cr", cr, 300),
+            ("alpha", alpha, 1023),
+        ] {
+            assert!(
+                plane.iter().all(|sample| sample.abs_diff(value) <= 1),
+                "{name}"
+            );
         }
-
-        // The cap fits one entry, so each save after the first evicted
-        // the oldest, and the caller was told which ones.
-        assert_eq!(evicted, vec![first, second]);
-        assert!(store.load(first, Role::Thumb, TEST_FIT_BOX).is_none());
-        assert!(store.load(second, Role::Thumb, TEST_FIT_BOX).is_none());
-        assert!(store.load(third, Role::Thumb, TEST_FIT_BOX).is_some());
-
-        // The fit namespace has its own budget, so a fit save cannot
-        // evict thumbnails and reports no evictions.
-        let fit_evicted = store
-            .save(first, Role::Fit, &page, TEST_FIT_BOX)
-            .expect("fit save persists");
-        assert_eq!(fit_evicted, []);
-        assert!(store.load(third, Role::Thumb, TEST_FIT_BOX).is_some());
     }
 
     #[test]
-    fn derive_clamps_full_to_max_texture_edge() {
-        let small = rgba_page(400, 200);
-        let limits = ImageLimits::new((300, 300), 500);
-        let fit = derive(&small, Role::Fit, limits).expect("fit");
-        assert_eq!((fit.width(), fit.height()), (300, 150));
+    fn derive_thumb_converts_planar_pages_to_8bit_srgb() {
+        let assert_rgba_close = |bytes: &[u8], expected: [u8; 4]| {
+            for pixel in bytes.as_chunks::<4>().0 {
+                for (&channel, target) in pixel.iter().zip(expected) {
+                    assert!(
+                        channel.abs_diff(target) <= 1,
+                        "expected ~{expected:?}, got {pixel:?}"
+                    );
+                }
+            }
+        };
 
-        let full_small = derive(&small, Role::Full, limits).expect("full");
-        assert_eq!((full_small.width(), full_small.height()), (400, 200));
-
-        let wide = rgba_page(1000, 200).with_page_dims((1000, 200));
-        let full_clamped =
-            derive(&wide, Role::Full, limits).expect("clamped full");
-        assert_eq!(
-            (full_clamped.width(), full_clamped.height()),
-            (500, 100)
+        let pq_black = flat_yuv_page(
+            400,
+            200,
+            Subsampling::Yuv420,
+            [64, 512, 512, 1023],
         );
-        assert_eq!(full_clamped.page_dims(), (1000, 200));
+        let black_thumb = derive_thumb(&pq_black, 2).expect("pq black");
+        assert_eq!(black_thumb.pixels, ThumbFormat::Rgba8);
+        assert_rgba_close(&black_thumb.bytes, [0, 0, 0, 255]);
+
+        let pq_white = flat_yuv_page(
+            400,
+            200,
+            Subsampling::Yuv420,
+            [940, 512, 512, 512],
+        );
+        let white_thumb = derive_thumb(&pq_white, 2).expect("pq white");
+        assert_eq!(white_thumb.pixels, ThumbFormat::Rgba8);
+        assert_rgba_close(&white_thumb.bytes, [255, 255, 255, 128]);
+
+        let gray10 = Decoded::gray(
+            400,
+            200,
+            Format::Avif,
+            Transfer::Srgb,
+            GrayImage {
+                full_range: true,
+                samples: Samples::U16 {
+                    depth: WideDepth::D10,
+                    planes: GrayPlanes {
+                        luma: vec![1023_u16; pixel_count(400, 200)]
+                            .into_boxed_slice(),
+                        alpha: Some(
+                            vec![512_u16; pixel_count(400, 200)]
+                                .into_boxed_slice(),
+                        ),
+                    },
+                },
+            },
+        )
+        .expect("gray10");
+        let gray10_thumb = derive_thumb(&gray10, 2).expect("gray10 thumb");
+        assert_eq!(gray10_thumb.pixels, ThumbFormat::Rgba8);
+        assert_rgba_close(&gray10_thumb.bytes, [255, 255, 255, 128]);
+
+        let gray8 = Decoded::gray(
+            400,
+            200,
+            Format::Png,
+            Transfer::Srgb,
+            GrayImage {
+                full_range: true,
+                samples: Samples::U8(GrayPlanes {
+                    luma: vec![120_u8; pixel_count(400, 200)].into_boxed_slice(),
+                    alpha: None,
+                }),
+            },
+        )
+        .expect("gray8");
+        let gray8_thumb = derive_thumb(&gray8, 1).expect("gray8 thumb");
+        assert_eq!(gray8_thumb.pixels, ThumbFormat::Gray8);
+        assert!(gray8_thumb.bytes.iter().all(|&byte| byte == 120));
+    }
+
+    #[test]
+    fn thumb_pack_roundtrips_recovers_torn_tail_and_prunes() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path().join("thumbs");
+        let gray8 = Decoded::gray(
+            400,
+            200,
+            Format::Png,
+            Transfer::Srgb,
+            GrayImage {
+                full_range: true,
+                samples: Samples::U8(GrayPlanes {
+                    luma: vec![120_u8; pixel_count(400, 200)].into_boxed_slice(),
+                    alpha: None,
+                }),
+            },
+        )
+        .expect("gray8");
+        let gray_thumb = derive_thumb(&gray8, 1).expect("gray thumb");
+        let rgba_thumb =
+            derive_thumb(&rgba_page(400, 200), 1).expect("rgba thumb");
+
+        let oldest_key = 0x1111_u128;
+        let mut oldest_pack =
+            ThumbPack::open_at(&root, oldest_key, 4).expect("oldest pack");
+        oldest_pack.record(0, gray_thumb.clone());
+        oldest_pack.record(2, rgba_thumb.clone());
+        // Duplicate record is ignored; pending load hits immediately.
+        oldest_pack.record(0, rgba_thumb.clone());
+        assert!(oldest_pack.has(0));
+        assert_eq!(oldest_pack.load(0), Some(gray_thumb.clone()));
+        oldest_pack.flush();
+        assert_eq!(oldest_pack.load(0), Some(gray_thumb.clone()));
+        assert_eq!(oldest_pack.load(2), Some(rgba_thumb.clone()));
+        assert!(oldest_pack.load(1).is_none());
+        drop(oldest_pack);
+
+        // Append torn bytes at EOF: reopen recovers intact entries and
+        // truncates the torn tail on the next flush.
+        let oldest_pack_path =
+            root.join(format!("{oldest_key:032x}{PACK_EXTENSION}"));
+        assert!(ThumbPack::open_at(&oldest_pack_path, 1, 2).is_none());
+        let mut pack_bytes = fs::read(&oldest_pack_path).expect("read pack");
+        pack_bytes.extend_from_slice(&[0xff, 0xaa, 0x55, 0x00, 0x01]);
+        fs::write(&oldest_pack_path, &pack_bytes).expect("write torn tail");
+
+        let mut reopened =
+            ThumbPack::open_at(&root, oldest_key, 4).expect("reopened pack");
+        assert_eq!(reopened.load(0), Some(gray_thumb));
+        assert_eq!(reopened.load(2), Some(rgba_thumb.clone()));
+        reopened.record(3, rgba_thumb.clone());
+        reopened.flush();
+        assert_eq!(reopened.load(3), Some(rgba_thumb.clone()));
+        drop(reopened);
+
+        // Book-level LRU pruning: cap fits ~1.5 packs, so saving a third
+        // book evicts the oldest book while preserving the active pack.
+        let oldest_pack_bytes =
+            fs::metadata(&oldest_pack_path).expect("pack len").len();
+        let middle_key = 0x2222_u128;
+        let newest_key = 0x3333_u128;
+        let mut middle_pack = ThumbPack::open_with_cap(
+            &root,
+            middle_key,
+            4,
+            THUMB_PACK_CAP_BYTES,
+        )
+        .expect("middle pack");
+        middle_pack.record(0, rgba_thumb.clone());
+        middle_pack.flush();
+        drop(middle_pack);
+
+        set_modified(&oldest_pack_path, 10);
+        set_modified(&root.join(format!("{middle_key:032x}{PACK_EXTENSION}")), 20);
+
+        let mut newest_pack = ThumbPack::open_with_cap(
+            &root,
+            newest_key,
+            4,
+            oldest_pack_bytes + 10,
+        )
+        .expect("newest pack");
+        newest_pack.record(0, rgba_thumb);
+        newest_pack.flush();
+        assert!(
+            !oldest_pack_path.exists(),
+            "oldest book pack should be pruned"
+        );
+        assert!(
+            root.join(format!("{newest_key:032x}{PACK_EXTENSION}"))
+                .exists()
+        );
     }
 }

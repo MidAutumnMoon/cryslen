@@ -23,12 +23,9 @@ use crate::decode;
 use crate::decode::Decoded;
 use crate::decode::Samples;
 
-pub use crate::browse::Direction;
-pub use crate::browse::Motion;
 pub use crate::browse::PageNames;
-pub use crate::browse::ReadingMode;
 pub use crate::browse::Request;
-pub use crate::browse::Role;
+pub use crate::browse::WorkRole;
 pub use crate::decode::Depth;
 pub use crate::decode::Format;
 pub use crate::decode::GraySpec;
@@ -301,16 +298,102 @@ where
     IpcSharedMemory::from_bytes(bytemuck::cast_slice(samples))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub enum ThumbFormat {
+    Gray8,
+    Rgba8,
+}
+
+impl ThumbFormat {
+    #[must_use]
+    pub const fn bytes_per_pixel(self) -> usize {
+        match self {
+            Self::Gray8 => 1,
+            Self::Rgba8 => decode::RGBA_BYTES_PER_PIXEL,
+        }
+    }
+
+    #[must_use]
+    pub fn byte_len(self, width: u32, height: u32) -> Option<usize> {
+        usize::try_from(width)
+            .ok()?
+            .checked_mul(usize::try_from(height).ok()?)?
+            .checked_mul(self.bytes_per_pixel())
+    }
+}
+
+/// Compact 8-bit sRGB thumbnail attached to `Fit` delivery and persisted
+/// in the parent's per-book thumb pack.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct WireThumb {
+    pub width: u32,
+    pub height: u32,
+    pub page_dims: (u32, u32),
+    pub format: Format,
+    pub pixels: ThumbFormat,
+    pub bytes: Vec<u8>,
+}
+
+/// Thumbnail whose dimensions and byte payload passed validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedThumb(WireThumb);
+
+impl ValidatedThumb {
+    #[must_use]
+    pub fn into_wire(self) -> WireThumb {
+        self.0
+    }
+}
+
+impl Deref for ValidatedThumb {
+    type Target = WireThumb;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl WireThumb {
+    pub fn validate(self) -> Result<ValidatedThumb, MsgError> {
+        if self.width == 0
+            || self.height == 0
+            || self.width > THUMB_EDGE
+            || self.height > THUMB_EDGE
+        {
+            return Err(MsgError::from_static("thumb dimensions"));
+        }
+        decode::admit_dims(
+            self.page_dims.0,
+            self.page_dims.1,
+            "thumb page dimensions",
+        )?;
+        let expected_bytes = self
+            .pixels
+            .byte_len(self.width, self.height)
+            .ok_or_else(|| MsgError::from_static("thumb extent"))?;
+        if self.bytes.len() != expected_bytes {
+            return Err(MsgError::from_static("thumb extent"));
+        }
+        Ok(ValidatedThumb(self))
+    }
+}
+
+/// Three-tier demand plan sent from parent to child.
+///
+/// `current` runs first at max threads and cancels lower tiers;
+/// `lookahead` runs next once `current` is empty; `thumbs` warms missing
+/// `.cyth` entries when both upper tiers are empty.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct WorkPlan {
+    pub current: Vec<Request>,
+    pub lookahead: Vec<usize>,
+    pub thumbs: Vec<usize>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub enum ParentMsg {
     SetLimits(ImageLimits),
-    SetView {
-        page: usize,
-        mode: ReadingMode,
-        direction: Direction,
-    },
-    SetMotion(Motion),
-    SetRequests(Vec<Request>),
+    SetWork(WorkPlan),
     Playback(PlaybackCommand),
 }
 
@@ -318,8 +401,13 @@ pub enum ParentMsg {
 pub enum ChildMsg {
     Ready {
         page: usize,
-        role: Role,
+        role: WorkRole,
         image: WireImage,
+        thumb: Option<WireThumb>,
+    },
+    Thumb {
+        page: usize,
+        thumb: WireThumb,
     },
     Failed {
         page: usize,

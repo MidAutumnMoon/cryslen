@@ -1,43 +1,24 @@
 # Decoding: choices and traps
 
-The ratios here are one laptop's measurements.
+Measured ratios are from one laptop.
 
-## Choices
+## Backends
 
-- JPEG and PNG use the `image` crate. JPEG runs through zune-jpeg; its PNG backend measured faster than zune-png on noise-heavy input. Opaque grayscale pages keep planar `Gray` (`src/decode/raster.rs`).
-- WebP uses `libwebp-sys`: opaque lossy pages decode to planar `Yuv420` (BT.601, studio range) for the display shader; other variants decode to RGBA8.
-- AVIF uses libavif with the dav1d codec. The libaom wrapper measured about 3x slower.
-- JXL uses the jxl crate (jxl-rs) with a parallel runner; jxl-oxide measured about 4x slower.
-- AVIF and JXL cost one to two orders more per pixel than JPEG. turbojpeg's scaled decode saves little because entropy decode dominates.
+- JPEG/PNG/GIF/BMP/TIFF (`src/decode/raster.rs`): `image` crate (`zune-jpeg`; `image`'s PNG backend measured faster than `zune-png` on noise-heavy input). `turbojpeg` scaled decode saves little because entropy decode dominates.
+- WebP (`src/decode/webp.rs`): `libwebp-sys`; opaque lossy pages keep planar YUV for the display shader.
+- AVIF (`src/decode/avif.rs`): `libavif` + `dav1d` (`libaom` measured ~3x slower); keep YUV planes for the shader to avoid a CPU pass and cut 4:2:0 upload size.
+- JXL (`src/decode/jxl.rs`): `jxl` (`jxl-rs`) with a custom parallel runner (`jxl-oxide` measured ~4x slower; the default runner is single-threaded).
+- AVIF and JXL cost 1–2 orders of magnitude more per pixel than JPEG.
 
-## JXL
+## Traps
 
-- Supply a parallel runner; the default path is single-threaded and several times slower. Scoped threads are the runner model.
-- Decode opaque grayscale into 8-bit planar `Gray` (full range); decode color or alpha pages into RGBA (`jxl` interleaves extra alpha and fills opaque alpha).
-- The whole file is in memory, so a request for more input means truncation: report a corrupt page.
+- GIF animation (`src/decode/mod.rs`): `image`'s `AnimationDecoder` already composites frames to the logical screen; read loop counts from `gif::Decoder::repeat()` because `image`'s wrapper reports a missing repeat extension as infinite.
+- Size caps: reject zero edges and pixel counts past the allocation ceiling before allocating (`src/decode/mod.rs`); texture edge limits are enforced during derivation (`src/cache.rs`) and upload (`src/render.rs`).
 
-## AVIF
+## Out of scope
 
-- Create the decoder behind an RAII guard, cap the thread count, set the IO memory limit, then parse and take the image.
-- Read the planes row by row using each row's stride; depth above 8 bits means native 16-bit samples.
-- Keep YUV planes and convert in the display shader. A full-frame YUV-to-RGB conversion is a second pass over the image; the shader path also cuts 4:2:0 upload size.
-- Map matrix coefficients, range, depth (8/10/12/16), and subsampling (400/420/422/444).
+Reduced-resolution JXL/AVIF decode, hardware AV1/JXL still decode, pure-Rust AV1 decode, external thumbnail caches, and EXIF IFD1 thumbnails.
 
-## Animation
+## Related docs
 
-- GIF playback uses the `image` crate's `AnimationDecoder`, which composites frames to the logical screen. Do not add a second compositor.
-- Loop counts come from `gif::Decoder::repeat()`; the `image` wrapper reports a file without the extension as infinite.
-
-## Guards
-
-The decode entry point rejects a zero edge or a pixel count over the 512 MiB RGBA allocation ceiling (`decode::MAX_PIXELS`) before allocating. `cache::derive` clamps derived roles to `max_texture_edge` (failing past it if resampling errors), and `PageTextures` enforces `max_texture_edge` at GPU upload.
-
-EXIF orientation: read the orientation before constructing the decoded image, then apply it. Orientation fixtures need real files; the test encoder cannot write EXIF tags.
-
-## Unavailable
-
-Reduced-resolution JXL and AVIF, hardware AV1 or JXL for stills, and a pure-Rust AV1 bitstream decoder are absent. External thumbnail caches and EXIF IFD1 thumbs are out of scope; the viewer decodes its own pages.
-
-## Division
-
-The child owns the message loop, requests, prefetch scheduling, and the panic boundary; the source owns archive unpacking. Scheduling and retention are in `docs/internal/cache.md`; transport is in `docs/internal/process.md`.
+Scheduling and caches: `docs/internal/cache.md`. Process and IPC boundary: `docs/internal/process.md`.
