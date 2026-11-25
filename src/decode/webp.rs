@@ -2,12 +2,13 @@
 
 #![expect(
     clippy::little_endian_bytes,
-    clippy::big_endian_bytes,
-    reason = "RIFF and TIFF containers specify explicit byte orders"
+    reason = "RIFF container specifies little-endian byte order"
 )]
 
+use std::marker::PhantomData;
 use std::ptr;
 
+use image::metadata::Orientation;
 use libwebp_sys::VP8StatusCode;
 use libwebp_sys::WEBP_CSP_MODE;
 use libwebp_sys::WebPAnimDecoder;
@@ -18,7 +19,6 @@ use libwebp_sys::WebPData;
 use libwebp_sys::WebPDecoderConfig;
 
 use super::Decoded;
-use super::DisplayTransform;
 use super::Format;
 use super::Subsampling;
 
@@ -38,16 +38,16 @@ pub(super) fn decode(
     };
     super::admit_dims(width, height, "webp: bad dimensions")?;
 
-    let transform = exif_transform(bytes);
+    let orientation = exif_orientation(bytes);
     let use_threads = max_threads > 1;
 
     if features.has_animation != 0 {
-        return decode_animated_first_frame(bytes, transform, use_threads);
+        return decode_animated_first_frame(bytes, orientation, use_threads);
     }
     if features.format == WEBP_FORMAT_LOSSY && features.has_alpha == 0 {
-        return decode_yuv(bytes, (width, height), transform, use_threads);
+        return decode_yuv(bytes, (width, height), orientation, use_threads);
     }
-    decode_rgba(bytes, (width, height), transform, use_threads)
+    decode_rgba(bytes, (width, height), orientation, use_threads)
 }
 
 fn read_features(bytes: &[u8]) -> eros::Result<WebPBitstreamFeatures> {
@@ -87,18 +87,17 @@ fn init_external_config(
 fn decode_yuv(
     bytes: &[u8],
     dims: (u32, u32),
-    transform: DisplayTransform,
+    orientation: Orientation,
     use_threads: bool,
 ) -> eros::Result<Decoded> {
     use libwebp_sys::WebPDecode;
     use libwebp_sys::WebPYUVABuffer;
 
-    use super::Depth;
     use super::Matrix;
-    use super::Plane;
+    use super::Samples;
     use super::Transfer;
     use super::YuvImage;
-    use super::YuvSpec;
+    use super::YuvPlanes;
 
     let ((luma_width, luma_height), (chroma_width, chroma_height)) =
         super::plane_dims(dims, Subsampling::Yuv420);
@@ -140,47 +139,30 @@ fn decode_yuv(
     drop(guard);
     check_status(status, "webp decode")?;
 
-    let luma_plane = super::transform_plane(
-        Plane::U8(luma.into_boxed_slice()),
-        dims,
-        transform,
-    );
-    let chroma_blue = super::transform_plane(
-        Plane::U8(cb.into_boxed_slice()),
-        (chroma_width, chroma_height),
-        transform,
-    );
-    let chroma_red = super::transform_plane(
-        Plane::U8(cr.into_boxed_slice()),
-        (chroma_width, chroma_height),
-        transform,
-    );
-    let (out_width, out_height) = transform.out_dims(dims);
-
     Ok(Decoded::yuv(
-        out_width,
-        out_height,
+        dims.0,
+        dims.1,
         Format::Webp,
         Transfer::Srgb,
         YuvImage {
-            spec: YuvSpec {
-                depth: Depth::D8,
-                subsampling: Subsampling::Yuv420,
-                full_range: false,
-                matrix: Matrix::Bt601,
-            },
-            luma: luma_plane,
-            cb: chroma_blue,
-            cr: chroma_red,
-            alpha: None,
+            subsampling: Subsampling::Yuv420,
+            full_range: false,
+            matrix: Matrix::Bt601,
+            samples: Samples::U8(YuvPlanes {
+                luma: luma.into_boxed_slice(),
+                cb: cb.into_boxed_slice(),
+                cr: cr.into_boxed_slice(),
+                alpha: None,
+            }),
         },
-    )?)
+    )?
+    .apply_orientation(orientation))
 }
 
 fn decode_rgba(
     bytes: &[u8],
     dims: (u32, u32),
-    transform: DisplayTransform,
+    orientation: Orientation,
     use_threads: bool,
 ) -> eros::Result<Decoded> {
     use libwebp_sys::WebPDecode;
@@ -212,30 +194,23 @@ fn decode_rgba(
     drop(guard);
     check_status(status, "webp decode")?;
 
-    finish_rgba(rgba.into_boxed_slice(), dims, transform)
+    finish_rgba(rgba.into_boxed_slice(), dims, orientation)
 }
 
 fn finish_rgba(
     rgba: Box<[u8]>,
     dims: (u32, u32),
-    transform: DisplayTransform,
+    orientation: Orientation,
 ) -> eros::Result<Decoded> {
     use super::Transfer;
 
-    let oriented = super::transform_rgba(rgba, dims, transform);
-    let (out_width, out_height) = transform.out_dims(dims);
-    Ok(Decoded::rgba(
-        out_width,
-        out_height,
-        Format::Webp,
-        Transfer::Srgb,
-        oriented,
-    )?)
+    Ok(Decoded::rgba(dims.0, dims.1, Format::Webp, Transfer::Srgb, rgba)?
+        .apply_orientation(orientation))
 }
 
 fn decode_animated_first_frame(
     bytes: &[u8],
-    transform: DisplayTransform,
+    orientation: Orientation,
     use_threads: bool,
 ) -> eros::Result<Decoded> {
     use std::mem::MaybeUninit;
@@ -256,18 +231,14 @@ fn decode_animated_first_frame(
     options.color_mode = WEBP_CSP_MODE::MODE_RGBA;
     options.use_threads = i32::from(use_threads);
 
-    let data = WebPData {
-        bytes: bytes.as_ptr(),
-        size: bytes.len(),
-    };
-    let decoder = AnimDecoderGuard::new(&data, &options)?;
+    let decoder = AnimDecoderGuard::new(bytes, &options)?;
     let info = decoder.info()?;
     let dims = (info.canvas_width, info.canvas_height);
     let byte_len = super::rgba_byte_len(dims.0, dims.1)?;
 
     let mut frame_ptr = ptr::null_mut();
     let mut timestamp = 0_i32;
-    // SAFETY: `decoder.ptr` is live and `data.bytes` (`bytes`) outlives it.
+    // SAFETY: `decoder.ptr` is live and `bytes` outlives it via `'bytes`.
     let got_frame = unsafe {
         WebPAnimDecoderGetNext(
             decoder.ptr,
@@ -285,7 +256,7 @@ fn decode_animated_first_frame(
     let owned = frame_slice.to_vec().into_boxed_slice();
     drop(decoder);
 
-    finish_rgba(owned, dims, transform)
+    finish_rgba(owned, dims, orientation)
 }
 
 struct DecoderConfigGuard(WebPDecoderConfig);
@@ -309,23 +280,31 @@ impl Drop for DecoderConfigGuard {
     }
 }
 
-struct AnimDecoderGuard {
+struct AnimDecoderGuard<'bytes> {
     ptr: *mut WebPAnimDecoder,
+    _bytes: PhantomData<&'bytes [u8]>,
 }
 
-impl AnimDecoderGuard {
+impl<'bytes> AnimDecoderGuard<'bytes> {
     fn new(
-        data: &WebPData,
+        bytes: &'bytes [u8],
         options: &WebPAnimDecoderOptions,
     ) -> eros::Result<Self> {
         use libwebp_sys::WebPAnimDecoderNew;
 
-        // SAFETY: `data` (`bytes` outlives the guard) and `options` are initialized.
-        let ptr = unsafe { WebPAnimDecoderNew(data, options) };
+        let data = WebPData {
+            bytes: bytes.as_ptr(),
+            size: bytes.len(),
+        };
+        // SAFETY: `data` (`bytes` outlives the guard via `'bytes`) and `options` are initialized.
+        let ptr = unsafe { WebPAnimDecoderNew(&raw const data, options) };
         if ptr.is_null() {
             eros::bail!("webp: anim decoder init failed");
         }
-        Ok(Self { ptr })
+        Ok(Self {
+            ptr,
+            _bytes: PhantomData,
+        })
     }
 
     fn info(&self) -> eros::Result<WebPAnimInfo> {
@@ -342,7 +321,7 @@ impl AnimDecoderGuard {
     }
 }
 
-impl Drop for AnimDecoderGuard {
+impl Drop for AnimDecoderGuard<'_> {
     fn drop(&mut self) {
         use libwebp_sys::WebPAnimDecoderDelete;
 
@@ -383,14 +362,11 @@ fn check_status(
     }
 }
 
-fn exif_transform(bytes: &[u8]) -> DisplayTransform {
-    let Some(exif) = find_exif_chunk(bytes) else {
-        return DisplayTransform::UPRIGHT;
-    };
-    let Some(orientation) = parse_exif_orientation(exif) else {
-        return DisplayTransform::UPRIGHT;
-    };
-    transform_for_exif_orientation(orientation)
+fn exif_orientation(bytes: &[u8]) -> Orientation {
+    find_exif_chunk(bytes)
+        .map(|chunk| chunk.strip_prefix(b"Exif\0\0").unwrap_or(chunk))
+        .and_then(Orientation::from_exif_chunk)
+        .unwrap_or(Orientation::NoTransforms)
 }
 
 const RIFF_HEADER_BYTES: usize = 12;
@@ -414,16 +390,12 @@ fn find_exif_chunk(bytes: &[u8]) -> Option<&[u8]> {
     while let Some(header) =
         bytes.get(offset..offset.checked_add(CHUNK_HEADER_BYTES)?)
     {
-        let fourcc: [u8; FOURCC_BYTES] =
-            header.get(..FOURCC_BYTES)?.try_into().ok()?;
-        let len_bytes: [u8; FOURCC_BYTES] = header
-            .get(FOURCC_BYTES..CHUNK_HEADER_BYTES)?
-            .try_into()
-            .ok()?;
-        let chunk_len = u32::from_le_bytes(len_bytes) as usize;
+        let (fourcc, rest) = header.split_first_chunk::<FOURCC_BYTES>()?;
+        let len_bytes = rest.first_chunk::<FOURCC_BYTES>()?;
+        let chunk_len = u32::from_le_bytes(*len_bytes) as usize;
         let payload_start = offset.checked_add(CHUNK_HEADER_BYTES)?;
         let payload_end = payload_start.checked_add(chunk_len)?;
-        if &fourcc == b"EXIF" {
+        if fourcc == b"EXIF" {
             return bytes.get(payload_start..payload_end);
         }
         let padded_len = chunk_len.checked_add(chunk_len & 1)?;
@@ -432,135 +404,12 @@ fn find_exif_chunk(bytes: &[u8]) -> Option<&[u8]> {
     None
 }
 
-fn parse_exif_orientation(data: &[u8]) -> Option<u16> {
-    const TIFF_HEADER_BYTES: usize = 8;
-    const TIFF_MAGIC: u16 = 42;
-    const TIFF_MAGIC_OFFSET: usize = 2;
-    const TIFF_IFD_OFFSET: usize = 4;
-    const IFD_COUNT_BYTES: usize = 2;
-    const TAG_ORIENTATION: u16 = 0x0112;
-    const TIFF_SHORT: u16 = 3;
-    const TIFF_LONG: u16 = 4;
-    const IFD_ENTRY_BYTES: usize = 12;
-    const ENTRY_TYPE_OFFSET: usize = 2;
-    const ENTRY_COUNT_OFFSET: usize = 4;
-    const ENTRY_VALUE_OFFSET: usize = 8;
-    const MAX_ENTRIES: usize = 1000;
-
-    let tiff = data.strip_prefix(b"Exif\0\0").unwrap_or(data);
-    if tiff.len() < TIFF_HEADER_BYTES {
-        return None;
-    }
-    let big_endian = match tiff.get(..2)? {
-        b"MM" => true,
-        b"II" => false,
-        _ => return None,
-    };
-    if read_u16(tiff, TIFF_MAGIC_OFFSET, big_endian)? != TIFF_MAGIC {
-        return None;
-    }
-    let ifd_offset = read_u32(tiff, TIFF_IFD_OFFSET, big_endian)? as usize;
-    let entry_count = usize::from(read_u16(tiff, ifd_offset, big_endian)?);
-    if entry_count > MAX_ENTRIES {
-        return None;
-    }
-    let entries_start = ifd_offset.checked_add(IFD_COUNT_BYTES)?;
-    for index in 0..entry_count {
-        let entry = entries_start.checked_add(index * IFD_ENTRY_BYTES)?;
-        if entry.checked_add(IFD_ENTRY_BYTES)? > tiff.len() {
-            break;
-        }
-        let tag = read_u16(tiff, entry, big_endian)?;
-        if tag != TAG_ORIENTATION {
-            continue;
-        }
-        let kind = read_u16(tiff, entry + ENTRY_TYPE_OFFSET, big_endian)?;
-        let count =
-            read_u32(tiff, entry + ENTRY_COUNT_OFFSET, big_endian)?;
-        if count == 0 {
-            return None;
-        }
-        let value_offset = entry + ENTRY_VALUE_OFFSET;
-        return match kind {
-            TIFF_SHORT => read_u16(tiff, value_offset, big_endian),
-            TIFF_LONG => {
-                u16::try_from(read_u32(tiff, value_offset, big_endian)?)
-                    .ok()
-            }
-            _ => None,
-        };
-    }
-    None
-}
-
-fn read_u16(bytes: &[u8], offset: usize, big_endian: bool) -> Option<u16> {
-    let pair: [u8; 2] =
-        bytes.get(offset..offset.checked_add(2)?)?.try_into().ok()?;
-    Some(if big_endian {
-        u16::from_be_bytes(pair)
-    } else {
-        u16::from_le_bytes(pair)
-    })
-}
-
-fn read_u32(bytes: &[u8], offset: usize, big_endian: bool) -> Option<u32> {
-    let quad: [u8; 4] =
-        bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?;
-    Some(if big_endian {
-        u32::from_be_bytes(quad)
-    } else {
-        u32::from_le_bytes(quad)
-    })
-}
-
-const MIRROR_VERTICAL: u8 = 0;
-const MIRROR_HORIZONTAL: u8 = 1;
-
-const EXIF_TRANSFORMS: [DisplayTransform; 8] = [
-    DisplayTransform::UPRIGHT,
-    DisplayTransform {
-        quarters: 0,
-        mirror_axis: Some(MIRROR_HORIZONTAL),
-    },
-    DisplayTransform {
-        quarters: 2,
-        mirror_axis: None,
-    },
-    DisplayTransform {
-        quarters: 0,
-        mirror_axis: Some(MIRROR_VERTICAL),
-    },
-    DisplayTransform {
-        quarters: 1,
-        mirror_axis: Some(MIRROR_HORIZONTAL),
-    },
-    DisplayTransform {
-        quarters: 3,
-        mirror_axis: None,
-    },
-    DisplayTransform {
-        quarters: 3,
-        mirror_axis: Some(MIRROR_HORIZONTAL),
-    },
-    DisplayTransform {
-        quarters: 1,
-        mirror_axis: None,
-    },
-];
-
-fn transform_for_exif_orientation(orientation: u16) -> DisplayTransform {
-    orientation
-        .checked_sub(1)
-        .and_then(|index| EXIF_TRANSFORMS.get(usize::from(index)))
-        .copied()
-        .unwrap_or(DisplayTransform::UPRIGHT)
-}
-
 #[cfg(test)]
 #[expect(
+    clippy::big_endian_bytes,
     clippy::expect_used,
     clippy::panic,
-    reason = "a panic in test code is inconsequential"
+    reason = "a panic in test code is inconsequential and EXIF test fixtures write big-endian TIFF headers"
 )]
 mod tests {
     use super::*;
@@ -740,8 +589,8 @@ mod tests {
 
     #[test]
     fn webp_decodes_yuv_rgba_and_animation() {
-        use crate::decode::Depth;
         use crate::decode::Matrix;
+        use crate::decode::Samples;
 
         let lossy =
             encode_rgba(5, 3, &[200_u8, 120, 60, 255].repeat(15), false);
@@ -755,11 +604,13 @@ mod tests {
         let Pixels::Yuv(yuv) = decoded_lossy.pixels() else {
             panic!("opaque lossy webp must decode to yuv");
         };
-        assert_eq!(yuv.spec.subsampling, Subsampling::Yuv420);
-        assert_eq!(yuv.spec.matrix, Matrix::Bt601);
-        assert!(!yuv.spec.full_range);
-        assert_eq!(yuv.spec.depth, Depth::D8);
-        assert!(yuv.alpha.is_none());
+        assert_eq!(yuv.subsampling, Subsampling::Yuv420);
+        assert_eq!(yuv.matrix, Matrix::Bt601);
+        assert!(!yuv.full_range);
+        assert!(matches!(
+            &yuv.samples,
+            Samples::U8(planes) if planes.alpha.is_none()
+        ));
 
         let lossless =
             encode_rgba(4, 2, &[10_u8, 20, 30, 255].repeat(8), true);

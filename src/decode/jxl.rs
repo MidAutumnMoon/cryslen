@@ -23,7 +23,6 @@ pub(super) fn decode(
 
     use super::Depth;
     use super::Format;
-    use super::Plane;
     use super::Transfer;
 
     let mut runner = Pool(max_threads.clamp(1, MAX_THREADS));
@@ -109,13 +108,12 @@ pub(super) fn decode(
     // The crate either converts to sRGB or emits simple PQ values its
     // API does not distinguish, so jxl pages ride the sRGB path.
     Ok(if mono {
-        Decoded::mono(
+        Decoded::gray_u8(
             width,
             height,
             Format::Jxl,
             Transfer::Srgb,
-            Depth::D8,
-            Plane::U8(pixels.into_boxed_slice()),
+            pixels.into_boxed_slice(),
         )?
     } else {
         Decoded::rgba(

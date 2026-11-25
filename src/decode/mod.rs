@@ -1,4 +1,4 @@
-//! Decoding: raw page bytes to `Decoded` (RGBA or YUV planes).
+//! Decoding: raw page bytes to `Decoded` (RGBA, Gray, or YUV planes).
 
 #![expect(
     clippy::definition_in_module_root,
@@ -7,16 +7,16 @@
 
 use std::time::Duration;
 
-use ::image::Delay;
 use bytes::Bytes;
 use eros::MsgError;
+use image::metadata::Orientation;
 use serde::Deserialize;
 use serde::Serialize;
 use strum::Display;
 
 mod avif;
-mod image;
 mod jxl;
+mod raster;
 mod webp;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -39,10 +39,38 @@ pub enum Depth {
     D16,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub enum WideDepth {
+    D10,
+    D12,
+    D16,
+}
+
+impl WideDepth {
+    #[must_use]
+    pub const fn depth(self) -> Depth {
+        match self {
+            Self::D10 => Depth::D10,
+            Self::D12 => Depth::D12,
+            Self::D16 => Depth::D16,
+        }
+    }
+}
+
 impl Depth {
     #[must_use]
     pub const fn is_wide(self) -> bool {
         !matches!(self, Self::D8)
+    }
+
+    #[must_use]
+    pub const fn wide(self) -> Option<WideDepth> {
+        match self {
+            Self::D8 => None,
+            Self::D10 => Some(WideDepth::D10),
+            Self::D12 => Some(WideDepth::D12),
+            Self::D16 => Some(WideDepth::D16),
+        }
     }
 
     #[must_use]
@@ -54,6 +82,21 @@ impl Depth {
             Self::D16 => 16,
         }
     }
+
+    #[must_use]
+    pub const fn sample_bytes(self) -> usize {
+        if self.is_wide() {
+            size_of::<u16>()
+        } else {
+            size_of::<u8>()
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub struct GraySpec {
+    pub depth: Depth,
+    pub full_range: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -65,9 +108,9 @@ pub struct YuvSpec {
     pub matrix: Matrix,
 }
 
-/// Construct via [`Decoded::rgba`] / [`Decoded::yuv`], which validate the
-/// pixel extents against the dimensions.
-#[derive(Clone)]
+/// Construct via [`Decoded::rgba`] / [`Decoded::gray`] / [`Decoded::yuv`],
+/// which validate the pixel extents against the dimensions.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Decoded {
     meta: ImageMeta,
     pixels: Pixels,
@@ -139,6 +182,32 @@ impl Decoded {
         })
     }
 
+    pub fn gray(
+        width: u32,
+        height: u32,
+        format: Format,
+        transfer: Transfer,
+        gray: GrayImage,
+    ) -> Result<Self, MsgError> {
+        let (luma_bytes, alpha_bytes) = gray.byte_lens();
+        validate_gray_extents(
+            (width, height),
+            gray.depth(),
+            luma_bytes,
+            alpha_bytes,
+        )?;
+        Ok(Self {
+            meta: ImageMeta {
+                width,
+                height,
+                page_dims: (width, height),
+                format,
+                transfer,
+            },
+            pixels: Pixels::Gray(gray),
+        })
+    }
+
     pub fn yuv(
         width: u32,
         height: u32,
@@ -146,25 +215,13 @@ impl Decoded {
         transfer: Transfer,
         yuv: YuvImage,
     ) -> Result<Self, MsgError> {
-        let wide = yuv.spec.depth.is_wide();
-        let matches_depth =
-            |plane: &Plane| matches!(plane, Plane::U16(_)) == wide;
-        if !matches_depth(&yuv.luma)
-            || yuv
-                .alpha
-                .as_ref()
-                .is_some_and(|alpha| !matches_depth(alpha))
-            || (yuv.spec.subsampling != Subsampling::Mono
-                && (!matches_depth(&yuv.cb) || !matches_depth(&yuv.cr)))
-        {
-            return Err(MsgError::from_static("yuv plane depth"));
-        }
+        let (plane_bytes, alpha_bytes) = yuv.byte_lens();
         validate_yuv_extents(
             (width, height),
-            yuv.spec.depth,
-            yuv.spec.subsampling,
-            [yuv.luma.byte_len(), yuv.cb.byte_len(), yuv.cr.byte_len()],
-            yuv.alpha.as_ref().map(Plane::byte_len),
+            yuv.depth(),
+            yuv.subsampling,
+            plane_bytes,
+            alpha_bytes,
         )?;
         Ok(Self {
             meta: ImageMeta {
@@ -178,38 +235,116 @@ impl Decoded {
         })
     }
 
-    pub fn mono(
+    #[must_use]
+    fn apply_orientation(mut self, orientation: Orientation) -> Self {
+        if orientation == Orientation::NoTransforms {
+            return self;
+        }
+        let dims = (self.meta.width, self.meta.height);
+        debug_assert!(
+            !(orientation_swaps_dims(orientation)
+                && matches!(
+                    &self.pixels,
+                    Pixels::Yuv(yuv)
+                        if yuv.subsampling == Subsampling::Yuv422
+                )),
+            "rotated 4:2:2 must be rejected before orientation"
+        );
+        self.pixels = match &self.pixels {
+            Pixels::Rgba8(bytes) => {
+                Pixels::Rgba8(transform_rgba(bytes, dims, orientation))
+            }
+            Pixels::Gray(gray) => Pixels::Gray(GrayImage {
+                full_range: gray.full_range,
+                samples: match &gray.samples {
+                    Samples::U8(planes) => {
+                        Samples::U8(planes.transform(dims, orientation))
+                    }
+                    Samples::U16 { depth, planes } => Samples::U16 {
+                        depth: *depth,
+                        planes: planes.transform(dims, orientation),
+                    },
+                },
+            }),
+            Pixels::Yuv(yuv) => {
+                let (luma_dims, chroma_dims) =
+                    plane_dims(dims, yuv.subsampling);
+                Pixels::Yuv(YuvImage {
+                    subsampling: yuv.subsampling,
+                    full_range: yuv.full_range,
+                    matrix: yuv.matrix,
+                    samples: match &yuv.samples {
+                        Samples::U8(planes) => Samples::U8(planes.transform(
+                            luma_dims,
+                            chroma_dims,
+                            orientation,
+                        )),
+                        Samples::U16 { depth, planes } => Samples::U16 {
+                            depth: *depth,
+                            planes: planes.transform(
+                                luma_dims,
+                                chroma_dims,
+                                orientation,
+                            ),
+                        },
+                    },
+                })
+            }
+        };
+        let out_dims = oriented_dims(orientation, dims);
+        self.meta.width = out_dims.0;
+        self.meta.height = out_dims.1;
+        self.meta.page_dims = out_dims;
+        self
+    }
+
+    pub fn gray_u8(
         width: u32,
         height: u32,
         format: Format,
         transfer: Transfer,
-        depth: Depth,
-        luma: Plane,
+        luma: Box<[u8]>,
     ) -> Result<Self, MsgError> {
-        let yuv = YuvImage {
-            spec: YuvSpec {
-                depth,
-                subsampling: Subsampling::Mono,
+        Self::gray(
+            width,
+            height,
+            format,
+            transfer,
+            GrayImage {
                 full_range: true,
-                matrix: Matrix::Identity,
+                samples: Samples::U8(GrayPlanes { luma, alpha: None }),
             },
-            luma,
-            cb: Plane::U8(Box::new([])),
-            cr: Plane::U8(Box::new([])),
-            alpha: None,
-        };
-        Self::yuv(width, height, format, transfer, yuv)
+        )
+    }
+
+    pub fn gray_u16(
+        width: u32,
+        height: u32,
+        format: Format,
+        transfer: Transfer,
+        depth: WideDepth,
+        luma: Box<[u16]>,
+    ) -> Result<Self, MsgError> {
+        Self::gray(
+            width,
+            height,
+            format,
+            transfer,
+            GrayImage {
+                full_range: true,
+                samples: Samples::U16 {
+                    depth,
+                    planes: GrayPlanes { luma, alpha: None },
+                },
+            },
+        )
     }
 
     pub fn resident_bytes(&self) -> usize {
         match &self.pixels {
             Pixels::Rgba8(bytes) => bytes.len(),
-            Pixels::Yuv(yuv) => {
-                yuv.luma.byte_len()
-                    + yuv.cb.byte_len()
-                    + yuv.cr.byte_len()
-                    + yuv.alpha.as_ref().map_or(0, Plane::byte_len)
-            }
+            Pixels::Gray(gray) => gray.byte_len(),
+            Pixels::Yuv(yuv) => yuv.byte_len(),
         }
     }
 }
@@ -237,15 +372,10 @@ pub const RGBA_BYTES_PER_PIXEL: usize = 4;
 pub struct YuvLayout {
     pub luma_samples: usize,
     pub chroma_samples: usize,
-    pub is_u16: bool,
+    pub depth: Depth,
 }
 
 impl YuvLayout {
-    #[must_use]
-    pub fn sample_bytes(self) -> usize {
-        if self.is_u16 { size_of::<u16>() } else { 1 }
-    }
-
     #[must_use]
     pub fn total_bytes(self, has_alpha: bool) -> Option<usize> {
         let alpha = if has_alpha { self.luma_samples } else { 0 };
@@ -253,7 +383,7 @@ impl YuvLayout {
             .checked_add(self.chroma_samples)?
             .checked_add(self.chroma_samples)?
             .checked_add(alpha)?
-            .checked_mul(self.sample_bytes())
+            .checked_mul(self.depth.sample_bytes())
     }
 }
 
@@ -275,6 +405,25 @@ pub fn validate_rgba_extent(
     Ok(())
 }
 
+pub fn validate_gray_extents(
+    dims: (u32, u32),
+    depth: Depth,
+    luma_bytes: usize,
+    alpha_bytes: Option<usize>,
+) -> Result<(), MsgError> {
+    let luma_samples =
+        admit_dims(dims.0, dims.1, "bad dimensions")? as usize;
+    let expected_bytes = luma_samples
+        .checked_mul(depth.sample_bytes())
+        .ok_or_else(|| MsgError::from_static("gray plane extent"))?;
+    if luma_bytes != expected_bytes
+        || alpha_bytes.is_some_and(|len| len != expected_bytes)
+    {
+        return Err(MsgError::from_static("gray plane extent"));
+    }
+    Ok(())
+}
+
 pub fn yuv_layout(
     dims: (u32, u32),
     depth: Depth,
@@ -282,17 +431,13 @@ pub fn yuv_layout(
 ) -> Result<YuvLayout, MsgError> {
     let luma_samples =
         admit_dims(dims.0, dims.1, "bad dimensions")? as usize;
-    let is_u16 = depth.is_wide();
-    let (_, (chroma_w, chroma_h)) = plane_dims(dims, subsampling);
-    let chroma_samples = if subsampling == Subsampling::Mono {
-        0
-    } else {
-        admit_dims(chroma_w, chroma_h, "bad dimensions")? as usize
-    };
+    let (_, (chroma_width, chroma_height)) = plane_dims(dims, subsampling);
+    let chroma_samples =
+        admit_dims(chroma_width, chroma_height, "bad dimensions")? as usize;
     Ok(YuvLayout {
         luma_samples,
         chroma_samples,
-        is_u16,
+        depth,
     })
 }
 
@@ -304,7 +449,7 @@ pub fn validate_yuv_extents(
     alpha_bytes: Option<usize>,
 ) -> Result<(), MsgError> {
     let layout = yuv_layout(dims, depth, subsampling)?;
-    let sample_bytes = layout.sample_bytes();
+    let sample_bytes = depth.sample_bytes();
     let expected_luma_bytes = layout
         .luma_samples
         .checked_mul(sample_bytes)
@@ -315,9 +460,8 @@ pub fn validate_yuv_extents(
         .ok_or_else(|| MsgError::from_static("yuv plane extent"))?;
     if luma_bytes != expected_luma_bytes
         || alpha_bytes.is_some_and(|len| len != expected_luma_bytes)
-        || (subsampling != Subsampling::Mono
-            && (chroma_blue_bytes != expected_chroma_bytes
-                || chroma_red_bytes != expected_chroma_bytes))
+        || chroma_blue_bytes != expected_chroma_bytes
+        || chroma_red_bytes != expected_chroma_bytes
     {
         return Err(MsgError::from_static("yuv plane extent"));
     }
@@ -328,10 +472,12 @@ pub fn validate_yuv_extents(
 pub const MAX_PIXELS: u32 =
     (512 * 1024 * 1024) >> RGBA_BYTES_PER_PIXEL.ilog2();
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Pixels {
     /// Interleaved RGBA, `4 * width * height` bytes, row-major, top-first.
     Rgba8(Box<[u8]>),
+    /// Planar grayscale, converted to RGB in the renderer's shader.
+    Gray(GrayImage),
     /// Planar YUV, converted to RGB in the renderer's shader.
     Yuv(YuvImage),
 }
@@ -372,21 +518,191 @@ pub enum Loops {
     Finite(u32),
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct GrayPlanes<Sample> {
+    pub luma: Box<[Sample]>,
+    pub alpha: Option<Box<[Sample]>>,
+}
+
+impl<Sample> GrayPlanes<Sample> {
+    fn byte_lens(&self) -> (usize, Option<usize>) {
+        (
+            size_of_val(&*self.luma),
+            self.alpha.as_deref().map(size_of_val),
+        )
+    }
+
+    fn transform(&self, dims: (u32, u32), orientation: Orientation) -> Self
+    where
+        Sample: Copy,
+    {
+        Self {
+            luma: transform_samples(&self.luma, dims, orientation),
+            alpha: self
+                .alpha
+                .as_ref()
+                .map(|alpha| transform_samples(alpha, dims, orientation)),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct YuvPlanes<Sample> {
+    pub luma: Box<[Sample]>,
+    pub cb: Box<[Sample]>,
+    pub cr: Box<[Sample]>,
+    pub alpha: Option<Box<[Sample]>>,
+}
+
+impl<Sample> YuvPlanes<Sample> {
+    fn byte_lens(&self) -> ([usize; 3], Option<usize>) {
+        (
+            [
+                size_of_val(&*self.luma),
+                size_of_val(&*self.cb),
+                size_of_val(&*self.cr),
+            ],
+            self.alpha.as_deref().map(size_of_val),
+        )
+    }
+
+    fn transform(
+        &self,
+        luma_dims: (u32, u32),
+        chroma_dims: (u32, u32),
+        orientation: Orientation,
+    ) -> Self
+    where
+        Sample: Copy,
+    {
+        Self {
+            luma: transform_samples(&self.luma, luma_dims, orientation),
+            cb: transform_samples(&self.cb, chroma_dims, orientation),
+            cr: transform_samples(&self.cr, chroma_dims, orientation),
+            alpha: self
+                .alpha
+                .as_ref()
+                .map(|alpha| transform_samples(alpha, luma_dims, orientation)),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub enum Samples<Planes8, Planes16> {
+    U8(Planes8),
+    U16 {
+        depth: WideDepth,
+        planes: Planes16,
+    },
+}
+
+impl<Planes8, Planes16> Samples<Planes8, Planes16> {
+    #[must_use]
+    pub const fn depth(&self) -> Depth {
+        match self {
+            Self::U8(_) => Depth::D8,
+            Self::U16 { depth, .. } => depth.depth(),
+        }
+    }
+}
+
+pub type GraySamples = Samples<GrayPlanes<u8>, GrayPlanes<u16>>;
+pub type YuvSamples = Samples<YuvPlanes<u8>, YuvPlanes<u16>>;
+
 /// 8-bit planes are one byte per sample; deeper planes are `u16` with
-/// `spec.depth` significant bits. Mono carries luma only; alpha, when present,
-/// is a luma-sized full-range plane.
-#[derive(Clone)]
+/// `depth` significant bits. Alpha, when present, is a luma-sized
+/// full-range plane.
+#[derive(Clone, PartialEq, Eq)]
+pub struct GrayImage {
+    pub full_range: bool,
+    pub samples: GraySamples,
+}
+
+impl GrayImage {
+    #[must_use]
+    pub const fn depth(&self) -> Depth {
+        self.samples.depth()
+    }
+
+    #[must_use]
+    pub const fn spec(&self) -> GraySpec {
+        GraySpec {
+            depth: self.depth(),
+            full_range: self.full_range,
+        }
+    }
+
+    #[must_use]
+    pub fn has_alpha(&self) -> bool {
+        match &self.samples {
+            Samples::U8(planes) => planes.alpha.is_some(),
+            Samples::U16 { planes, .. } => planes.alpha.is_some(),
+        }
+    }
+
+    fn byte_lens(&self) -> (usize, Option<usize>) {
+        match &self.samples {
+            Samples::U8(planes) => planes.byte_lens(),
+            Samples::U16 { planes, .. } => planes.byte_lens(),
+        }
+    }
+
+    fn byte_len(&self) -> usize {
+        let (luma, alpha) = self.byte_lens();
+        luma + alpha.unwrap_or(0)
+    }
+}
+
+/// 8-bit planes are one byte per sample; deeper planes are `u16` with
+/// `depth` significant bits. Alpha, when present, is a luma-sized
+/// full-range plane.
+#[derive(Clone, PartialEq, Eq)]
 pub struct YuvImage {
-    pub spec: YuvSpec,
-    pub luma: Plane,
-    pub cb: Plane,
-    pub cr: Plane,
-    pub alpha: Option<Plane>,
+    pub subsampling: Subsampling,
+    pub full_range: bool,
+    pub matrix: Matrix,
+    pub samples: YuvSamples,
+}
+
+impl YuvImage {
+    #[must_use]
+    pub const fn depth(&self) -> Depth {
+        self.samples.depth()
+    }
+
+    #[must_use]
+    pub const fn spec(&self) -> YuvSpec {
+        YuvSpec {
+            depth: self.depth(),
+            subsampling: self.subsampling,
+            full_range: self.full_range,
+            matrix: self.matrix,
+        }
+    }
+
+    #[must_use]
+    pub fn has_alpha(&self) -> bool {
+        match &self.samples {
+            Samples::U8(planes) => planes.alpha.is_some(),
+            Samples::U16 { planes, .. } => planes.alpha.is_some(),
+        }
+    }
+
+    fn byte_lens(&self) -> ([usize; 3], Option<usize>) {
+        match &self.samples {
+            Samples::U8(planes) => planes.byte_lens(),
+            Samples::U16 { planes, .. } => planes.byte_lens(),
+        }
+    }
+
+    fn byte_len(&self) -> usize {
+        let ([luma, cb, cr], alpha) = self.byte_lens();
+        luma + cb + cr + alpha.unwrap_or(0)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub enum Subsampling {
-    Mono,
     Yuv420,
     Yuv422,
     Yuv444,
@@ -394,12 +710,11 @@ pub enum Subsampling {
 
 impl Subsampling {
     /// Chroma texels per luma texel on each axis: the sampling ratio
-    /// behind `plane_dims`'s texel counts. Mono carries no chroma, so
-    /// its ratio is identity for the renderer's midpoint stub.
+    /// behind `plane_dims`'s texel counts.
     #[must_use]
     pub fn chroma_ratio(self) -> (f64, f64) {
         match self {
-            Self::Mono | Self::Yuv444 => (1.0, 1.0),
+            Self::Yuv444 => (1.0, 1.0),
             Self::Yuv420 => (0.5, 0.5),
             Self::Yuv422 => (0.5, 1.0),
         }
@@ -414,29 +729,12 @@ pub enum Matrix {
     Identity,
 }
 
-#[derive(Clone)]
-pub enum Plane {
-    U8(Box<[u8]>),
-    U16(Box<[u16]>),
-}
-
-impl Plane {
-    pub fn byte_len(&self) -> usize {
-        match self {
-            Self::U8(bytes) => bytes.len(),
-            Self::U16(words) => words.len() * 2,
-        }
-    }
-}
-
-/// Mono's chroma dims are 1x1 so renderers can bind a midpoint texture.
 pub fn plane_dims(
     size: (u32, u32),
     subsampling: Subsampling,
 ) -> ((u32, u32), (u32, u32)) {
     let (width, height) = size;
     match subsampling {
-        Subsampling::Mono => ((width, height), (1, 1)),
         Subsampling::Yuv420 => {
             ((width, height), (width.div_ceil(2), height.div_ceil(2)))
         }
@@ -447,92 +745,53 @@ pub fn plane_dims(
     }
 }
 
-/// Byte view of a plane. `u16` planes become native-endian byte pairs.
-pub fn plane_bytes(plane: &Plane) -> &[u8] {
-    match plane {
-        Plane::U8(bytes) => bytes,
-        Plane::U16(words) => bytemuck::cast_slice(words),
+fn orientation_swaps_dims(orientation: Orientation) -> bool {
+    matches!(
+        orientation,
+        Orientation::Rotate90
+            | Orientation::Rotate270
+            | Orientation::Rotate90FlipH
+            | Orientation::Rotate270FlipH
+    )
+}
+
+#[must_use]
+fn oriented_dims(
+    orientation: Orientation,
+    (width, height): (u32, u32),
+) -> (u32, u32) {
+    if orientation_swaps_dims(orientation) {
+        (height, width)
+    } else {
+        (width, height)
     }
 }
 
-/// The AVIF irot/imir display transform, applied at decode so the renderer
-/// and the layout see upright pixels with plain dimensions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DisplayTransform {
-    /// Quarter-turns counter-clockwise (the `irot` angle), 0..=3.
-    pub quarters: u8,
-    /// The `imir` axis: 0 exchanges top and bottom, 1 exchanges left and
-    /// right.
-    pub mirror_axis: Option<u8>,
-}
-
-impl DisplayTransform {
-    pub const UPRIGHT: Self = Self {
-        quarters: 0,
-        mirror_axis: None,
-    };
-
-    pub fn swaps_dims(self) -> bool {
-        self.quarters % 2 == 1
-    }
-
-    #[must_use]
-    pub fn out_dims(self, (width, height): (u32, u32)) -> (u32, u32) {
-        if self.swaps_dims() {
-            (height, width)
-        } else {
-            (width, height)
-        }
-    }
-}
-
-/// Transforms one row-major plane; empty stub planes stay empty.
-pub fn transform_plane(
-    plane: Plane,
+fn transform_rgba(
+    bytes: &[u8],
     dims: (u32, u32),
-    transform: DisplayTransform,
-) -> Plane {
-    if transform == DisplayTransform::UPRIGHT {
-        return plane;
-    }
-    match plane {
-        Plane::U8(samples) if samples.is_empty() => Plane::U8(samples),
-        Plane::U16(samples) if samples.is_empty() => Plane::U16(samples),
-        Plane::U8(samples) => {
-            Plane::U8(transform_samples(&samples, dims, transform))
-        }
-        Plane::U16(samples) => {
-            Plane::U16(transform_samples(&samples, dims, transform))
-        }
-    }
-}
-
-pub fn transform_rgba(
-    bytes: Box<[u8]>,
-    dims: (u32, u32),
-    transform: DisplayTransform,
+    orientation: Orientation,
 ) -> Box<[u8]> {
-    if transform == DisplayTransform::UPRIGHT || bytes.is_empty() {
-        return bytes;
+    if bytes.is_empty() {
+        return Box::new([]);
     }
     let (pixels, tail) = bytes.as_chunks::<RGBA_BYTES_PER_PIXEL>();
     debug_assert!(tail.is_empty(), "rgba buffer must be 4-byte aligned");
-    transform_samples(pixels, dims, transform)
+    transform_samples(pixels, dims, orientation)
         .into_vec()
         .into_flattened()
         .into_boxed_slice()
 }
 
-/// Mirroring runs before rotation, matching the property order HEIF writers use.
-fn transform_samples<T>(
-    samples: &[T],
+fn transform_samples<Sample>(
+    samples: &[Sample],
     (width, height): (u32, u32),
-    transform: DisplayTransform,
-) -> Box<[T]>
+    orientation: Orientation,
+) -> Box<[Sample]>
 where
-    T: Copy,
+    Sample: Copy,
 {
-    let (out_width, out_height) = transform.out_dims((width, height));
+    let (out_width, out_height) = oriented_dims(orientation, (width, height));
     let (width, height) = (width as usize, height as usize);
     debug_assert_eq!(
         samples.len(),
@@ -542,17 +801,20 @@ where
     let mut out = Vec::with_capacity(samples.len());
     for out_y in 0..out_height as usize {
         for out_x in 0..out_width as usize {
-            let (mut source_x, mut source_y) = match transform.quarters {
-                1 => (width - 1 - out_y, out_x),
-                2 => (width - 1 - out_x, height - 1 - out_y),
-                3 => (out_y, height - 1 - out_x),
-                _ => (out_x, out_y),
+            let (source_x, source_y) = match orientation {
+                Orientation::NoTransforms => (out_x, out_y),
+                Orientation::Rotate90 => (out_y, height - 1 - out_x),
+                Orientation::Rotate180 => {
+                    (width - 1 - out_x, height - 1 - out_y)
+                }
+                Orientation::Rotate270 => (width - 1 - out_y, out_x),
+                Orientation::FlipHorizontal => (width - 1 - out_x, out_y),
+                Orientation::FlipVertical => (out_x, height - 1 - out_y),
+                Orientation::Rotate90FlipH => (out_y, out_x),
+                Orientation::Rotate270FlipH => {
+                    (width - 1 - out_y, height - 1 - out_x)
+                }
             };
-            match transform.mirror_axis {
-                Some(1) => source_x = width - 1 - source_x,
-                Some(_) => source_y = height - 1 - source_y,
-                None => {}
-            }
             #[expect(
                 clippy::indexing_slicing,
                 reason = "source coordinates stay within (width, height)"
@@ -590,7 +852,7 @@ pub fn decode_with_threads(
         | Format::Png
         | Format::Gif
         | Format::Bmp
-        | Format::Tiff => image::decode(bytes, format),
+        | Format::Tiff => raster::decode(bytes, format),
     }
 }
 
@@ -599,7 +861,7 @@ pub fn decode_with_threads(
 pub struct Animation {
     bytes: Bytes,
     loops: Loops,
-    frames: ::image::Frames<'static>,
+    frames: image::Frames<'static>,
 }
 
 impl Animation {
@@ -623,7 +885,7 @@ impl Animation {
                 return Some(Err(error.into()));
             }
         };
-        let delay = delay_duration(frame.delay());
+        let delay = Duration::from(frame.delay());
         let buffer = frame.into_buffer();
         let (width, height) = buffer.dimensions();
         let rgba = buffer.into_raw().into_boxed_slice();
@@ -650,15 +912,25 @@ pub struct Frame {
 
 fn open_gif_frames(
     bytes: Bytes,
-) -> eros::Result<::image::Frames<'static>> {
-    use ::image::AnimationDecoder as _;
-    use ::image::ImageDecoder as _;
-    use ::image::codecs::gif::GifDecoder;
+) -> eros::Result<image::Frames<'static>> {
+    use image::AnimationDecoder as _;
+    use image::ImageDecoder as _;
+    use image::Limits;
+    use image::codecs::gif::GifDecoder;
     use std::io::Cursor;
 
-    let decoder = GifDecoder::new(Cursor::new(bytes))?;
+    const CANVAS_BUFFERS: u64 = 2;
+
+    let mut decoder = GifDecoder::new(Cursor::new(bytes))?;
     let (width, height) = decoder.dimensions();
     admit_dims(width, height, "bad dimensions")?;
+    let screen_bytes =
+        u64::from(width) * u64::from(height) * RGBA_BYTES_PER_PIXEL as u64;
+    let max_frame_bytes =
+        u64::from(MAX_PIXELS) * RGBA_BYTES_PER_PIXEL as u64;
+    let mut limits = Limits::default();
+    limits.max_alloc = Some(screen_bytes * CANVAS_BUFFERS + max_frame_bytes);
+    decoder.set_limits(limits)?;
     Ok(decoder.into_frames())
 }
 
@@ -675,7 +947,7 @@ pub fn open_animation(
     if !format.may_animate() {
         return Ok(None);
     }
-    let loops = gif_loops(&bytes);
+    let loops = gif_loops(&bytes)?;
     let frames = open_gif_frames(bytes.clone())?;
     tracing::debug!(%format, ?loops, "animation opened");
     Ok(Some(Animation {
@@ -687,33 +959,19 @@ pub fn open_animation(
 
 /// GIF's NETSCAPE repeat field. A file without the extension reports
 /// `Finite(0)`; the `image` wrapper would call that a forever loop.
-fn gif_loops(bytes: &[u8]) -> Loops {
+fn gif_loops(bytes: &[u8]) -> eros::Result<Loops> {
     use gif::DecodeOptions;
     use gif::Repeat;
     use std::io::Cursor;
 
-    match DecodeOptions::new().read_info(Cursor::new(bytes)) {
-        Ok(decoder) => match decoder.repeat() {
-            Repeat::Infinite => Loops::Infinite,
-            Repeat::Finite(0) => Loops::Finite(1),
-            Repeat::Finite(repeats) => {
-                Loops::Finite(u32::from(repeats) + 1)
-            }
-        },
-        Err(error) => {
-            tracing::debug!(
-                %error,
-                "gif loop metadata unreadable; playing once"
-            );
-            Loops::Finite(1)
+    let decoder = DecodeOptions::new().read_info(Cursor::new(bytes))?;
+    Ok(match decoder.repeat() {
+        Repeat::Infinite => Loops::Infinite,
+        Repeat::Finite(0) => Loops::Finite(1),
+        Repeat::Finite(repeats) => {
+            Loops::Finite(u32::from(repeats) + 1)
         }
-    }
-}
-
-/// `image` reports delays as an exact millisecond ratio.
-fn delay_duration(delay: Delay) -> Duration {
-    let (numer, denom) = delay.numer_denom_ms();
-    Duration::from_millis(u64::from(numer)) / denom.max(1)
+    })
 }
 
 /// Format for a page filename's extension. The same table decides what can
@@ -790,18 +1048,22 @@ fn sniff_ftyp_avif(bytes: &[u8]) -> bool {
 /// Brand region of the leading `ftyp` box. A box length under 12 still
 /// yields the 4-byte major brand.
 fn ftyp_brands(bytes: &[u8]) -> Option<&[u8]> {
+    const BOX_FIELD_BYTES: usize = 4;
+    const BOX_HEADER_BYTES: usize = BOX_FIELD_BYTES * 2;
+    const MIN_FTYP_BOX_BYTES: usize = BOX_HEADER_BYTES + BOX_FIELD_BYTES;
+
+    let (&box_len_bytes, rest) = bytes.split_first_chunk::<BOX_FIELD_BYTES>()?;
     #[expect(
         clippy::big_endian_bytes,
         reason = "the ISOBMFF box length is big-endian by specification"
     )]
-    let box_len =
-        u32::from_be_bytes(bytes.get(..4)?.try_into().ok()?) as usize;
-    let kind: [u8; 4] = bytes.get(4..8)?.try_into().ok()?;
-    if kind != *b"ftyp" {
+    let box_len = u32::from_be_bytes(box_len_bytes) as usize;
+    let kind = rest.first_chunk::<BOX_FIELD_BYTES>()?;
+    if kind != b"ftyp" {
         return None;
     }
-    let end = box_len.max(12).min(bytes.len());
-    bytes.get(8..end)
+    let end = box_len.max(MIN_FTYP_BOX_BYTES).min(bytes.len());
+    bytes.get(BOX_HEADER_BYTES..end)
 }
 
 #[cfg(test)]
@@ -814,7 +1076,7 @@ mod tests {
     use super::*;
 
     use crate::testkit;
-    use ::image::codecs::gif::Repeat;
+    use image::codecs::gif::Repeat;
 
     #[test]
     fn format_detection() {
@@ -892,12 +1154,8 @@ mod tests {
     }
 
     #[test]
-    fn yuv_planes() {
-        // odd edges round chroma up. Mono carries a 1x1 chroma stub.
-        assert_eq!(
-            plane_dims((5, 3), Subsampling::Mono),
-            ((5, 3), (1, 1))
-        );
+    fn gray_and_yuv_planes() {
+        // odd edges round chroma up.
         assert_eq!(
             plane_dims((5, 3), Subsampling::Yuv420),
             ((5, 3), (3, 2))
@@ -911,40 +1169,31 @@ mod tests {
             ((5, 3), (5, 3))
         );
 
-        // a well-sized mono page constructs; an empty luma plane does not;
-        // a short alpha plane does not either
-        let mono = |luma: Plane, alpha: Option<Plane>| YuvImage {
-            spec: YuvSpec {
-                depth: Depth::D10,
-                subsampling: Subsampling::Mono,
-                full_range: true,
-                matrix: Matrix::Bt601,
+        let gray = |luma: Box<[u16]>, alpha: Option<Box<[u16]>>| GrayImage {
+            full_range: true,
+            samples: Samples::U16 {
+                depth: WideDepth::D10,
+                planes: GrayPlanes { luma, alpha },
             },
-            luma,
-            cb: Plane::U8(Box::new([])),
-            cr: Plane::U8(Box::new([])),
-            alpha,
         };
-        let real =
-            mono(Plane::U16(vec![0; 32 * 16].into_boxed_slice()), None);
-        let page =
-            Decoded::yuv(32, 16, Format::Avif, Transfer::Srgb, real)
-                .expect("mono yuv page constructs");
+        let real = gray(vec![0; 32 * 16].into_boxed_slice(), None);
+        let page = Decoded::gray(32, 16, Format::Avif, Transfer::Srgb, real)
+            .expect("gray page constructs");
         // The app's upload drain charges this count against its
         // per-frame byte budget.
         assert_eq!(page.resident_bytes(), 32 * 16 * 2);
-        let empty = mono(Plane::U16(Box::new([])), None);
+        let empty = gray(Box::new([]), None);
         assert_eq!(
-            Decoded::yuv(32, 16, Format::Avif, Transfer::Srgb, empty)
+            Decoded::gray(32, 16, Format::Avif, Transfer::Srgb, empty)
                 .err(),
-            Some(MsgError::from_static("yuv plane extent"))
+            Some(MsgError::from_static("gray plane extent"))
         );
-        let short_alpha = mono(
-            Plane::U16(vec![0; 32 * 16].into_boxed_slice()),
-            Some(Plane::U16(vec![0; 5].into_boxed_slice())),
+        let short_alpha = gray(
+            vec![0; 32 * 16].into_boxed_slice(),
+            Some(vec![0; 5].into_boxed_slice()),
         );
         assert_eq!(
-            Decoded::yuv(
+            Decoded::gray(
                 32,
                 16,
                 Format::Avif,
@@ -952,21 +1201,20 @@ mod tests {
                 short_alpha
             )
             .err(),
-            Some(MsgError::from_static("yuv plane extent"))
+            Some(MsgError::from_static("gray plane extent"))
         );
         // A 420 image whose chroma planes are stubs: a 4x2 image needs
         // 2x1 chroma samples.
         let undersized = YuvImage {
-            spec: YuvSpec {
-                depth: Depth::D8,
-                subsampling: Subsampling::Yuv420,
-                full_range: true,
-                matrix: Matrix::Bt601,
-            },
-            luma: Plane::U8(vec![0; 4 * 2].into_boxed_slice()),
-            cb: Plane::U8(Box::new([])),
-            cr: Plane::U8(Box::new([])),
-            alpha: None,
+            subsampling: Subsampling::Yuv420,
+            full_range: true,
+            matrix: Matrix::Bt601,
+            samples: Samples::U8(YuvPlanes {
+                luma: vec![0; 4 * 2].into_boxed_slice(),
+                cb: Box::new([]),
+                cr: Box::new([]),
+                alpha: None,
+            }),
         };
         assert_eq!(
             Decoded::yuv(4, 2, Format::Avif, Transfer::Srgb, undersized)
@@ -976,51 +1224,45 @@ mod tests {
     }
 
     #[test]
-    fn display_transform_maps_samples() {
+    fn orientation_maps_samples() {
         fn check(
             samples: &[u8],
             dims: (u32, u32),
-            transform: DisplayTransform,
+            orientation: Orientation,
             want_dims: (u32, u32),
             want_samples: &[u8],
         ) {
-            assert_eq!(transform.out_dims(dims), want_dims);
-            let plane = Plane::U8(samples.to_vec().into_boxed_slice());
+            let page = Decoded::gray_u8(
+                dims.0,
+                dims.1,
+                Format::Avif,
+                Transfer::Srgb,
+                samples.to_vec().into_boxed_slice(),
+            )
+            .expect("gray page constructs")
+            .apply_orientation(orientation);
+            assert_eq!((page.width(), page.height()), want_dims);
+            assert_eq!(page.page_dims(), want_dims);
             assert!(matches!(
-                transform_plane(plane, dims, transform),
-                Plane::U8(got) if *got == *want_samples
+                page.pixels(),
+                Pixels::Gray(GrayImage {
+                    samples: Samples::U8(planes),
+                    ..
+                }) if &*planes.luma == want_samples
             ));
         }
-        // A 2x1 plane [A B]: 90° CCW stands B above A.
-        let quarters = |quarters: u8| DisplayTransform {
-            quarters,
-            mirror_axis: None,
-        };
-        check(b"AB", (2, 1), quarters(1), (1, 2), b"BA");
+        check(b"AB", (2, 1), Orientation::NoTransforms, (2, 1), b"AB");
+        // [A B]: 90° CW stands A above B.
+        check(b"AB", (2, 1), Orientation::Rotate90, (1, 2), b"AB");
         // 180° reads the row backwards.
-        check(b"AB", (2, 1), quarters(2), (2, 1), b"BA");
-        // 270° CCW keeps [A B] standing: A above B.
-        check(b"AB", (2, 1), quarters(3), (1, 2), b"AB");
-        // 360° is identity.
-        check(b"AB", (2, 1), quarters(0), (2, 1), b"AB");
-        // A 2x2 mirror, both axes: axis 0 exchanges rows, axis 1 columns.
-        let mirror = |axis: u8| DisplayTransform {
-            quarters: 0,
-            mirror_axis: Some(axis),
-        };
-        check(b"ABCD", (2, 2), mirror(0), (2, 2), b"CDAB");
-        check(b"ABCD", (2, 2), mirror(1), (2, 2), b"BADC");
-        // Mirror runs before rotate: a horizontal mirror then a 90° turn
-        // transposes the grid.
-        let mirrored_then_turned = DisplayTransform {
-            quarters: 1,
-            mirror_axis: Some(1),
-        };
-        check(b"ABCD", (2, 2), mirrored_then_turned, (2, 2), b"ACBD");
-        assert!(matches!(
-            transform_plane(Plane::U8(Box::new([])), (1, 1), quarters(1)),
-            Plane::U8(got) if got.is_empty()
-        ));
+        check(b"AB", (2, 1), Orientation::Rotate180, (2, 1), b"BA");
+        // 270° CW (90° CCW) stands B above A.
+        check(b"AB", (2, 1), Orientation::Rotate270, (1, 2), b"BA");
+        // A 2x2 grid [AB / CD]:
+        check(b"ABCD", (2, 2), Orientation::FlipHorizontal, (2, 2), b"BADC");
+        check(b"ABCD", (2, 2), Orientation::FlipVertical, (2, 2), b"CDAB");
+        check(b"ABCD", (2, 2), Orientation::Rotate90FlipH, (2, 2), b"ACBD");
+        check(b"ABCD", (2, 2), Orientation::Rotate270FlipH, (2, 2), b"DBCA");
     }
 
     // 32x16 10-bit 4:0:0 fixture, a black-to-white grayscale gradient.
@@ -1033,17 +1275,15 @@ mod tests {
         .expect("mono avif decodes");
         assert_eq!(page.format(), Format::Avif);
         assert_eq!((page.width(), page.height()), (32, 16));
-        let Pixels::Yuv(yuv) = &page.pixels else {
-            panic!("avif must decode to yuv planes")
+        let Pixels::Gray(gray) = &page.pixels else {
+            panic!("mono avif must decode to gray plane")
         };
-        assert_eq!(yuv.spec.subsampling, Subsampling::Mono);
-        let Plane::U16(luma) = &yuv.luma else {
+        let Samples::U16 { planes, .. } = &gray.samples else {
             panic!("10-bit luma must be u16 samples")
         };
-        assert_eq!(luma.len(), 32 * 16);
-        assert!(luma.first() < luma.last());
-        assert!(matches!(&yuv.cb, Plane::U8(bytes) if bytes.is_empty()));
-        assert!(matches!(&yuv.cr, Plane::U8(bytes) if bytes.is_empty()));
+        assert_eq!(planes.luma.len(), 32 * 16);
+        assert!(planes.luma.first() < planes.luma.last());
+        assert!(planes.alpha.is_none());
     }
 
     // wide.jxl and animated.jxl are verbatim copies of exif.jxl and
@@ -1059,20 +1299,17 @@ mod tests {
         assert_eq!((gray.width(), gray.height()), (8, 8));
         assert_eq!(gray.format(), Format::Jxl);
         match gray.pixels {
-            Pixels::Yuv(yuv) => {
-                assert_eq!(yuv.spec.depth, Depth::D8);
-                assert_eq!(yuv.spec.subsampling, Subsampling::Mono);
-                assert!(yuv.spec.full_range);
-                assert_eq!(yuv.spec.matrix, Matrix::Identity);
-                assert!(yuv.alpha.is_none());
-                let Plane::U8(luma) = yuv.luma else {
+            Pixels::Gray(gray) => {
+                assert!(gray.full_range);
+                let Samples::U8(planes) = gray.samples else {
                     panic!("8-bit mono jxl must use U8 luma");
                 };
-                assert_eq!(luma.first().copied(), Some(0x20));
-                assert_eq!(luma.get(32).copied(), Some(0xE0));
+                assert!(planes.alpha.is_none());
+                assert_eq!(planes.luma.first().copied(), Some(0x20));
+                assert_eq!(planes.luma.get(32).copied(), Some(0xE0));
             }
-            Pixels::Rgba8(_) => {
-                panic!("opaque gray jxl must decode to mono")
+            Pixels::Rgba8(_) | Pixels::Yuv(_) => {
+                panic!("opaque gray jxl must decode to gray")
             }
         }
 
@@ -1093,7 +1330,9 @@ mod tests {
                     Some(&[0x40, 0x80, 0xC0, 0x80][..])
                 );
             }
-            Pixels::Yuv(_) => panic!("jxl must decode to rgba"),
+            Pixels::Gray(_) | Pixels::Yuv(_) => {
+                panic!("jxl must decode to rgba")
+            }
         }
 
         // wide: 256x128 pins the row/stride order. Opaque alpha on every
@@ -1257,5 +1496,30 @@ mod tests {
                 .expect("truncated jxl decode finishes");
             assert!(result.is_err(), "cut {cut} did not fail");
         }
+    }
+
+    #[test]
+    fn oversized_gif_frame_is_rejected_by_limits() {
+        // 1x1 logical screen, 2-color GCT, and a 20000x20000 frame descriptor
+        // (1.6 GiB RGBA, exceeding MAX_PIXELS * 4).
+        let bytes = vec![
+            b'G', b'I', b'F', b'8', b'9', b'a', // header
+            0x01, 0x00, 0x01, 0x00, // 1x1 logical screen
+            0x80, 0x00, 0x00, // GCT flag, 2 colors
+            0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, // 2 RGB colors
+            0x2C, // image separator
+            0x00, 0x00, 0x00, 0x00, // left, top = 0, 0
+            0x20, 0x4E, 0x20, 0x4E, // width, height = 20000, 20000 (LE)
+            0x00, // local color table = 0
+            0x02, 0x00, // LZW min code size 2, terminator
+            0x3B, // trailer
+        ];
+        let mut animation = open_animation(Bytes::from(bytes), "big.gif")
+            .expect("header opens")
+            .expect("gif animation");
+        let frame = animation
+            .next_frame()
+            .expect("oversized frame reports error");
+        assert!(frame.is_err(), "oversized frame must hit memory limit");
     }
 }

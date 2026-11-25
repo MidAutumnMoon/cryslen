@@ -7,6 +7,8 @@ use std::fs::DirEntry;
 use std::path::Path;
 use std::path::PathBuf;
 
+use crate::browse::Direction;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PageName {
     pub parent_dir: Option<String>,
@@ -81,7 +83,7 @@ pub fn normalize_path(path: &Path) -> PathBuf {
 pub fn sibling(
     path: &Path,
     archive: bool,
-    forward: bool,
+    direction: Direction,
 ) -> Option<PathBuf> {
     use std::ffi::OsString;
 
@@ -112,10 +114,9 @@ pub fn sibling(
     let position = siblings
         .iter()
         .position(|(_, file_name, _)| file_name.as_os_str() == current)?;
-    let next = if forward {
-        position.checked_add(1)?
-    } else {
-        position.checked_sub(1)?
+    let next = match direction {
+        Direction::Forward => position.checked_add(1)?,
+        Direction::Backward => position.checked_sub(1)?,
     };
     siblings.get(next).map(|(_, _, sibling)| sibling.clone())
 }
@@ -280,7 +281,7 @@ mod tests {
         unix_fs::symlink(targets.join("real-dir"), books.join("3-link"))
             .expect("symlink dir");
         assert_eq!(
-            sibling(&books.join("1-dir"), false, true),
+            sibling(&books.join("1-dir"), false, Direction::Forward),
             Some(books.join("3-link"))
         );
 
@@ -303,7 +304,7 @@ mod tests {
         )
         .expect("symlink archive");
         assert_eq!(
-            sibling(&books.join("1-book.cbz"), true, true),
+            sibling(&books.join("1-book.cbz"), true, Direction::Forward),
             Some(books.join("4-link.cbz"))
         );
     }

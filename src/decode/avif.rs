@@ -1,24 +1,24 @@
 //! AVIF decode through libavif. The FFI `unsafe` is confined to this
 //! module.
 
+use bytemuck::Pod;
+use image::metadata::Orientation;
 use libavif_sys::avifDecoder;
 use libavif_sys::avifImage;
 use libavif_sys::avifResult;
 use std::marker::PhantomData;
 
 use super::Decoded;
-use super::Depth;
-use super::DisplayTransform;
-use super::Plane;
+use super::GrayPlanes;
+use super::Samples;
+use super::Subsampling;
+use super::WideDepth;
+use super::YuvPlanes;
 
 /// dav1d parallelism saturates quickly on stills, so the thread count
 /// is capped.
 const MAX_THREADS: i32 = 8;
 
-#[expect(
-    clippy::similar_names,
-    reason = "Cb and Cr are the YUV plane names the two locals hold"
-)]
 pub(super) fn decode(
     bytes: &[u8],
     max_threads: usize,
@@ -38,42 +38,24 @@ pub(super) fn decode(
     use libavif_sys::AVIF_TRANSFER_CHARACTERISTICS_SMPTE2084;
 
     use super::Format;
+    use super::GrayImage;
     use super::Matrix;
-    use super::Subsampling;
     use super::Transfer;
     use super::YuvImage;
-    use super::YuvSpec;
 
     let decoder = DecoderGuard::new(bytes, max_threads)?;
     let frame = decoder.image()?;
 
     let (width, height) = (frame.width, frame.height);
-    let depth = match frame.depth {
-        8 => Depth::D8,
-        10 => Depth::D10,
-        12 => Depth::D12,
-        16 => Depth::D16,
+    let wide_depth = match frame.depth {
+        8 => None,
+        10 => Some(WideDepth::D10),
+        12 => Some(WideDepth::D12),
+        16 => Some(WideDepth::D16),
         _ => eros::bail!("avif: bad depth"),
     };
     super::admit_dims(width, height, "avif: bad dimensions")?;
-    let subsampling = match frame.yuvFormat {
-        AVIF_PIXEL_FORMAT_YUV444 => Subsampling::Yuv444,
-        AVIF_PIXEL_FORMAT_YUV422 => Subsampling::Yuv422,
-        AVIF_PIXEL_FORMAT_YUV420 => Subsampling::Yuv420,
-        AVIF_PIXEL_FORMAT_YUV400 => Subsampling::Mono,
-        _ => eros::bail!("avif: unsupported pixel format"),
-    };
     let full_range = frame.yuvRange == AVIF_RANGE_FULL;
-    let matrix = match u32::from(frame.matrixCoefficients) {
-        AVIF_MATRIX_COEFFICIENTS_IDENTITY => Matrix::Identity,
-        AVIF_MATRIX_COEFFICIENTS_BT709 => Matrix::Bt709,
-        AVIF_MATRIX_COEFFICIENTS_BT2020_NCL => Matrix::Bt2020,
-        // avifCalcYUVCoefficients treats unspecified/BG/601 as BT.601.
-        AVIF_MATRIX_COEFFICIENTS_UNSPECIFIED
-        | AVIF_MATRIX_COEFFICIENTS_BT470BG
-        | AVIF_MATRIX_COEFFICIENTS_BT601 => Matrix::Bt601,
-        _ => eros::bail!("avif: unsupported matrix coefficients"),
-    };
     // HLG has no fixed SDR map; a wrong render is worse than a
     // refused page.
     let transfer = match u32::from(frame.transferCharacteristics) {
@@ -83,85 +65,70 @@ pub(super) fn decode(
         }
         _ => Transfer::Srgb,
     };
-    let transform = display_transform(frame);
-    // A quarter turn makes 4:2:2 subsample vertically instead of
-    // horizontally, which no plane geometry in the model expresses.
-    if transform.swaps_dims() && subsampling == Subsampling::Yuv422 {
-        eros::bail!("avif: unsupported rotated 4:2:2");
-    }
+    let orientation = orientation(frame);
+    let yuv = if frame.yuvFormat == AVIF_PIXEL_FORMAT_YUV400 {
+        None
+    } else {
+        let subsampling = match frame.yuvFormat {
+            AVIF_PIXEL_FORMAT_YUV444 => Subsampling::Yuv444,
+            AVIF_PIXEL_FORMAT_YUV422 => Subsampling::Yuv422,
+            AVIF_PIXEL_FORMAT_YUV420 => Subsampling::Yuv420,
+            _ => eros::bail!("avif: unsupported pixel format"),
+        };
+        let matrix = match u32::from(frame.matrixCoefficients) {
+            AVIF_MATRIX_COEFFICIENTS_IDENTITY => Matrix::Identity,
+            AVIF_MATRIX_COEFFICIENTS_BT709 => Matrix::Bt709,
+            AVIF_MATRIX_COEFFICIENTS_BT2020_NCL => Matrix::Bt2020,
+            // avifCalcYUVCoefficients treats unspecified/BG/601 as BT.601.
+            AVIF_MATRIX_COEFFICIENTS_UNSPECIFIED
+            | AVIF_MATRIX_COEFFICIENTS_BT470BG
+            | AVIF_MATRIX_COEFFICIENTS_BT601 => Matrix::Bt601,
+            _ => eros::bail!("avif: unsupported matrix coefficients"),
+        };
+        // A quarter turn makes 4:2:2 subsample vertically instead of
+        // horizontally, which no plane geometry in the model expresses.
+        if super::orientation_swaps_dims(orientation)
+            && subsampling == Subsampling::Yuv422
+        {
+            eros::bail!("avif: unsupported rotated 4:2:2");
+        }
+        Some((subsampling, matrix))
+    };
 
-    // Mono skips the chroma copy below, so its 1x1 stub dims from
-    // `super::plane_dims` are unused.
-    let (_, (chroma_width, chroma_height)) =
-        super::plane_dims((width, height), subsampling);
-    // SAFETY: the guard still owns the frame, so the luma plane is live.
-    // `copy_plane` rejects null planes and short strides.
-    let luma_plane = unsafe {
-        copy_plane(
-            frame.yuvPlanes[0],
-            frame.yuvRowBytes[0],
+    let Some((subsampling, matrix)) = yuv else {
+        let samples = match wide_depth {
+            // SAFETY: the guard keeps `frame`'s planes live; `copy_plane` rejects null/short strides.
+            None => Samples::U8(unsafe { copy_gray_planes::<u8>(frame) }?),
+            Some(depth) => Samples::U16 {
+                depth,
+                // SAFETY: the guard keeps `frame`'s planes live; `copy_plane` rejects null/short strides.
+                planes: unsafe { copy_gray_planes::<u16>(frame) }?,
+            },
+        };
+        return Ok(Decoded::gray(
             width,
             height,
-            depth,
-        )
-    }?;
-    let (cb_plane, cr_plane) = if subsampling == Subsampling::Mono {
-        (Plane::U8(Box::new([])), Plane::U8(Box::new([])))
-    } else {
-        (
-            // SAFETY: same contract as the luma plane.
-            unsafe {
-                copy_plane(
-                    frame.yuvPlanes[1],
-                    frame.yuvRowBytes[1],
-                    chroma_width,
-                    chroma_height,
-                    depth,
-                )
-            }?,
-            // SAFETY: same contract as the luma plane.
-            unsafe {
-                copy_plane(
-                    frame.yuvPlanes[2],
-                    frame.yuvRowBytes[2],
-                    chroma_width,
-                    chroma_height,
-                    depth,
-                )
-            }?,
-        )
-    };
-    // SAFETY: same contract as the luma plane, at luma dimensions.
-    let alpha_plane = unsafe {
-        (!frame.alphaPlane.is_null())
-            .then(|| {
-                copy_plane(
-                    frame.alphaPlane,
-                    frame.alphaRowBytes,
-                    width,
-                    height,
-                    depth,
-                )
-            })
-            .transpose()?
+            Format::Avif,
+            transfer,
+            GrayImage {
+                full_range,
+                samples,
+            },
+        )?
+        .apply_orientation(orientation));
     };
 
-    let luma_plane =
-        super::transform_plane(luma_plane, (width, height), transform);
-    let cb_plane = super::transform_plane(
-        cb_plane,
-        (chroma_width, chroma_height),
-        transform,
-    );
-    let cr_plane = super::transform_plane(
-        cr_plane,
-        (chroma_width, chroma_height),
-        transform,
-    );
-    let alpha_plane = alpha_plane.map(|plane| {
-        super::transform_plane(plane, (width, height), transform)
-    });
-    let (width, height) = transform.out_dims((width, height));
+    let samples = match wide_depth {
+        // SAFETY: the guard keeps `frame`'s planes live; `copy_plane` rejects null/short strides.
+        None => Samples::U8(unsafe {
+            copy_yuv_planes::<u8>(frame, subsampling)
+        }?),
+        Some(depth) => Samples::U16 {
+            depth,
+            // SAFETY: the guard keeps `frame`'s planes live; `copy_plane` rejects null/short strides.
+            planes: unsafe { copy_yuv_planes::<u16>(frame, subsampling) }?,
+        },
+    };
 
     Ok(Decoded::yuv(
         width,
@@ -169,35 +136,50 @@ pub(super) fn decode(
         Format::Avif,
         transfer,
         YuvImage {
-            spec: YuvSpec {
-                depth,
-                subsampling,
-                full_range,
-                matrix,
-            },
-            luma: luma_plane,
-            cb: cb_plane,
-            cr: cr_plane,
-            alpha: alpha_plane,
+            subsampling,
+            full_range,
+            matrix,
+            samples,
         },
-    )?)
+    )?
+    .apply_orientation(orientation))
 }
 
-fn display_transform(frame: &avifImage) -> DisplayTransform {
+/// Mirroring runs before rotation, matching the property order HEIF writers use.
+fn orientation(frame: &avifImage) -> Orientation {
     use libavif_sys::AVIF_TRANSFORM_IMIR;
     use libavif_sys::AVIF_TRANSFORM_IROT;
 
+    const QUARTER_TURNS_PER_ROTATION: u8 = 4;
+    const IMIR_HORIZONTAL_AXIS: u8 = 1;
+
     let flags = frame.transformFlags;
-    let quarters = if flags & AVIF_TRANSFORM_IROT != 0 {
-        frame.irot.angle % 4
+    let ccw_quarters = if flags & AVIF_TRANSFORM_IROT != 0 {
+        frame.irot.angle % QUARTER_TURNS_PER_ROTATION
     } else {
         0
     };
     let mirror_axis =
         (flags & AVIF_TRANSFORM_IMIR != 0).then_some(frame.imir.axis);
-    DisplayTransform {
-        quarters,
-        mirror_axis,
+    match mirror_axis {
+        None => match ccw_quarters {
+            0 => Orientation::NoTransforms,
+            1 => Orientation::Rotate270,
+            2 => Orientation::Rotate180,
+            _ => Orientation::Rotate90,
+        },
+        Some(IMIR_HORIZONTAL_AXIS) => match ccw_quarters {
+            0 => Orientation::FlipHorizontal,
+            1 => Orientation::Rotate90FlipH,
+            2 => Orientation::FlipVertical,
+            _ => Orientation::Rotate270FlipH,
+        },
+        Some(_) => match ccw_quarters {
+            0 => Orientation::FlipVertical,
+            1 => Orientation::Rotate270FlipH,
+            2 => Orientation::FlipHorizontal,
+            _ => Orientation::Rotate90FlipH,
+        },
     }
 }
 
@@ -225,57 +207,118 @@ fn check(code: avifResult, what: &'static str) -> eros::Result<()> {
 
 /// # Safety
 ///
+/// Live non-null planes in `frame` must hold `frame.height` rows at their
+/// declared row strides.
+unsafe fn copy_gray_planes<Sample>(
+    frame: &avifImage,
+) -> eros::Result<GrayPlanes<Sample>>
+where
+    Sample: Copy + Default + Pod,
+{
+    // SAFETY: caller guarantees `frame`'s luma plane is live.
+    let luma = unsafe {
+        copy_plane::<Sample>(
+            frame.yuvPlanes[0],
+            frame.yuvRowBytes[0],
+            frame.width,
+            frame.height,
+        )
+    }?;
+    // SAFETY: caller guarantees `frame`'s alpha plane is live when non-null.
+    let alpha = unsafe {
+        (!frame.alphaPlane.is_null())
+            .then(|| {
+                copy_plane::<Sample>(
+                    frame.alphaPlane,
+                    frame.alphaRowBytes,
+                    frame.width,
+                    frame.height,
+                )
+            })
+            .transpose()?
+    };
+    Ok(GrayPlanes { luma, alpha })
+}
+
+/// # Safety
+///
+/// Live non-null planes in `frame` must hold their subsampled dimensions at
+/// their declared row strides.
+unsafe fn copy_yuv_planes<Sample>(
+    frame: &avifImage,
+    subsampling: Subsampling,
+) -> eros::Result<YuvPlanes<Sample>>
+where
+    Sample: Copy + Default + Pod,
+{
+    // SAFETY: caller guarantees `frame`'s luma and alpha planes are live.
+    let gray = unsafe { copy_gray_planes::<Sample>(frame) }?;
+    let (_, (chroma_width, chroma_height)) =
+        super::plane_dims((frame.width, frame.height), subsampling);
+    // SAFETY: caller guarantees `frame`'s Cb plane is live.
+    let cb = unsafe {
+        copy_plane::<Sample>(
+            frame.yuvPlanes[1],
+            frame.yuvRowBytes[1],
+            chroma_width,
+            chroma_height,
+        )
+    }?;
+    // SAFETY: caller guarantees `frame`'s Cr plane is live.
+    let cr = unsafe {
+        copy_plane::<Sample>(
+            frame.yuvPlanes[2],
+            frame.yuvRowBytes[2],
+            chroma_width,
+            chroma_height,
+        )
+    }?;
+    Ok(YuvPlanes {
+        luma: gray.luma,
+        cb,
+        cr,
+        alpha: gray.alpha,
+    })
+}
+
+/// # Safety
+///
 /// When non-null, `plane_ptr` must hold `height` live rows spaced by
 /// `row_stride` bytes.
-unsafe fn copy_plane(
+unsafe fn copy_plane<Sample>(
     plane_ptr: *const u8,
     row_stride: u32,
     width: u32,
     height: u32,
-    depth: Depth,
-) -> eros::Result<Plane> {
+) -> eros::Result<Box<[Sample]>>
+where
+    Sample: Copy + Default + Pod,
+{
     if plane_ptr.is_null() {
         eros::bail!("avif: missing plane");
     }
     let width = width as usize;
     let height = height as usize;
     let row_stride = row_stride as usize;
-    let wide = depth.is_wide();
-    let sample_bytes = if wide { size_of::<u16>() } else { 1 };
-    let row_bytes = width * sample_bytes;
+    let row_bytes = width * size_of::<Sample>();
     if row_stride < row_bytes {
         eros::bail!("avif: bad stride");
     }
     if width == 0 || height == 0 {
-        return Ok(if wide {
-            Plane::U16(Box::new([]))
-        } else {
-            Plane::U8(Box::new([]))
-        });
+        return Ok(Box::new([]));
     }
-    if wide {
-        let mut out = vec![0_u16; width * height];
-        // SAFETY: `plane_ptr` holds `height` live rows at `row_stride >= row_bytes`.
-        unsafe {
-            copy_strided_bytes(
-                plane_ptr,
-                row_stride,
-                row_bytes,
-                height,
-                bytemuck::cast_slice_mut(&mut out),
-            );
-        }
-        Ok(Plane::U16(out.into_boxed_slice()))
-    } else {
-        let mut out = vec![0_u8; width * height];
-        // SAFETY: `plane_ptr` holds `height` live rows at `row_stride >= row_bytes`.
-        unsafe {
-            copy_strided_bytes(
-                plane_ptr, row_stride, row_bytes, height, &mut out,
-            );
-        }
-        Ok(Plane::U8(out.into_boxed_slice()))
+    let mut out = vec![Sample::default(); width * height];
+    // SAFETY: `plane_ptr` holds `height` live rows at `row_stride >= row_bytes`.
+    unsafe {
+        copy_strided_bytes(
+            plane_ptr,
+            row_stride,
+            row_bytes,
+            height,
+            bytemuck::cast_slice_mut(&mut out),
+        );
     }
+    Ok(out.into_boxed_slice())
 }
 
 /// # Safety
@@ -407,29 +450,29 @@ mod tests {
         let raw_u8 = [10_u8, 20, 30, 40];
         // SAFETY: `raw_u8` holds two contiguous 2-byte rows.
         let contiguous_u8 =
-            unsafe { copy_plane(raw_u8.as_ptr(), 2, 2, 2, Depth::D8) };
+            unsafe { copy_plane::<u8>(raw_u8.as_ptr(), 2, 2, 2) };
         assert!(matches!(
             contiguous_u8,
-            Ok(Plane::U8(bytes)) if *bytes == [10, 20, 30, 40]
+            Ok(bytes) if *bytes == [10, 20, 30, 40]
         ));
 
         let padded_u8 = [10_u8, 20, 0xff, 0xff, 30, 40];
         // SAFETY: `padded_u8` holds 2 rows at stride 4 with the last row 2 bytes wide.
         let strided_u8 =
-            unsafe { copy_plane(padded_u8.as_ptr(), 4, 2, 2, Depth::D8) };
+            unsafe { copy_plane::<u8>(padded_u8.as_ptr(), 4, 2, 2) };
         assert!(matches!(
             strided_u8,
-            Ok(Plane::U8(bytes)) if *bytes == [10, 20, 30, 40]
+            Ok(bytes) if *bytes == [10, 20, 30, 40]
         ));
 
         let padded_u16 = [100_u16, 200, 0xffff, 300, 400];
         let raw_u16: &[u8] = bytemuck::cast_slice(&padded_u16);
         // SAFETY: `raw_u16` holds 2 rows of 4 bytes spaced by stride 6 (10 bytes total).
         let strided_u16 =
-            unsafe { copy_plane(raw_u16.as_ptr(), 6, 2, 2, Depth::D10) };
+            unsafe { copy_plane::<u16>(raw_u16.as_ptr(), 6, 2, 2) };
         assert!(matches!(
             strided_u16,
-            Ok(Plane::U16(words)) if *words == [100, 200, 300, 400]
+            Ok(words) if *words == [100, 200, 300, 400]
         ));
     }
 }

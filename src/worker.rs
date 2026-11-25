@@ -4,12 +4,10 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
-use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::fmt::Display;
+use std::mem::DropGuard;
 use std::num::NonZeroUsize;
-use std::panic;
-use std::panic::AssertUnwindSafe;
 use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -72,42 +70,35 @@ fn available_parallelism() -> usize {
 
 #[derive(Clone, Copy, Debug)]
 enum PlaybackStep {
-    Start { id: PlaybackId, role: Role },
+    Start { id: PlaybackId },
     Next { id: PlaybackId },
 }
 
 impl PlaybackStep {
     const fn id(self) -> PlaybackId {
         match self {
-            Self::Start { id, .. } | Self::Next { id } => id,
+            Self::Start { id } | Self::Next { id } => id,
         }
     }
 }
 
 struct PlaybackSession {
     id: PlaybackId,
-    role: Role,
     animation: Animation,
     passes: u32,
 }
 
 impl PlaybackSession {
     fn advance(&mut self) -> eros::Result<Option<Frame>> {
-        let mut rewound = false;
-        loop {
-            if let Some(frame) = self.animation.next_frame().transpose()? {
-                return Ok(Some(frame));
-            }
-            if rewound {
-                return Ok(None);
-            }
-            self.passes = self.passes.saturating_add(1);
-            if !self.should_repeat() {
-                return Ok(None);
-            }
-            self.animation.rewind()?;
-            rewound = true;
+        if let Some(frame) = self.animation.next_frame().transpose()? {
+            return Ok(Some(frame));
         }
+        self.passes = self.passes.saturating_add(1);
+        if !self.should_repeat() {
+            return Ok(None);
+        }
+        self.animation.rewind()?;
+        self.animation.next_frame().transpose()
     }
 
     fn should_repeat(&self) -> bool {
@@ -326,12 +317,14 @@ enum PreloadGate {
     Open,
 }
 
-#[derive(Clone, Copy)]
-struct PageState {
-    wanted: Roles,
-    in_head_still: bool,
-    in_prefetch: bool,
-    stored: Roles,
+fn includes_preview(roles: Roles) -> bool {
+    roles.contains(Role::Fit) || roles.contains(Role::Thumb)
+}
+
+struct PrefetchCandidate {
+    page: usize,
+    role: Role,
+    preload: bool,
 }
 
 struct BookState {
@@ -394,8 +387,10 @@ impl BookState {
     }
 
     fn wanted_roles(&self, page: usize) -> Roles {
+        use strum::VariantArray as _;
+
         let mut roles = Roles::default();
-        for role in [Role::Full, Role::Fit, Role::Thumb] {
+        for &role in Role::VARIANTS {
             if self.wants_unserved(page, role) {
                 roles.set(role);
             }
@@ -415,22 +410,20 @@ impl BookState {
         self.stored.get(&hash).copied().unwrap_or_default()
     }
 
-    fn page_state(&self, page: usize, hash: u128) -> PageState {
-        let in_head_still = self.motion == Motion::Still
-            && self
-                .prefetch
-                .as_ref()
-                .is_some_and(|prefetch| prefetch.in_head(page));
-        let in_prefetch = self
-            .prefetch
-            .as_ref()
-            .is_some_and(|prefetch| prefetch.contains(page));
-        PageState {
-            wanted: self.wanted_roles(page),
-            in_head_still,
-            in_prefetch,
-            stored: self.stored_for_hash(hash),
+    fn needed_roles(&self, page: usize, hash: u128) -> Roles {
+        let mut needed = self.wanted_roles(page);
+        let Some(prefetch) = self.prefetch.as_ref() else {
+            return needed;
+        };
+        if prefetch.in_head(page) && self.motion == Motion::Still {
+            needed.set(Role::Fit);
         }
+        if prefetch.contains(page)
+            && !self.stored_for_hash(hash).contains(Role::Thumb)
+        {
+            needed.set(Role::Thumb);
+        }
+        needed
     }
 
     fn in_flight_prefetch(&self) -> usize {
@@ -464,10 +457,7 @@ impl BookState {
                 .any(|&request| self.is_unsettled(request))
     }
 
-    fn next_prefetch_job(
-        &self,
-        source: &Source,
-    ) -> Option<(usize, Role, bool, Motion)> {
+    fn next_prefetch_job(&self, source: &Source) -> Option<PrefetchCandidate> {
         let prefetch = self.prefetch.as_ref()?;
         for (index, spread) in prefetch.spreads().iter().enumerate() {
             let in_head = index < prefetch.head;
@@ -488,15 +478,18 @@ impl BookState {
                     && self.motion == Motion::Still
                     && !stored.contains(Role::Fit)
                 {
-                    return Some((page, Role::Fit, false, self.motion));
+                    return Some(PrefetchCandidate {
+                        page,
+                        role: Role::Fit,
+                        preload: false,
+                    });
                 }
                 if !stored.contains(Role::Thumb) {
-                    return Some((
+                    return Some(PrefetchCandidate {
                         page,
-                        Role::Thumb,
-                        !in_head,
-                        self.motion,
-                    ));
+                        role: Role::Thumb,
+                        preload: !in_head,
+                    });
                 }
             }
         }
@@ -505,17 +498,6 @@ impl BookState {
 
     fn mark_stored(&mut self, hash: u128, role: Role) {
         self.stored.entry(hash).or_default().set(role);
-    }
-}
-
-struct InFlightGuard<'shared> {
-    shared: &'shared Shared,
-    page: usize,
-}
-
-impl Drop for InFlightGuard<'_> {
-    fn drop(&mut self) {
-        self.shared.finish_page_job(self.page);
     }
 }
 
@@ -563,6 +545,14 @@ impl Shared {
         self.state.lock().stopped
     }
 
+    fn update_and_reset_preload(&self, edit: impl FnOnce(&mut BookState)) {
+        let mut state = self.state.lock();
+        state.preload = PreloadGate::Idle;
+        edit(&mut state);
+        drop(state);
+        self.wake.notify_all();
+    }
+
     fn apply_message(
         &self,
         message: ParentMsg,
@@ -592,40 +582,36 @@ impl Shared {
                 mode,
                 direction,
             } => {
-                let mut state = self.state.lock();
-                state.preload = PreloadGate::Idle;
-                let prefetch = Prefetch::build(
-                    browse::spread_for(page, mode, state.page_count),
-                    direction,
-                    mode,
-                    state.page_count,
-                );
-                tracing::debug!(
-                    origin = ?prefetch.spreads().first(),
-                    motion = ?state.motion,
-                    "prefetch set"
-                );
-                state.prefetch = Some(prefetch);
-                drop(state);
-                self.wake.notify_all();
+                self.update_and_reset_preload(|state| {
+                    let prefetch = Prefetch::build(
+                        browse::spread_for(page, mode, state.page_count),
+                        direction,
+                        mode,
+                        state.page_count,
+                    );
+                    tracing::debug!(
+                        origin = ?prefetch.spreads().first(),
+                        motion = ?state.motion,
+                        "prefetch set"
+                    );
+                    state.prefetch = Some(prefetch);
+                });
             }
             ParentMsg::SetMotion(motion) => {
-                let mut state = self.state.lock();
-                state.preload = PreloadGate::Idle;
-                tracing::debug!(?motion, "motion");
-                state.motion = motion;
-                drop(state);
-                self.wake.notify_all();
+                self.update_and_reset_preload(|state| {
+                    tracing::debug!(?motion, "motion");
+                    state.motion = motion;
+                });
             }
             ParentMsg::SetRequests(requests) => {
-                let mut state = self.state.lock();
-                state.preload = PreloadGate::Idle;
-                tracing::debug!(count = requests.len(), "requests");
-                state.requests_at = Instant::now();
-                state.served.retain(|request| requests.contains(request));
-                state.requests = requests;
-                drop(state);
-                self.wake.notify_all();
+                self.update_and_reset_preload(|state| {
+                    tracing::debug!(count = requests.len(), "requests");
+                    state.requests_at = Instant::now();
+                    state
+                        .served
+                        .retain(|request| requests.contains(request));
+                    state.requests = requests;
+                });
             }
         }
     }
@@ -635,13 +621,20 @@ impl Shared {
         commands: &IpcReceiver<ParentMsg>,
         playback: &mut PlaybackRunner,
     ) -> bool {
+        use ipc_channel::IpcError;
         use ipc_channel::TryRecvError as IpcTryRecvError;
 
         loop {
             match commands.try_recv() {
                 Ok(message) => self.apply_message(message, playback),
                 Err(IpcTryRecvError::Empty) => return true,
-                Err(IpcTryRecvError::IpcError(_)) => return false,
+                Err(IpcTryRecvError::IpcError(IpcError::Disconnected)) => {
+                    return false;
+                }
+                Err(IpcTryRecvError::IpcError(error)) => {
+                    tracing::warn!(%error, "worker ipc receive failed");
+                    return false;
+                }
             }
         }
     }
@@ -675,13 +668,17 @@ impl Shared {
                 self.wake.wait(&mut state);
                 continue;
             }
-            let Some((page, role, preload, motion)) =
-                state.next_prefetch_job(source)
+            let Some(PrefetchCandidate {
+                page,
+                role,
+                preload,
+            }) = state.next_prefetch_job(source)
             else {
                 self.wake.wait(&mut state);
                 continue;
             };
             if !preload || matches!(state.preload, PreloadGate::Open) {
+                let motion = state.motion;
                 let kind = JobKind::Prefetch { preload };
                 state.in_flight.insert(page, kind);
                 drop(state);
@@ -719,8 +716,8 @@ impl Shared {
         }
     }
 
-    fn page_state(&self, page: usize, hash: u128) -> PageState {
-        self.state.lock().page_state(page, hash)
+    fn needed_roles(&self, page: usize, hash: u128) -> Roles {
+        self.state.lock().needed_roles(page, hash)
     }
 
     fn load_memory_fit(&self, hash: u128) -> Option<Arc<Decoded>> {
@@ -816,35 +813,41 @@ impl Shared {
     }
 
     fn emit(&self, message: ChildMsg) {
-        let sent = self.to_parent.lock().send(message).is_ok();
-        if !sent {
-            self.state.lock().stopped = true;
-            self.wake.notify_all();
+        let sent = self.to_parent.lock().send(message);
+        if let Err(error) = sent {
+            tracing::debug!(?error, "parent ipc send failed");
+            self.stop();
         }
     }
 
-    fn claim_and_publish(
+    fn deliver(
         &self,
-        page: usize,
+        job: PageJob,
         role: Role,
         image: &Decoded,
-    ) -> bool {
-        if !self.state.lock().claim_publish(page, role) {
-            return false;
+        hit: bool,
+        started: Instant,
+    ) {
+        let published = if self.state.lock().claim_publish(job.page, role) {
+            tracing::debug!(
+                page = job.page,
+                ?role,
+                width = image.width(),
+                height = image.height(),
+                "publish"
+            );
+            self.emit(ChildMsg::Ready {
+                page: job.page,
+                role,
+                image: WireImage::from_decoded(image),
+            });
+            true
+        } else {
+            false
+        };
+        if published || job.kind.is_prefetch() {
+            job.kind.report(job.page, role, hit, started.elapsed());
         }
-        tracing::debug!(
-            page,
-            ?role,
-            width = image.width(),
-            height = image.height(),
-            "publish"
-        );
-        self.emit(ChildMsg::Ready {
-            page,
-            role,
-            image: WireImage::from_decoded(image),
-        });
-        true
     }
 
     fn record_failure(&self, page: usize, error: &dyn Display) {
@@ -905,38 +908,27 @@ fn finish_fit(
     hash: u128,
     fit: &Arc<Decoded>,
     origin: FitOrigin,
-    thumb_done: bool,
     started: Instant,
 ) {
     let page = job.page;
-    let state = shared.page_state(page, hash);
-    if state.wanted.contains(Role::Fit) || state.in_head_still {
+    let needed = shared.needed_roles(page, hash);
+    if needed.contains(Role::Fit) {
         shared.save_memory_fit(hash, Arc::clone(fit));
-        if state.wanted.contains(Role::Fit) {
-            shared.claim_and_publish(page, Role::Fit, fit);
-        }
-        job.kind.report(
-            page,
+        shared.deliver(
+            job,
             Role::Fit,
+            fit,
             origin == FitOrigin::Cache,
-            started.elapsed(),
+            started,
         );
     }
 
-    let need_thumb = state.wanted.contains(Role::Thumb)
-        || (!thumb_done
-            && (state.in_prefetch || state.in_head_still)
-            && !state.stored.contains(Role::Thumb));
-    if need_thumb
+    if needed.contains(Role::Thumb)
         && let Some(derived) =
             shared.derive_for(page, Role::Thumb, fit, job.kind.label())
     {
-        let thumb = derived.into_owned();
-        if state.wanted.contains(Role::Thumb) {
-            shared.claim_and_publish(page, Role::Thumb, &thumb);
-        }
-        job.kind.report(page, Role::Thumb, false, started.elapsed());
-        shared.persist_if_missing(page, hash, Role::Thumb, &thumb);
+        shared.deliver(job, Role::Thumb, &derived, false, started);
+        shared.persist_if_missing(page, hash, Role::Thumb, &derived);
     }
 
     // Persist freshly derived `Fit` during tail preload so advancing into
@@ -959,33 +951,23 @@ fn produce_page(
         return;
     };
 
-    let initial = shared.page_state(page, hash);
-    let mut thumb_done = false;
     let mut cached_fit = shared.load_memory_fit(hash);
-
-    // Check stored thumbnails before deriving from a cached `Fit` while
-    // `MemoryCache` is cold so external store entries remain authoritative.
-    let want_or_missing_thumb = initial.wanted.contains(Role::Thumb)
-        || ((initial.in_prefetch || initial.in_head_still)
-            && !initial.stored.contains(Role::Thumb));
-    if cached_fit.is_none()
-        && want_or_missing_thumb
-        && let Some(loaded_thumb) = shared.load_stored(hash, Role::Thumb)
-    {
-        if initial.wanted.contains(Role::Thumb) {
-            shared.claim_and_publish(page, Role::Thumb, &loaded_thumb);
+    if cached_fit.is_none() {
+        // Check stored thumbnails before deriving from a cached `Fit` while
+        // `MemoryCache` is cold so external store entries remain authoritative.
+        let mut needed = shared.needed_roles(page, hash);
+        if needed.contains(Role::Thumb)
+            && let Some(loaded_thumb) =
+                shared.load_stored(hash, Role::Thumb)
+        {
+            shared.deliver(job, Role::Thumb, &loaded_thumb, true, started);
+            needed = shared.needed_roles(page, hash);
         }
-        job.kind.report(page, Role::Thumb, true, started.elapsed());
-        thumb_done = true;
-    }
-
-    let want_fit =
-        initial.wanted.contains(Role::Fit) || initial.in_head_still;
-    if cached_fit.is_none()
-        && (want_fit || (want_or_missing_thumb && !thumb_done))
-        && let Some(loaded_fit) = shared.load_stored(hash, Role::Fit)
-    {
-        cached_fit = Some(Arc::new(loaded_fit));
+        if includes_preview(needed)
+            && let Some(loaded_fit) = shared.load_stored(hash, Role::Fit)
+        {
+            cached_fit = Some(Arc::new(loaded_fit));
+        }
     }
 
     if let Some(fit) = cached_fit.as_ref() {
@@ -995,18 +977,14 @@ fn produce_page(
             hash,
             fit,
             FitOrigin::Cache,
-            thumb_done,
             started,
         );
     }
 
-    let before_decode = shared.page_state(page, hash);
-    let need_fit_decode = cached_fit.is_none()
-        && (before_decode.wanted.contains(Role::Fit)
-            || before_decode.wanted.contains(Role::Thumb)
-            || before_decode.in_head_still
-            || (before_decode.in_prefetch && !thumb_done));
-    if !before_decode.wanted.contains(Role::Full) && !need_fit_decode {
+    let before_decode = shared.needed_roles(page, hash);
+    let need_preview_decode =
+        cached_fit.is_none() && includes_preview(before_decode);
+    if !before_decode.contains(Role::Full) && !need_preview_decode {
         return;
     }
 
@@ -1022,20 +1000,15 @@ fn produce_page(
         return;
     };
 
-    let after_decode = shared.page_state(page, hash);
-    if after_decode.wanted.contains(Role::Full)
+    let after_decode = shared.needed_roles(page, hash);
+    if after_decode.contains(Role::Full)
         && let Some(full) =
             shared.derive_for(page, Role::Full, &native, job.kind.label())
     {
-        shared.claim_and_publish(page, Role::Full, &full);
-        job.kind.report(page, Role::Full, false, started.elapsed());
+        shared.deliver(job, Role::Full, &full, false, started);
     }
 
-    let need_preview = after_decode.wanted.contains(Role::Fit)
-        || after_decode.wanted.contains(Role::Thumb)
-        || after_decode.in_head_still
-        || after_decode.in_prefetch;
-    if cached_fit.is_none() && need_preview {
+    if cached_fit.is_none() && includes_preview(after_decode) {
         let Some(derived) =
             shared.derive_for(page, Role::Fit, &native, job.kind.label())
         else {
@@ -1052,7 +1025,6 @@ fn produce_page(
             hash,
             &decoded_fit,
             FitOrigin::Decode,
-            thumb_done,
             started,
         );
     }
@@ -1073,23 +1045,14 @@ impl PlaybackRunner {
 
     fn apply(&mut self, command: PlaybackCommand) {
         match command {
-            PlaybackCommand::Start { id, role } => {
+            PlaybackCommand::Start { id } => {
                 self.steps.retain(|step| step.id().page != id.page);
-                self.steps.push_back(PlaybackStep::Start { id, role });
+                self.steps.push_back(PlaybackStep::Start { id });
             }
             PlaybackCommand::Next { id } => {
                 self.steps.push_back(PlaybackStep::Next { id });
             }
-            PlaybackCommand::Stop { id } => {
-                if self
-                    .playing_pages
-                    .get(&id.page)
-                    .is_some_and(|session| session.id == id)
-                {
-                    self.playing_pages.remove(&id.page);
-                }
-                self.steps.retain(|step| step.id() != id);
-            }
+            PlaybackCommand::Stop { id } => self.drop_session(id),
         }
     }
 
@@ -1104,8 +1067,8 @@ impl PlaybackRunner {
         shared: &Shared,
     ) {
         match step {
-            PlaybackStep::Start { id, role } => {
-                self.start_playback(source, id, role, shared);
+            PlaybackStep::Start { id } => {
+                self.start_playback(source, id, shared);
             }
             PlaybackStep::Next { id } => self.next_playback(id, shared),
         }
@@ -1115,7 +1078,6 @@ impl PlaybackRunner {
         &mut self,
         source: &Source,
         id: PlaybackId,
-        role: Role,
         shared: &Shared,
     ) {
         let page = id.page;
@@ -1133,43 +1095,27 @@ impl PlaybackRunner {
         };
 
         self.playing_pages.remove(&page);
-        let opened = panic::catch_unwind(AssertUnwindSafe(|| {
+        match source::catch_panic("playback open", || {
             decode::open_animation(bytes.clone(), name)
-        }));
-        match opened {
-            Ok(Ok(Some(animation))) => {
+        }) {
+            Ok(Some(animation)) => {
                 let loops = animation.loops();
                 self.playing_pages.insert(
                     page,
                     PlaybackSession {
                         id,
-                        role,
                         animation,
                         passes: 0,
                     },
                 );
-                tracing::debug!(?id, ?role, ?loops, "playback start");
+                tracing::debug!(?id, ?loops, "playback start");
             }
-            Ok(Ok(None)) => {
-                tracing::debug!(?id, ?role, "no playback path");
+            Ok(None) => {
+                tracing::debug!(?id, "no playback path");
                 self.fail_playback(id, shared);
             }
-            Ok(Err(error)) => {
-                tracing::warn!(
-                    ?id,
-                    ?role,
-                    %error,
-                    "playback open failed"
-                );
-                self.fail_playback(id, shared);
-            }
-            Err(payload) => {
-                let message = source::panic_message(payload.as_ref());
-                tracing::warn!(
-                    ?id,
-                    ?role,
-                    "playback open panicked: {message}"
-                );
+            Err(error) => {
+                tracing::warn!(?id, %error, "playback open failed");
                 self.fail_playback(id, shared);
             }
         }
@@ -1190,28 +1136,23 @@ impl PlaybackRunner {
             self.fail_playback(id, shared);
             return;
         };
-        let role = session.role;
-        let produced =
-            panic::catch_unwind(AssertUnwindSafe(|| session.advance()));
-        match produced {
-            Ok(Ok(Some(frame))) => {
-                let image = match cache::derive(&frame.image, role, limits)
-                {
-                    Ok(image) => image,
-                    Err(fault) => {
-                        tracing::warn!(
-                            ?id,
-                            ?role,
-                            %fault,
-                            "playback frame exceeds texture limit"
-                        );
-                        self.fail_playback(id, shared);
-                        return;
-                    }
-                };
+        match source::catch_panic("playback frame", || session.advance()) {
+            Ok(Some(frame)) => {
+                let image =
+                    match cache::derive(&frame.image, Role::Full, limits) {
+                        Ok(image) => image,
+                        Err(fault) => {
+                            tracing::warn!(
+                                ?id,
+                                %fault,
+                                "playback frame exceeds texture limit"
+                            );
+                            self.fail_playback(id, shared);
+                            return;
+                        }
+                    };
                 tracing::debug!(
                     ?id,
-                    ?role,
                     delay = ?frame.delay,
                     width = image.width(),
                     height = image.height(),
@@ -1223,35 +1164,21 @@ impl PlaybackRunner {
                     image: WireImage::from_decoded(&image),
                 }));
             }
-            Ok(Ok(None)) => {
-                tracing::debug!(?id, ?role, "playback finished");
+            Ok(None) => {
+                tracing::debug!(?id, "playback finished");
                 self.playing_pages.remove(&page);
                 shared.emit(ChildMsg::Playback(PlaybackEvent::Finished {
                     id,
                 }));
             }
-            Ok(Err(error)) => {
-                tracing::warn!(
-                    ?id,
-                    ?role,
-                    %error,
-                    "playback frame failed"
-                );
-                self.fail_playback(id, shared);
-            }
-            Err(payload) => {
-                let message = source::panic_message(payload.as_ref());
-                tracing::warn!(
-                    ?id,
-                    ?role,
-                    "playback frame panicked: {message}"
-                );
+            Err(error) => {
+                tracing::warn!(?id, %error, "playback frame failed");
                 self.fail_playback(id, shared);
             }
         }
     }
 
-    fn fail_playback(&mut self, id: PlaybackId, shared: &Shared) {
+    fn drop_session(&mut self, id: PlaybackId) {
         if self
             .playing_pages
             .get(&id.page)
@@ -1260,6 +1187,10 @@ impl PlaybackRunner {
             self.playing_pages.remove(&id.page);
         }
         self.steps.retain(|step| step.id() != id);
+    }
+
+    fn fail_playback(&mut self, id: PlaybackId, shared: &Shared) {
+        self.drop_session(id);
         shared.emit(ChildMsg::Playback(PlaybackEvent::Failed { id }));
     }
 }
@@ -1268,10 +1199,8 @@ fn worker_loop(source: &Source, shared: &Shared, cpu_threads: usize) {
     let prefetch_threads =
         cpu_threads.div_ceil(PREFETCH_THREAD_DIVISOR).max(1);
     while let Some(job) = shared.next_job(source) {
-        let _guard = InFlightGuard {
-            shared,
-            page: job.page,
-        };
+        let _guard =
+            DropGuard::new(job.page, |page| shared.finish_page_job(page));
         let max_threads = if job.kind.is_prefetch() {
             prefetch_threads
         } else {
@@ -1295,6 +1224,8 @@ fn run(
     store: Store,
     to_parent: IpcSender<ChildMsg>,
 ) {
+    use ipc_channel::IpcError;
+
     let cpu_threads = available_parallelism();
     let workers = cpu_threads.clamp(MIN_WORKERS, MAX_WORKERS);
     let shared = Arc::new(Shared::new(source.len(), store, to_parent));
@@ -1329,8 +1260,13 @@ fn run(
                 playback.serve(source, step, shared);
                 continue;
             }
-            let Ok(message) = commands.recv() else {
-                break;
+            let message = match commands.recv() {
+                Ok(message) => message,
+                Err(IpcError::Disconnected) => break,
+                Err(error) => {
+                    tracing::warn!(%error, "worker ipc receive failed");
+                    break;
+                }
             };
             shared.apply_message(message, &mut playback);
         }
@@ -1349,15 +1285,9 @@ fn decode_page(
         // miss is a caller bug.
         eros::bail!("no such page");
     };
-    match panic::catch_unwind(AssertUnwindSafe(|| {
+    source::catch_panic("decoder", || {
         decode::decode_with_threads(bytes, name, max_threads)
-    })) {
-        Ok(result) => result,
-        Err(payload) => eros::bail!(
-            "decoder panicked: {}",
-            source::panic_message(payload.as_ref())
-        ),
-    }
+    })
 }
 
 pub fn main(args: &[OsString]) -> ExitCode {
@@ -1368,12 +1298,13 @@ pub fn main(args: &[OsString]) -> ExitCode {
     use crate::protocol::BookInfo;
     use crate::protocol::Hello;
 
-    let Some((server, path)) = parse(args) else {
+    let [server, path] = args else {
         tracing::error!(
             "--worker needs an ipc server name and a book path"
         );
         return ExitCode::FAILURE;
     };
+    let path = Path::new(path);
     // The kernel kills this process with SIGKILL once the parent dies, so a
     // parent crash ends the decode.
     if let Err(error) =
@@ -1447,16 +1378,6 @@ pub fn main(args: &[OsString]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn parse(args: &[OsString]) -> Option<(&OsStr, &Path)> {
-    let [_program, flag, server, path] = args else {
-        return None;
-    };
-    if flag.as_os_str() != OsStr::new("--worker") {
-        return None;
-    }
-    Some((server.as_os_str(), Path::new(path)))
-}
-
 #[cfg(test)]
 #[expect(
     clippy::expect_used,
@@ -1473,17 +1394,12 @@ mod tests {
     use crate::cache::Store;
     use crate::protocol::THUMB_EDGE;
     use crate::testkit;
+    use crate::testkit::TEST_FIT_BOX;
 
     /// Page edge for the tests that check derived and full dimensions:
     /// larger than the thumb edge, smaller than the fit box, so the
     /// thumb is scaled and the fit image is the page itself.
     const BIG: u32 = 1400;
-    const TEST_FIT_BOX: (u32, u32) = (2560, 1440);
-
-    fn test_limits() -> ImageLimits {
-        const MAX_TEXTURE_EDGE: u32 = 16_384;
-        ImageLimits::new(TEST_FIT_BOX, MAX_TEXTURE_EDGE)
-    }
 
     struct TestWorker {
         to_worker: Option<IpcSender<ParentMsg>>,
@@ -1529,7 +1445,7 @@ mod tests {
                 worker: Some(worker),
                 drain,
             };
-            handle.send(ParentMsg::SetLimits(test_limits()));
+            handle.send(ParentMsg::SetLimits(testkit::limits()));
             if let Some(page) = initial_view {
                 handle.set_view(page);
             }
@@ -1578,15 +1494,9 @@ mod tests {
         }
     }
 
-    fn start_playback(
-        worker: &TestWorker,
-        page: usize,
-        role: Role,
-        generation: u32,
-    ) {
+    fn start_playback(worker: &TestWorker, page: usize, generation: u32) {
         worker.playback(PlaybackCommand::Start {
             id: PlaybackId { page, generation },
-            role,
         });
     }
 
@@ -1694,7 +1604,7 @@ mod tests {
             what: &str,
             want: impl Fn(usize, Role) -> bool,
         ) -> WireImage {
-            testkit::eventually(20, what, || {
+            testkit::eventually(what, || {
                 self.drain();
                 let seen = self.seen.lock();
                 seen.iter().find_map(|event| match event {
@@ -1711,7 +1621,7 @@ mod tests {
         }
 
         fn failure(&self, page: usize) {
-            testkit::eventually(20, "page never failed", || {
+            testkit::eventually("page never failed", || {
                 self.drain();
                 let seen = self.seen.lock();
                 seen.iter().find_map(|event| match event {
@@ -1759,7 +1669,7 @@ mod tests {
             page: usize,
             offset: usize,
         ) -> (Duration, WireImage) {
-            testkit::eventually(20, "no animation frame", || {
+            testkit::eventually("no animation frame", || {
                 self.drain();
                 let seen = self.seen.lock();
                 seen.iter()
@@ -1780,7 +1690,7 @@ mod tests {
         }
 
         fn finished(&self, page: usize) {
-            testkit::eventually(20, "no animation finish", || {
+            testkit::eventually("no animation finish", || {
                 self.drain();
                 let seen = self.seen.lock();
                 seen.iter()
@@ -1799,12 +1709,9 @@ mod tests {
 
     #[test]
     fn an_archive_serves_pages() {
-        const SEVENZ_FIXTURE: &str = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/two_pages.7z"
-        );
         let source = Arc::new(
-            Source::open(Path::new(SEVENZ_FIXTURE)).expect("7z opens"),
+            Source::open(Path::new(testkit::SEVENZ_FIXTURE))
+                .expect("7z opens"),
         );
         let root = TempDir::new().expect("create temp dir");
         let (events, to_parent) = Updates::new();
@@ -1880,25 +1787,21 @@ mod tests {
         let store = Store::at(root.path());
         // Wait until all head spreads are fully produced.
         for page in 0..PREFETCH_HEAD_SPREADS {
-            testkit::eventually(
-                20,
-                "the head never reached the store",
-                || {
-                    store
-                        .load(
-                            page_hash(&source, page),
-                            Role::Thumb,
-                            TEST_FIT_BOX,
-                        )
-                        .is_some()
-                        .then_some(())
-                },
-            );
+            testkit::eventually("the head never reached the store", || {
+                store
+                    .load(
+                        page_hash(&source, page),
+                        Role::Thumb,
+                        TEST_FIT_BOX,
+                    )
+                    .is_some()
+                    .then_some(())
+            });
         }
         let head_done = Instant::now();
         // The first page beyond the head must not start until the quiet
         // window has elapsed after the head finishes.
-        testkit::eventually(20, "the tail never preloaded", || {
+        testkit::eventually("the tail never preloaded", || {
             store
                 .load(
                     page_hash(&source, PREFETCH_HEAD_SPREADS),
@@ -1943,16 +1846,12 @@ mod tests {
         // The failure leaves the rest of the prefetch running: pages behind it
         // still reach the store.
         let store = Store::at(root.path());
-        testkit::eventually(
-            20,
-            "the failure stalled the prefetch",
-            || {
-                store
-                    .load(page_hash(&source, 4), Role::Thumb, TEST_FIT_BOX)
-                    .is_some()
-                    .then_some(())
-            },
-        );
+        testkit::eventually("the failure stalled the prefetch", || {
+            store
+                .load(page_hash(&source, 4), Role::Thumb, TEST_FIT_BOX)
+                .is_some()
+                .then_some(())
+        });
         assert_eq!(
             events.failures(0),
             1,
@@ -1974,7 +1873,6 @@ mod tests {
 
         let store = Store::at(root.path());
         testkit::eventually(
-            20,
             "the prefetch never produced the head fit image",
             || {
                 store
@@ -2020,11 +1918,9 @@ mod tests {
         // must fetch it again.
         worker.set_requests(Vec::new());
         worker.set_requests(vec![request_fit(0)]);
-        testkit::eventually(
-            20,
-            "the re-added fit image was never served",
-            || (events.delivered(0, is_fit) >= 2).then_some(()),
-        );
+        testkit::eventually("the re-added fit image was never served", || {
+            (events.delivered(0, is_fit) >= 2).then_some(())
+        });
     }
 
     #[test]
@@ -2080,7 +1976,7 @@ mod tests {
             Some(to_parent),
         );
 
-        start_playback(&worker, 0, Role::Fit, 9);
+        start_playback(&worker, 0, 9);
         for (offset, color) in colors.into_iter().enumerate() {
             next_frame(&worker, 0, 9);
             let (delay, image) = events.frame(0, offset);
@@ -2124,7 +2020,7 @@ mod tests {
             Some(to_parent),
         );
 
-        start_playback(&worker, 0, Role::Fit, 3);
+        start_playback(&worker, 0, 3);
         for (offset, color) in colors.into_iter().enumerate() {
             next_frame(&worker, 0, 3);
             let (_, image) = events.frame(0, offset);
@@ -2233,8 +2129,6 @@ mod tests {
 
     #[test]
     fn store_hit_with_known_hash_skips_source_read() {
-        const WAIT_TIMEOUT_SECS: u64 = 20;
-
         let (dir, source) = page_dir(2, BIG);
         let root = TempDir::new().expect("create temp dir");
         let requested_hash = page_hash(&source, 0);
@@ -2251,22 +2145,18 @@ mod tests {
         events
             .ready("initial fit", |page, role| page == 0 && is_fit(role));
         let store = Store::at(root.path());
-        testkit::eventually(
-            WAIT_TIMEOUT_SECS,
-            "warmed fit and thumb never persisted",
-            || {
-                (store
-                    .load(requested_hash, Role::Fit, TEST_FIT_BOX)
+        testkit::eventually("warmed fit and thumb never persisted", || {
+            (store
+                .load(requested_hash, Role::Fit, TEST_FIT_BOX)
+                .is_some()
+                && store
+                    .load(requested_hash, Role::Thumb, TEST_FIT_BOX)
                     .is_some()
-                    && store
-                        .load(requested_hash, Role::Thumb, TEST_FIT_BOX)
-                        .is_some()
-                    && store
-                        .load(prefetched_hash, Role::Fit, TEST_FIT_BOX)
-                        .is_some())
-                .then_some(())
-            },
-        );
+                && store
+                    .load(prefetched_hash, Role::Fit, TEST_FIT_BOX)
+                    .is_some())
+            .then_some(())
+        });
 
         for name in ["p0000.png", "p0001.png"] {
             fs::remove_file(dir.path().join(name))
@@ -2279,7 +2169,6 @@ mod tests {
             request_fit(1),
         ]);
         testkit::eventually(
-            WAIT_TIMEOUT_SECS,
             "known-hash store hits never delivered from shared store",
             || {
                 (events.delivered(0, is_fit) >= 2
@@ -2290,6 +2179,62 @@ mod tests {
         );
         assert_eq!(events.failures(0), 0);
         assert_eq!(events.failures(1), 0);
+    }
+
+    #[test]
+    fn tail_prefetch_with_stored_thumb_skips_source_decode() {
+        let tail_page = PREFETCH_HEAD_SPREADS;
+        let (dir, _) = page_dir(tail_page, 8);
+        let corrupt = b"not an image";
+        fs::write(dir.path().join(format!("p{tail_page:04}.png")), corrupt)
+            .expect("write corrupt tail page");
+        let source =
+            Arc::new(Source::open(dir.path()).expect("temp source opens"));
+        let root = TempDir::new().expect("create temp dir");
+        let tail_hash = cache::content_hash(corrupt);
+        let sentinel = decode::decode(
+            &testkit::tiny_png(4, 4, [1, 2, 3, 255]),
+            "sentinel.png",
+        )
+        .expect("sentinel decodes");
+        let store = Store::at(root.path());
+        assert!(
+            store
+                .save(tail_hash, Role::Thumb, &sentinel, TEST_FIT_BOX)
+                .is_some()
+        );
+        drop(store);
+
+        let shared =
+            Shared::new(source.len(), Store::at(root.path()), Updates::new().1);
+        shared
+            .limits
+            .set(testkit::limits())
+            .expect("limits unset");
+        shared.update_and_reset_preload(|state| {
+            state.prefetch = Some(Prefetch::build(
+                browse::spread_for(0, ReadingMode::Normal, state.page_count),
+                Direction::Forward,
+                ReadingMode::Normal,
+                state.page_count,
+            ));
+        });
+
+        produce_page(
+            &source,
+            &shared,
+            PageJob {
+                page: tail_page,
+                kind: JobKind::Prefetch { preload: true },
+            },
+            1,
+        );
+        assert!(!shared.state.lock().failed.contains(&tail_page));
+        assert!(shared
+            .state
+            .lock()
+            .stored_for_hash(tail_hash)
+            .contains(Role::Thumb));
     }
 
     #[test]

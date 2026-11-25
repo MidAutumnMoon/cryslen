@@ -8,7 +8,20 @@ use image::Rgb;
 use image::RgbImage;
 use image::codecs::gif::Repeat;
 
+use crate::protocol::ImageLimits;
 use crate::source::Source;
+
+pub const TEST_FIT_BOX: (u32, u32) = (2560, 1440);
+
+pub const SEVENZ_FIXTURE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/two_pages.7z"
+);
+
+pub fn limits() -> ImageLimits {
+    const MAX_TEXTURE_EDGE: u32 = 16_384;
+    ImageLimits::new(TEST_FIT_BOX, MAX_TEXTURE_EDGE)
+}
 
 fn encode(img: &DynamicImage, format: ImageFormat) -> Vec<u8> {
     use std::io::Cursor;
@@ -93,21 +106,22 @@ pub fn unreadable_page(source: &Source, index: usize) -> Arc<ErrorUnion> {
     }
 }
 
-/// Poll `probe` until it returns `Some`, or `secs` seconds pass.
+/// Poll `probe` until it returns `Some`, or the test timeout passes.
 ///
 /// # Panics
 ///
 /// Panics with `what` on timeout.
-pub fn eventually<T>(
-    secs: u64,
+pub fn eventually<Value>(
     what: &str,
-    mut probe: impl FnMut() -> Option<T>,
-) -> T {
+    mut probe: impl FnMut() -> Option<Value>,
+) -> Value {
     use std::thread;
     use std::time::Duration;
     use std::time::Instant;
 
-    let deadline = Instant::now() + Duration::from_secs(secs);
+    const EVENTUALLY_TIMEOUT: Duration = Duration::from_secs(20);
+
+    let deadline = Instant::now() + EVENTUALLY_TIMEOUT;
     loop {
         if let Some(value) = probe() {
             return value;

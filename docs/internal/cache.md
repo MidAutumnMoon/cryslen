@@ -11,7 +11,7 @@
 
 `$TMPDIR/cryslen-cache/{thumb,view}/<xxh3-128 of encoded page bytes>`, implemented in `src/cache.rs`. `view` stores `Role::Fit`.
 
-- Entries are little-endian and versioned by format version (`7`), page hash, role, and target bounding box (`target_box`); the resampling kernel is outside the key, so existing entries keep their look until pruned.
+- Entries are little-endian and versioned by format version (`8`), page hash, role, and target bounding box (`target_box`); the resampling kernel is outside the key, so existing entries keep their look until pruned.
 - Writes lock a unique temp file until atomic rename, allowing store open to sweep orphaned temps; loading refreshes mtime for shared per-namespace LRU caps across child processes. Failures degrade to re-deriving.
 
 ## Prefetch and worker

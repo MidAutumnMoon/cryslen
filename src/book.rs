@@ -27,7 +27,7 @@ use crate::protocol::WireImage;
 /// fault.
 const OPEN_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub enum BookEvent {
+pub enum PageEvent {
     Ready {
         page: usize,
         role: Role,
@@ -38,6 +38,10 @@ pub enum BookEvent {
         page: usize,
         fault: String,
     },
+}
+
+pub enum BookEvent {
+    Page(PageEvent),
     Died(String),
 }
 
@@ -236,6 +240,16 @@ impl Drop for ChildGuard {
 }
 
 fn kill_and_reap(child: &mut Child) {
+    match child.try_wait() {
+        Ok(Some(status)) => {
+            tracing::warn!(%status, "the book process already exited");
+            return;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::debug!(?error, "cannot poll the book process");
+        }
+    }
     if let Err(error) = child.kill() {
         tracing::debug!(?error, "cannot signal the book process");
     }
@@ -261,11 +275,23 @@ fn read_events(
     event_sender: &Sender<BookEvent>,
     wake: &dyn Fn(),
 ) {
+    use ipc_channel::IpcError;
+
     loop {
-        let event = child_rx.recv().map_or_else(
-            |_| BookEvent::Died(String::from("the book process exited")),
-            event_from_message,
-        );
+        let event = match child_rx.recv() {
+            Ok(message) => BookEvent::Page(event_from_message(message)),
+            Err(IpcError::Disconnected) => {
+                BookEvent::Died(String::from("the book process exited"))
+            }
+            Err(
+                error @ (IpcError::Io(_) | IpcError::SerializationError(_)),
+            ) => {
+                tracing::warn!(%error, "book ipc receive failed");
+                BookEvent::Died(format!(
+                    "the book process IPC failed: {error}"
+                ))
+            }
+        };
         let last = matches!(event, BookEvent::Died(_));
         if event_sender.send(event).is_err() {
             return;
@@ -277,24 +303,24 @@ fn read_events(
     }
 }
 
-fn event_from_message(message: ChildMsg) -> BookEvent {
+fn event_from_message(message: ChildMsg) -> PageEvent {
     match message {
         ChildMsg::Ready { page, role, image } => match image.validate() {
-            Ok(image) => BookEvent::Ready {
+            Ok(image) => PageEvent::Ready {
                 page,
                 role,
                 image: Box::new(image),
             },
-            Err(refusal) => BookEvent::Failed {
+            Err(refusal) => PageEvent::Failed {
                 page,
                 fault: refusal.to_string(),
             },
         },
         ChildMsg::Playback(event) => {
-            BookEvent::Playback(validated_event(event))
+            PageEvent::Playback(validated_event(event))
         }
         ChildMsg::Failed { page, fault } => {
-            BookEvent::Failed { page, fault }
+            PageEvent::Failed { page, fault }
         }
     }
 }

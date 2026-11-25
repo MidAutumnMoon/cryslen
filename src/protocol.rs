@@ -21,7 +21,7 @@ use serde::Serialize;
 
 use crate::decode;
 use crate::decode::Decoded;
-use crate::decode::Plane;
+use crate::decode::Samples;
 
 pub use crate::browse::Direction;
 pub use crate::browse::Motion;
@@ -31,6 +31,7 @@ pub use crate::browse::Request;
 pub use crate::browse::Role;
 pub use crate::decode::Depth;
 pub use crate::decode::Format;
+pub use crate::decode::GraySpec;
 pub use crate::decode::ImageMeta;
 pub use crate::decode::Matrix;
 pub use crate::decode::Subsampling;
@@ -75,6 +76,22 @@ pub struct TextureFault {
     pub max_edge: u32,
 }
 
+impl TextureFault {
+    pub fn check_dims(
+        dims: (u32, u32),
+        max_edge: u32,
+    ) -> Result<(), Self> {
+        if dims.0 == 0
+            || dims.1 == 0
+            || dims.0 > max_edge
+            || dims.1 > max_edge
+        {
+            return Err(Self { dims, max_edge });
+        }
+        Ok(())
+    }
+}
+
 impl Display for TextureFault {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(
@@ -97,8 +114,8 @@ pub struct PlaybackId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub enum PlaybackCommand {
-    /// Open the page's stream and fix its role.
-    Start { id: PlaybackId, role: Role },
+    /// Open the page's stream.
+    Start { id: PlaybackId },
     /// Produce the next frame. A pass boundary is invisible to the parent.
     Next { id: PlaybackId },
     /// Drop the session. The child answers nothing.
@@ -108,7 +125,7 @@ pub enum PlaybackCommand {
 /// One child answer about a session. Frames arrive in order.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub enum PlaybackEvent<Image> {
-    /// One composited frame, already sized for the session's role.
+    /// One composited frame, clamped to `max_texture_edge`.
     Frame {
         id: PlaybackId,
         delay: Duration,
@@ -131,6 +148,11 @@ pub struct BookInfo {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub enum WirePixels {
     Rgba8(IpcSharedMemory),
+    Gray {
+        spec: GraySpec,
+        luma: IpcSharedMemory,
+        alpha: Option<IpcSharedMemory>,
+    },
     Yuv {
         spec: YuvSpec,
         luma: IpcSharedMemory,
@@ -167,13 +189,46 @@ impl WireImage {
             Pixels::Rgba8(bytes) => {
                 WirePixels::Rgba8(IpcSharedMemory::from_bytes(bytes))
             }
-            Pixels::Yuv(yuv) => WirePixels::Yuv {
-                spec: yuv.spec,
-                luma: shared_plane(&yuv.luma),
-                cb: shared_plane(&yuv.cb),
-                cr: shared_plane(&yuv.cr),
-                alpha: yuv.alpha.as_ref().map(shared_plane),
-            },
+            Pixels::Gray(gray) => {
+                let (luma, alpha) = match &gray.samples {
+                    Samples::U8(planes) => (
+                        shared_samples(&planes.luma),
+                        planes.alpha.as_deref().map(shared_samples),
+                    ),
+                    Samples::U16 { planes, .. } => (
+                        shared_samples(&planes.luma),
+                        planes.alpha.as_deref().map(shared_samples),
+                    ),
+                };
+                WirePixels::Gray {
+                    spec: gray.spec(),
+                    luma,
+                    alpha,
+                }
+            }
+            Pixels::Yuv(yuv) => {
+                let (luma, cb, cr, alpha) = match &yuv.samples {
+                    Samples::U8(planes) => (
+                        shared_samples(&planes.luma),
+                        shared_samples(&planes.cb),
+                        shared_samples(&planes.cr),
+                        planes.alpha.as_deref().map(shared_samples),
+                    ),
+                    Samples::U16 { planes, .. } => (
+                        shared_samples(&planes.luma),
+                        shared_samples(&planes.cb),
+                        shared_samples(&planes.cr),
+                        planes.alpha.as_deref().map(shared_samples),
+                    ),
+                };
+                WirePixels::Yuv {
+                    spec: yuv.spec(),
+                    luma,
+                    cb,
+                    cr,
+                    alpha,
+                }
+            }
         };
         Self {
             meta: image.meta(),
@@ -190,6 +245,14 @@ impl WireImage {
                 self.meta.height,
                 bytes.len(),
             )?,
+            WirePixels::Gray { spec, luma, alpha } => {
+                decode::validate_gray_extents(
+                    (self.meta.width, self.meta.height),
+                    spec.depth,
+                    luma.len(),
+                    alpha.as_ref().map(|plane| plane.len()),
+                )?;
+            }
             WirePixels::Yuv {
                 spec,
                 luma,
@@ -212,6 +275,9 @@ impl WireImage {
     pub fn resident_bytes(&self) -> usize {
         match &self.pixels {
             WirePixels::Rgba8(bytes) => bytes.len(),
+            WirePixels::Gray { luma, alpha, .. } => {
+                luma.len() + alpha.as_ref().map_or(0, |plane| plane.len())
+            }
             WirePixels::Yuv {
                 luma,
                 cb,
@@ -228,8 +294,11 @@ impl WireImage {
     }
 }
 
-fn shared_plane(plane: &Plane) -> IpcSharedMemory {
-    IpcSharedMemory::from_bytes(decode::plane_bytes(plane))
+fn shared_samples<Sample>(samples: &[Sample]) -> IpcSharedMemory
+where
+    Sample: bytemuck::Pod,
+{
+    IpcSharedMemory::from_bytes(bytemuck::cast_slice(samples))
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -335,48 +404,102 @@ mod tests {
     }
 
     #[test]
-    fn yuv_wire_validation_checks_depth_and_plane_extents() {
-        use crate::decode::Plane;
+    fn planar_wire_validation_checks_depth_and_plane_extents() {
+        use crate::decode::GrayImage;
+        use crate::decode::GrayPlanes;
+        use crate::decode::WideDepth;
         use crate::decode::YuvImage;
+        use crate::decode::YuvPlanes;
 
-        let yuv = YuvImage {
-            spec: YuvSpec {
-                depth: Depth::D10,
+        fn check_planar(
+            decoded: &Decoded,
+            expected_bytes: usize,
+            expected_error: &'static str,
+            corrupt_depth: impl FnOnce(&mut WirePixels),
+        ) {
+            let wire = WireImage::from_decoded(decoded);
+            assert_eq!(wire.resident_bytes(), expected_bytes);
+            let mut mismatched_depth = wire.clone();
+            let mut bad_dims = wire.clone();
+            wire.validate().expect("valid wire image validates");
+
+            corrupt_depth(&mut mismatched_depth.pixels);
+            assert_eq!(
+                mismatched_depth
+                    .validate()
+                    .expect_err("mismatched plane depth is rejected"),
+                MsgError::from_static(expected_error)
+            );
+
+            bad_dims.meta.width += 2;
+            assert_eq!(
+                bad_dims
+                    .validate()
+                    .expect_err("mismatched plane width is rejected"),
+                MsgError::from_static(expected_error)
+            );
+        }
+
+        let yuv = Decoded::yuv(
+            4,
+            2,
+            Format::Avif,
+            Transfer::Srgb,
+            YuvImage {
                 subsampling: Subsampling::Yuv420,
                 full_range: false,
                 matrix: Matrix::Bt709,
+                samples: Samples::U16 {
+                    depth: WideDepth::D10,
+                    planes: YuvPlanes {
+                        luma: vec![512_u16; 4 * 2].into_boxed_slice(),
+                        cb: vec![512_u16; 2].into_boxed_slice(),
+                        cr: vec![512_u16; 2].into_boxed_slice(),
+                        alpha: None,
+                    },
+                },
             },
-            luma: Plane::U16(vec![512_u16; 4 * 2].into_boxed_slice()),
-            cb: Plane::U16(vec![512_u16; 2].into_boxed_slice()),
-            cr: Plane::U16(vec![512_u16; 2].into_boxed_slice()),
-            alpha: None,
-        };
-        let decoded =
-            Decoded::yuv(4, 2, Format::Avif, Transfer::Srgb, yuv)
-                .expect("valid yuv page");
-        let wire = WireImage::from_decoded(&decoded);
-        assert_eq!(wire.resident_bytes(), (8 + 2 + 2) * 2);
-        let mut mismatched_depth = wire.clone();
-        let mut bad_dims = wire.clone();
-        wire.validate().expect("valid yuv wire image validates");
-
-        if let WirePixels::Yuv { spec, .. } = &mut mismatched_depth.pixels
-        {
-            spec.depth = Depth::D8;
-        }
-        assert_eq!(
-            mismatched_depth
-                .validate()
-                .expect_err("mismatched plane depth is rejected"),
-            MsgError::from_static("yuv plane extent")
+        )
+        .expect("valid yuv page");
+        check_planar(
+            &yuv,
+            (4 * 2 + 2 + 2) * size_of::<u16>(),
+            "yuv plane extent",
+            |pixels| {
+                if let WirePixels::Yuv { spec, .. } = pixels {
+                    spec.depth = Depth::D8;
+                }
+            },
         );
 
-        bad_dims.meta.width = 6;
-        assert_eq!(
-            bad_dims
-                .validate()
-                .expect_err("mismatched plane width is rejected"),
-            MsgError::from_static("yuv plane extent")
+        let gray = Decoded::gray(
+            4,
+            2,
+            Format::Avif,
+            Transfer::Srgb,
+            GrayImage {
+                full_range: true,
+                samples: Samples::U16 {
+                    depth: WideDepth::D10,
+                    planes: GrayPlanes {
+                        luma: vec![512_u16; 4 * 2].into_boxed_slice(),
+                        alpha: Some(
+                            vec![1023_u16; 4 * 2].into_boxed_slice(),
+                        ),
+                    },
+                },
+            },
+        )
+        .expect("valid gray page");
+        check_planar(
+            &gray,
+            (4 * 2 + 4 * 2) * size_of::<u16>(),
+            "gray plane extent",
+            |pixels| {
+                if let WirePixels::Gray { spec, .. } = pixels {
+                    spec.depth = Depth::D8;
+                }
+            },
         );
     }
 }

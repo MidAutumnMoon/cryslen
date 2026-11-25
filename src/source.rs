@@ -102,6 +102,22 @@ pub fn panic_message(payload: &(dyn Any + Send)) -> &str {
         .unwrap_or("non-string panic payload")
 }
 
+pub fn catch_panic<Output>(
+    operation: &str,
+    body: impl FnOnce() -> eros::Result<Output>,
+) -> eros::Result<Output> {
+    use std::panic;
+    use std::panic::AssertUnwindSafe;
+
+    match panic::catch_unwind(AssertUnwindSafe(body)) {
+        Ok(result) => result,
+        Err(payload) => eros::bail!(
+            "{operation} panicked: {}",
+            panic_message(payload.as_ref())
+        ),
+    }
+}
+
 type PageRead = Result<Bytes, Arc<ErrorUnion>>;
 type ReadyHook = Arc<dyn Fn() + Send + Sync>;
 
@@ -462,12 +478,10 @@ fn validated_listing(
     entries.sort_by(|left, right| {
         catalog::compare_names(&left.name, &right.name)
     });
-    let mut names = Vec::with_capacity(entries.len());
-    let mut archive_indices = Vec::with_capacity(entries.len());
-    for entry in entries {
-        names.push(entry.name);
-        archive_indices.push(entry.archive_index);
-    }
+    let (names, archive_indices): (Vec<_>, Vec<_>) = entries
+        .into_iter()
+        .map(|entry| (entry.name, entry.archive_index))
+        .unzip();
     if let Some(name) = duplicate_name(&names) {
         eros::bail!("duplicate entry name: {name}");
     }
@@ -537,8 +551,6 @@ fn spawn_materialize(
     slots: &Arc<ArchiveSlots>,
     body: impl FnOnce(&ArchiveSlots) -> eros::Result<()> + Send + 'static,
 ) {
-    use std::panic;
-    use std::panic::AssertUnwindSafe;
     use std::thread::Builder;
     use std::time::Instant;
 
@@ -548,19 +560,14 @@ fn spawn_materialize(
     let spawned =
         Builder::new().name("cy-unpack".into()).spawn(move || {
             let started = Instant::now();
-            let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+            let verdict = match catch_panic("unpack", || {
                 body(&thread_slots)
-            }));
-            let verdict = match outcome {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(reason)) => {
-                    tracing::warn!(?reason, "unpack pass ended early");
+            }) {
+                Ok(()) => Ok(()),
+                Err(reason) => {
+                    tracing::warn!(%reason, "unpack pass ended early");
                     Err(Arc::new(reason))
                 }
-                Err(payload) => Err(Arc::new(eros::error!(
-                    "unpack panicked: {}",
-                    panic_message(payload.as_ref())
-                ))),
             };
             tracing::debug!(
                 elapsed = ?started.elapsed(),
@@ -695,12 +702,10 @@ fn coder_dictionary_bytes(
             _ => None,
         },
         EncoderMethod::ID_LZMA => {
-            let end = LZMA_DICTIONARY_OFFSET + LZMA_DICTIONARY_BYTES;
-            let raw: [u8; LZMA_DICTIONARY_BYTES] = properties
-                .get(LZMA_DICTIONARY_OFFSET..end)?
-                .try_into()
-                .ok()?;
-            Some(u64::from(u32::from_le_bytes(raw)))
+            let raw = properties
+                .get(LZMA_DICTIONARY_OFFSET..)
+                ?.first_chunk::<LZMA_DICTIONARY_BYTES>()?;
+            Some(u64::from(u32::from_le_bytes(*raw)))
         }
         _ => None,
     }
@@ -850,13 +855,6 @@ mod tests {
 
     use tempfile::TempDir;
     use zip::ZipWriter;
-
-    /// LZMA-compressed 7z with two small PNGs, built by 7zz. The crate's
-    /// encoder features are trimmed, so the fixture is checked in.
-    const SEVENZ_FIXTURE: &str = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/two_pages.7z"
-    );
 
     /// LZMA solid 7z with two PNGs and a non-page text member in the
     /// same block, built by 7zz.
@@ -1313,8 +1311,8 @@ mod tests {
 
     #[test]
     fn sevenz_listing() {
-        let source =
-            Source::open(Path::new(SEVENZ_FIXTURE)).expect("7z opens");
+        let source = Source::open(Path::new(testkit::SEVENZ_FIXTURE))
+            .expect("7z opens");
         assert_eq!(source.names, ["p1.png", "p2.png"]);
         assert_eq!(
             catalog::page_name(&source.names, true, None, 0),
@@ -1588,6 +1586,8 @@ mod tests {
 
     #[test]
     fn sibling_books_step_between_their_own_kind() {
+        use crate::browse::Direction;
+
         let parent = TempDir::new().expect("create temp dir");
         let volume = |name: &str| {
             let dir = parent.path().join(name);
@@ -1607,17 +1607,17 @@ mod tests {
             .expect("plain file writes");
 
         assert_eq!(
-            catalog::sibling(&middle, false, true),
+            catalog::sibling(&middle, false, Direction::Forward),
             Some(last),
             "forward follows natural order"
         );
         assert_eq!(
-            catalog::sibling(&middle, false, false),
+            catalog::sibling(&middle, false, Direction::Backward),
             Some(first.clone()),
             "backward follows natural order"
         );
         assert_eq!(
-            catalog::sibling(&first, false, false),
+            catalog::sibling(&first, false, Direction::Backward),
             None,
             "the shelf's start has no earlier book"
         );
@@ -1644,12 +1644,12 @@ mod tests {
         // The volumes directory is a sibling entry of the other kind and
         // must not answer.
         assert_eq!(
-            catalog::sibling(&before, true, true),
+            catalog::sibling(&before, true, Direction::Forward),
             Some(after),
             "archives step between archives"
         );
         assert_eq!(
-            catalog::sibling(&before, true, false),
+            catalog::sibling(&before, true, Direction::Backward),
             None,
             "the first archive has no earlier book"
         );

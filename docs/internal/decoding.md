@@ -4,7 +4,7 @@ The ratios here are one laptop's measurements.
 
 ## Choices
 
-- JPEG and PNG use the `image` crate. JPEG runs through zune-jpeg; its PNG backend measured faster than zune-png on noise-heavy input. Opaque grayscale pages keep planar `Mono` (`src/decode/image.rs`).
+- JPEG and PNG use the `image` crate. JPEG runs through zune-jpeg; its PNG backend measured faster than zune-png on noise-heavy input. Opaque grayscale pages keep planar `Gray` (`src/decode/raster.rs`).
 - WebP uses `libwebp-sys`: opaque lossy pages decode to planar `Yuv420` (BT.601, studio range) for the display shader; other variants decode to RGBA8.
 - AVIF uses libavif with the dav1d codec. The libaom wrapper measured about 3x slower.
 - JXL uses the jxl crate (jxl-rs) with a parallel runner; jxl-oxide measured about 4x slower.
@@ -13,7 +13,7 @@ The ratios here are one laptop's measurements.
 ## JXL
 
 - Supply a parallel runner; the default path is single-threaded and several times slower. Scoped threads are the runner model.
-- Decode opaque grayscale into 1-byte planar `Mono` (`Matrix::Identity`, full range); decode color or alpha pages into RGBA (`jxl` interleaves extra alpha and fills opaque alpha).
+- Decode opaque grayscale into 8-bit planar `Gray` (full range); decode color or alpha pages into RGBA (`jxl` interleaves extra alpha and fills opaque alpha).
 - The whole file is in memory, so a request for more input means truncation: report a corrupt page.
 
 ## AVIF

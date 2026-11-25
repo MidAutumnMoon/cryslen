@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::animation::Player;
-use crate::book::BookEvent;
+use crate::book::PageEvent;
 use crate::browse;
 use crate::browse::Direction;
 use crate::browse::Motion;
@@ -26,7 +26,7 @@ use crate::protocol::PlaybackEvent;
 use crate::protocol::PlaybackId;
 use crate::protocol::TextureFault;
 use crate::protocol::ValidatedImage;
-use crate::ui::StatusLine;
+use crate::ui::ReadingStatus;
 
 const FIT_KEEP_SPREADS: usize = 2;
 
@@ -43,7 +43,10 @@ pub struct PendingUpload {
     pub image: Box<ValidatedImage>,
 }
 
+#[derive(Default)]
 enum PagePlayback {
+    #[default]
+    Idle,
     Playing(Player<Box<ValidatedImage>>),
     /// Sticky for the book so a stopped decoder is not retried on revisit.
     Refused,
@@ -54,7 +57,7 @@ struct PageState {
     info: Option<PageInfo>,
     /// Page faults stay sticky so a later upload or blip cannot erase them.
     fault: Option<String>,
-    playback: Option<PagePlayback>,
+    playback: PagePlayback,
 }
 
 impl PageState {
@@ -63,11 +66,12 @@ impl PageState {
         id: PlaybackId,
     ) -> Option<&mut Player<Box<ValidatedImage>>> {
         match &mut self.playback {
-            Some(PagePlayback::Playing(player)) if player.id() == id => {
+            PagePlayback::Playing(player) if player.id() == id => {
                 Some(player)
             }
-            Some(PagePlayback::Playing(_) | PagePlayback::Refused)
-            | None => {
+            PagePlayback::Playing(_)
+            | PagePlayback::Refused
+            | PagePlayback::Idle => {
                 tracing::debug!(?id, "stale playback update");
                 None
             }
@@ -75,24 +79,28 @@ impl PageState {
     }
 
     fn stop_playback(&mut self) -> Option<PlaybackCommand> {
-        if !matches!(self.playback, Some(PagePlayback::Playing(_))) {
-            return None;
-        }
-        let Some(PagePlayback::Playing(player)) = self.playback.take()
-        else {
-            return None;
+        let id = match &self.playback {
+            PagePlayback::Playing(player) => player.id(),
+            PagePlayback::Idle | PagePlayback::Refused => return None,
         };
-        let id = player.id();
-        let role = player.role();
-        tracing::debug!(?id, ?role, "playback player stop");
+        self.playback = PagePlayback::Idle;
+        tracing::debug!(?id, "playback player stop");
         Some(PlaybackCommand::Stop { id })
     }
 
     fn refuse_playback(&mut self) -> Option<PlaybackCommand> {
         let stop = self.stop_playback();
-        self.playback = Some(PagePlayback::Refused);
+        self.playback = PagePlayback::Refused;
         stop
     }
+}
+
+#[derive(Clone, Copy, Default)]
+enum Hold {
+    #[default]
+    Idle,
+    Since(Instant),
+    Logged,
 }
 
 pub struct Reading {
@@ -108,8 +116,7 @@ pub struct Reading {
     /// Drives child prefetch order and skim tie-breaking.
     direction: Direction,
     last_turn: Option<Instant>,
-    hold_since: Option<Instant>,
-    hold_logged: bool,
+    hold: Hold,
     sent_requests: Vec<Request>,
     next_generation: u32,
 }
@@ -147,8 +154,7 @@ impl Reading {
             motion: Motion::Still,
             direction: Direction::Forward,
             last_turn: None,
-            hold_since: None,
-            hold_logged: false,
+            hold: Hold::Idle,
             sent_requests: requests.clone(),
             next_generation: 0,
         };
@@ -181,8 +187,8 @@ impl Reading {
         mem::take(&mut self.pending_uploads)
     }
 
-    pub fn sibling(&self, forward: bool) -> Option<PathBuf> {
-        catalog::sibling(&self.path, self.archive, forward)
+    pub fn sibling(&self, direction: Direction) -> Option<PathBuf> {
+        catalog::sibling(&self.path, self.archive, direction)
     }
 
     fn name(&self, index: usize) -> Option<&str> {
@@ -358,32 +364,32 @@ impl Reading {
         state.player_mut(id)
     }
 
-    pub fn apply_event(
-        &mut self,
-        event: BookEvent,
-    ) -> Option<PlaybackCommand> {
+    pub fn apply_event(&mut self, event: PageEvent) -> EventEffect {
         match event {
-            BookEvent::Ready { page, role, image } => {
+            PageEvent::Ready { page, role, image } => {
                 self.pending_uploads.push_back(PendingUpload {
                     page,
                     role,
                     image,
                 });
-                None
+                EventEffect::default()
             }
-            BookEvent::Failed { page, fault } => {
+            PageEvent::Failed { page, fault } => {
                 let state = self.pages.entry(page).or_default();
                 state.fault = Some(fault);
-                state.stop_playback()
+                EventEffect {
+                    command: state.stop_playback(),
+                    redraw: true,
+                }
             }
-            BookEvent::Playback(playback) => match playback {
+            PageEvent::Playback(playback) => match playback {
                 PlaybackEvent::Frame { id, delay, image } => {
                     if let Some(player) = self.player_mut(id)
                         && !player.on_frame(delay, image)
                     {
                         tracing::debug!(?id, "unrequested playback frame");
                     }
-                    None
+                    EventEffect::default()
                 }
                 PlaybackEvent::Finished { id } => {
                     if let Some(player) = self.player_mut(id)
@@ -391,21 +397,24 @@ impl Reading {
                     {
                         tracing::debug!(?id, "playback finished");
                     }
-                    None
+                    EventEffect::default()
                 }
                 PlaybackEvent::Failed { id } => {
                     let Some(state) = self.pages.get_mut(&id.page) else {
                         tracing::debug!(?id, "stale playback update");
-                        return None;
+                        return EventEffect::default();
                     };
                     if state.player_mut(id).is_some() {
                         tracing::warn!(?id, "playback failed");
-                        return state.refuse_playback();
+                        EventEffect {
+                            command: state.refuse_playback(),
+                            redraw: true,
+                        }
+                    } else {
+                        EventEffect::default()
                     }
-                    None
                 }
             },
-            BookEvent::Died(_) => None,
         }
     }
 
@@ -571,12 +580,8 @@ impl Reading {
         self.shown().unwrap_or_else(|| self.target_spread(mode))
     }
 
-    pub fn seat_dims(
-        &self,
-        mode: ReadingMode,
-        spread: Spread,
-    ) -> [Option<(u32, u32)>; 2] {
-        spread.seats(mode).map(|seat| {
+    pub fn seat_dims(&self, mode: ReadingMode) -> [Option<(u32, u32)>; 2] {
+        self.on_screen(mode).seats(mode).map(|seat| {
             let page = seat?;
             self.pages.get(&page)?.info.map(|info| info.dims)
         })
@@ -585,11 +590,11 @@ impl Reading {
     pub fn update_requests(
         &mut self,
         mode: ReadingMode,
-        on_screen: Spread,
         on_screen_scale: Option<f64>,
         limits: ImageLimits,
         roles: impl Fn(usize) -> Roles,
     ) -> Option<Vec<Request>> {
+        let on_screen = self.on_screen(mode);
         let demand = self.demand_spread(on_screen, mode);
         let requests = self.request_roles(
             demand,
@@ -698,55 +703,64 @@ impl Reading {
 
         let target = self.target_spread(mode);
         let shown = self.shown();
-        if self.motion == Motion::Still && shown != Some(target) {
-            let since = *self.hold_since.get_or_insert(now);
-            let waited = now.saturating_duration_since(since);
-            if !self.hold_logged && waited >= HOLD_LOG_THRESHOLD {
-                self.hold_logged = true;
-                tracing::info!(
-                    ?target,
-                    ?shown,
-                    ?waited,
-                    "holding for a fit image"
-                );
+        let holding = self.motion == Motion::Still && shown != Some(target);
+        self.hold = match (self.hold, holding) {
+            (_, false) => Hold::Idle,
+            (Hold::Idle, true) => Hold::Since(now),
+            (Hold::Since(since), true) => {
+                let waited = now.saturating_duration_since(since);
+                if waited >= HOLD_LOG_THRESHOLD {
+                    tracing::info!(
+                        ?target,
+                        ?shown,
+                        ?waited,
+                        "holding for a fit image"
+                    );
+                    Hold::Logged
+                } else {
+                    Hold::Since(since)
+                }
             }
-        } else {
-            self.hold_since = None;
-            self.hold_logged = false;
-        }
+            (Hold::Logged, true) => Hold::Logged,
+        };
     }
 
     pub fn retains_texture(
         &self,
         mode: ReadingMode,
-        on_screen: Spread,
         page: usize,
         role: Role,
     ) -> bool {
         if self.sent_requests.contains(&Request { page, role }) {
             return true;
         }
+        let on_screen = self.on_screen(mode);
         let target = self.target_spread(mode);
         match role {
             Role::Thumb => true,
             Role::Fit => {
-                let start =
-                    browse::spread_for(page, mode, self.page_count())
-                        .first;
-                start.abs_diff(on_screen.first) <= FIT_KEEP_SPREADS
-                    || start.abs_diff(target.first) <= FIT_KEEP_SPREADS
+                browse::spread_distance(page, on_screen.first, mode)
+                    <= FIT_KEEP_SPREADS
+                    || browse::spread_distance(page, target.first, mode)
+                        <= FIT_KEEP_SPREADS
             }
             Role::Full => on_screen.contains(page),
         }
     }
 
-    /// A player follows the role its seat draws; a role change restarts it.
+    pub fn retains_playback(&self, page: usize) -> bool {
+        self.pages.get(&page).is_some_and(|state| {
+            matches!(state.playback, PagePlayback::Playing(_))
+        })
+    }
+
+    /// Starts a live playback stream when a still animated seat has settled.
     pub fn sync_playback(
         &mut self,
         mode: ReadingMode,
-        on_screen: Spread,
         roles: impl Fn(usize) -> Roles,
     ) -> Vec<PlaybackCommand> {
+        let on_screen = self.on_screen(mode);
         let targets = if self.motion == Motion::Still {
             on_screen.seats(mode).map(|seat| {
                 let page = seat?;
@@ -755,11 +769,12 @@ impl Reading {
                     return None;
                 }
                 let info = state.info?;
-                if !info.format.may_animate() {
+                if !info.format.may_animate()
+                    || !roles(page).has_settled_image()
+                {
                     return None;
                 }
-                let role = roles(page).best()?;
-                (role != Role::Thumb).then_some((page, role))
+                Some(page)
             })
         } else {
             [None, None]
@@ -767,28 +782,26 @@ impl Reading {
         let mut commands = Vec::new();
         for (&page, state) in &mut self.pages {
             let keep = match &state.playback {
-                Some(PagePlayback::Playing(player)) => {
+                PagePlayback::Playing(_) => {
                     state.fault.is_none()
-                        && targets.iter().flatten().any(
-                            |&(want_page, want_role)| {
-                                want_page == page
-                                    && want_role == player.role()
-                            },
-                        )
+                        && targets
+                            .iter()
+                            .flatten()
+                            .any(|&want_page| want_page == page)
                 }
-                Some(PagePlayback::Refused) | None => true,
+                PagePlayback::Idle | PagePlayback::Refused => true,
             };
             if !keep && let Some(command) = state.stop_playback() {
                 commands.push(command);
             }
         }
-        for &(page, role) in targets.iter().flatten() {
+        for &page in targets.iter().flatten() {
             let Some(state) = self.pages.get_mut(&page) else {
                 continue;
             };
             if state.info.is_none()
                 || state.fault.is_some()
-                || state.playback.is_some()
+                || !matches!(state.playback, PagePlayback::Idle)
             {
                 continue;
             }
@@ -797,10 +810,9 @@ impl Reading {
                 generation: self.next_generation,
             };
             self.next_generation = id.generation.wrapping_add(1);
-            state.playback =
-                Some(PagePlayback::Playing(Player::new(id, role)));
-            commands.push(PlaybackCommand::Start { id, role });
-            tracing::debug!(?id, ?role, "playback player start");
+            state.playback = PagePlayback::Playing(Player::new(id));
+            commands.push(PlaybackCommand::Start { id });
+            tracing::debug!(?id, "playback player start");
         }
         commands
     }
@@ -808,11 +820,7 @@ impl Reading {
     pub fn tick_playback(
         &mut self,
         now: Instant,
-        mut upload: impl FnMut(
-            usize,
-            Role,
-            &ValidatedImage,
-        ) -> Result<(), TextureFault>,
+        mut upload: impl FnMut(usize, &ValidatedImage) -> Result<(), TextureFault>,
     ) -> PlaybackTick {
         use crate::animation::Due;
 
@@ -820,18 +828,15 @@ impl Reading {
         let mut commands = Vec::new();
         let mut updated = false;
         for (&page, state) in &mut self.pages {
-            let Some(PagePlayback::Playing(player)) = &mut state.playback
-            else {
+            let PagePlayback::Playing(player) = &mut state.playback else {
                 continue;
             };
             let id = player.id();
-            let role = player.role();
             match player.tick(now) {
                 Due::Show { image, next_due } => {
-                    if let Err(error) = upload(page, role, &image) {
+                    if let Err(error) = upload(page, &image) {
                         tracing::warn!(
                             page,
-                            ?role,
                             %error,
                             "playback frame upload failed"
                         );
@@ -842,7 +847,6 @@ impl Reading {
                     }
                     tracing::debug!(
                         page,
-                        ?role,
                         delay = ?next_due.saturating_duration_since(now),
                         "playback frame shown"
                     );
@@ -869,11 +873,12 @@ impl Reading {
 
     pub fn is_waiting(
         &self,
-        on_screen: Spread,
+        mode: ReadingMode,
         has_texture: impl Fn(usize) -> bool,
     ) -> bool {
         use std::iter;
 
+        let on_screen = self.on_screen(mode);
         iter::once(on_screen.first)
             .chain(on_screen.second)
             .all(|page| {
@@ -888,18 +893,16 @@ impl Reading {
             })
     }
 
-    pub fn status_line<'fault>(
+    pub fn book_status<'fault>(
         &'fault self,
-        on_screen: Spread,
         mode: ReadingMode,
         zoom: f64,
-        book_fault: Option<&'fault str>,
         has_texture: impl Fn(usize) -> bool,
-    ) -> StatusLine<'fault> {
+    ) -> BookStatus<'fault> {
         use crate::decode;
-        use crate::ui::ReadingStatus;
         use std::iter;
 
+        let on_screen = self.on_screen(mode);
         let mut failure: Option<(usize, &'fault str)> = None;
         let mut first_decoded: Option<(usize, PageInfo)> = None;
         for page in iter::once(on_screen.first).chain(on_screen.second) {
@@ -920,7 +923,7 @@ impl Reading {
                 first_decoded.get_or_insert((page, info));
             }
         }
-        let (named_page, page_fault) = match failure {
+        let (named_page, fault) = match failure {
             Some((page, fault)) => (page, Some(fault)),
             None => (
                 first_decoded.map_or(on_screen.first, |(page, _)| page),
@@ -937,21 +940,32 @@ impl Reading {
             }
             None => (None, None),
         };
-        StatusLine {
-            reading: Some(ReadingStatus {
+        BookStatus {
+            reading: ReadingStatus {
                 page_count: self.page_count().get(),
                 spread: on_screen,
                 page_dims,
                 actual_format,
                 zoom,
-            }),
-            mode,
-            toast: false,
+            },
             name: self.page_name(named_page),
             waiting: failure.is_none() && first_decoded.is_none(),
-            fault: page_fault.or(book_fault),
+            fault,
         }
     }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct EventEffect {
+    pub command: Option<PlaybackCommand>,
+    pub redraw: bool,
+}
+
+pub struct BookStatus<'fault> {
+    pub reading: ReadingStatus,
+    pub name: PageName,
+    pub waiting: bool,
+    pub fault: Option<&'fault str>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1010,12 +1024,7 @@ fn full_wanted(
 )]
 mod tests {
     use super::*;
-
-    fn test_limits() -> ImageLimits {
-        const FIT_BOX: (u32, u32) = (2560, 1440);
-        const MAX_TEXTURE_EDGE: u32 = 16_384;
-        ImageLimits::new(FIT_BOX, MAX_TEXTURE_EDGE)
-    }
+    use crate::testkit;
 
     fn roles_with(role: Role) -> Roles {
         let mut roles = Roles::default();
@@ -1084,30 +1093,17 @@ mod tests {
         width: u32,
         height: u32,
         format: Format,
-    ) -> BookEvent {
-        BookEvent::Ready {
+    ) -> PageEvent {
+        PageEvent::Ready {
             page,
             role,
             image: wire_image(width, height, format),
         }
     }
 
-    fn check_texture_edge(
-        image: &ValidatedImage,
-        max_edge: u32,
-    ) -> Result<(), TextureFault> {
-        if image.meta.width > max_edge || image.meta.height > max_edge {
-            return Err(TextureFault {
-                dims: (image.meta.width, image.meta.height),
-                max_edge,
-            });
-        }
-        Ok(())
-    }
-
     #[test]
     fn a_full_image_is_only_requested_when_the_fit_has_fewer_pixels() {
-        let limits = test_limits();
+        let limits = testkit::limits();
         assert!(!full_wanted(16.0, (1920, 1080), limits));
         assert!(!full_wanted(16.0, (2560, 1440), limits));
         let portrait = (3628, 5148);
@@ -1137,36 +1133,31 @@ mod tests {
         let (mut reading, _) =
             reading_with_pages(20, Some("010.png"), ReadingMode::Normal);
         reading.shown = Some((ReadingMode::Normal, Spread::lone(10)));
-        assert!(reading.retains_texture(
-            ReadingMode::Normal,
-            Spread::lone(10),
-            10,
-            Role::Full,
+        assert!(reading.retains_texture(ReadingMode::Normal, 10, Role::Full));
+        assert!(!reading.retains_texture(ReadingMode::Normal, 12, Role::Full));
+        assert!(reading.retains_texture(ReadingMode::Normal, 12, Role::Fit));
+        assert!(!reading.retains_texture(ReadingMode::Normal, 13, Role::Fit));
+        assert!(reading.retains_texture(ReadingMode::Normal, 0, Role::Thumb));
+
+        // Manga keeps ±2 spreads: on spread 5-6 (spread 3), spreads 1..=5
+        // span pages 1..=10, while cover (0) and page 11 are 3 spreads away.
+        let (mut manga, _) =
+            reading_with_pages(20, Some("005.png"), ReadingMode::Manga);
+        manga.shown = Some((
+            ReadingMode::Manga,
+            Spread {
+                first: 5,
+                second: Some(6),
+            },
         ));
-        assert!(!reading.retains_texture(
-            ReadingMode::Normal,
-            Spread::lone(10),
-            12,
-            Role::Full,
-        ));
-        assert!(reading.retains_texture(
-            ReadingMode::Normal,
-            Spread::lone(10),
-            12,
-            Role::Fit,
-        ));
-        assert!(!reading.retains_texture(
-            ReadingMode::Normal,
-            Spread::lone(10),
-            13,
-            Role::Fit,
-        ));
-        assert!(reading.retains_texture(
-            ReadingMode::Normal,
-            Spread::lone(10),
-            0,
-            Role::Thumb,
-        ));
+        assert!(!manga.retains_texture(ReadingMode::Manga, 0, Role::Fit));
+        for kept in [1, 2, 9, 10] {
+            assert!(
+                manga.retains_texture(ReadingMode::Manga, kept, Role::Fit),
+                "page {kept} within 2 spreads of 5-6"
+            );
+        }
+        assert!(!manga.retains_texture(ReadingMode::Manga, 11, Role::Fit));
     }
 
     #[test]
@@ -1177,14 +1168,12 @@ mod tests {
         seed_page(&mut reading, 1, (4000, 6000), Format::Png);
         seed_page(&mut reading, 2, (4000, 6000), Format::Png);
 
-        let on_screen = reading.on_screen(ReadingMode::Normal);
-        assert_eq!(on_screen, Spread::lone(1));
+        assert_eq!(reading.on_screen(ReadingMode::Normal), Spread::lone(1));
         let requests = reading
             .update_requests(
                 ReadingMode::Normal,
-                on_screen,
                 Some(1.0),
-                test_limits(),
+                testkit::limits(),
                 |_| Roles::default(),
             )
             .expect("requests changed");
@@ -1409,36 +1398,40 @@ mod tests {
             roles_with(if page == 6 { Role::Thumb } else { Role::Fit })
         };
 
+        reading.shown = Some((mode, Spread::lone(6)));
         assert_eq!(
-            reading.sync_playback(mode, Spread::lone(6), roles),
+            reading.sync_playback(mode, roles),
             [],
             "a thumb-only page never plays"
         );
+        reading.shown = Some((mode, Spread::lone(8)));
         assert_eq!(
-            reading.sync_playback(mode, Spread::lone(8), roles),
+            reading.sync_playback(mode, roles),
             [],
             "a still image never plays"
         );
+        reading.shown = Some((mode, Spread::lone(10)));
         assert_eq!(
-            reading.sync_playback(mode, Spread::lone(10), roles),
+            reading.sync_playback(mode, roles),
             [],
             "a faulted page never plays"
         );
+        reading.shown = Some((mode, Spread::lone(12)));
         reading.motion = Motion::Skimming;
         assert_eq!(
-            reading.sync_playback(mode, Spread::lone(12), roles),
+            reading.sync_playback(mode, roles),
             [],
             "skimming never plays"
         );
+        reading.shown = Some((mode, Spread::lone(4)));
         reading.motion = Motion::Still;
         assert_eq!(
-            reading.sync_playback(mode, Spread::lone(4), roles),
+            reading.sync_playback(mode, roles),
             vec![PlaybackCommand::Start {
                 id: PlaybackId {
                     page: 4,
                     generation: 0
                 },
-                role: Role::Fit,
             }]
         );
     }
@@ -1461,9 +1454,8 @@ mod tests {
         let requests = reading
             .update_requests(
                 ReadingMode::Normal,
-                Spread::lone(2),
                 Some(1.0),
-                test_limits(),
+                testkit::limits(),
                 |page| {
                     if page == 2 {
                         roles_with(Role::Thumb)
@@ -1499,9 +1491,8 @@ mod tests {
         let requests = reading
             .update_requests(
                 ReadingMode::Normal,
-                Spread::lone(4),
                 Some(1.0),
-                test_limits(),
+                testkit::limits(),
                 |page| {
                     if page == 4 {
                         roles_with(Role::Fit)
@@ -1521,81 +1512,49 @@ mod tests {
     }
 
     #[test]
-    fn status_line_blames_page_before_book_and_summarizes_spread() {
+    fn book_status_blames_page_and_summarizes_spread() {
         let (mut reading, _) =
             reading_with_pages(10, None, ReadingMode::Manga);
         let spread = Spread {
             first: 1,
             second: Some(2),
         };
-        let book_fault = "the book process did not answer in time";
+        reading.shown = Some((ReadingMode::Manga, spread));
 
-        let waiting = reading.status_line(
-            spread,
-            ReadingMode::Manga,
-            1.0,
-            None,
-            |_| false,
-        );
+        let waiting =
+            reading.book_status(ReadingMode::Manga, 1.0, |_| false);
         assert!(waiting.waiting);
         assert_eq!(waiting.fault, None);
         assert_eq!(waiting.name.file, "001.png");
-        assert!(
-            waiting
-                .reading
-                .is_some_and(|status| status.page_dims.is_none())
-        );
-
-        let book_only = reading.status_line(
-            spread,
-            ReadingMode::Manga,
-            1.0,
-            Some(book_fault),
-            |_| false,
-        );
-        assert_eq!(book_only.fault, Some(book_fault));
+        assert!(waiting.reading.page_dims.is_none());
 
         seed_page(&mut reading, 1, (800, 600), Format::Png);
-        let settled = reading.status_line(
-            spread,
-            ReadingMode::Manga,
-            1.0,
-            None,
-            |page| page == 1,
-        );
+        let settled =
+            reading.book_status(ReadingMode::Manga, 1.0, |page| page == 1);
         assert!(!settled.waiting);
         assert_eq!(settled.name.file, "001.png");
-        let settled_reading = settled.reading.expect("reading status");
-        assert_eq!(settled_reading.page_dims, Some((800, 600)));
-        assert_eq!(settled_reading.actual_format, None);
+        assert_eq!(settled.reading.page_dims, Some((800, 600)));
+        assert_eq!(settled.reading.actual_format, None);
 
         seed_page(&mut reading, 2, (1200, 900), Format::Jxl);
-        let single_mismatch = reading.status_line(
-            Spread::lone(2),
-            ReadingMode::Normal,
-            0.5,
-            None,
-            |page| page == 2,
-        );
-        assert_eq!(
-            single_mismatch
-                .reading
-                .expect("reading status")
-                .actual_format,
-            Some(Format::Jxl)
-        );
+        reading.shown = Some((ReadingMode::Normal, Spread::lone(2)));
+        let single_mismatch =
+            reading.book_status(ReadingMode::Normal, 0.5, |page| page == 2);
+        assert_eq!(single_mismatch.reading.actual_format, Some(Format::Jxl));
 
-        reading.apply_event(BookEvent::Failed {
-            page: 2,
-            fault: String::from("page"),
-        });
-        let page_faulted = reading.status_line(
-            spread,
-            ReadingMode::Manga,
-            1.0,
-            Some(book_fault),
-            |page| page == 1,
+        reading.shown = Some((ReadingMode::Manga, spread));
+        assert_eq!(
+            reading.apply_event(PageEvent::Failed {
+                page: 2,
+                fault: String::from("page"),
+            }),
+            EventEffect {
+                command: None,
+                redraw: true,
+            }
         );
+        let page_faulted =
+            reading.book_status(ReadingMode::Manga, 1.0, |page| page == 1);
         assert!(!page_faulted.waiting);
         assert_eq!(page_faulted.fault, Some("page"));
         assert_eq!(page_faulted.name.file, "002.png");
@@ -1657,7 +1616,7 @@ mod tests {
     }
 
     #[test]
-    fn playback_lifecycle_handles_restarts_refusals_and_page_faults() {
+    fn playback_lifecycle_handles_promotions_refusals_and_page_faults() {
         use std::time::Duration;
 
         const MAX_EDGE: u32 = 100;
@@ -1668,7 +1627,7 @@ mod tests {
         let playback_id =
             |page, generation| PlaybackId { page, generation };
         let frame_event = |target_id, edge| {
-            BookEvent::Playback(PlaybackEvent::Frame {
+            PageEvent::Playback(PlaybackEvent::Frame {
                 id: target_id,
                 delay: FRAME_DELAY,
                 image: wire_image(edge, edge, Format::Gif),
@@ -1685,131 +1644,129 @@ mod tests {
                 FITTING_EDGE,
                 Format::Gif,
             );
-            assert_eq!(reading.apply_event(event), None);
+            assert_eq!(reading.apply_event(event), EventEffect::default());
         }
         for upload in reading.take_pending_uploads() {
             reading.record_uploaded(upload.page, &upload.image);
         }
 
-        let fit_playback = playback_id(0, 0);
-        let full_playback = playback_id(0, 1);
+        let playback = playback_id(0, 0);
+        reading.shown = Some((mode, Spread::lone(0)));
+        assert!(!reading.retains_playback(0));
         assert_eq!(
-            reading.sync_playback(mode, Spread::lone(0), |_| {
-                roles_with(Role::Fit)
-            }),
-            vec![PlaybackCommand::Start {
-                id: fit_playback,
-                role: Role::Fit
-            }]
+            reading.sync_playback(mode, |_| roles_with(Role::Fit)),
+            vec![PlaybackCommand::Start { id: playback }]
         );
+        assert!(reading.retains_playback(0));
+        // Promoting Fit to Full keeps the running stream instead of restarting.
         assert_eq!(
-            reading.sync_playback(mode, Spread::lone(0), |_| {
-                roles_with(Role::Full)
-            }),
-            vec![
-                PlaybackCommand::Stop { id: fit_playback },
-                PlaybackCommand::Start {
-                    id: full_playback,
-                    role: Role::Full
-                },
-            ]
+            reading.sync_playback(mode, |_| roles_with(Role::Full)),
+            []
         );
+        assert!(reading.retains_playback(0));
 
         let now = Instant::now();
         assert_eq!(
-            reading.tick_playback(now, |_, _, image| {
-                check_texture_edge(image, MAX_EDGE)
+            reading.tick_playback(now, |_, image| {
+                TextureFault::check_dims(
+                    (image.meta.width, image.meta.height),
+                    MAX_EDGE,
+                )
             }),
             PlaybackTick {
                 next_deadline: None,
-                commands: vec![PlaybackCommand::Next {
-                    id: full_playback
-                }],
+                commands: vec![PlaybackCommand::Next { id: playback }],
                 updated: false,
             }
         );
 
+        let stale_playback = playback_id(0, 99);
         assert_eq!(
-            reading.apply_event(frame_event(fit_playback, FITTING_EDGE)),
-            None
+            reading.apply_event(frame_event(stale_playback, FITTING_EDGE)),
+            EventEffect::default()
         );
         assert_eq!(
-            reading.apply_event(frame_event(full_playback, FITTING_EDGE)),
-            None
+            reading.apply_event(frame_event(playback, FITTING_EDGE)),
+            EventEffect::default()
         );
         assert_eq!(
-            reading.tick_playback(now, |_, _, image| {
-                check_texture_edge(image, MAX_EDGE)
+            reading.tick_playback(now, |_, image| {
+                TextureFault::check_dims(
+                    (image.meta.width, image.meta.height),
+                    MAX_EDGE,
+                )
             }),
             PlaybackTick {
                 next_deadline: Some(now + FRAME_DELAY),
-                commands: vec![PlaybackCommand::Next {
-                    id: full_playback
-                }],
+                commands: vec![PlaybackCommand::Next { id: playback }],
                 updated: true,
             }
         );
         assert_eq!(
-            reading.apply_event(BookEvent::Playback(
-                PlaybackEvent::Failed { id: fit_playback }
-            )),
-            None
+            reading.apply_event(PageEvent::Playback(PlaybackEvent::Failed {
+                id: stale_playback
+            })),
+            EventEffect::default()
         );
         assert_eq!(
-            reading.apply_event(BookEvent::Playback(
-                PlaybackEvent::Failed { id: full_playback }
-            )),
-            Some(PlaybackCommand::Stop { id: full_playback })
+            reading.apply_event(PageEvent::Playback(PlaybackEvent::Failed {
+                id: playback
+            })),
+            EventEffect {
+                command: Some(PlaybackCommand::Stop { id: playback }),
+                redraw: true,
+            }
         );
+        assert!(!reading.retains_playback(0));
         assert_eq!(
-            reading.sync_playback(mode, Spread::lone(0), |_| {
-                roles_with(Role::Full)
-            }),
+            reading.sync_playback(mode, |_| roles_with(Role::Full)),
             []
         );
 
-        let faulted_playback = playback_id(1, 2);
+        let faulted_playback = playback_id(1, 1);
+        reading.shown = Some((mode, Spread::lone(1)));
         assert_eq!(
-            reading.sync_playback(mode, Spread::lone(1), |_| {
-                roles_with(Role::Fit)
-            }),
+            reading.sync_playback(mode, |_| roles_with(Role::Fit)),
             vec![PlaybackCommand::Start {
                 id: faulted_playback,
-                role: Role::Fit
             }]
         );
+        assert!(reading.retains_playback(1));
         assert_eq!(
-            reading.apply_event(BookEvent::Failed {
+            reading.apply_event(PageEvent::Failed {
                 page: 1,
                 fault: String::from("corrupt"),
             }),
-            Some(PlaybackCommand::Stop {
-                id: faulted_playback
-            })
+            EventEffect {
+                command: Some(PlaybackCommand::Stop {
+                    id: faulted_playback,
+                }),
+                redraw: true,
+            }
         );
+        assert!(!reading.retains_playback(1));
         assert!(
             reading.pages.get(&1).and_then(|state| state.info).is_some()
         );
         assert_eq!(
-            reading.sync_playback(mode, Spread::lone(1), |_| {
-                roles_with(Role::Fit)
-            }),
+            reading.sync_playback(mode, |_| roles_with(Role::Fit)),
             []
         );
 
-        let oversized_playback = playback_id(2, 3);
+        let oversized_playback = playback_id(2, 2);
+        reading.shown = Some((mode, Spread::lone(2)));
         assert_eq!(
-            reading.sync_playback(mode, Spread::lone(2), |_| {
-                roles_with(Role::Fit)
-            }),
+            reading.sync_playback(mode, |_| roles_with(Role::Fit)),
             vec![PlaybackCommand::Start {
                 id: oversized_playback,
-                role: Role::Fit
             }]
         );
         assert_eq!(
-            reading.tick_playback(now, |_, _, image| {
-                check_texture_edge(image, MAX_EDGE)
+            reading.tick_playback(now, |_, image| {
+                TextureFault::check_dims(
+                    (image.meta.width, image.meta.height),
+                    MAX_EDGE,
+                )
             }),
             PlaybackTick {
                 next_deadline: None,
@@ -1824,11 +1781,14 @@ mod tests {
                 oversized_playback,
                 OVERSIZED_EDGE,
             )),
-            None
+            EventEffect::default()
         );
         assert_eq!(
-            reading.tick_playback(now, |_, _, image| {
-                check_texture_edge(image, MAX_EDGE)
+            reading.tick_playback(now, |_, image| {
+                TextureFault::check_dims(
+                    (image.meta.width, image.meta.height),
+                    MAX_EDGE,
+                )
             }),
             PlaybackTick {
                 next_deadline: None,
@@ -1839,9 +1799,7 @@ mod tests {
             }
         );
         assert_eq!(
-            reading.sync_playback(mode, Spread::lone(2), |_| {
-                roles_with(Role::Fit)
-            }),
+            reading.sync_playback(mode, |_| roles_with(Role::Fit)),
             []
         );
     }
@@ -1865,9 +1823,8 @@ mod tests {
         assert_eq!(
             reading.update_requests(
                 mode,
-                Spread::lone(0),
                 None,
-                test_limits(),
+                testkit::limits(),
                 roles(0),
             ),
             Some(vec![Request {
@@ -1880,9 +1837,8 @@ mod tests {
         assert_eq!(
             reading.update_requests(
                 mode,
-                Spread::lone(1),
                 None,
-                test_limits(),
+                testkit::limits(),
                 roles(1),
             ),
             Some(vec![Request {
@@ -1896,9 +1852,8 @@ mod tests {
         assert_eq!(
             reading.update_requests(
                 mode,
-                Spread::lone(5),
                 None,
-                test_limits(),
+                testkit::limits(),
                 roles(5),
             ),
             Some(Vec::new())

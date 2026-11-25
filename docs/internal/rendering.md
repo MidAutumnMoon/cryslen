@@ -33,4 +33,4 @@ A seat rect is in page pixels and a texture's UV spans the page; each draw compa
 
 ## Page textures
 
-The cache maps each page to one slot per role, in `Role::VARIANTS` order; a seat keeps `Fit` while both axes cover the screen size (`best_texture`), otherwise draws the largest resident slot.
+The cache maps each page to one slot per role (in `Role::VARIANTS` order) plus an active playback slot; when playing, the live playback frame takes precedence, otherwise a seat keeps `Fit` while both axes cover the screen size (`best_texture`), or else draws the largest resident slot.

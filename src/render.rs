@@ -35,7 +35,6 @@ use crate::browse::Role;
 use crate::browse::Roles;
 use crate::decode::Depth;
 use crate::decode::Matrix;
-use crate::decode::Subsampling;
 use crate::decode::Transfer;
 use crate::geometry::PageRect;
 use crate::geometry::Placement;
@@ -355,12 +354,49 @@ const EWA_LUT_INTERVALS: i32 = 128;
 const EWA_LUT_LEN: usize = EWA_LUT_INTERVALS.cast_unsigned() as usize + 1;
 const EWA_GRID_LEN: usize = EWA_LUT_LEN * 2 - 1;
 
+#[derive(Default)]
+struct PageSlots {
+    roles: EnumMap<Role, Option<PageTexture>>,
+    playback: Option<PageTexture>,
+}
+
+impl PageSlots {
+    fn roles(&self) -> Roles {
+        let mut roles = Roles::default();
+        for (role, slot) in &self.roles {
+            if slot.is_some() {
+                roles.set(role);
+            }
+        }
+        roles
+    }
+
+    fn has_any(&self) -> bool {
+        self.playback.is_some() || self.roles.values().any(Option::is_some)
+    }
+
+    /// Keep `Fit` whenever it covers `screen_size` so zooming back out
+    /// avoids re-filtering `Full`. A live playback frame takes precedence.
+    fn best_texture(&self, screen_size: (f64, f64)) -> Option<&PageTexture> {
+        if let Some(playback) = self.playback.as_ref() {
+            return Some(playback);
+        }
+        if let Some(fit) = self.roles[Role::Fit].as_ref()
+            && f64::from(fit.dims.0) + ROLE_COVER_MARGIN_PX >= screen_size.0
+            && f64::from(fit.dims.1) + ROLE_COVER_MARGIN_PX >= screen_size.1
+        {
+            return Some(fit);
+        }
+        self.roles[self.roles().best()?].as_ref()
+    }
+}
+
 pub struct PageTextures {
     gl: Arc<Context>,
     vao: EmptyVao,
     pipeline: Pipeline,
     ewa: EwaResampler,
-    pages: HashMap<usize, EnumMap<Role, Option<PageTexture>>>,
+    pages: HashMap<usize, PageSlots>,
     max_texture_edge: u32,
 }
 
@@ -542,29 +578,13 @@ struct ColorConversion {
     offset: [f32; 3],
 }
 
-fn slot_roles(slots: &EnumMap<Role, Option<PageTexture>>) -> Roles {
-    let mut roles = Roles::default();
-    for (role, slot) in slots {
-        if slot.is_some() {
-            roles.set(role);
+impl ColorConversion {
+    const fn gray(gain: f32, offset: f32) -> Self {
+        Self {
+            matrix: [gain, gain, gain, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            offset: [offset; 3],
         }
     }
-    roles
-}
-
-/// Keep `Fit` whenever it covers `screen_size` so zooming back out
-/// avoids re-filtering `Full`.
-fn best_texture(
-    slots: &EnumMap<Role, Option<PageTexture>>,
-    screen_size: (f64, f64),
-) -> Option<&PageTexture> {
-    if let Some(fit) = slots[Role::Fit].as_ref()
-        && f64::from(fit.dims.0) + ROLE_COVER_MARGIN_PX >= screen_size.0
-        && f64::from(fit.dims.1) + ROLE_COVER_MARGIN_PX >= screen_size.1
-    {
-        return Some(fit);
-    }
-    slots[slot_roles(slots).best()?].as_ref()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -649,19 +669,6 @@ fn compute_visible_slice(
     })
 }
 
-/// Refuse a page over `MAX_TEXTURE_SIZE` before upload; an oversized
-/// upload samples black.
-fn check_texture_dims(
-    dims: (u32, u32),
-    max_edge: u32,
-) -> Result<(), TextureFault> {
-    if dims.0 == 0 || dims.1 == 0 || dims.0 > max_edge || dims.1 > max_edge
-    {
-        return Err(TextureFault { dims, max_edge });
-    }
-    Ok(())
-}
-
 impl PageTextures {
     fn new(gl: Arc<Context>) -> eros::Result<Self> {
         use crate::protocol::THUMB_EDGE;
@@ -720,29 +727,27 @@ impl PageTextures {
             return Ok(());
         }
         let dims = (image.meta.width, image.meta.height);
-        check_texture_dims(dims, self.max_texture_edge)?;
+        TextureFault::check_dims(dims, self.max_texture_edge)?;
         let texture = upload_page_texture(Arc::clone(&self.gl), image);
-        label_entry(&self.gl, page, role, &texture);
-        self.pages.entry(page).or_default()[role] = Some(texture);
+        label_entry(&self.gl, page, role.into(), &texture);
+        self.pages.entry(page).or_default().roles[role] = Some(texture);
         Ok(())
     }
 
-    /// Keeps the page's role slot.
-    pub fn update(
+    /// Updates `page`'s live playback slot in place when dimensions and format match.
+    pub fn update_playback(
         &mut self,
         page: usize,
-        role: Role,
         image: &ValidatedImage,
     ) -> Result<(), TextureFault> {
         let dims = (image.meta.width, image.meta.height);
-        check_texture_dims(dims, self.max_texture_edge)?;
+        TextureFault::check_dims(dims, self.max_texture_edge)?;
         if let Some(PageTexture {
             dims: present_dims,
             layout: PixelLayout::Rgba { texture },
             transfer,
             ..
-        }) =
-            self.pages.get(&page).and_then(|slots| slots[role].as_ref())
+        }) = self.pages.get(&page).and_then(|slots| slots.playback.as_ref())
             && *present_dims == dims
             && *transfer == image.meta.transfer
             && let WirePixels::Rgba8(bytes) = &image.pixels
@@ -750,42 +755,43 @@ impl PageTextures {
             update_rgba(&self.gl, *texture, bytes, dims);
             return Ok(());
         }
-        let empty = self.pages.get_mut(&page).is_some_and(|slots| {
-            slots[role] = None;
-            slots.values().all(Option::is_none)
-        });
-        if empty {
-            self.pages.remove(&page);
-        }
-        self.insert(page, role, image)
+        let texture = upload_page_texture(Arc::clone(&self.gl), image);
+        label_entry(&self.gl, page, "playback", &texture);
+        self.pages.entry(page).or_default().playback = Some(texture);
+        Ok(())
     }
 
     pub fn roles(&self, page: usize) -> Roles {
         self.pages
             .get(&page)
-            .map_or_else(Roles::default, slot_roles)
+            .map_or_else(Roles::default, PageSlots::roles)
     }
 
     fn has(&self, page: usize, role: Role) -> bool {
         self.pages
             .get(&page)
-            .is_some_and(|slots| slots[role].is_some())
+            .is_some_and(|slots| slots.roles[role].is_some())
     }
 
     pub fn has_any(&self, page: usize) -> bool {
-        self.pages
-            .get(&page)
-            .is_some_and(|slots| slots.values().any(Option::is_some))
+        self.pages.get(&page).is_some_and(PageSlots::has_any)
     }
 
-    pub fn retain(&mut self, keep: impl Fn(usize, Role) -> bool) {
+    pub fn retain(
+        &mut self,
+        keep_role: impl Fn(usize, Role) -> bool,
+        keep_playback: impl Fn(usize) -> bool,
+    ) {
         self.pages.retain(|&page, slots| {
-            for (role, slot) in slots.iter_mut() {
-                if slot.is_some() && !keep(page, role) {
+            for (role, slot) in &mut slots.roles {
+                if slot.is_some() && !keep_role(page, role) {
                     *slot = None;
                 }
             }
-            slots.values().any(Option::is_some)
+            if slots.playback.is_some() && !keep_playback(page) {
+                slots.playback = None;
+            }
+            slots.has_any()
         });
     }
 
@@ -821,7 +827,7 @@ impl PageTextures {
             let Some(texture) = self
                 .pages
                 .get(page)
-                .and_then(|slots| best_texture(slots, screen_size))
+                .and_then(|slots| slots.best_texture(screen_size))
             else {
                 continue;
             };
@@ -1541,16 +1547,12 @@ impl EwaResampler {
             "ewa vert color",
         )?;
 
-        let lut = upload_ewa_lut(&gl);
         // SAFETY: Context is current (module invariant).
         let fbo = unsafe { gl.create_framebuffer() }.map_err(|error| {
-            // SAFETY: Context is current (module invariant) and `lut` is owned locally.
-            unsafe {
-                gl.delete_texture(lut);
-            }
             eros::error!("GL framebuffer creation failed: {error}")
         })?;
         label(&gl, glow::FRAMEBUFFER, fbo.0.get(), "ewa scratch fbo");
+        let lut = upload_ewa_lut(&gl);
 
         Ok(Self {
             gl,
@@ -2038,7 +2040,7 @@ fn label(gl: &Context, identifier: u32, name: u32, text: &str) {
 fn label_entry(
     gl: &Context,
     page: usize,
-    role: Role,
+    slot: &str,
     page_texture: &PageTexture,
 ) {
     if !gl.supports_debug() {
@@ -2049,16 +2051,16 @@ fn label_entry(
             gl,
             glow::TEXTURE,
             texture.0.get(),
-            &format!("page {page} {role} rgba"),
+            &format!("page {page} {slot} rgba"),
         ),
         PixelLayout::Mono { luma, .. } => label(
             gl,
             glow::TEXTURE,
             luma.0.get(),
-            &format!("page {page} {role} luma"),
+            &format!("page {page} {slot} luma"),
         ),
         PixelLayout::Yuv(yuv) => {
-            for (slot, name) in [
+            for (texture, name) in [
                 (yuv.luma, "luma"),
                 (yuv.cb, "cb"),
                 (yuv.cr, "cr"),
@@ -2067,8 +2069,8 @@ fn label_entry(
                 label(
                     gl,
                     glow::TEXTURE,
-                    slot.0.get(),
-                    &format!("page {page} {role} {name}"),
+                    texture.0.get(),
+                    &format!("page {page} {slot} {name}"),
                 );
             }
         }
@@ -2255,31 +2257,72 @@ fn upload_plane(
     texture
 }
 
-#[expect(
-    clippy::similar_names,
-    reason = "Cb and Cr are the YUV plane names the two textures hold"
-)]
+fn stub_plane(gl: &Context, value: u8) -> Texture {
+    const STUB_DIMS: (u32, u32) = (1, 1);
+    upload_plane(gl, &[value], STUB_DIMS, false, MagnificationFilter::Linear)
+}
+
 fn upload_page_texture(
     gl: Arc<Context>,
     image: &ValidatedImage,
 ) -> PageTexture {
     use crate::decode;
 
+    const OPAQUE_ALPHA_8BIT: u8 = u8::MAX;
+
     let dims = (image.meta.width, image.meta.height);
     let page_dims = image.meta.page_dims;
     let magnification_filter = magnification_filter(dims, page_dims);
-    match &image.pixels {
-        WirePixels::Rgba8(rgba_bytes) => {
-            let texture =
-                upload_rgba(&gl, rgba_bytes, dims, magnification_filter);
-            PageTexture {
-                gl,
+    let (layout, depth) = match &image.pixels {
+        WirePixels::Rgba8(rgba_bytes) => (
+            PixelLayout::Rgba {
+                texture: upload_rgba(
+                    &gl,
+                    rgba_bytes,
+                    dims,
+                    magnification_filter,
+                ),
+            },
+            None,
+        ),
+        WirePixels::Gray { spec, luma, alpha } => {
+            let depth = spec.depth;
+            let wide = depth.is_wide();
+            let luma_texture = upload_plane(
+                &gl,
+                luma,
                 dims,
-                page_dims,
-                transfer: image.meta.transfer,
-                needs_dither: needs_dither(image.meta.transfer, None),
-                layout: PixelLayout::Rgba { texture },
-            }
+                wide,
+                magnification_filter,
+            );
+            let (gain, offset) = gray_gain_offset(depth, spec.full_range);
+            let layout = alpha.as_ref().map_or_else(
+                || PixelLayout::Mono {
+                    luma: luma_texture,
+                    gain,
+                    offset,
+                },
+                |alpha| {
+                    // `EWA_MONO` packs `(gray2, weight2)` with no alpha channel,
+                    // so gray+alpha rides the YUV path with neutral chroma stubs.
+                    PixelLayout::Yuv(YuvTexture {
+                        luma: luma_texture,
+                        cb: stub_plane(&gl, CHROMA_NEUTRAL_8BIT),
+                        cr: stub_plane(&gl, CHROMA_NEUTRAL_8BIT),
+                        alpha: upload_plane(
+                            &gl,
+                            alpha,
+                            dims,
+                            wide,
+                            MagnificationFilter::Linear,
+                        ),
+                        chroma_uv_per_texel: (1.0, 1.0),
+                        color_conversion: ColorConversion::gray(gain, offset),
+                        alpha_normalization: depth_normalization(depth),
+                    })
+                },
+            );
+            (layout, Some(depth))
         }
         WirePixels::Yuv {
             spec,
@@ -2299,116 +2342,68 @@ fn upload_page_texture(
                 wide,
                 magnification_filter,
             );
-            let color_conversion = page_color_conversion(
+            let color_conversion = yuv_color_conversion(
                 depth,
-                spec.subsampling,
                 spec.full_range,
                 spec.matrix,
             );
-            let layout = if spec.subsampling == Subsampling::Mono
-                && alpha.is_none()
-            {
-                PixelLayout::Mono {
-                    luma: luma_texture,
-                    gain: color_conversion.matrix[0],
-                    offset: color_conversion.offset[0],
-                }
-            } else {
-                const STUB_DIMS: (u32, u32) = (1, 1);
-                const OPAQUE_ALPHA_8BIT: u8 = u8::MAX;
-
-                let (cb_texture, cr_texture) =
-                    if spec.subsampling == Subsampling::Mono {
-                        // `color_conversion` zeroes columns 1 and 2; two distinct
-                        // textures keep unique ownership for `Drop`.
+            let (alpha_texture, alpha_normalization) =
+                alpha.as_ref().map_or_else(
+                    || {
+                        (
+                            stub_plane(&gl, OPAQUE_ALPHA_8BIT),
+                            depth_normalization(Depth::D8),
+                        )
+                    },
+                    |alpha| {
                         (
                             upload_plane(
                                 &gl,
-                                &[CHROMA_NEUTRAL_8BIT],
-                                STUB_DIMS,
-                                false,
-                                MagnificationFilter::Linear,
-                            ),
-                            upload_plane(
-                                &gl,
-                                &[CHROMA_NEUTRAL_8BIT],
-                                STUB_DIMS,
-                                false,
-                                MagnificationFilter::Linear,
-                            ),
-                        )
-                    } else {
-                        (
-                            upload_plane(
-                                &gl,
-                                cb,
-                                (chroma_w, chroma_h),
+                                alpha,
+                                dims,
                                 wide,
                                 MagnificationFilter::Linear,
                             ),
-                            upload_plane(
-                                &gl,
-                                cr,
-                                (chroma_w, chroma_h),
-                                wide,
-                                MagnificationFilter::Linear,
-                            ),
+                            depth_normalization(depth),
                         )
-                    };
-                let (alpha_texture, alpha_normalization) =
-                    alpha.as_ref().map_or_else(
-                        || {
-                            (
-                                upload_plane(
-                                    &gl,
-                                    &[OPAQUE_ALPHA_8BIT],
-                                    STUB_DIMS,
-                                    false,
-                                    MagnificationFilter::Linear,
-                                ),
-                                1.0,
-                            )
-                        },
-                        |alpha| {
-                            (
-                                upload_plane(
-                                    &gl,
-                                    alpha,
-                                    dims,
-                                    wide,
-                                    MagnificationFilter::Linear,
-                                ),
-                                depth_normalization(depth),
-                            )
-                        },
-                    );
-                let chroma_px = (f64::from(chroma_w), f64::from(chroma_h));
-                let ratio = spec.subsampling.chroma_ratio();
-                PixelLayout::Yuv(YuvTexture {
-                    luma: luma_texture,
-                    cb: cb_texture,
-                    cr: cr_texture,
-                    alpha: alpha_texture,
-                    chroma_uv_per_texel: (
-                        ratio.0 / chroma_px.0,
-                        ratio.1 / chroma_px.1,
-                    ),
-                    color_conversion,
-                    alpha_normalization,
-                })
-            };
-            PageTexture {
-                gl,
-                dims,
-                page_dims,
-                transfer: image.meta.transfer,
-                needs_dither: needs_dither(
-                    image.meta.transfer,
-                    Some(depth),
+                    },
+                );
+            let chroma_px = (f64::from(chroma_w), f64::from(chroma_h));
+            let ratio = spec.subsampling.chroma_ratio();
+            let layout = PixelLayout::Yuv(YuvTexture {
+                luma: luma_texture,
+                cb: upload_plane(
+                    &gl,
+                    cb,
+                    (chroma_w, chroma_h),
+                    wide,
+                    MagnificationFilter::Linear,
                 ),
-                layout,
-            }
+                cr: upload_plane(
+                    &gl,
+                    cr,
+                    (chroma_w, chroma_h),
+                    wide,
+                    MagnificationFilter::Linear,
+                ),
+                alpha: alpha_texture,
+                chroma_uv_per_texel: (
+                    ratio.0 / chroma_px.0,
+                    ratio.1 / chroma_px.1,
+                ),
+                color_conversion,
+                alpha_normalization,
+            });
+            (layout, Some(depth))
         }
+    };
+    PageTexture {
+        gl,
+        dims,
+        page_dims,
+        transfer: image.meta.transfer,
+        needs_dither: needs_dither(image.meta.transfer, depth),
+        layout,
     }
 }
 
@@ -2444,71 +2439,81 @@ fn depth_normalization(depth: Depth) -> f32 {
     max_storage_code(depth) / f32::from(max_sample_code(depth))
 }
 
-/// Fold storage samples to gamma RGB: depth normalization, quantization,
-/// and the KR/KB matrix (or GBR permutation). The offset is the matrix
-/// times the anchor codes.
-fn page_color_conversion(
-    depth: Depth,
-    subsampling: Subsampling,
-    full_range: bool,
-    color_matrix: Matrix,
-) -> ColorConversion {
+struct RangeQuantization {
+    luma_black: f32,
+    luma_scale: f32,
+    chroma_scale: f32,
+    chroma_neutral: f32,
+}
+
+fn range_quantization(depth: Depth, full_range: bool) -> RangeQuantization {
     const STUDIO_LUMA_BLACK_8BIT: u16 = 16;
     const STUDIO_LUMA_SWING_8BIT: u16 = 219;
     const STUDIO_CHROMA_SWING_8BIT: u16 = 224;
 
     let depth_scale = 1_u16 << (depth.bits() - Depth::D8.bits());
-    let range_chroma_neutral =
+    let chroma_neutral =
         f32::from(u16::from(CHROMA_NEUTRAL_8BIT) * depth_scale);
-    let (range_luma_black, range_luma_scale, range_chroma_scale) =
-        if full_range {
-            (0.0, 1.0, 1.0)
-        } else {
-            let max_code = f32::from(max_sample_code(depth));
+    let (luma_black, luma_scale, chroma_scale) = if full_range {
+        (0.0, 1.0, 1.0)
+    } else {
+        let max_code = f32::from(max_sample_code(depth));
+        (
+            f32::from(STUDIO_LUMA_BLACK_8BIT * depth_scale),
+            max_code / f32::from(STUDIO_LUMA_SWING_8BIT * depth_scale),
+            max_code / f32::from(STUDIO_CHROMA_SWING_8BIT * depth_scale),
+        )
+    };
+    RangeQuantization {
+        luma_black,
+        luma_scale,
+        chroma_scale,
+        chroma_neutral,
+    }
+}
+
+fn gray_gain_offset(depth: Depth, full_range: bool) -> (f32, f32) {
+    let range = range_quantization(depth, full_range);
+    let gain = range.luma_scale * depth_normalization(depth);
+    let offset = gain * (range.luma_black / max_storage_code(depth));
+    (gain, offset)
+}
+
+/// Fold storage samples to gamma RGB: depth normalization, quantization,
+/// and the KR/KB matrix (or GBR permutation). The offset is the matrix
+/// times the anchor codes.
+fn yuv_color_conversion(
+    depth: Depth,
+    full_range: bool,
+    color_matrix: Matrix,
+) -> ColorConversion {
+    const GBR_TO_RGB_MATRIX: [f32; 9] =
+        [0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0];
+
+    let range = range_quantization(depth, full_range);
+    let (mut matrix, luma_scale, chroma_scale, luma_black, chroma_neutral) =
+        if color_matrix == Matrix::Identity {
+            // H.273 identity planes are GBR in the (Y, Cb, Cr) slots,
+            // quantized as luma on all three axes: permute into RGB and
+            // anchor every axis at luma black.
             (
-                f32::from(STUDIO_LUMA_BLACK_8BIT * depth_scale),
-                max_code / f32::from(STUDIO_LUMA_SWING_8BIT * depth_scale),
-                max_code
-                    / f32::from(STUDIO_CHROMA_SWING_8BIT * depth_scale),
+                GBR_TO_RGB_MATRIX,
+                range.luma_scale,
+                range.luma_scale,
+                range.luma_black,
+                range.luma_black,
+            )
+        } else {
+            (
+                yuv_to_rgb_matrix(color_matrix),
+                range.luma_scale,
+                range.chroma_scale,
+                range.luma_black,
+                range.chroma_neutral,
             )
         };
     let storage_max = max_storage_code(depth);
     let normalization = depth_normalization(depth);
-    let (
-        base_matrix,
-        luma_scale,
-        chroma_scale,
-        luma_black,
-        chroma_neutral,
-    ) = if subsampling == Subsampling::Mono {
-        (
-            [1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-            range_luma_scale,
-            0.0,
-            range_luma_black,
-            0.0,
-        )
-    } else if color_matrix == Matrix::Identity {
-        // H.273 identity planes are GBR in the (Y, Cb, Cr) slots,
-        // quantized as luma on all three axes: permute into RGB and
-        // anchor every axis at luma black.
-        (
-            [0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0],
-            range_luma_scale,
-            range_luma_scale,
-            range_luma_black,
-            range_luma_black,
-        )
-    } else {
-        (
-            yuv_to_rgb_matrix(color_matrix),
-            range_luma_scale,
-            range_chroma_scale,
-            range_luma_black,
-            range_chroma_neutral,
-        )
-    };
-    let mut matrix = base_matrix;
     for (column, matrix_column) in
         matrix.as_chunks_mut::<3>().0.iter_mut().enumerate()
     {
@@ -2539,7 +2544,7 @@ fn page_color_conversion(
 
 /// Full-range YUV→RGB from the exact KR/KB of each standard.
 /// KG = 1 - KR - KB. Identity pages never reach here;
-/// `page_color_conversion` routes them through the GBR permutation.
+/// `yuv_color_conversion` routes them through the GBR permutation.
 #[expect(
     clippy::similar_names,
     reason = "the green coefficients are the Cb and Cr terms of the BT matrix derivation"
@@ -2862,15 +2867,16 @@ mod tests {
 
     #[test]
     fn color_conversion_anchors_black_and_white_at_every_depth() {
-        for subsampling in [Subsampling::Yuv444, Subsampling::Mono] {
-            for depth in [Depth::D8, Depth::D10, Depth::D12, Depth::D16] {
-                for full_range in [true, false] {
-                    let conversion = page_color_conversion(
-                        depth,
-                        subsampling,
-                        full_range,
-                        Matrix::Bt601,
-                    );
+        for depth in [Depth::D8, Depth::D10, Depth::D12, Depth::D16] {
+            for full_range in [true, false] {
+                for conversion in [
+                    yuv_color_conversion(depth, full_range, Matrix::Bt601),
+                    {
+                        let (gain, offset) =
+                            gray_gain_offset(depth, full_range);
+                        ColorConversion::gray(gain, offset)
+                    },
+                ] {
                     let (black, white, neutral, storage_max) =
                         code_quantization_codes(depth, full_range);
                     for (code, expected) in [(black, 0.0), (white, 1.0)] {
@@ -2886,7 +2892,7 @@ mod tests {
                         for (row, channel) in rgb.into_iter().enumerate() {
                             assert!(
                                 (channel - expected).abs() < 1e-4,
-                                "{subsampling:?} depth {depth:?} full {full_range} row {row}: {channel} vs {expected}"
+                                "depth {depth:?} full {full_range} row {row}: {channel} vs {expected}"
                             );
                         }
                     }
@@ -2897,12 +2903,7 @@ mod tests {
 
     #[test]
     fn identity_pages_permute_gbr() {
-        let color = page_color_conversion(
-            Depth::D8,
-            Subsampling::Yuv444,
-            true,
-            Matrix::Identity,
-        );
+        let color = yuv_color_conversion(Depth::D8, true, Matrix::Identity);
         // Column j is plane j's contribution: Y->G, U->B, V->R.
         for (col, row) in [(0, 1), (1, 2), (2, 0)] {
             for probe in 0..3 {
@@ -2916,34 +2917,6 @@ mod tests {
         }
         // Full range anchors everything at black zero.
         assert_eq!(color.offset, [0.0; 3]);
-
-        let mono = page_color_conversion(
-            Depth::D10,
-            Subsampling::Mono,
-            true,
-            Matrix::Identity,
-        );
-        for row in 0..3 {
-            assert!(
-                (element(&mono.matrix, row, 1)).abs() < 1e-6,
-                "mono chroma col must be inert"
-            );
-            assert!(
-                (element(&mono.matrix, row, 2)).abs() < 1e-6,
-                "mono chroma col must be inert"
-            );
-        }
-        assert_eq!(mono.offset, [0.0; 3]);
-        // The norm-folded luma column still spans the range: white (code
-        // 1023 in u16 storage) reads 1 on every channel.
-        let white = 1023.0 / 65535.0;
-        let rgb = convert(&mono, [white, white, white]);
-        for (row, channel) in rgb.into_iter().enumerate() {
-            assert!(
-                (channel - 1.0).abs() < 1e-4,
-                "mono row {row}: {channel}"
-            );
-        }
     }
 
     #[test]

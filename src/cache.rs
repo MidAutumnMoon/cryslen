@@ -37,10 +37,15 @@ use serde::Serialize;
 use crate::browse::Role;
 use crate::decode;
 use crate::decode::Decoded;
+use crate::decode::GrayImage;
+use crate::decode::GrayPlanes;
+use crate::decode::GraySpec;
 use crate::decode::ImageMeta;
 use crate::decode::Pixels;
-use crate::decode::Plane;
+use crate::decode::Samples;
+use crate::decode::Subsampling;
 use crate::decode::YuvImage;
+use crate::decode::YuvPlanes;
 use crate::decode::YuvSpec;
 use crate::protocol::ImageLimits;
 use crate::protocol::THUMB_EDGE;
@@ -162,43 +167,57 @@ fn resample_page(
                 pixels.into_flattened().into_boxed_slice(),
             )?)
         }
-        Pixels::Yuv(yuv) => {
-            let ((luma_w, luma_h), (chroma_w, chroma_h)) =
-                decode::plane_dims(dims, yuv.spec.subsampling);
-            let (_, (target_w, target_h)) =
-                decode::plane_dims(target, yuv.spec.subsampling);
-            let planes = YuvImage {
-                spec: yuv.spec,
-                luma: resize_plane(
+        Pixels::Gray(gray) => {
+            let samples = match &gray.samples {
+                Samples::U8(planes) => Samples::U8(resize_gray::<u8, u8>(
                     &mut resizer,
-                    &yuv.luma,
-                    (luma_w, luma_h),
+                    planes,
+                    dims,
                     target,
                     filter,
-                )?,
-                cb: resize_plane(
-                    &mut resizer,
-                    &yuv.cb,
-                    (chroma_w, chroma_h),
-                    (target_w, target_h),
-                    filter,
-                )?,
-                cr: resize_plane(
-                    &mut resizer,
-                    &yuv.cr,
-                    (chroma_w, chroma_h),
-                    (target_w, target_h),
-                    filter,
-                )?,
-                alpha: match yuv.alpha.as_ref() {
-                    Some(alpha) => Some(resize_plane(
+                )?),
+                Samples::U16 { depth, planes } => Samples::U16 {
+                    depth: *depth,
+                    planes: resize_gray::<u16, u16>(
                         &mut resizer,
-                        alpha,
-                        (luma_w, luma_h),
+                        planes,
+                        dims,
                         target,
                         filter,
-                    )?),
-                    None => None,
+                    )?,
+                },
+            };
+            Ok(Decoded::gray(
+                target.0,
+                target.1,
+                page.format(),
+                page.transfer(),
+                GrayImage {
+                    full_range: gray.full_range,
+                    samples,
+                },
+            )?)
+        }
+        Pixels::Yuv(yuv) => {
+            let samples = match &yuv.samples {
+                Samples::U8(planes) => Samples::U8(resize_yuv::<u8, u8>(
+                    &mut resizer,
+                    planes,
+                    dims,
+                    target,
+                    yuv.subsampling,
+                    filter,
+                )?),
+                Samples::U16 { depth, planes } => Samples::U16 {
+                    depth: *depth,
+                    planes: resize_yuv::<u16, u16>(
+                        &mut resizer,
+                        planes,
+                        dims,
+                        target,
+                        yuv.subsampling,
+                        filter,
+                    )?,
                 },
             };
             Ok(Decoded::yuv(
@@ -206,46 +225,121 @@ fn resample_page(
                 target.1,
                 page.format(),
                 page.transfer(),
-                planes,
+                YuvImage {
+                    subsampling: yuv.subsampling,
+                    full_range: yuv.full_range,
+                    matrix: yuv.matrix,
+                    samples,
+                },
             )?)
         }
     }
 }
 
-fn resize_plane(
+fn resize_gray<Sample, Component>(
     resizer: &mut Resizer,
-    plane: &Plane,
+    planes: &GrayPlanes<Sample>,
+    dims: (u32, u32),
+    target: (u32, u32),
+    filter: FilterType,
+) -> eros::Result<GrayPlanes<Sample>>
+where
+    Sample: Copy + Default + PartialEq + Pod,
+    Component: PixelComponent,
+    Pixel<Sample, Component, 1>: PixelTrait,
+{
+    Ok(GrayPlanes {
+        luma: resize_plane::<Sample, Component>(
+            resizer,
+            &planes.luma,
+            dims,
+            target,
+            filter,
+        )?,
+        alpha: planes
+            .alpha
+            .as_ref()
+            .map(|alpha| {
+                resize_plane::<Sample, Component>(
+                    resizer, alpha, dims, target, filter,
+                )
+            })
+            .transpose()?,
+    })
+}
+
+fn resize_yuv<Sample, Component>(
+    resizer: &mut Resizer,
+    planes: &YuvPlanes<Sample>,
+    dims: (u32, u32),
+    target: (u32, u32),
+    subsampling: Subsampling,
+    filter: FilterType,
+) -> eros::Result<YuvPlanes<Sample>>
+where
+    Sample: Copy + Default + PartialEq + Pod,
+    Component: PixelComponent,
+    Pixel<Sample, Component, 1>: PixelTrait,
+{
+    let (luma_dims, chroma_dims) = decode::plane_dims(dims, subsampling);
+    let (_, target_chroma_dims) = decode::plane_dims(target, subsampling);
+    Ok(YuvPlanes {
+        luma: resize_plane::<Sample, Component>(
+            resizer,
+            &planes.luma,
+            luma_dims,
+            target,
+            filter,
+        )?,
+        cb: resize_plane::<Sample, Component>(
+            resizer,
+            &planes.cb,
+            chroma_dims,
+            target_chroma_dims,
+            filter,
+        )?,
+        cr: resize_plane::<Sample, Component>(
+            resizer,
+            &planes.cr,
+            chroma_dims,
+            target_chroma_dims,
+            filter,
+        )?,
+        alpha: planes
+            .alpha
+            .as_ref()
+            .map(|alpha| {
+                resize_plane::<Sample, Component>(
+                    resizer, alpha, luma_dims, target, filter,
+                )
+            })
+            .transpose()?,
+    })
+}
+
+fn resize_plane<Sample, Component>(
+    resizer: &mut Resizer,
+    source: &[Sample],
     source_dims: (u32, u32),
     target_dims: (u32, u32),
     filter: FilterType,
-) -> eros::Result<Plane> {
-    // Equal extents also cover Mono's empty chroma planes, which carry a
-    // 1x1 extent without samples.
+) -> eros::Result<Box<[Sample]>>
+where
+    Sample: Copy + Default + PartialEq + Pod,
+    Component: PixelComponent,
+    Pixel<Sample, Component, 1>: PixelTrait,
+{
     if source_dims == target_dims {
-        return Ok(plane.clone());
+        return Ok(source.into());
     }
-    Ok(match plane {
-        Plane::U8(bytes) => Plane::U8(
-            resize_typed::<_, u8, 1>(
-                resizer,
-                bytes,
-                source_dims,
-                target_dims,
-                filter,
-            )?
-            .into_boxed_slice(),
-        ),
-        Plane::U16(words) => Plane::U16(
-            resize_typed::<_, u16, 1>(
-                resizer,
-                words,
-                source_dims,
-                target_dims,
-                filter,
-            )?
-            .into_boxed_slice(),
-        ),
-    })
+    Ok(resize_typed::<Sample, Component, 1>(
+        resizer,
+        source,
+        source_dims,
+        target_dims,
+        filter,
+    )?
+    .into_boxed_slice())
 }
 
 fn resize_typed<S, C, const N: usize>(
@@ -330,6 +424,9 @@ impl Store {
             thumb: Namespace::new(thumb, thumb_cap),
             view: Namespace::new(view, view_cap),
         });
+        if state.is_none() {
+            tracing::warn!(root = %root.display(), "preview store disabled");
+        }
         Self { state }
     }
 
@@ -341,7 +438,6 @@ impl Store {
         role: Role,
         fit_box: (u32, u32),
     ) -> Option<Decoded> {
-        use std::fs::FileTimes;
         use std::time::Instant;
 
         let started = Instant::now();
@@ -354,9 +450,7 @@ impl Store {
                         clippy::let_underscore_untyped,
                         reason = "the recency touch is advisory; its failure changes nothing"
                     )]
-                    let _ = file.set_times(
-                        FileTimes::new().set_modified(SystemTime::now()),
-                    );
+                    let _ = file.set_modified(SystemTime::now());
                     read_stored(file, bounds)
                 });
         tracing::debug!(
@@ -380,8 +474,14 @@ impl Store {
 
         let (namespace, bounds) = self.role_target(role, fit_box)?;
         let started = Instant::now();
-        let size =
-            write_encoded_atomic(namespace, hash, page, bounds).ok()?;
+        let size = match write_encoded_atomic(namespace, hash, page, bounds)
+        {
+            Ok(size) => size,
+            Err(error) => {
+                tracing::debug!(%error, ?role, "preview save failed");
+                return None;
+            }
+        };
         let prev = namespace.total.fetch_add(size, Ordering::Relaxed);
         let over = prev.saturating_add(size) > namespace.cap;
         tracing::debug!(
@@ -721,7 +821,7 @@ fn write_atomic(
 }
 
 const MAGIC: [u8; 4] = *b"CYPV";
-const VERSION: u16 = 7;
+const VERSION: u16 = 8;
 const PREFIX_BYTES: usize =
     MAGIC.len() + size_of::<u16>() + size_of::<u8>();
 const MAX_META_BYTES: usize = u8::MAX as usize;
@@ -736,6 +836,7 @@ struct CacheMeta {
 #[derive(Deserialize, Serialize)]
 enum PixelMeta {
     Rgba8,
+    Gray { spec: GraySpec, has_alpha: bool },
     Yuv { spec: YuvSpec, has_alpha: bool },
 }
 
@@ -743,9 +844,13 @@ impl CacheMeta {
     fn from_page(page: &Decoded, target_box: (u32, u32)) -> Self {
         let pixels = match page.pixels() {
             Pixels::Rgba8(_) => PixelMeta::Rgba8,
+            Pixels::Gray(gray) => PixelMeta::Gray {
+                spec: gray.spec(),
+                has_alpha: gray.has_alpha(),
+            },
             Pixels::Yuv(yuv) => PixelMeta::Yuv {
-                spec: yuv.spec,
-                has_alpha: yuv.alpha.is_some(),
+                spec: yuv.spec(),
+                has_alpha: yuv.has_alpha(),
             },
         };
         Self {
@@ -773,6 +878,20 @@ fn encode_header(meta: &CacheMeta) -> io::Result<Vec<u8>> {
     Ok(header)
 }
 
+fn write_planes_atomic(
+    namespace: &Namespace,
+    hash: u128,
+    header: &[u8],
+    planes: &[Cow<'_, [u8]>],
+) -> io::Result<u64> {
+    let mut slices = Vec::with_capacity(1 + planes.len());
+    slices.push(IoSlice::new(header));
+    for plane in planes {
+        slices.push(IoSlice::new(plane));
+    }
+    write_atomic(namespace, hash, &mut slices)
+}
+
 fn write_encoded_atomic(
     namespace: &Namespace,
     hash: u128,
@@ -785,41 +904,50 @@ fn write_encoded_atomic(
             let mut slices = [IoSlice::new(&header), IoSlice::new(bytes)];
             write_atomic(namespace, hash, &mut slices)
         }
+        Pixels::Gray(gray) => {
+            use std::iter;
+
+            let planes: Vec<Cow<'_, [u8]>> = match &gray.samples {
+                Samples::U8(planes) => iter::once(&planes.luma)
+                    .chain(&planes.alpha)
+                    .map(|plane| Cow::Borrowed(&**plane))
+                    .collect(),
+                Samples::U16 { planes, .. } => iter::once(&planes.luma)
+                    .chain(&planes.alpha)
+                    .map(|plane| little_endian_u16_bytes(plane))
+                    .collect(),
+            };
+            write_planes_atomic(namespace, hash, &header, &planes)
+        }
         Pixels::Yuv(yuv) => {
-            // Header + 3 YUV planes + optional alpha plane.
-            const YUV_MAX_SLICES: usize = 1 + 3 + 1;
-            let luma = little_endian_plane_bytes(&yuv.luma);
-            let cb = little_endian_plane_bytes(&yuv.cb);
-            let cr = little_endian_plane_bytes(&yuv.cr);
-            let alpha = yuv.alpha.as_ref().map(little_endian_plane_bytes);
-            let mut slices = Vec::with_capacity(YUV_MAX_SLICES);
-            slices.push(IoSlice::new(&header));
-            slices.push(IoSlice::new(&luma));
-            slices.push(IoSlice::new(&cb));
-            slices.push(IoSlice::new(&cr));
-            if let Some(alpha) = &alpha {
-                slices.push(IoSlice::new(alpha));
-            }
-            write_atomic(namespace, hash, &mut slices)
+            let planes: Vec<Cow<'_, [u8]>> = match &yuv.samples {
+                Samples::U8(planes) => [&planes.luma, &planes.cb, &planes.cr]
+                    .into_iter()
+                    .chain(&planes.alpha)
+                    .map(|plane| Cow::Borrowed(&**plane))
+                    .collect(),
+                Samples::U16 { planes, .. } => {
+                    [&planes.luma, &planes.cb, &planes.cr]
+                        .into_iter()
+                        .chain(&planes.alpha)
+                        .map(|plane| little_endian_u16_bytes(plane))
+                        .collect()
+                }
+            };
+            write_planes_atomic(namespace, hash, &header, &planes)
         }
     }
 }
 
-fn little_endian_plane_bytes(plane: &Plane) -> Cow<'_, [u8]> {
-    match plane {
-        Plane::U8(bytes) => Cow::Borrowed(bytes),
-        Plane::U16(words) => {
-            if cfg!(target_endian = "little") {
-                Cow::Borrowed(bytemuck::cast_slice(words))
-            } else {
-                let mut out =
-                    Vec::with_capacity(words.len() * size_of::<u16>());
-                for word in words {
-                    out.extend_from_slice(&word.to_le_bytes());
-                }
-                Cow::Owned(out)
-            }
+fn little_endian_u16_bytes(words: &[u16]) -> Cow<'_, [u8]> {
+    if cfg!(target_endian = "little") {
+        Cow::Borrowed(bytemuck::cast_slice(words))
+    } else {
+        let mut out = Vec::with_capacity(size_of_val(words));
+        for word in words {
+            out.extend_from_slice(&word.to_le_bytes());
         }
+        Cow::Owned(out)
     }
 }
 
@@ -856,6 +984,49 @@ fn read_stored(mut file: File, target_box: (u32, u32)) -> Option<Decoded> {
     decode::pixel_count(meta.page_dims.0, meta.page_dims.1)?;
     let page = match cached.pixels {
         PixelMeta::Rgba8 => read_rgba(&mut file, payload_len, meta)?,
+        PixelMeta::Gray { spec, has_alpha } => {
+            let sample_count =
+                decode::pixel_count(meta.width, meta.height)? as usize;
+            let plane_count = if has_alpha { 2 } else { 1 };
+            let expected_bytes = sample_count
+                .checked_mul(plane_count)?
+                .checked_mul(spec.depth.sample_bytes())?;
+            if u64::try_from(expected_bytes).ok()? != payload_len {
+                return None;
+            }
+            let samples = match spec.depth.wide() {
+                None => Samples::U8(GrayPlanes {
+                    luma: read_u8_plane(&mut file, sample_count)?,
+                    alpha: if has_alpha {
+                        Some(read_u8_plane(&mut file, sample_count)?)
+                    } else {
+                        None
+                    },
+                }),
+                Some(depth) => Samples::U16 {
+                    depth,
+                    planes: GrayPlanes {
+                        luma: read_u16_plane(&mut file, sample_count)?,
+                        alpha: if has_alpha {
+                            Some(read_u16_plane(&mut file, sample_count)?)
+                        } else {
+                            None
+                        },
+                    },
+                },
+            };
+            Decoded::gray(
+                meta.width,
+                meta.height,
+                meta.format,
+                meta.transfer,
+                GrayImage {
+                    full_range: spec.full_range,
+                    samples,
+                },
+            )
+            .ok()?
+        }
         PixelMeta::Yuv { spec, has_alpha } => {
             let layout = decode::yuv_layout(
                 (meta.width, meta.height),
@@ -867,26 +1038,33 @@ fn read_stored(mut file: File, target_box: (u32, u32)) -> Option<Decoded> {
             if u64::try_from(expected_bytes).ok()? != payload_len {
                 return None;
             }
-            let luma =
-                read_plane(&mut file, layout.luma_samples, layout.is_u16)?;
-            let cb = read_plane(
-                &mut file,
-                layout.chroma_samples,
-                layout.is_u16,
-            )?;
-            let cr = read_plane(
-                &mut file,
-                layout.chroma_samples,
-                layout.is_u16,
-            )?;
-            let alpha = if has_alpha {
-                Some(read_plane(
-                    &mut file,
-                    layout.luma_samples,
-                    layout.is_u16,
-                )?)
-            } else {
-                None
+            let samples = match spec.depth.wide() {
+                None => Samples::U8(YuvPlanes {
+                    luma: read_u8_plane(&mut file, layout.luma_samples)?,
+                    cb: read_u8_plane(&mut file, layout.chroma_samples)?,
+                    cr: read_u8_plane(&mut file, layout.chroma_samples)?,
+                    alpha: if has_alpha {
+                        Some(read_u8_plane(&mut file, layout.luma_samples)?)
+                    } else {
+                        None
+                    },
+                }),
+                Some(depth) => Samples::U16 {
+                    depth,
+                    planes: YuvPlanes {
+                        luma: read_u16_plane(&mut file, layout.luma_samples)?,
+                        cb: read_u16_plane(&mut file, layout.chroma_samples)?,
+                        cr: read_u16_plane(&mut file, layout.chroma_samples)?,
+                        alpha: if has_alpha {
+                            Some(read_u16_plane(
+                                &mut file,
+                                layout.luma_samples,
+                            )?)
+                        } else {
+                            None
+                        },
+                    },
+                },
             };
             Decoded::yuv(
                 meta.width,
@@ -894,11 +1072,10 @@ fn read_stored(mut file: File, target_box: (u32, u32)) -> Option<Decoded> {
                 meta.format,
                 meta.transfer,
                 YuvImage {
-                    spec,
-                    luma,
-                    cb,
-                    cr,
-                    alpha,
+                    subsampling: spec.subsampling,
+                    full_range: spec.full_range,
+                    matrix: spec.matrix,
+                    samples,
                 },
             )
             .ok()?
@@ -929,24 +1106,24 @@ fn read_rgba(
     .ok()
 }
 
-fn read_plane(
+fn read_u8_plane(file: &mut File, sample_count: usize) -> Option<Box<[u8]>> {
+    let mut bytes = vec![0_u8; sample_count];
+    file.read_exact(&mut bytes).ok()?;
+    Some(bytes.into_boxed_slice())
+}
+
+fn read_u16_plane(
     file: &mut File,
-    samples: usize,
-    is_u16: bool,
-) -> Option<Plane> {
-    if !is_u16 {
-        let mut bytes = vec![0_u8; samples];
-        file.read_exact(&mut bytes).ok()?;
-        return Some(Plane::U8(bytes.into_boxed_slice()));
-    }
-    let mut words = vec![0_u16; samples];
+    sample_count: usize,
+) -> Option<Box<[u16]>> {
+    let mut words = vec![0_u16; sample_count];
     file.read_exact(bytemuck::cast_slice_mut(&mut words)).ok()?;
     if cfg!(not(target_endian = "little")) {
         for word in &mut words {
             *word = u16::from_le(*word);
         }
     }
-    Some(Plane::U16(words.into_boxed_slice()))
+    Some(words.into_boxed_slice())
 }
 
 #[cfg(test)]
@@ -962,25 +1139,31 @@ mod tests {
     use crate::decode::Depth;
     use crate::decode::Format;
     use crate::decode::Matrix;
-    use crate::decode::Subsampling;
     use crate::decode::Transfer;
-
-    const TEST_FIT_BOX: (u32, u32) = (2560, 1440);
-
-    fn test_limits() -> ImageLimits {
-        const MAX_TEXTURE_EDGE: u32 = 16_384;
-        ImageLimits::new(TEST_FIT_BOX, MAX_TEXTURE_EDGE)
-    }
+    use crate::decode::WideDepth;
+    use crate::testkit;
+    use crate::testkit::TEST_FIT_BOX;
 
     fn count(width: u32, height: u32) -> usize {
         (width as usize) * (height as usize)
     }
 
-    fn sample_count(plane: &Plane) -> usize {
-        match plane {
-            Plane::U8(bytes) => bytes.len(),
-            Plane::U16(words) => words.len(),
-        }
+    fn test_u8_samples(sample_count: usize) -> Box<[u8]> {
+        (0..sample_count)
+            .map(|index| u8::try_from(index % 251).expect("sample"))
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+    }
+
+    fn test_u16_samples(sample_count: usize) -> Box<[u16]> {
+        const D10_SAMPLE_VALUES: usize = 1 << Depth::D10.bits();
+
+        (0..sample_count)
+            .map(|index| {
+                u16::try_from(index % D10_SAMPLE_VALUES).expect("sample")
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
     }
 
     fn rgba_page(width: u32, height: u32) -> Decoded {
@@ -1010,48 +1193,77 @@ mod tests {
     ) -> Decoded {
         let ((_, _), (chroma_w, chroma_h)) =
             decode::plane_dims((width, height), subsampling);
-        let plane = |samples: usize| {
-            if depth.is_wide() {
-                Plane::U16(
-                    (0..samples)
-                        .map(|index| {
-                            u16::try_from(index % 1024).expect("sample")
-                        })
-                        .collect::<Vec<_>>()
-                        .into_boxed_slice(),
-                )
-            } else {
-                Plane::U8(
-                    (0..samples)
-                        .map(|index| {
-                            u8::try_from(index % 251).expect("sample")
-                        })
-                        .collect::<Vec<_>>()
-                        .into_boxed_slice(),
-                )
-            }
-        };
-        let chroma = if subsampling == Subsampling::Mono {
-            0
-        } else {
-            count(chroma_w, chroma_h)
-        };
+        let chroma = count(chroma_w, chroma_h);
         let luma = count(width, height);
-        let yuv = YuvImage {
-            spec: YuvSpec {
-                depth,
+        let samples = depth.wide().map_or_else(
+            || {
+                Samples::U8(YuvPlanes {
+                    luma: test_u8_samples(luma),
+                    cb: test_u8_samples(chroma),
+                    cr: test_u8_samples(chroma),
+                    alpha: with_alpha.then(|| test_u8_samples(luma)),
+                })
+            },
+            |wide_depth| Samples::U16 {
+                depth: wide_depth,
+                planes: YuvPlanes {
+                    luma: test_u16_samples(luma),
+                    cb: test_u16_samples(chroma),
+                    cr: test_u16_samples(chroma),
+                    alpha: with_alpha.then(|| test_u16_samples(luma)),
+                },
+            },
+        );
+        Decoded::yuv(
+            width,
+            height,
+            Format::Avif,
+            Transfer::Pq,
+            YuvImage {
                 subsampling,
                 full_range: false,
                 matrix: Matrix::Bt709,
+                samples,
             },
-            luma: plane(luma),
-            cb: plane(chroma),
-            cr: plane(chroma),
-            alpha: with_alpha.then(|| plane(luma)),
-        };
-        Decoded::yuv(width, height, Format::Avif, Transfer::Pq, yuv)
-            .expect("yuv page")
-            .with_page_dims((width, height))
+        )
+        .expect("yuv page")
+        .with_page_dims((width, height))
+    }
+
+    fn gray_page_with(
+        width: u32,
+        height: u32,
+        depth: Depth,
+        with_alpha: bool,
+    ) -> Decoded {
+        let sample_count = count(width, height);
+        let samples = depth.wide().map_or_else(
+            || {
+                Samples::U8(GrayPlanes {
+                    luma: test_u8_samples(sample_count),
+                    alpha: with_alpha.then(|| test_u8_samples(sample_count)),
+                })
+            },
+            |wide_depth| Samples::U16 {
+                depth: wide_depth,
+                planes: GrayPlanes {
+                    luma: test_u16_samples(sample_count),
+                    alpha: with_alpha.then(|| test_u16_samples(sample_count)),
+                },
+            },
+        );
+        Decoded::gray(
+            width,
+            height,
+            Format::Avif,
+            Transfer::Srgb,
+            GrayImage {
+                full_range: true,
+                samples,
+            },
+        )
+        .expect("gray page")
+        .with_page_dims((width, height))
     }
 
     fn rgba_bytes(page: &Decoded) -> Vec<u8> {
@@ -1072,24 +1284,22 @@ mod tests {
         let ((_, _), (chroma_w, chroma_h)) =
             decode::plane_dims((width, height), subsampling);
         let plane = |samples: usize, value: u16| {
-            Plane::U16(vec![value; samples].into_boxed_slice())
+            vec![value; samples].into_boxed_slice()
         };
-        let chroma = if subsampling == Subsampling::Mono {
-            0
-        } else {
-            count(chroma_w, chroma_h)
-        };
+        let chroma = count(chroma_w, chroma_h);
         let yuv = YuvImage {
-            spec: YuvSpec {
-                depth: Depth::D10,
-                subsampling,
-                full_range: false,
-                matrix: Matrix::Bt709,
+            subsampling,
+            full_range: false,
+            matrix: Matrix::Bt709,
+            samples: Samples::U16 {
+                depth: WideDepth::D10,
+                planes: YuvPlanes {
+                    luma: plane(count(width, height), values[0]),
+                    cb: plane(chroma, values[1]),
+                    cr: plane(chroma, values[2]),
+                    alpha: Some(plane(count(width, height), values[3])),
+                },
             },
-            luma: plane(count(width, height), values[0]),
-            cb: plane(chroma, values[1]),
-            cr: plane(chroma, values[2]),
-            alpha: Some(plane(count(width, height), values[3])),
         };
         Decoded::yuv(width, height, Format::Avif, Transfer::Pq, yuv)
             .expect("yuv page")
@@ -1100,18 +1310,25 @@ mod tests {
         let Pixels::Yuv(yuv) = page.pixels() else {
             panic!("expected yuv pixels");
         };
-        let samples = |plane: &Plane| match plane {
-            Plane::U8(bytes) => {
-                bytes.iter().map(|&byte| u16::from(byte)).collect()
+        match &yuv.samples {
+            Samples::U8(planes) => {
+                let widen = |bytes: &[u8]| {
+                    bytes.iter().map(|&byte| u16::from(byte)).collect()
+                };
+                [
+                    widen(&planes.luma),
+                    widen(&planes.cb),
+                    widen(&planes.cr),
+                    planes.alpha.as_deref().map_or_else(Vec::new, widen),
+                ]
             }
-            Plane::U16(words) => words.to_vec(),
-        };
-        [
-            samples(&yuv.luma),
-            samples(&yuv.cb),
-            samples(&yuv.cr),
-            yuv.alpha.as_ref().map_or_else(Vec::new, samples),
-        ]
+            Samples::U16 { planes, .. } => [
+                planes.luma.to_vec(),
+                planes.cb.to_vec(),
+                planes.cr.to_vec(),
+                planes.alpha.as_deref().map_or_else(Vec::new, <[u16]>::to_vec),
+            ],
+        }
     }
 
     fn set_modified(path: &Path, seconds: u64) {
@@ -1251,11 +1468,7 @@ mod tests {
         let loaded = store
             .load(hash, Role::Thumb, TEST_FIT_BOX)
             .expect("cached thumb");
-        assert_eq!((loaded.width(), loaded.height()), (3, 2));
-        assert_eq!(loaded.page_dims(), (9, 6));
-        assert_eq!(loaded.format(), Format::Png);
-        assert_eq!(loaded.transfer(), Transfer::Srgb);
-        assert_eq!(rgba_bytes(&loaded), rgba_bytes(&page));
+        assert!(loaded == page, "cached thumb preserves the page");
     }
 
     #[test]
@@ -1282,18 +1495,38 @@ mod tests {
         let loaded = store
             .load(hash, Role::Fit, TEST_FIT_BOX)
             .expect("cached view");
-        assert_eq!((loaded.width(), loaded.height()), (5, 3));
-        assert_eq!(loaded.page_dims(), (15, 9));
-        assert_eq!(loaded.format(), Format::Avif);
-        assert_eq!(loaded.transfer(), Transfer::Pq);
-        let Pixels::Yuv(yuv) = loaded.pixels() else {
-            panic!("expected yuv pixels");
+        assert!(loaded == page, "cached view preserves the page");
+    }
+
+    #[test]
+    fn gray_plane_roundtrip_and_derive() {
+        let dir = TempDir::new().expect("create temp dir");
+        let store = Store::at(dir.path());
+        for (tag, depth, with_alpha) in [
+            (b"gray-8".as_slice(), Depth::D8, false),
+            (b"gray-10-alpha".as_slice(), Depth::D10, true),
+        ] {
+            let page = gray_page_with(8, 4, depth, with_alpha)
+                .with_page_dims((16, 8));
+            let hash = content_hash(tag);
+            assert!(
+                store.save(hash, Role::Thumb, &page, TEST_FIT_BOX).is_some()
+            );
+            let loaded = store
+                .load(hash, Role::Thumb, TEST_FIT_BOX)
+                .expect("cached gray thumb");
+            assert!(loaded == page, "cached gray thumb preserves the page");
+        }
+
+        let wide_gray = gray_page_with(400, 200, Depth::D10, true);
+        let derived =
+            derive(&wide_gray, Role::Thumb, testkit::limits())
+                .expect("gray derives");
+        assert_eq!((derived.width(), derived.height()), (THUMB_EDGE, 96));
+        let Pixels::Gray(gray) = derived.pixels() else {
+            panic!("derived gray stays gray");
         };
-        assert_eq!(yuv.spec.depth, Depth::D10);
-        assert_eq!(yuv.spec.subsampling, Subsampling::Yuv420);
-        assert!(!yuv.spec.full_range);
-        assert_eq!(yuv.spec.matrix, Matrix::Bt709);
-        assert_eq!(yuv_planes(&loaded), yuv_planes(&page));
+        assert!(gray.has_alpha());
     }
 
     #[test]
@@ -1310,12 +1543,7 @@ mod tests {
         let loaded = store
             .load(hash, Role::Thumb, TEST_FIT_BOX)
             .expect("cached thumb");
-        let Pixels::Yuv(yuv) = loaded.pixels() else {
-            panic!("expected yuv pixels");
-        };
-        assert_eq!(yuv.spec.depth, Depth::D8);
-        assert!(yuv.alpha.is_some());
-        assert_eq!(yuv_planes(&loaded), yuv_planes(&page));
+        assert!(loaded == page, "cached u8 yuv+alpha preserves the page");
     }
 
     #[test]
@@ -1477,7 +1705,7 @@ mod tests {
             bytes.into_boxed_slice(),
         )
         .expect("rgba page");
-        let limits = test_limits();
+        let limits = testkit::limits();
         for (kind, edge, row_count) in [
             (Role::Thumb, THUMB_EDGE, 5_u32),
             (Role::Fit, TEST_FIT_BOX.0, 64),
@@ -1548,7 +1776,7 @@ mod tests {
             Subsampling::Yuv420,
             [400, 600, 300, 1023],
         );
-        let limits = test_limits();
+        let limits = testkit::limits();
         for (kind, edge, row_count) in [
             (Role::Thumb, THUMB_EDGE, 5_u32),
             (Role::Fit, TEST_FIT_BOX.0, 64),
@@ -1563,8 +1791,8 @@ mod tests {
             let Pixels::Yuv(yuv) = derived.pixels() else {
                 panic!("expected yuv pixels");
             };
-            assert_eq!(yuv.spec.depth, Depth::D10, "{kind:?}");
-            assert_eq!(yuv.spec.matrix, Matrix::Bt709, "{kind:?}");
+            assert_eq!(yuv.depth(), Depth::D10, "{kind:?}");
+            assert_eq!(yuv.matrix, Matrix::Bt709, "{kind:?}");
             let [luma, cb, cr, alpha] = yuv_planes(&derived);
             for (name, plane, value) in [
                 ("luma", luma, 400_u16),
@@ -1590,11 +1818,17 @@ mod tests {
         let Pixels::Yuv(yuv) = thumb.pixels() else {
             panic!("expected yuv pixels");
         };
-        assert_eq!(sample_count(&yuv.luma), count(200, 80));
-        assert_eq!(sample_count(&yuv.cb), count(100, 40));
-        assert_eq!(sample_count(&yuv.cr), count(100, 40));
-        assert_eq!(yuv.spec.depth, Depth::D10);
-        assert_eq!(yuv.spec.matrix, Matrix::Bt709);
+        let Samples::U16 {
+            depth: WideDepth::D10,
+            planes,
+        } = &yuv.samples
+        else {
+            panic!("expected D10 yuv samples");
+        };
+        assert_eq!(planes.luma.len(), count(200, 80));
+        assert_eq!(planes.cb.len(), count(100, 40));
+        assert_eq!(planes.cr.len(), count(100, 40));
+        assert_eq!(yuv.matrix, Matrix::Bt709);
     }
 
     #[test]
@@ -1606,8 +1840,15 @@ mod tests {
         let Pixels::Yuv(yuv) = thumb.pixels() else {
             panic!("expected yuv pixels");
         };
-        assert_eq!(sample_count(&yuv.cb), count(3, 7));
-        assert_eq!(sample_count(&yuv.cr), count(3, 7));
+        let Samples::U16 {
+            depth: WideDepth::D10,
+            planes,
+        } = &yuv.samples
+        else {
+            panic!("expected D10 yuv samples");
+        };
+        assert_eq!(planes.cb.len(), count(3, 7));
+        assert_eq!(planes.cr.len(), count(3, 7));
     }
 
     #[test]

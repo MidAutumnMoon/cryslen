@@ -4,7 +4,6 @@ use std::collections::VecDeque;
 use std::time::Duration;
 use std::time::Instant;
 
-use crate::browse::Role;
 use crate::protocol::PlaybackId;
 
 /// Below this a GIF delay is a stuck frame.
@@ -24,15 +23,14 @@ enum RequestState {
     Idle,
     Queued,
     Sent,
+    Finished,
 }
 
 pub struct Player<Image> {
     id: PlaybackId,
-    role: Role,
     buffered: VecDeque<BufferedFrame<Image>>,
     request: RequestState,
     next_due: Option<Instant>,
-    finished: bool,
 }
 
 pub enum Due<Image> {
@@ -42,25 +40,18 @@ pub enum Due<Image> {
 }
 
 impl<Image> Player<Image> {
-    pub fn new(id: PlaybackId, role: Role) -> Self {
+    pub fn new(id: PlaybackId) -> Self {
         Self {
             id,
-            role,
             buffered: VecDeque::new(),
             request: RequestState::Queued,
             next_due: None,
-            finished: false,
         }
     }
 
     #[must_use]
     pub fn id(&self) -> PlaybackId {
         self.id
-    }
-
-    #[must_use]
-    pub fn role(&self) -> Role {
-        self.role
     }
 
     /// Buffer a frame the child answered. A frame without a sent request
@@ -83,8 +74,7 @@ impl<Image> Player<Image> {
         if !matches!(self.request, RequestState::Sent) {
             return false;
         }
-        self.finished = true;
-        self.request = RequestState::Idle;
+        self.request = RequestState::Finished;
         true
     }
 
@@ -95,13 +85,17 @@ impl<Image> Player<Image> {
                 self.request = RequestState::Sent;
                 true
             }
-            RequestState::Idle | RequestState::Sent => false,
+            RequestState::Idle
+            | RequestState::Sent
+            | RequestState::Finished => false,
         }
     }
 
     /// A late frame shows on arrival and its delay starts then.
     pub fn tick(&mut self, now: Instant) -> Due<Image> {
-        if self.finished && self.buffered.is_empty() {
+        if matches!(self.request, RequestState::Finished)
+            && self.buffered.is_empty()
+        {
             return Due::Idle;
         }
         if let Some(due) = self.next_due
@@ -131,7 +125,7 @@ impl<Image> Player<Image> {
 
     /// Keeps one request in flight.
     fn replenish(&mut self) {
-        if self.finished || !matches!(self.request, RequestState::Idle) {
+        if !matches!(self.request, RequestState::Idle) {
             return;
         }
         if self.buffered.len() < LOOKAHEAD {
@@ -153,13 +147,10 @@ mod tests {
     use super::*;
 
     fn player(generation: u32) -> Player<u8> {
-        Player::new(
-            PlaybackId {
-                page: 0,
-                generation,
-            },
-            Role::Fit,
-        )
+        Player::new(PlaybackId {
+            page: 0,
+            generation,
+        })
     }
 
     fn shown_delay<Image>(

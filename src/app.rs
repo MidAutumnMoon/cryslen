@@ -514,9 +514,7 @@ impl App {
 
     fn current_spread_size(&self) -> Option<(f64, f64)> {
         let reading = self.book.reading()?;
-        let mode = self.view.mode;
-        let on_screen = reading.on_screen(mode);
-        let dims = reading.seat_dims(mode, on_screen);
+        let dims = reading.seat_dims(self.view.mode);
         let total = geometry::layout(dims).total();
         (total.0 > 0.0 && total.1 > 0.0).then_some(total)
     }
@@ -579,32 +577,23 @@ impl App {
                     return;
                 };
                 let mut died = None;
-                let mut failed = false;
                 for event in process.drain() {
                     match event {
                         BookEvent::Died(detail) => died = Some(detail),
-                        other @ (BookEvent::Ready { .. }
-                        | BookEvent::Playback(_)
-                        | BookEvent::Failed { .. }) => {
-                            if matches!(other, BookEvent::Failed { .. }) {
-                                failed = true;
+                        BookEvent::Page(page_event) => {
+                            let effect = reading.apply_event(page_event);
+                            if effect.redraw {
+                                self.needs_redraw = true;
                             }
-                            if let Some(command) =
-                                reading.apply_event(other)
-                            {
+                            if let Some(command) = effect.command {
                                 process.send(ParentMsg::Playback(command));
                             }
                         }
                     }
                 }
-                if failed {
-                    self.needs_redraw = true;
-                }
                 if let Some(detail) = died {
                     tracing::warn!(%detail, "the book process failed");
-                    self.child = ChildProcess::Faulted(format!(
-                        "the book process died: {detail}"
-                    ));
+                    self.child = ChildProcess::Faulted(detail);
                     self.needs_redraw = true;
                 }
             }
@@ -649,7 +638,7 @@ impl App {
                 if touched.iter().any(|&page| on_screen.contains(page)) {
                     *needs_redraw = true;
                 }
-                let dims = reading.seat_dims(view.mode, on_screen);
+                let dims = reading.seat_dims(view.mode);
                 let layout = geometry::layout(dims);
                 let spread_size = layout.total();
                 let placement =
@@ -672,7 +661,6 @@ impl App {
                     .then_some(placement.scale);
                 if let Some(requests) = reading.update_requests(
                     view.mode,
-                    on_screen,
                     on_screen_scale,
                     gl.limits,
                     |page| gl.window.pages().roles(page),
@@ -681,21 +669,20 @@ impl App {
                 }
                 reading.note_hold(view.mode, now);
 
-                gl.window.pages_mut().retain(|page, role| {
-                    reading
-                        .retains_texture(view.mode, on_screen, page, role)
-                });
-                for command in
-                    reading.sync_playback(view.mode, on_screen, |page| {
-                        gl.window.pages().roles(page)
-                    })
-                {
+                for command in reading.sync_playback(view.mode, |page| {
+                    gl.window.pages().roles(page)
+                }) {
                     child.send(ParentMsg::Playback(command));
                 }
-                let playback =
-                    reading.tick_playback(now, |page, role, image| {
-                        gl.window.pages_mut().update(page, role, image)
-                    });
+                gl.window.pages_mut().retain(
+                    |page, role| {
+                        reading.retains_texture(view.mode, page, role)
+                    },
+                    |page| reading.retains_playback(page),
+                );
+                let playback = reading.tick_playback(now, |page, image| {
+                    gl.window.pages_mut().update_playback(page, image)
+                });
                 for command in playback.commands {
                     child.send(ParentMsg::Playback(command));
                 }
@@ -703,7 +690,7 @@ impl App {
                     *needs_redraw = true;
                 }
 
-                let waiting = reading.is_waiting(on_screen, |page| {
+                let waiting = reading.is_waiting(view.mode, |page| {
                     gl.window.pages().has_any(page)
                 });
                 (waiting && child.is_live(), playback.next_deadline)
@@ -748,45 +735,51 @@ impl App {
         let Some(gl) = gl.as_mut() else {
             return Ok(());
         };
-        let followup_redraw = match book {
-            BookSlot::Initial(name) => {
-                let status = StatusLine {
-                    reading: None,
-                    mode: view.mode,
-                    toast: view.timers.is_toasting(),
-                    name: name.clone(),
-                    waiting: view.timers.is_waiting()
-                        && child.is_opening(),
-                    fault: child.fault(),
-                };
-                present_frame(gl, view, size, &status, None, None)?
-            }
+        let (spread, reading_status, name, waiting, page_fault) = match book {
+            BookSlot::Initial(name) => (
+                None,
+                None,
+                name.clone(),
+                view.timers.is_waiting() && child.is_opening(),
+                None,
+            ),
             BookSlot::Loaded(reading) => {
-                let on_screen = reading.on_screen(view.mode);
-                let dims = reading.seat_dims(view.mode, on_screen);
+                let dims = reading.seat_dims(view.mode);
                 let layout = geometry::layout(dims);
                 let placement =
                     view.fit.resolve(layout.total(), view.last_viewport);
-                let mut status = reading.status_line(
-                    on_screen,
+                let book_status = reading.book_status(
                     view.mode,
                     placement.scale,
-                    child.fault(),
                     |page| gl.window.pages().has_any(page),
                 );
-                status.waiting =
-                    status.waiting && view.timers.is_waiting();
-                status.toast = view.timers.is_toasting();
-                present_frame(
-                    gl,
-                    view,
-                    size,
-                    &status,
-                    Some((&layout, reading.shown())),
-                    input_mode.jump_digits(),
-                )?
+                (
+                    Some((layout, reading.shown())),
+                    Some(book_status.reading),
+                    book_status.name,
+                    book_status.waiting && view.timers.is_waiting(),
+                    book_status.fault,
+                )
             }
         };
+        let status = StatusLine {
+            reading: reading_status,
+            mode: view.mode,
+            toast: view.timers.is_toasting(),
+            name,
+            waiting,
+            fault: page_fault.or_else(|| child.fault()),
+        };
+        let followup_redraw = present_frame(
+            gl,
+            view,
+            size,
+            &status,
+            spread
+                .as_ref()
+                .map(|(layout, shown)| (layout, *shown)),
+            input_mode.jump_digits(),
+        )?;
         if followup_redraw {
             *needs_redraw = true;
         }
@@ -897,10 +890,10 @@ impl App {
                 else {
                     return;
                 };
-                if key.repeat && !action.repeats() {
-                    return;
-                }
-                if action.repeats() && key.repeat {
+                if key.repeat {
+                    if !matches!(action, Action::Turn(_)) {
+                        return;
+                    }
                     self.skimming_keys.insert(code);
                     self.sync_motion();
                 }
@@ -970,28 +963,24 @@ impl App {
                 }
                 self.after_page_change();
             }
-            Action::NextBook | Action::PrevBook => {
+            Action::SwitchBook(direction) => {
                 // Switch runs off the event loop; the old book's view and
                 // textures stay on screen until the new one lands.
                 if self.child.is_opening() {
                     return;
                 }
-                let Some(path) = self.book.reading().and_then(|reading| {
-                    reading.sibling(matches!(action, Action::NextBook))
-                }) else {
+                let Some(path) = self
+                    .book
+                    .reading()
+                    .and_then(|reading| reading.sibling(direction))
+                else {
                     return;
                 };
                 tracing::debug!(path = %path.display(), "book switch");
                 self.start_open(&path, None);
             }
-            Action::Right
-            | Action::Left
-            | Action::Forward
-            | Action::Back => {
-                let Some(direction) = action.direction(self.view.mode)
-                else {
-                    return;
-                };
+            Action::Turn(turn) => {
+                let direction = turn.direction(self.view.mode);
                 let mode = self.view.mode;
                 let Some(reading) = self.book.reading_mut() else {
                     return;
@@ -1400,6 +1389,39 @@ mod tests {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Turn {
+    /// Page one spread toward the screen right.
+    Right,
+    /// Page one spread toward the screen left.
+    Left,
+    /// Page one spread in reading order.
+    Reading(Direction),
+}
+
+impl Turn {
+    /// Manga flips the arrows (Left advances); reading-order keys never flip.
+    fn direction(self, mode: ReadingMode) -> Direction {
+        match self {
+            Self::Reading(direction) => direction,
+            Self::Right => {
+                if mode.rtl() {
+                    Direction::Backward
+                } else {
+                    Direction::Forward
+                }
+            }
+            Self::Left => {
+                if mode.rtl() {
+                    Direction::Forward
+                } else {
+                    Direction::Backward
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Action {
     Quit,
     /// Leave fullscreen when fullscreen, quit otherwise.
@@ -1411,18 +1433,9 @@ enum Action {
     First,
     /// The book's last spread.
     Last,
-    /// The next sibling book in the parent directory.
-    NextBook,
-    /// The previous sibling book in the parent directory.
-    PrevBook,
-    /// Page one spread toward the screen right.
-    Right,
-    /// Page one spread toward the screen left.
-    Left,
-    /// Page one spread forward in reading order.
-    Forward,
-    /// Page one spread backward in reading order.
-    Back,
+    /// The next or previous sibling book in the parent directory.
+    SwitchBook(Direction),
+    Turn(Turn),
 }
 
 impl Action {
@@ -1443,18 +1456,18 @@ impl Action {
             && !modifiers.super_key();
         if bare_shift {
             return match code {
-                KeyCode::Space => Some(Self::Back),
-                KeyCode::KeyB => Some(Self::PrevBook),
+                KeyCode::Space => {
+                    Some(Self::Turn(Turn::Reading(Direction::Backward)))
+                }
+                KeyCode::KeyB => {
+                    Some(Self::SwitchBook(Direction::Backward))
+                }
                 _ => None,
             };
         }
         if !modifiers.is_empty() {
             return None;
         }
-        #[expect(
-            clippy::wildcard_enum_match_arm,
-            reason = "winit's unmapped KeyCode variants map to no action"
-        )]
         match code {
             KeyCode::KeyQ => Some(Self::Quit),
             KeyCode::Escape => Some(Self::Escape),
@@ -1466,51 +1479,18 @@ impl Action {
             KeyCode::KeyW => Some(Self::SelectFit(FitMode::Width)),
             KeyCode::KeyH => Some(Self::SelectFit(FitMode::Height)),
             KeyCode::Digit1 => Some(Self::SelectFit(FitMode::Actual)),
-            KeyCode::KeyB => Some(Self::NextBook),
+            KeyCode::KeyB => Some(Self::SwitchBook(Direction::Forward)),
             KeyCode::Home => Some(Self::First),
             KeyCode::End => Some(Self::Last),
-            KeyCode::ArrowRight => Some(Self::Right),
-            KeyCode::ArrowLeft => Some(Self::Left),
-            KeyCode::Space | KeyCode::PageDown => Some(Self::Forward),
-            KeyCode::PageUp => Some(Self::Back),
+            KeyCode::ArrowRight => Some(Self::Turn(Turn::Right)),
+            KeyCode::ArrowLeft => Some(Self::Turn(Turn::Left)),
+            KeyCode::Space | KeyCode::PageDown => {
+                Some(Self::Turn(Turn::Reading(Direction::Forward)))
+            }
+            KeyCode::PageUp => {
+                Some(Self::Turn(Turn::Reading(Direction::Backward)))
+            }
             _ => None,
-        }
-    }
-
-    /// Whether a held key keeps firing this action.
-    pub fn repeats(self) -> bool {
-        matches!(
-            self,
-            Self::Right | Self::Left | Self::Forward | Self::Back
-        )
-    }
-
-    /// The reading direction this action advances in `mode`, if it turns
-    /// pages. Manga flips the arrows (Left advances). The reading-order
-    /// keys never flip.
-    pub fn direction(self, mode: ReadingMode) -> Option<Direction> {
-        match self {
-            Self::Forward => Some(Direction::Forward),
-            Self::Right => Some(if mode.rtl() {
-                Direction::Backward
-            } else {
-                Direction::Forward
-            }),
-            Self::Left => Some(if mode.rtl() {
-                Direction::Forward
-            } else {
-                Direction::Backward
-            }),
-            Self::Back => Some(Direction::Backward),
-            Self::Quit
-            | Self::Escape
-            | Self::SelectMode(_)
-            | Self::ToggleFullscreen
-            | Self::SelectFit(_)
-            | Self::First
-            | Self::Last
-            | Self::NextBook
-            | Self::PrevBook => None,
         }
     }
 }
@@ -1532,15 +1512,24 @@ mod input_tests {
             (KeyCode::KeyW, Some(Action::SelectFit(FitMode::Width))),
             (KeyCode::KeyH, Some(Action::SelectFit(FitMode::Height))),
             (KeyCode::Digit1, Some(Action::SelectFit(FitMode::Actual))),
-            (KeyCode::KeyB, Some(Action::NextBook)),
+            (KeyCode::KeyB, Some(Action::SwitchBook(Direction::Forward))),
             (KeyCode::ShiftLeft, None), // the Shift+Space pairing lives on Space
             (KeyCode::Home, Some(Action::First)),
             (KeyCode::End, Some(Action::Last)),
-            (KeyCode::ArrowRight, Some(Action::Right)),
-            (KeyCode::ArrowLeft, Some(Action::Left)),
-            (KeyCode::Space, Some(Action::Forward)),
-            (KeyCode::PageDown, Some(Action::Forward)),
-            (KeyCode::PageUp, Some(Action::Back)),
+            (KeyCode::ArrowRight, Some(Action::Turn(Turn::Right))),
+            (KeyCode::ArrowLeft, Some(Action::Turn(Turn::Left))),
+            (
+                KeyCode::Space,
+                Some(Action::Turn(Turn::Reading(Direction::Forward))),
+            ),
+            (
+                KeyCode::PageDown,
+                Some(Action::Turn(Turn::Reading(Direction::Forward))),
+            ),
+            (
+                KeyCode::PageUp,
+                Some(Action::Turn(Turn::Reading(Direction::Backward))),
+            ),
             (KeyCode::KeyA, None),
             (KeyCode::KeyD, None),
             (KeyCode::ArrowUp, None),
@@ -1557,8 +1546,16 @@ mod input_tests {
     #[test]
     fn modifier_interactions() {
         let bindings: &[(KeyCode, ModifiersState, Option<Action>)] = &[
-            (KeyCode::Space, ModifiersState::SHIFT, Some(Action::Back)),
-            (KeyCode::KeyB, ModifiersState::SHIFT, Some(Action::PrevBook)),
+            (
+                KeyCode::Space,
+                ModifiersState::SHIFT,
+                Some(Action::Turn(Turn::Reading(Direction::Backward))),
+            ),
+            (
+                KeyCode::KeyB,
+                ModifiersState::SHIFT,
+                Some(Action::SwitchBook(Direction::Backward)),
+            ),
             (KeyCode::KeyQ, ModifiersState::CONTROL, None),
             (KeyCode::KeyQ, ModifiersState::SUPER, None),
             (KeyCode::KeyC, ModifiersState::CONTROL, None),
@@ -1582,52 +1579,19 @@ mod input_tests {
     }
 
     #[test]
-    fn action_semantics() {
-        use strum::VariantArray as _;
-
-        assert!(Action::Right.repeats());
-        assert!(Action::Left.repeats());
-        assert!(Action::Forward.repeats());
-        assert!(Action::Back.repeats());
-        let one_shot = [
-            Action::Quit,
-            Action::Escape,
-            Action::ToggleFullscreen,
-            Action::First,
-            Action::Last,
-            Action::NextBook,
-            Action::PrevBook,
-        ]
-        .into_iter()
-        .chain(
-            ReadingMode::VARIANTS
-                .iter()
-                .copied()
-                .map(Action::SelectMode),
-        )
-        .chain(FitMode::VARIANTS.iter().copied().map(Action::SelectFit));
-        for action in one_shot {
-            assert!(!action.repeats(), "{action:?} is one-shot");
-        }
-        let forwards: &[(Action, ReadingMode, Direction)] = &[
-            (Action::Right, ReadingMode::Normal, Direction::Forward),
-            (Action::Left, ReadingMode::Normal, Direction::Backward),
-            (Action::Forward, ReadingMode::Normal, Direction::Forward),
-            (Action::Back, ReadingMode::Normal, Direction::Backward),
-            (Action::Right, ReadingMode::Manga, Direction::Backward),
-            (Action::Left, ReadingMode::Manga, Direction::Forward),
-            (Action::Forward, ReadingMode::Manga, Direction::Forward),
-            (Action::Back, ReadingMode::Manga, Direction::Backward),
-            (Action::Right, ReadingMode::Comic, Direction::Forward),
-            (Action::Left, ReadingMode::Comic, Direction::Backward),
-            (Action::Forward, ReadingMode::Comic, Direction::Forward),
-            (Action::Back, ReadingMode::Comic, Direction::Backward),
-        ];
-        for &(action, mode, want) in forwards {
+    fn turn_direction_flips_arrows_only_in_rtl() {
+        for (turn, mode, want) in [
+            (Turn::Right, ReadingMode::Normal, Direction::Forward),
+            (Turn::Left, ReadingMode::Normal, Direction::Backward),
+            (Turn::Right, ReadingMode::Manga, Direction::Backward),
+            (Turn::Left, ReadingMode::Manga, Direction::Forward),
+            (Turn::Right, ReadingMode::Comic, Direction::Forward),
+            (Turn::Left, ReadingMode::Comic, Direction::Backward),
+        ] {
             assert_eq!(
-                action.direction(mode),
-                Some(want),
-                "{action:?} in {mode:?}"
+                turn.direction(mode),
+                want,
+                "{turn:?} in {mode:?}"
             );
         }
     }

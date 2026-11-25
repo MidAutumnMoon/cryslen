@@ -7,9 +7,8 @@ pub(super) fn decode(
     bytes: &[u8],
     format: Format,
 ) -> eros::Result<Decoded> {
-    use super::Depth;
-    use super::Plane;
     use super::Transfer;
+    use super::WideDepth;
     use image::DynamicImage;
     use image::ImageDecoder as _;
     use image::ImageFormat;
@@ -37,22 +36,21 @@ pub(super) fn decode(
     let mut oriented = DynamicImage::from_decoder(decoder)?;
     oriented.apply_orientation(orientation);
     Ok(if let DynamicImage::ImageLuma8(gray) = oriented {
-        Decoded::mono(
+        Decoded::gray_u8(
             gray.width(),
             gray.height(),
             format,
             Transfer::Srgb,
-            Depth::D8,
-            Plane::U8(gray.into_raw().into_boxed_slice()),
+            gray.into_raw().into_boxed_slice(),
         )?
     } else if let DynamicImage::ImageLuma16(gray) = oriented {
-        Decoded::mono(
+        Decoded::gray_u16(
             gray.width(),
             gray.height(),
             format,
             Transfer::Srgb,
-            Depth::D16,
-            Plane::U16(gray.into_raw().into_boxed_slice()),
+            WideDepth::D16,
+            gray.into_raw().into_boxed_slice(),
         )?
     } else {
         let rgba = oriented.into_rgba8();
@@ -93,7 +91,9 @@ mod tests {
                 assert_eq!(bytes.len(), 4 * 4 * 3);
                 assert_eq!(bytes.get(..4), Some(&[10, 20, 30, 255][..]));
             }
-            Pixels::Yuv(_) => panic!("png must decode to rgba"),
+            Pixels::Gray(_) | Pixels::Yuv(_) => {
+                panic!("png must decode to rgba")
+            }
         }
 
         let jpeg = testkit::tiny_jpeg(5, 2, [200, 100, 50]);
@@ -120,10 +120,9 @@ mod tests {
     }
 
     #[test]
-    fn opaque_grayscale_png_decodes_to_mono() {
-        use crate::decode::Depth;
-        use crate::decode::Plane;
-        use crate::decode::Subsampling;
+    fn opaque_grayscale_png_decodes_to_gray() {
+        use crate::decode::Samples;
+        use crate::decode::WideDepth;
         use image::DynamicImage;
         use image::GrayImage;
         use image::ImageBuffer;
@@ -131,49 +130,53 @@ mod tests {
         use image::Luma;
         use std::io::Cursor;
 
-        let mut png8 = Vec::new();
-        let gray8 =
-            GrayImage::from_raw(3, 2, vec![0, 40, 80, 120, 160, 200])
-                .expect("gray8 dims");
-        DynamicImage::ImageLuma8(gray8)
-            .write_to(&mut Cursor::new(&mut png8), ImageFormat::Png)
-            .expect("encode 8-bit grayscale png");
-        let page8 =
-            decode::decode(&png8, "g8.png").expect("luma8 decodes");
-        let Pixels::Yuv(yuv8) = page8.pixels() else {
-            panic!("opaque luma8 png must decode to mono");
-        };
-        assert_eq!(
-            (yuv8.spec.depth, yuv8.spec.subsampling),
-            (Depth::D8, Subsampling::Mono)
-        );
-        assert!(matches!(
-            &yuv8.luma,
-            Plane::U8(luma) if **luma == [0, 40, 80, 120, 160, 200]
-        ));
+        {
+            let mut png = Vec::new();
+            let image =
+                GrayImage::from_raw(3, 2, vec![0, 40, 80, 120, 160, 200])
+                    .expect("gray8 dims");
+            DynamicImage::ImageLuma8(image)
+                .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
+                .expect("encode 8-bit grayscale png");
+            let page =
+                decode::decode(&png, "g8.png").expect("luma8 decodes");
+            let Pixels::Gray(gray) = page.pixels() else {
+                panic!("opaque luma8 png must decode to gray");
+            };
+            assert!(gray.full_range);
+            let Samples::U8(planes) = &gray.samples else {
+                panic!("opaque luma8 png must use 8-bit samples");
+            };
+            assert!(planes.alpha.is_none());
+            assert_eq!(*planes.luma, [0, 40, 80, 120, 160, 200]);
+        }
 
-        let mut png16 = Vec::new();
-        let gray16 = ImageBuffer::<Luma<u16>, Vec<u16>>::from_raw(
-            2,
-            2,
-            vec![0, 15000, 30000, 45000],
-        )
-        .expect("gray16 dims");
-        DynamicImage::ImageLuma16(gray16)
-            .write_to(&mut Cursor::new(&mut png16), ImageFormat::Png)
-            .expect("encode 16-bit grayscale png");
-        let page16 =
-            decode::decode(&png16, "g16.png").expect("luma16 decodes");
-        let Pixels::Yuv(yuv16) = page16.pixels() else {
-            panic!("opaque luma16 png must decode to mono");
-        };
-        assert_eq!(
-            (yuv16.spec.depth, yuv16.spec.subsampling),
-            (Depth::D16, Subsampling::Mono)
-        );
-        assert!(matches!(
-            &yuv16.luma,
-            Plane::U16(luma) if **luma == [0, 15000, 30000, 45000]
-        ));
+        {
+            let mut png = Vec::new();
+            let image = ImageBuffer::<Luma<u16>, Vec<u16>>::from_raw(
+                2,
+                2,
+                vec![0, 15000, 30000, 45000],
+            )
+            .expect("gray16 dims");
+            DynamicImage::ImageLuma16(image)
+                .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
+                .expect("encode 16-bit grayscale png");
+            let page =
+                decode::decode(&png, "g16.png").expect("luma16 decodes");
+            let Pixels::Gray(gray) = page.pixels() else {
+                panic!("opaque luma16 png must decode to gray");
+            };
+            assert!(gray.full_range);
+            let Samples::U16 {
+                depth: WideDepth::D16,
+                planes,
+            } = &gray.samples
+            else {
+                panic!("opaque luma16 png must use 16-bit samples");
+            };
+            assert!(planes.alpha.is_none());
+            assert_eq!(*planes.luma, [0, 15000, 30000, 45000]);
+        }
     }
 }

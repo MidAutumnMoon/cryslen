@@ -174,7 +174,8 @@ pub enum Motion {
     Serialize,
     Display,
     Enum,
-    IntoStaticStr
+    IntoStaticStr,
+    VariantArray
 )]
 pub enum Role {
     #[strum(serialize = "thumb")]
@@ -219,8 +220,12 @@ impl Roles {
     /// The largest role present.
     #[must_use]
     pub fn best(self) -> Option<Role> {
-        [Role::Full, Role::Fit, Role::Thumb]
-            .into_iter()
+        use strum::VariantArray as _;
+
+        Role::VARIANTS
+            .iter()
+            .rev()
+            .copied()
             .find(|&role| self.contains(role))
     }
 }
@@ -248,7 +253,7 @@ pub fn spread_for(
     if index == 0 {
         return Spread::lone(0);
     }
-    let first = spread_start(spread_number(index));
+    let first = spread_start(spread_number(index, mode));
     Spread {
         first,
         second: (first + 1 < len).then_some(first + 1),
@@ -288,7 +293,7 @@ pub fn step(
             Direction::Backward => current.checked_sub(1),
         };
     }
-    let number = spread_number(current);
+    let number = spread_number(current, mode);
     let next = match direction {
         Direction::Forward => {
             let candidate = number + 1;
@@ -299,8 +304,8 @@ pub fn step(
     Some(spread_start(next))
 }
 
-fn spread_number(page: usize) -> usize {
-    page.div_ceil(2)
+fn spread_number(page: usize, mode: ReadingMode) -> usize {
+    if mode.pairs() { page.div_ceil(2) } else { page }
 }
 
 fn spread_start(number: usize) -> usize {
@@ -316,6 +321,14 @@ pub fn last_spread(mode: ReadingMode, len: NonZeroUsize) -> usize {
         return len.get() - 1;
     }
     spread_start(spread_count(len.get()) - 1)
+}
+
+pub fn spread_distance(
+    from: usize,
+    to: usize,
+    mode: ReadingMode,
+) -> usize {
+    spread_number(from, mode).abs_diff(spread_number(to, mode))
 }
 
 #[cfg(test)]
@@ -347,6 +360,11 @@ mod tests {
                     let spread = spread_for(page, mode, pages(len));
                     assert!(
                         spread.contains(clamped),
+                        "mode {mode:?} len {len} page {page}"
+                    );
+                    assert_eq!(
+                        spread_distance(clamped, spread.first, mode),
+                        0,
                         "mode {mode:?} len {len} page {page}"
                     );
                     if mode.pairs() {
@@ -404,11 +422,20 @@ mod tests {
                             }
                             Direction::Backward => start == 0,
                         };
+                        let bounded =
+                            step(page, direction, mode, pages(len));
                         assert_eq!(
-                            step(page, direction, mode, pages(len)),
+                            bounded,
                             (!at_end).then_some(stepped),
                             "bounded step must match advance except at book ends: len {len} mode {mode:?} page {page} direction {direction:?}"
                         );
+                        if let Some(next) = bounded {
+                            assert_eq!(
+                                spread_distance(start, next, mode),
+                                1,
+                                "bounded step moves one spread: len {len} mode {mode:?} page {page} direction {direction:?}"
+                            );
+                        }
                     }
                 }
             }

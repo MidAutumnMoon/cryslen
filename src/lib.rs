@@ -26,11 +26,10 @@ mod worker;
 pub fn run(args: &[OsString]) -> ExitCode {
     use std::ffi::OsStr;
 
-    let worker_mode = args
-        .get(1)
-        .is_some_and(|arg| arg.as_os_str() == OsStr::new("--worker"));
-    if worker_mode {
-        worker::main(args)
+    if let [_, flag, rest @ ..] = args
+        && flag.as_os_str() == OsStr::new("--worker")
+    {
+        worker::main(rest)
     } else {
         app::main(args)
     }
