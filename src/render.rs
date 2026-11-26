@@ -34,6 +34,7 @@ use winit::window::Window as WinitWindow;
 use crate::browse::Role;
 use crate::browse::Roles;
 use crate::browse::WorkRole;
+use crate::cache::ThumbImage;
 use crate::decode::ColorConversion;
 use crate::decode::Depth;
 use crate::decode::Transfer;
@@ -42,9 +43,7 @@ use crate::geometry::Placement;
 use crate::geometry::SpreadLayout;
 use crate::geometry::Viewport;
 use crate::protocol::TextureFault;
-use crate::protocol::ThumbFormat;
 use crate::protocol::ValidatedImage;
-use crate::protocol::ValidatedThumb;
 use crate::protocol::WirePixels;
 use crate::reading::PageStore;
 
@@ -863,14 +862,14 @@ impl PageStore for PageTextures {
     }
 
     /// Upload an 8-bit sRGB thumbnail to `page`'s `Role::Thumb` slot.
-    fn insert_thumb(&mut self, page: usize, thumb: &ValidatedThumb) {
+    fn insert_thumb(&mut self, page: usize, thumb: &ThumbImage) {
         if self.has(page, Role::Thumb) {
             return;
         }
-        let dims = (thumb.width, thumb.height);
+        let dims = thumb.dims();
         debug_assert!(
             TextureFault::check_dims(dims, self.max_texture_edge).is_ok(),
-            "ValidatedThumb ({dims:?}) must fit max_texture_edge ({})",
+            "ThumbImage ({dims:?}) must fit max_texture_edge ({})",
             self.max_texture_edge
         );
         let texture = upload_thumb_texture(Arc::clone(&self.gl), thumb);
@@ -2481,45 +2480,21 @@ fn upload_page_texture(
 
 fn upload_thumb_texture(
     gl: Arc<Context>,
-    thumb: &ValidatedThumb,
+    thumb: &ThumbImage,
 ) -> PageTexture {
-    use crate::decode;
-
-    let dims = (thumb.width, thumb.height);
-    let page_dims = thumb.page_dims;
+    let dims = thumb.dims();
+    let page_dims = thumb.page_dims();
     let magnification_filter = magnification_filter(dims, page_dims);
-    let layout = match thumb.pixels {
-        ThumbFormat::Gray8 => {
-            let (gain, offset) = decode::gray_gain_offset(Depth::D8, true);
-            PixelLayout::Mono {
-                luma: upload_plane(
-                    &gl,
-                    &thumb.bytes,
-                    dims,
-                    false,
-                    magnification_filter,
-                ),
-                gain,
-                offset,
-            }
-        }
-        ThumbFormat::Rgba8 => PixelLayout::Rgba {
-            texture: upload_rgba(
-                &gl,
-                &thumb.bytes,
-                dims,
-                magnification_filter,
-            ),
-        },
-    };
+    let rgba = thumb.rgba();
+    let texture = upload_rgba(&gl, rgba, dims, magnification_filter);
     PageTexture {
         gl,
         dims,
         page_dims,
         transfer: Transfer::Srgb,
         needs_dither: false,
-        resident_bytes: thumb.bytes.len(),
-        layout,
+        resident_bytes: rgba.len(),
+        layout: PixelLayout::Rgba { texture },
     }
 }
 

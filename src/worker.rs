@@ -671,8 +671,7 @@ impl Shared {
         }
         tracing::debug!(
             page = job.page,
-            width = thumb.width,
-            height = thumb.height,
+            bytes = thumb.webp.len(),
             threads = job.threads,
             waited = ?job.requested_at.elapsed(),
             elapsed = ?started.elapsed(),
@@ -1486,8 +1485,11 @@ mod tests {
                 page == 0 && role == WorkRole::Fit
             });
         assert_eq!((image.meta.width, image.meta.height), (40, 30));
-        let thumb = thumb.expect("fit delivery includes thumb");
-        assert_eq!((thumb.width, thumb.height), (40, 30));
+        let thumb = thumb
+            .expect("fit delivery includes thumb")
+            .validate()
+            .expect("valid webp thumb");
+        assert_eq!(thumb.dims(), (40, 30));
     }
 
     #[test]
@@ -1516,8 +1518,11 @@ mod tests {
             (fit.meta.width, fit.meta.height),
             (TEST_FIT_BOX.0, fit.meta.height)
         );
-        let thumb = thumb.expect("thumb attached");
-        assert_eq!(thumb.width.max(thumb.height), THUMB_EDGE);
+        let thumb = thumb
+            .expect("thumb attached")
+            .validate()
+            .expect("valid webp thumb");
+        assert_eq!(thumb.dims().0.max(thumb.dims().1), THUMB_EDGE);
 
         // Delete the backing file: `WorkRole::Full` must still succeed from
         // `native_cache` without touching disk!
@@ -1648,8 +1653,10 @@ mod tests {
             thumbs: vec![0, 1, 2],
         });
         for page in 0..3 {
-            let thumb = events.thumb("background thumb never arrived", page);
-            assert_eq!(thumb.width.max(thumb.height), THUMB_EDGE);
+            events
+                .thumb("background thumb never arrived", page)
+                .validate()
+                .expect("valid webp thumb");
             assert_eq!(
                 events.ready_count(page),
                 0,

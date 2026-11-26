@@ -1,26 +1,14 @@
-//! Downscaled page derivation and the per-book parent thumbnail pack
-//! (`$XDG_CACHE_HOME/cryslen/thumbs/<book_key>.cyth`).
-
-#![expect(
-    clippy::little_endian_bytes,
-    reason = "the thumb-pack binary format is defined little-endian"
-)]
+//! Downscaled page derivation and the shared parent thumbnail store
+//! (`$XDG_CACHE_HOME/cryslen/thumbs-v1.redb`).
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::ffi::OsStr;
-use std::ffi::OsString;
 use std::fs;
 use std::fs::File;
-use std::io;
-use std::io::BufReader;
-use std::io::BufWriter;
+use std::fs::OpenOptions;
 use std::io::ErrorKind;
-use std::io::Read as _;
-use std::io::Seek as _;
-use std::io::SeekFrom;
-use std::io::Write as _;
 use std::mem;
+use std::ops::RangeInclusive;
 use std::path::Path;
 use std::path::PathBuf;
 use std::thread;
@@ -32,6 +20,17 @@ use fast_image_resize::PixelTrait;
 use fast_image_resize::Resizer;
 use fast_image_resize::pixels::Pixel;
 use fast_image_resize::pixels::PixelComponent;
+use redb::Builder;
+use redb::ConcurrencyMode;
+use redb::Database;
+use redb::ReadOnlyTable;
+use redb::ReadTransaction;
+use redb::ReadableDatabase as _;
+use redb::ReadableTable as _;
+use redb::Table;
+use redb::TableDefinition;
+use redb::TableError;
+use redb::backends::FileBackend;
 
 use crate::browse::WorkRole;
 use crate::catalog;
@@ -49,7 +48,6 @@ use crate::decode::YuvPlanes;
 use crate::protocol::ImageLimits;
 use crate::protocol::THUMB_EDGE;
 use crate::protocol::TextureFault;
-use crate::protocol::ThumbFormat;
 use crate::protocol::ValidatedThumb;
 use crate::protocol::WireThumb;
 
@@ -57,7 +55,7 @@ const THUMB_PACK_CAP_BYTES: u64 = 512 * 1024 * 1024;
 const THUMB_PACK_PRUNE_NUMERATOR: u64 = 4;
 const THUMB_PACK_PRUNE_DENOMINATOR: u64 = 5;
 const FLUSH_ENTRY_THRESHOLD: usize = 32;
-const FLUSH_BYTE_THRESHOLD: usize = 2 * 1024 * 1024;
+const THUMB_WEBP_QUALITY: f32 = 78.0;
 
 fn derivation(
     role: WorkRole,
@@ -101,7 +99,7 @@ pub fn derive(
     Err(TextureFault { dims, max_edge })
 }
 
-/// Derive a compact 8-bit sRGB thumbnail (`<= THUMB_EDGE` per axis) from a
+/// Derive a compact WebP thumbnail (`<= THUMB_EDGE` per axis) from a
 /// decoded or `Fit`-sized page.
 pub fn derive_thumb(
     page: &Decoded,
@@ -113,76 +111,61 @@ pub fn derive_thumb(
         FilterType::Box,
         max_threads,
     )?;
-    encode_thumb(&thumb)
-}
-
-fn encode_thumb(page: &Decoded) -> eros::Result<ValidatedThumb> {
-    const RGB_CHANNELS: usize = 3;
-
-    let width = page.width();
-    let height = page.height();
-    let transfer = page.transfer();
-    let (pixels, bytes) = match page.pixels() {
-        Pixels::Rgba8(raw) => {
-            let mut rgba = raw.to_vec();
-            if transfer == Transfer::Pq {
-                for pixel in
-                    rgba.as_chunks_mut::<{ decode::RGBA_BYTES_PER_PIXEL }>().0
-                {
-                    for channel in pixel.iter_mut().take(RGB_CHANNELS) {
-                        *channel = quantize_unit(decode::pq_to_srgb_channel(
-                            f32::from(*channel) / decode::R8_STORAGE_MAX,
-                        ));
-                    }
-                }
-            }
-            (ThumbFormat::Rgba8, rgba)
-        }
-        Pixels::Gray(gray) => encode_gray_thumb(
-            gray,
-            (width, height),
-            transfer,
-        ),
-        Pixels::Yuv(yuv) => encode_yuv_thumb(
-            yuv,
-            (width, height),
-            transfer,
-        ),
-    };
+    let rgba = thumb_rgba(&thumb);
+    let webp = decode::encode_webp_rgba(
+        (thumb.width(), thumb.height()),
+        &rgba,
+        THUMB_WEBP_QUALITY,
+    )?;
     let wire = WireThumb {
-        width,
-        height,
-        page_dims: page.page_dims(),
-        format: page.format(),
-        pixels,
-        bytes,
+        page_dims: thumb.page_dims(),
+        format: thumb.format(),
+        webp,
     };
     Ok(wire.validate()?)
 }
 
-fn encode_gray_thumb(
-    gray: &GrayImage,
-    (width, height): (u32, u32),
-    transfer: Transfer,
-) -> (ThumbFormat, Vec<u8>) {
-    let pixel_count = width as usize * height as usize;
+fn thumb_rgba(page: &Decoded) -> Cow<'_, [u8]> {
+    const RGB_CHANNELS: usize = 3;
 
-    match &gray.samples {
-        Samples::U8(planes) => {
-            gray_planes_to_thumb(gray, pixel_count, transfer, planes)
+    let dims = (page.width(), page.height());
+    let transfer = page.transfer();
+    match page.pixels() {
+        Pixels::Rgba8(raw) => {
+            if transfer == Transfer::Srgb {
+                return Cow::Borrowed(raw);
+            }
+            let mut rgba = raw.to_vec();
+            for pixel in
+                rgba.as_chunks_mut::<{ decode::RGBA_BYTES_PER_PIXEL }>().0
+            {
+                for channel in pixel.iter_mut().take(RGB_CHANNELS) {
+                    *channel = quantize_unit(decode::pq_to_srgb_channel(
+                        f32::from(*channel) / decode::R8_STORAGE_MAX,
+                    ));
+                }
+            }
+            Cow::Owned(rgba)
         }
+        Pixels::Gray(gray) => Cow::Owned(encode_gray_rgba8(gray, transfer)),
+        Pixels::Yuv(yuv) => Cow::Owned(encode_yuv_rgba8(yuv, dims, transfer)),
+    }
+}
+
+fn encode_gray_rgba8(gray: &GrayImage, transfer: Transfer) -> Vec<u8> {
+    match &gray.samples {
+        Samples::U8(planes) => gray_planes_to_rgba8(gray, transfer, planes),
         Samples::U16 { planes, .. } => {
-            gray_planes_to_thumb(gray, pixel_count, transfer, planes)
+            gray_planes_to_rgba8(gray, transfer, planes)
         }
     }
 }
 
-fn gray_planes_to_thumb<Sample>(
+fn gray_planes_to_rgba8<Sample>(
     gray: &GrayImage,
-    pixel_count: usize,
     transfer: Transfer,
     planes: &GrayPlanes<Sample>,
-) -> (ThumbFormat, Vec<u8>)
+) -> Vec<u8>
 where
     Sample: Copy,
     f32: From<Sample>,
@@ -202,47 +185,31 @@ where
         )
     };
 
-    planes.alpha.as_deref().map_or_else(
-        || {
-            let bytes = planes
-                .luma
-                .iter()
-                .map(|sample| map_luma(f32::from(*sample)))
-                .collect();
-            (ThumbFormat::Gray8, bytes)
-        },
-        |alpha_plane| {
-            let mut bytes = Vec::with_capacity(
-                pixel_count * decode::RGBA_BYTES_PER_PIXEL,
-            );
-            for (luma_sample, alpha_sample) in
-                planes.luma.iter().zip(alpha_plane.iter())
-            {
-                let gray_byte = map_luma(f32::from(*luma_sample));
-                let alpha_byte = map_alpha(f32::from(*alpha_sample));
-                bytes.extend_from_slice(&[
-                    gray_byte, gray_byte, gray_byte, alpha_byte,
-                ]);
-            }
-            (ThumbFormat::Rgba8, bytes)
-        },
-    )
+    let mut bytes =
+        Vec::with_capacity(planes.luma.len() * decode::RGBA_BYTES_PER_PIXEL);
+    for (index, luma_sample) in planes.luma.iter().enumerate() {
+        let gray_byte = map_luma(f32::from(*luma_sample));
+        let alpha_byte = planes.alpha.as_deref().map_or(u8::MAX, |plane| {
+            plane
+                .get(index)
+                .copied()
+                .map_or(u8::MAX, |sample| map_alpha(f32::from(sample)))
+        });
+        bytes.extend_from_slice(&[gray_byte, gray_byte, gray_byte, alpha_byte]);
+    }
+    bytes
 }
 
-fn encode_yuv_thumb(
+fn encode_yuv_rgba8(
     yuv: &YuvImage,
     dims: (u32, u32),
     transfer: Transfer,
-) -> (ThumbFormat, Vec<u8>) {
+) -> Vec<u8> {
     match &yuv.samples {
-        Samples::U8(planes) => (
-            ThumbFormat::Rgba8,
-            yuv_planes_to_rgba8(yuv, dims, transfer, planes),
-        ),
-        Samples::U16 { planes, .. } => (
-            ThumbFormat::Rgba8,
-            yuv_planes_to_rgba8(yuv, dims, transfer, planes),
-        ),
+        Samples::U8(planes) => yuv_planes_to_rgba8(yuv, dims, transfer, planes),
+        Samples::U16 { planes, .. } => {
+            yuv_planes_to_rgba8(yuv, dims, transfer, planes)
+        }
     }
 }
 
@@ -665,115 +632,128 @@ where
     Ok(buffer)
 }
 
-const PACK_MAGIC: [u8; 4] = *b"CYTH";
-const PACK_VERSION: u16 = 1;
-const PACK_HEADER_BYTES: usize = 16;
-const RECORD_HEADER_BYTES: usize = 20;
-const PACK_EXTENSION: &str = ".cyth";
+const THUMB_DB_FILENAME: &str = "thumbs-v1.redb";
+const THUMB_DB_CACHE_BYTES: usize = 8 * 1024 * 1024;
+const THUMB_DB_FILE_MODE: u32 = 0o600;
 
-#[derive(Clone, Copy)]
-struct RecordLocation {
-    payload_offset: u64,
-    width: u32,
-    height: u32,
+type StoredThumb<'bytes> = (u32, u32, u8, &'bytes [u8]);
+
+const BOOKS_TABLE: TableDefinition<'_, [u8; 16], (u64, u64)> =
+    TableDefinition::new("books");
+const THUMBS_TABLE: TableDefinition<'_, ([u8; 16], u32), StoredThumb<'_>> =
+    TableDefinition::new("thumbs");
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThumbImage {
+    dims: (u32, u32),
     page_dims: (u32, u32),
     format: Format,
-    pixels: ThumbFormat,
+    rgba: Vec<u8>,
 }
 
-struct PackFile {
-    file: File,
-    valid_end: u64,
+impl ThumbImage {
+    #[must_use]
+    pub const fn dims(&self) -> (u32, u32) {
+        self.dims
+    }
+
+    #[must_use]
+    pub const fn page_dims(&self) -> (u32, u32) {
+        self.page_dims
+    }
+
+    #[must_use]
+    pub const fn format(&self) -> Format {
+        self.format
+    }
+
+    #[must_use]
+    pub fn rgba(&self) -> &[u8] {
+        &self.rgba
+    }
 }
 
-/// Parent-owned append-only per-book thumbnail pack under
-/// `$XDG_CACHE_HOME/cryslen/thumbs/<book_key>.cyth`.
+/// Parent-owned shared thumbnail cache under
+/// `$XDG_CACHE_HOME/cryslen/thumbs-v1.redb`.
 pub struct ThumbPack {
-    path: PathBuf,
-    cap_bytes: u64,
-    file: Option<PackFile>,
-    index: Vec<Option<RecordLocation>>,
+    db: Database,
+    book_key: [u8; 16],
+    present: Vec<bool>,
     pending: BTreeMap<usize, ValidatedThumb>,
-    pending_bytes: usize,
     pruned_once: bool,
 }
 
 impl ThumbPack {
     pub fn open(path: &Path, archive: bool, names: &[String]) -> Option<Self> {
-        let root = default_thumb_dir()?;
+        let root = default_cache_dir()?;
         let key = book_key(path, archive, names)?;
         Self::open_at(&root, key, names.len())
     }
 
-    pub fn open_at(root: &Path, key: u128, page_count: usize) -> Option<Self> {
-        Self::open_with_cap(root, key, page_count, THUMB_PACK_CAP_BYTES)
-    }
-
-    fn open_with_cap(
+    pub fn open_at(
         root: &Path,
-        key: u128,
+        book_key: [u8; 16],
         page_count: usize,
-        cap_bytes: u64,
     ) -> Option<Self> {
         if make_dir(root).is_none() {
             tracing::warn!(root = %root.display(), "thumb pack disabled");
             return None;
         }
-        let path = root.join(format!("{key:032x}{PACK_EXTENSION}"));
-        let mut index = vec![None; page_count];
-        let file = open_existing_pack(&path, &mut index);
+        let db_path = root.join(THUMB_DB_FILENAME);
+        let (db, present, existing_last_used) =
+            open_or_recreate(&db_path, book_key, page_count)?;
+        let warm = present.iter().filter(|&&hit| hit).count();
+        tracing::debug!(warm, total = page_count, "thumb pack opened");
+        let now_secs = now_unix_secs();
+        if let Some(last_used) = existing_last_used
+            && last_used != now_secs
+            && let Err(error) = touch_book_last_used(&db, book_key, now_secs)
+        {
+            tracing::debug!(%error, "thumb pack touch failed");
+        }
         Some(Self {
-            path,
-            cap_bytes,
-            file,
-            index,
+            db,
+            book_key,
+            present,
             pending: BTreeMap::new(),
-            pending_bytes: 0,
             pruned_once: false,
         })
     }
 
     pub fn has(&self, page: usize) -> bool {
         self.pending.contains_key(&page)
-            || self.index.get(page).is_some_and(Option::is_some)
+            || self.present.get(page).copied().unwrap_or(false)
     }
 
-    pub fn load(&self, page: usize) -> Option<ValidatedThumb> {
-        use std::os::unix::fs::FileExt as _;
-
+    pub fn load(&self, page: usize) -> Option<ThumbImage> {
         if let Some(pending) = self.pending.get(&page) {
-            return Some(pending.clone());
+            return decode_thumb_image(
+                pending.page_dims,
+                pending.format,
+                &pending.webp,
+            );
         }
-        let location = self.index.get(page).copied().flatten()?;
-        let pack = self.file.as_ref()?;
-        let payload_bytes =
-            location.pixels.byte_len(location.width, location.height)?;
-        let mut bytes = vec![0_u8; payload_bytes];
-        pack.file
-            .read_exact_at(&mut bytes, location.payload_offset)
+        if !self.present.get(page).copied().unwrap_or(false) {
+            return None;
+        }
+        let page_u32 = u32::try_from(page).ok()?;
+        let read_txn = self.db.begin_read().ok()?;
+        let table = read_txn.open_table(THUMBS_TABLE).ok()?;
+        let entry = table.get((self.book_key, page_u32)).ok()??;
+        let (page_width, page_height, format_tag, webp) = entry.value();
+        let format = Format::from_repr(format_tag)?;
+        let page_dims = (page_width, page_height);
+        decode::admit_dims(page_dims.0, page_dims.1, "thumb page dimensions")
             .ok()?;
-        WireThumb {
-            width: location.width,
-            height: location.height,
-            page_dims: location.page_dims,
-            format: location.format,
-            pixels: location.pixels,
-            bytes,
-        }
-        .validate()
-        .ok()
+        decode_thumb_image(page_dims, format, webp)
     }
 
     pub fn record(&mut self, page: usize, thumb: ValidatedThumb) {
-        if self.has(page) || page >= self.index.len() {
+        if self.has(page) || page >= self.present.len() {
             return;
         }
-        self.pending_bytes =
-            self.pending_bytes.saturating_add(thumb.bytes.len());
         self.pending.insert(page, thumb);
-        if self.pending.len() >= FLUSH_ENTRY_THRESHOLD
-            || self.pending_bytes >= FLUSH_BYTE_THRESHOLD
-        {
+        if self.pending.len() >= FLUSH_ENTRY_THRESHOLD {
             self.flush();
         }
     }
@@ -782,96 +762,70 @@ impl ThumbPack {
         if self.pending.is_empty() {
             return;
         }
-        if let Err(error) = self.flush_pending() {
-            tracing::debug!(%error, path = %self.path.display(), "thumb pack flush failed");
-            return;
-        }
-        if !self.pruned_once {
-            self.pruned_once = true;
-            if let (Some(dir), Some(file_name)) =
-                (self.path.parent(), self.path.file_name())
-            {
-                prune_packs(dir, self.cap_bytes, file_name);
-            }
+        if let Err(error) =
+            self.flush_pending(now_unix_secs(), THUMB_PACK_CAP_BYTES)
+        {
+            tracing::warn!(%error, "thumb pack flush failed");
         }
     }
 
-    fn flush_pending(&mut self) -> io::Result<()> {
-        use std::fs::OpenOptions;
-        use std::os::unix::fs::OpenOptionsExt as _;
-
-        const PACK_FILE_MODE: u32 = 0o600;
-
-        if let Ok(metadata) = fs::symlink_metadata(&self.path)
-            && metadata.file_type().is_symlink()
-        {
-            return Err(io::Error::new(
-                ErrorKind::PermissionDenied,
-                "thumb pack path is a symlink",
-            ));
-        }
-
-        let (target_file, mut offset) = match &self.file {
-            None => {
-                let mut file = OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .mode(PACK_FILE_MODE)
-                    .open(&self.path)?;
-                file.write_all(&encode_pack_header(self.index.len()))?;
-                (file, PACK_HEADER_BYTES as u64)
-            }
-            Some(pack) => {
-                let mut file = OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(&self.path)?;
-                file.set_len(pack.valid_end)?;
-                file.seek(SeekFrom::Start(pack.valid_end))?;
-                (file, pack.valid_end)
-            }
-        };
-
+    fn flush_pending(
+        &mut self,
+        now_secs: u64,
+        cap_bytes: u64,
+    ) -> Result<(), redb::Error> {
         let items = mem::take(&mut self.pending);
-        self.pending_bytes = 0;
+        let write_txn = self.db.begin_write()?;
+        let mut flushed_pages = Vec::with_capacity(items.len());
+        {
+            let mut books_table = write_txn.open_table(BOOKS_TABLE)?;
+            let mut thumbs_table = write_txn.open_table(THUMBS_TABLE)?;
 
-        let mut new_locations = Vec::with_capacity(items.len());
-        let mut writer = BufWriter::new(target_file);
-        for (page, thumb) in items {
-            let Some(record_header) = encode_record_header(page, &thumb)
-            else {
-                continue;
-            };
-            writer.write_all(&record_header)?;
-            writer.write_all(&thumb.bytes)?;
-            let payload_offset = offset + RECORD_HEADER_BYTES as u64;
-            let payload_bytes = thumb.bytes.len() as u64;
-            new_locations.push((
-                page,
-                RecordLocation {
-                    payload_offset,
-                    width: thumb.width,
-                    height: thumb.height,
-                    page_dims: thumb.page_dims,
-                    format: thumb.format,
-                    pixels: thumb.pixels,
-                },
-            ));
-            offset += RECORD_HEADER_BYTES as u64 + payload_bytes;
-        }
-        writer.flush()?;
-        let file = writer.into_inner().map_err(io::IntoInnerError::into_error)?;
-        for (page, location) in new_locations {
-            if let Some(slot) = self.index.get_mut(page) {
-                *slot = Some(location);
+            let mut book_bytes = books_table
+                .get(self.book_key)?
+                .map_or(0, |existing| existing.value().1);
+
+            for (page, thumb) in items {
+                let Ok(page_u32) = u32::try_from(page) else {
+                    continue;
+                };
+                let new_bytes = thumb.webp.len() as u64;
+                let previous_bytes = thumbs_table
+                    .insert(
+                        (self.book_key, page_u32),
+                        (
+                            thumb.page_dims.0,
+                            thumb.page_dims.1,
+                            thumb.format as u8,
+                            thumb.webp.as_slice(),
+                        ),
+                    )?
+                    .map_or(0, |previous| previous.value().3.len() as u64);
+                book_bytes = book_bytes
+                    .saturating_add(new_bytes)
+                    .saturating_sub(previous_bytes);
+                flushed_pages.push(page);
+            }
+
+            books_table.insert(self.book_key, (now_secs, book_bytes))?;
+
+            if !self.pruned_once {
+                prune_old_books(
+                    &mut books_table,
+                    &mut thumbs_table,
+                    self.book_key,
+                    cap_bytes,
+                )?;
             }
         }
-        self.file = Some(PackFile {
-            file,
-            valid_end: offset,
-        });
+        write_txn.commit()?;
+        self.pruned_once = true;
+
+        for page in flushed_pages {
+            if let Some(slot) = self.present.get_mut(page) {
+                *slot = true;
+            }
+        }
         Ok(())
     }
 }
@@ -882,191 +836,221 @@ impl Drop for ThumbPack {
     }
 }
 
-fn open_existing_pack(
-    path: &Path,
-    index: &mut [Option<RecordLocation>],
-) -> Option<PackFile> {
-    let metadata = fs::symlink_metadata(path).ok()?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return None;
-    }
-    let file = File::open(path).ok()?;
-    if let Err(error) = file.set_modified(SystemTime::now()) {
-        tracing::debug!(%error, path = %path.display(), "thumb pack mtime touch failed");
-    }
-    let file_bytes = file.metadata().map_or(0, |meta| meta.len());
-    if file_bytes < PACK_HEADER_BYTES as u64 {
-        return None;
-    }
-
-    let page_count = index.len();
-    let mut reader = BufReader::new(&file);
-    let mut header = [0_u8; PACK_HEADER_BYTES];
-    reader.read_exact(&mut header).ok()?;
-    if decode_pack_header(&header) != Some(page_count) {
-        return None;
-    }
-
-    let mut offset = PACK_HEADER_BYTES as u64;
-    let mut record = [0_u8; RECORD_HEADER_BYTES];
-    loop {
-        if reader.read_exact(&mut record).is_err() {
-            break;
-        }
-        let Some((page, location, payload_bytes)) =
-            decode_record_header(&record, page_count, offset)
-        else {
-            break;
-        };
-        let Some(next_offset) =
-            offset.checked_add(RECORD_HEADER_BYTES as u64 + payload_bytes)
-        else {
-            break;
-        };
-        if next_offset > file_bytes {
-            break;
-        }
-        let Ok(payload_skip) = i64::try_from(payload_bytes) else {
-            break;
-        };
-        if reader.seek_relative(payload_skip).is_err() {
-            break;
-        }
-        if let Some(slot) = index.get_mut(page) {
-            *slot = Some(location);
-        }
-        offset = next_offset;
-    }
-    drop(reader);
-    Some(PackFile {
-        file,
-        valid_end: offset,
+fn decode_thumb_image(
+    page_dims: (u32, u32),
+    format: Format,
+    webp: &[u8],
+) -> Option<ThumbImage> {
+    let (dims, rgba) = decode::decode_webp_rgba(webp, THUMB_EDGE)
+        .inspect_err(|error| {
+            tracing::debug!(%error, "thumb webp decode failed");
+        })
+        .ok()?;
+    Some(ThumbImage {
+        dims,
+        page_dims,
+        format,
+        rgba,
     })
 }
 
-fn encode_pack_header(page_count: usize) -> [u8; PACK_HEADER_BYTES] {
-    let mut header = [0_u8; PACK_HEADER_BYTES];
-    header[..4].copy_from_slice(&PACK_MAGIC);
-    header[4..6].copy_from_slice(&PACK_VERSION.to_le_bytes());
-    header[8..16].copy_from_slice(&(page_count as u64).to_le_bytes());
-    header
-}
-
-fn decode_pack_header(header: &[u8; PACK_HEADER_BYTES]) -> Option<usize> {
-    if header[..4] != PACK_MAGIC {
-        return None;
-    }
-    let version = u16::from_le_bytes([header[4], header[5]]);
-    if version != PACK_VERSION {
-        return None;
-    }
-    let page_count = u64::from_le_bytes([
-        header[8], header[9], header[10], header[11], header[12], header[13],
-        header[14], header[15],
-    ]);
-    usize::try_from(page_count).ok()
-}
-
-fn encode_record_header(
-    page: usize,
-    thumb: &ValidatedThumb,
-) -> Option<[u8; RECORD_HEADER_BYTES]> {
-    let page = u32::try_from(page).ok()?;
-    let width = u16::try_from(thumb.width).ok()?;
-    let height = u16::try_from(thumb.height).ok()?;
-    let mut record = [0_u8; RECORD_HEADER_BYTES];
-    record[0..4].copy_from_slice(&page.to_le_bytes());
-    record[4..6].copy_from_slice(&width.to_le_bytes());
-    record[6..8].copy_from_slice(&height.to_le_bytes());
-    record[8..12].copy_from_slice(&thumb.page_dims.0.to_le_bytes());
-    record[12..16].copy_from_slice(&thumb.page_dims.1.to_le_bytes());
-    record[16] = format_to_code(thumb.format);
-    record[17] = pixel_to_code(thumb.pixels);
-    Some(record)
-}
-
-fn decode_record_header(
-    record: &[u8; RECORD_HEADER_BYTES],
+fn open_or_recreate(
+    path: &Path,
+    book_key: [u8; 16],
     page_count: usize,
-    record_offset: u64,
-) -> Option<(usize, RecordLocation, u64)> {
-    let page = u32::from_le_bytes([record[0], record[1], record[2], record[3]])
-        as usize;
-    if page >= page_count {
+) -> Option<(Database, Vec<bool>, Option<u64>)> {
+    let file = open_regular_file(path)?;
+    let error = match open_and_scan(file, book_key, page_count) {
+        Ok(opened) => return Some(opened),
+        Err(error) => error,
+    };
+    tracing::warn!(
+        path = %path.display(),
+        %error,
+        "recreating corrupt or outdated thumb pack"
+    );
+    if let Err(remove_error) = fs::remove_file(path)
+        && remove_error.kind() != ErrorKind::NotFound
+    {
+        tracing::warn!(
+            path = %path.display(),
+            error = %remove_error,
+            "cannot remove thumb pack"
+        );
         return None;
     }
-    let width = u32::from(u16::from_le_bytes([record[4], record[5]]));
-    let height = u32::from(u16::from_le_bytes([record[6], record[7]]));
-    if width == 0 || height == 0 || width > THUMB_EDGE || height > THUMB_EDGE {
-        return None;
-    }
-    let page_width =
-        u32::from_le_bytes([record[8], record[9], record[10], record[11]]);
-    let page_height =
-        u32::from_le_bytes([record[12], record[13], record[14], record[15]]);
-    decode::pixel_count(page_width, page_height)?;
-    let format = code_to_format(record[16])?;
-    let pixels = code_to_pixel(record[17])?;
-    let payload_bytes = pixels.byte_len(width, height)? as u64;
-    let payload_offset =
-        record_offset.checked_add(RECORD_HEADER_BYTES as u64)?;
-    Some((
-        page,
-        RecordLocation {
-            payload_offset,
-            width,
-            height,
-            page_dims: (page_width, page_height),
-            format,
-            pixels,
-        },
-        payload_bytes,
-    ))
+    let fresh_file = open_regular_file(path)?;
+    open_and_scan(fresh_file, book_key, page_count)
+        .inspect_err(|retry_error| {
+            tracing::warn!(
+                path = %path.display(),
+                error = %retry_error,
+                "thumb pack disabled after recreate"
+            );
+        })
+        .ok()
 }
 
-const fn format_to_code(format: Format) -> u8 {
-    match format {
-        Format::Jpeg => 0,
-        Format::Png => 1,
-        Format::Gif => 2,
-        Format::Webp => 3,
-        Format::Bmp => 4,
-        Format::Tiff => 5,
-        Format::Avif => 6,
-        Format::Jxl => 7,
+fn open_regular_file(path: &Path) -> Option<File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                tracing::warn!(
+                    path = %path.display(),
+                    "thumb pack path is not a regular file"
+                );
+                return None;
+            }
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "thumb pack disabled");
+            return None;
+        }
+    }
+
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(THUMB_DB_FILE_MODE)
+        .open(path)
+        .inspect_err(|error| {
+            tracing::warn!(path = %path.display(), %error, "thumb pack disabled");
+        })
+        .ok()
+}
+
+fn open_and_scan(
+    file: File,
+    book_key: [u8; 16],
+    page_count: usize,
+) -> Result<(Database, Vec<bool>, Option<u64>), redb::Error> {
+    let db = Builder::new()
+        .set_cache_size(THUMB_DB_CACHE_BYTES)
+        .set_concurrency_mode(ConcurrencyMode::MultiWriter)
+        .create_with_backend(FileBackend::new(file))?;
+    let mut present = vec![false; page_count];
+    let last_used = {
+        let read_txn = db.begin_read()?;
+        let books = open_if_exists(&read_txn, BOOKS_TABLE)?;
+        let thumbs = open_if_exists(&read_txn, THUMBS_TABLE)?;
+        if let (Some(books), Some(thumbs)) = (books, thumbs)
+            && let Some(row) = books.get(book_key)?
+        {
+            for entry in thumbs.range(book_thumb_range(book_key))? {
+                let (key, _) = entry?;
+                if let Some(slot) = present.get_mut(key.value().1 as usize) {
+                    *slot = true;
+                }
+            }
+            Some(row.value().0)
+        } else {
+            None
+        }
+    };
+    Ok((db, present, last_used))
+}
+
+fn open_if_exists<Key, Value>(
+    read_txn: &ReadTransaction,
+    definition: TableDefinition<'_, Key, Value>,
+) -> Result<Option<ReadOnlyTable<Key, Value>>, redb::Error>
+where
+    Key: redb::Key + 'static,
+    Value: redb::Value + 'static,
+{
+    match read_txn.open_table(definition) {
+        Ok(table) => Ok(Some(table)),
+        Err(TableError::TableDoesNotExist(_)) => Ok(None),
+        Err(error) => Err(error.into()),
     }
 }
 
-const fn code_to_format(code: u8) -> Option<Format> {
-    match code {
-        0 => Some(Format::Jpeg),
-        1 => Some(Format::Png),
-        2 => Some(Format::Gif),
-        3 => Some(Format::Webp),
-        4 => Some(Format::Bmp),
-        5 => Some(Format::Tiff),
-        6 => Some(Format::Avif),
-        7 => Some(Format::Jxl),
-        _ => None,
-    }
+const fn book_thumb_range(book_key: [u8; 16]) -> RangeInclusive<([u8; 16], u32)> {
+    (book_key, 0)..=(book_key, u32::MAX)
 }
 
-const fn pixel_to_code(pixels: ThumbFormat) -> u8 {
-    match pixels {
-        ThumbFormat::Gray8 => 0,
-        ThumbFormat::Rgba8 => 1,
+fn touch_book_last_used(
+    db: &Database,
+    book_key: [u8; 16],
+    now_secs: u64,
+) -> Result<(), redb::Error> {
+    let write_txn = db.begin_write()?;
+    let mut updated = false;
+    {
+        let mut books_table = write_txn.open_table(BOOKS_TABLE)?;
+        let existing = books_table.get(book_key)?.map(|guard| guard.value());
+        if let Some((last_used, total_bytes)) = existing
+            && last_used != now_secs
+        {
+            books_table.insert(book_key, (now_secs, total_bytes))?;
+            updated = true;
+        }
     }
+    if updated {
+        write_txn.commit()?;
+    }
+    Ok(())
 }
 
-const fn code_to_pixel(code: u8) -> Option<ThumbFormat> {
-    match code {
-        0 => Some(ThumbFormat::Gray8),
-        1 => Some(ThumbFormat::Rgba8),
-        _ => None,
+fn prune_old_books(
+    books_table: &mut Table<'_, [u8; 16], (u64, u64)>,
+    thumbs_table: &mut Table<'_, ([u8; 16], u32), StoredThumb<'_>>,
+    keep_key: [u8; 16],
+    cap_bytes: u64,
+) -> Result<(), redb::Error> {
+    let mut entries = Vec::new();
+    let mut total_bytes = 0_u64;
+    for entry in books_table.iter()? {
+        let (key_guard, value_guard) = entry?;
+        let key = key_guard.value();
+        let (last_used_secs, book_bytes) = value_guard.value();
+        total_bytes = total_bytes.saturating_add(book_bytes);
+        entries.push((last_used_secs, key, book_bytes));
     }
+    if total_bytes <= cap_bytes {
+        return Ok(());
+    }
+    entries.sort_unstable();
+    let target_bytes = cap_bytes
+        .checked_div(THUMB_PACK_PRUNE_DENOMINATOR)
+        .map_or(cap_bytes, |step| {
+            step.saturating_mul(THUMB_PACK_PRUNE_NUMERATOR)
+        });
+    let mut removed_count = 0_u64;
+    for (_, victim_key, victim_bytes) in entries {
+        if total_bytes <= target_bytes {
+            break;
+        }
+        if victim_key == keep_key {
+            continue;
+        }
+        thumbs_table.retain_in(book_thumb_range(victim_key), |_, _| false)?;
+        books_table.remove(victim_key)?;
+        total_bytes = total_bytes.saturating_sub(victim_bytes);
+        removed_count += 1;
+    }
+    tracing::debug!(
+        removed = removed_count,
+        total_bytes,
+        cap_bytes,
+        "thumb pack prune"
+    );
+    Ok(())
 }
 
-fn default_thumb_dir() -> Option<PathBuf> {
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn default_cache_dir() -> Option<PathBuf> {
     use std::env;
 
     if let Some(xdg_cache_home) = env::var_os("XDG_CACHE_HOME")
@@ -1074,17 +1058,21 @@ fn default_thumb_dir() -> Option<PathBuf> {
     {
         let path = PathBuf::from(xdg_cache_home);
         if path.is_absolute() {
-            return Some(path.join("cryslen").join("thumbs"));
+            return Some(path.join("cryslen"));
         }
     }
     let home = env::var_os("HOME")?;
     if home.is_empty() {
         return None;
     }
-    Some(PathBuf::from(home).join(".cache").join("cryslen").join("thumbs"))
+    Some(PathBuf::from(home).join(".cache").join("cryslen"))
 }
 
-fn book_key(path: &Path, archive: bool, names: &[String]) -> Option<u128> {
+#[expect(
+    clippy::little_endian_bytes,
+    reason = "book_key hashes metadata fields in fixed little-endian order"
+)]
+fn book_key(path: &Path, archive: bool, names: &[String]) -> Option<[u8; 16]> {
     use xxhash_rust::xxh3::Xxh3;
 
     const KEY_FIELD_SEPARATOR: &[u8] = b"\0";
@@ -1118,79 +1106,7 @@ fn book_key(path: &Path, archive: bool, names: &[String]) -> Option<u128> {
             hasher.update(KEY_FIELD_SEPARATOR);
         }
     }
-    Some(hasher.digest128())
-}
-
-fn prune_packs(dir: &Path, cap_bytes: u64, keep_name: &OsStr) {
-    struct PackEntry {
-        modified: SystemTime,
-        name: OsString,
-        bytes: u64,
-    }
-
-    let Ok(dir_entries) = fs::read_dir(dir) else {
-        return;
-    };
-    let mut entries = Vec::new();
-    let mut total_bytes = 0_u64;
-    for entry in dir_entries.flatten() {
-        let Ok(metadata) = entry.metadata() else {
-            continue;
-        };
-        if !metadata.is_file() {
-            continue;
-        }
-        let name = entry.file_name();
-        if !name
-            .to_str()
-            .is_some_and(|text| text.ends_with(PACK_EXTENSION))
-        {
-            continue;
-        }
-        let Ok(modified) = metadata.modified() else {
-            continue;
-        };
-        let bytes = metadata.len();
-        total_bytes = total_bytes.saturating_add(bytes);
-        entries.push(PackEntry {
-            modified,
-            name,
-            bytes,
-        });
-    }
-    if total_bytes <= cap_bytes {
-        return;
-    }
-    entries.sort_by(|left, right| {
-        left.modified
-            .cmp(&right.modified)
-            .then_with(|| left.name.cmp(&right.name))
-    });
-    let target_bytes = cap_bytes
-        .checked_div(THUMB_PACK_PRUNE_DENOMINATOR)
-        .map_or(cap_bytes, |step| {
-            step.saturating_mul(THUMB_PACK_PRUNE_NUMERATOR)
-        });
-    let mut removed_count = 0_u64;
-    for entry in entries {
-        if total_bytes <= target_bytes {
-            break;
-        }
-        if entry.name == keep_name {
-            continue;
-        }
-        if fs::remove_file(dir.join(&entry.name)).is_ok() {
-            total_bytes = total_bytes.saturating_sub(entry.bytes);
-            removed_count += 1;
-        }
-    }
-    tracing::debug!(
-        dir = %dir.display(),
-        removed = removed_count,
-        total_bytes,
-        cap_bytes,
-        "thumb pack prune"
-    );
+    Some(hasher.digest128().to_le_bytes())
 }
 
 fn make_dir(path: &Path) -> Option<()> {
@@ -1314,16 +1230,6 @@ mod tests {
         }
     }
 
-    fn set_modified(path: &Path, seconds: u64) {
-        use std::fs::FileTimes;
-        use std::time::Duration;
-
-        let modified =
-            SystemTime::UNIX_EPOCH + Duration::from_secs(seconds);
-        fs::set_times(path, FileTimes::new().set_modified(modified))
-            .expect("set mtime");
-    }
-
     #[test]
     fn derive_scales_to_the_box() {
         let page = rgba_page(500, 200).with_page_dims((1500, 600));
@@ -1389,36 +1295,24 @@ mod tests {
 
     #[test]
     fn derive_thumb_converts_planar_pages_to_8bit_srgb() {
-        let assert_rgba_close = |bytes: &[u8], expected: [u8; 4]| {
+        let assert_rgba_close = |bytes: &[u8], expected: [u8; 4], tol: u8| {
             for pixel in bytes.as_chunks::<4>().0 {
                 for (&channel, target) in pixel.iter().zip(expected) {
                     assert!(
-                        channel.abs_diff(target) <= 1,
+                        channel.abs_diff(target) <= tol,
                         "expected ~{expected:?}, got {pixel:?}"
                     );
                 }
             }
         };
 
-        let pq_black = flat_yuv_page(
-            400,
-            200,
-            Subsampling::Yuv420,
-            [64, 512, 512, 1023],
-        );
-        let black_thumb = derive_thumb(&pq_black, 2).expect("pq black");
-        assert_eq!(black_thumb.pixels, ThumbFormat::Rgba8);
-        assert_rgba_close(&black_thumb.bytes, [0, 0, 0, 255]);
+        let pq_black =
+            flat_yuv_page(4, 2, Subsampling::Yuv420, [64, 512, 512, 1023]);
+        assert_rgba_close(&thumb_rgba(&pq_black), [0, 0, 0, 255], 1);
 
-        let pq_white = flat_yuv_page(
-            400,
-            200,
-            Subsampling::Yuv420,
-            [940, 512, 512, 512],
-        );
-        let white_thumb = derive_thumb(&pq_white, 2).expect("pq white");
-        assert_eq!(white_thumb.pixels, ThumbFormat::Rgba8);
-        assert_rgba_close(&white_thumb.bytes, [255, 255, 255, 128]);
+        let pq_white =
+            flat_yuv_page(4, 2, Subsampling::Yuv420, [940, 512, 512, 512]);
+        assert_rgba_close(&thumb_rgba(&pq_white), [255, 255, 255, 128], 1);
 
         let gray10 = Decoded::gray(
             400,
@@ -1441,120 +1335,130 @@ mod tests {
             },
         )
         .expect("gray10");
-        let gray10_thumb = derive_thumb(&gray10, 2).expect("gray10 thumb");
-        assert_eq!(gray10_thumb.pixels, ThumbFormat::Rgba8);
-        assert_rgba_close(&gray10_thumb.bytes, [255, 255, 255, 128]);
-
-        let gray8 = Decoded::gray(
-            400,
-            200,
-            Format::Png,
-            Transfer::Srgb,
-            GrayImage {
-                full_range: true,
-                samples: Samples::U8(GrayPlanes {
-                    luma: vec![120_u8; pixel_count(400, 200)].into_boxed_slice(),
-                    alpha: None,
-                }),
-            },
+        let wire_thumb = derive_thumb(&gray10, 1).expect("gray10 webp thumb");
+        let decoded = decode_thumb_image(
+            wire_thumb.page_dims,
+            wire_thumb.format,
+            &wire_thumb.webp,
         )
-        .expect("gray8");
-        let gray8_thumb = derive_thumb(&gray8, 1).expect("gray8 thumb");
-        assert_eq!(gray8_thumb.pixels, ThumbFormat::Gray8);
-        assert!(gray8_thumb.bytes.iter().all(|&byte| byte == 120));
+        .expect("decoded gray10 webp");
+        assert_eq!(decoded.dims(), (THUMB_EDGE, 96));
+        assert_rgba_close(decoded.rgba(), [255, 255, 255, 128], 4);
     }
 
     #[test]
-    fn thumb_pack_roundtrips_recovers_torn_tail_and_prunes() {
+    fn thumb_pack_roundtrips_recovers_corrupt_db_shares_multiwriter_and_prunes() {
         let dir = TempDir::new().expect("temp dir");
-        let root = dir.path().join("thumbs");
-        let gray8 = Decoded::gray(
-            400,
-            200,
-            Format::Png,
-            Transfer::Srgb,
-            GrayImage {
-                full_range: true,
-                samples: Samples::U8(GrayPlanes {
-                    luma: vec![120_u8; pixel_count(400, 200)].into_boxed_slice(),
-                    alpha: None,
-                }),
-            },
-        )
-        .expect("gray8");
-        let gray_thumb = derive_thumb(&gray8, 1).expect("gray thumb");
-        let rgba_thumb =
-            derive_thumb(&rgba_page(400, 200), 1).expect("rgba thumb");
+        let root = dir.path().join("cache");
+        let thumb_a = derive_thumb(&rgba_page(16, 12), 1).expect("thumb a");
+        let thumb_b = derive_thumb(&rgba_page(24, 10), 1).expect("thumb b");
+        let expected_a =
+            decode_thumb_image(thumb_a.page_dims, thumb_a.format, &thumb_a.webp)
+                .expect("decoded a");
+        let expected_b =
+            decode_thumb_image(thumb_b.page_dims, thumb_b.format, &thumb_b.webp)
+                .expect("decoded b");
 
-        let oldest_key = 0x1111_u128;
+        // Order keys opposite to LRU eviction so key sort cannot mask timestamp ordering.
+        let oldest_key = [0x33; 16];
         let mut oldest_pack =
             ThumbPack::open_at(&root, oldest_key, 4).expect("oldest pack");
-        oldest_pack.record(0, gray_thumb.clone());
-        oldest_pack.record(2, rgba_thumb.clone());
+        oldest_pack.record(0, thumb_a);
+        oldest_pack.record(2, thumb_b.clone());
         // Duplicate record is ignored; pending load hits immediately.
-        oldest_pack.record(0, rgba_thumb.clone());
+        oldest_pack.record(0, thumb_b.clone());
         assert!(oldest_pack.has(0));
-        assert_eq!(oldest_pack.load(0), Some(gray_thumb.clone()));
-        oldest_pack.flush();
-        assert_eq!(oldest_pack.load(0), Some(gray_thumb.clone()));
-        assert_eq!(oldest_pack.load(2), Some(rgba_thumb.clone()));
+        assert_eq!(oldest_pack.load(0), Some(expected_a.clone()));
+        oldest_pack
+            .flush_pending(2, THUMB_PACK_CAP_BYTES)
+            .expect("flush oldest");
+        assert_eq!(oldest_pack.load(0), Some(expected_a));
         assert!(oldest_pack.load(1).is_none());
+
+        // Non-directory root is rejected cleanly.
+        let db_path = root.join(THUMB_DB_FILENAME);
+        assert!(ThumbPack::open_at(&db_path, [1; 16], 2).is_none());
+
+        // Concurrent MultiWriter handle on the same database works.
+        let middle_key = [0x22; 16];
+        let mut middle_pack =
+            ThumbPack::open_at(&root, middle_key, 4).expect("middle pack");
+        middle_pack.record(1, thumb_b.clone());
+        middle_pack
+            .flush_pending(1, THUMB_PACK_CAP_BYTES)
+            .expect("flush middle");
+        drop(middle_pack);
         drop(oldest_pack);
 
-        // Append torn bytes at EOF: reopen recovers intact entries and
-        // truncates the torn tail on the next flush.
-        let oldest_pack_path =
-            root.join(format!("{oldest_key:032x}{PACK_EXTENSION}"));
-        assert!(ThumbPack::open_at(&oldest_pack_path, 1, 2).is_none());
-        let mut pack_bytes = fs::read(&oldest_pack_path).expect("read pack");
-        pack_bytes.extend_from_slice(&[0xff, 0xaa, 0x55, 0x00, 0x01]);
-        fs::write(&oldest_pack_path, &pack_bytes).expect("write torn tail");
-
-        let mut reopened =
-            ThumbPack::open_at(&root, oldest_key, 4).expect("reopened pack");
-        assert_eq!(reopened.load(0), Some(gray_thumb));
-        assert_eq!(reopened.load(2), Some(rgba_thumb.clone()));
-        reopened.record(3, rgba_thumb.clone());
-        reopened.flush();
-        assert_eq!(reopened.load(3), Some(rgba_thumb.clone()));
+        // Reopening persists entries, isolates keys, and touches `last_used` past `oldest_key`.
+        let reopened =
+            ThumbPack::open_at(&root, middle_key, 4).expect("reopened pack");
+        assert!(reopened.has(1));
+        assert!(!reopened.has(0));
+        assert_eq!(reopened.load(1), Some(expected_b));
         drop(reopened);
 
-        // Book-level LRU pruning: cap fits ~1.5 packs, so saving a third
-        // book evicts the oldest book while preserving the active pack.
-        let oldest_pack_bytes =
-            fs::metadata(&oldest_pack_path).expect("pack len").len();
-        let middle_key = 0x2222_u128;
-        let newest_key = 0x3333_u128;
-        let mut middle_pack = ThumbPack::open_with_cap(
-            &root,
-            middle_key,
-            4,
-            THUMB_PACK_CAP_BYTES,
-        )
-        .expect("middle pack");
-        middle_pack.record(0, rgba_thumb.clone());
-        middle_pack.flush();
-        drop(middle_pack);
+        // Book-level LRU pruning: cap fits ~2.5 entries, so flushing a third
+        // book evicts `oldest_key` (last_used = 2) while keeping `middle_key`
+        // (bumped by reopen) and `newest_key`.
+        let thumb_b_bytes = thumb_b.webp.len() as u64;
+        let newest_key = [0x11; 16];
+        let mut newest_pack =
+            ThumbPack::open_at(&root, newest_key, 4).expect("newest pack");
+        newest_pack.record(0, thumb_b.clone());
+        newest_pack
+            .flush_pending(now_unix_secs(), 3 * thumb_b_bytes)
+            .expect("flush newest");
+        assert!(newest_pack.has(0));
+        drop(newest_pack);
 
-        set_modified(&oldest_pack_path, 10);
-        set_modified(&root.join(format!("{middle_key:032x}{PACK_EXTENSION}")), 20);
-
-        let mut newest_pack = ThumbPack::open_with_cap(
-            &root,
-            newest_key,
-            4,
-            oldest_pack_bytes + 10,
-        )
-        .expect("newest pack");
-        newest_pack.record(0, rgba_thumb);
-        newest_pack.flush();
         assert!(
-            !oldest_pack_path.exists(),
-            "oldest book pack should be pruned"
+            !ThumbPack::open_at(&root, oldest_key, 4)
+                .expect("check oldest")
+                .has(0),
+            "oldest book should be pruned"
         );
         assert!(
-            root.join(format!("{newest_key:032x}{PACK_EXTENSION}"))
-                .exists()
+            ThumbPack::open_at(&root, middle_key, 4)
+                .expect("check middle")
+                .has(1),
+            "touched middle book should survive"
         );
+
+        // Corrupt database file recovers cleanly by recreating thumbs-v1.redb.
+        fs::write(&db_path, b"corrupt-db-header").expect("corrupt db");
+        let mut recovered =
+            ThumbPack::open_at(&root, oldest_key, 4).expect("recovered pack");
+        assert!(!recovered.has(0));
+        recovered.record(0, thumb_b.clone());
+        recovered.flush();
+        assert!(recovered.load(0).is_some());
+        drop(recovered);
+
+        // Table-type mismatch recreates thumbs-v1.redb.
+        fs::remove_file(&db_path).expect("remove db");
+        {
+            const LEGACY_BOOKS_TABLE: TableDefinition<'_, [u8; 16], &[u8]> =
+                TableDefinition::new("books");
+            const LEGACY_THUMBS_TABLE: TableDefinition<'_, ([u8; 16], u32), &[u8]> =
+                TableDefinition::new("thumbs");
+
+            let legacy = Database::create(&db_path).expect("legacy db");
+            let write_txn = legacy.begin_write().expect("legacy write");
+            {
+                write_txn
+                    .open_table(LEGACY_BOOKS_TABLE)
+                    .expect("legacy books");
+                write_txn
+                    .open_table(LEGACY_THUMBS_TABLE)
+                    .expect("legacy thumbs");
+            }
+            write_txn.commit().expect("legacy commit");
+        }
+        let mut migrated =
+            ThumbPack::open_at(&root, oldest_key, 4).expect("migrated pack");
+        migrated.record(0, thumb_b);
+        migrated.flush();
+        assert!(migrated.load(0).is_some());
     }
 }

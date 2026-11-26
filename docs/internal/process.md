@@ -2,7 +2,7 @@
 
 `cy` is the windowed parent; `cy --worker` serves one book over `src/protocol.rs`.
 
-The parent owns the window, UI, GL, app state, VRAM textures, and the per-book thumb pack; the child owns the book source, archive unpacking, decode, and derivation. A child crash becomes a book fault.
+The parent owns the window, UI, GL, app state, VRAM textures, and the thumb pack; the child owns the book source, archive unpacking, decode, and derivation. A child crash becomes a book fault.
 
 ## Lifecycle
 

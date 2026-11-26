@@ -172,7 +172,6 @@ fn child_serves_a_decoded_fit_with_thumb() {
     use cryslen::protocol::ImageLimits;
     use cryslen::protocol::ParentMsg;
     use cryslen::protocol::Request;
-    use cryslen::protocol::ThumbFormat;
     use cryslen::protocol::WirePixels;
     use cryslen::protocol::WorkPlan;
     use cryslen::protocol::WorkRole;
@@ -268,12 +267,13 @@ fn child_serves_a_decoded_fit_with_thumb() {
         "the fit image holds the page's color",
     );
 
-    let thumb = thumb.expect("fit delivery includes an 8-bit thumb");
-    assert_eq!((thumb.width, thumb.height), (PAGE_EDGE, PAGE_EDGE));
+    let thumb = thumb
+        .expect("fit delivery includes a webp thumb")
+        .validate()
+        .expect("valid webp thumb");
+    assert_eq!(thumb.dims(), (PAGE_EDGE, PAGE_EDGE));
     assert_eq!(thumb.page_dims, (PAGE_EDGE, PAGE_EDGE));
     assert_eq!(thumb.format, Format::Png);
-    assert_eq!(thumb.pixels, ThumbFormat::Rgba8);
-    assert_eq!(thumb.bytes, expected);
 }
 
 #[test]

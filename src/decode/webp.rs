@@ -1,4 +1,4 @@
-//! WebP decode through libwebp. FFI `unsafe` is confined to this module.
+//! WebP encode and decode through libwebp. FFI `unsafe` is confined to this module.
 
 #![expect(
     clippy::little_endian_bytes,
@@ -48,6 +48,115 @@ pub(super) fn decode(
         return decode_yuv(bytes, (width, height), orientation, use_threads);
     }
     decode_rgba(bytes, (width, height), orientation, use_threads)
+}
+
+fn rgba_stride(width: u32) -> eros::Result<i32> {
+    let bytes_per_pixel = u32::try_from(super::RGBA_BYTES_PER_PIXEL)?;
+    let stride = width
+        .checked_mul(bytes_per_pixel)
+        .ok_or_else(|| eros::error!("webp: stride overflows u32"))?;
+    Ok(i32::try_from(stride)?)
+}
+
+pub(super) fn encode_rgba(
+    dims: (u32, u32),
+    rgba: &[u8],
+    quality: f32,
+) -> eros::Result<Vec<u8>> {
+    use std::slice;
+
+    use libwebp_sys::WebPEncodeRGBA;
+    use libwebp_sys::WebPFree;
+
+    let expected_bytes = super::rgba_byte_len(dims.0, dims.1)?;
+    if rgba.len() != expected_bytes {
+        eros::bail!("webp: unexpected rgba buffer size");
+    }
+    let stride = rgba_stride(dims.0)?;
+    let width = i32::try_from(dims.0)?;
+    let height = i32::try_from(dims.1)?;
+    let mut out_ptr = ptr::null_mut();
+    // SAFETY: `rgba` holds `width * height * 4` bytes matching `stride` for this call.
+    let len = unsafe {
+        WebPEncodeRGBA(
+            rgba.as_ptr(),
+            width,
+            height,
+            stride,
+            quality,
+            &raw mut out_ptr,
+        )
+    };
+    if out_ptr.is_null() {
+        eros::bail!("webp: encode failed");
+    }
+    let owned = (len > 0).then(|| {
+        // SAFETY: `WebPEncodeRGBA` returned a non-null buffer of `len` bytes.
+        unsafe { slice::from_raw_parts(out_ptr, len) }.to_vec()
+    });
+    // SAFETY: `out_ptr` was allocated by `WebPEncodeRGBA`.
+    unsafe {
+        WebPFree(out_ptr.cast());
+    }
+    owned.ok_or_else(|| eros::error!("webp: encode failed"))
+}
+
+pub(super) fn dims(bytes: &[u8]) -> eros::Result<(u32, u32)> {
+    use libwebp_sys::WebPGetInfo;
+
+    let mut raw_width = 0_i32;
+    let mut raw_height = 0_i32;
+    // SAFETY: `bytes` is live and both dimension out-pointers are valid.
+    let header_ok = unsafe {
+        WebPGetInfo(
+            bytes.as_ptr(),
+            bytes.len(),
+            &raw mut raw_width,
+            &raw mut raw_height,
+        )
+    };
+    if header_ok == 0 {
+        eros::bail!("webp: invalid header");
+    }
+    let (Ok(width), Ok(height)) =
+        (u32::try_from(raw_width), u32::try_from(raw_height))
+    else {
+        eros::bail!("webp: bad dimensions");
+    };
+    if width == 0 || height == 0 {
+        eros::bail!("webp: bad dimensions");
+    }
+    Ok((width, height))
+}
+
+pub(super) fn decode_rgba_bounded(
+    bytes: &[u8],
+    max_edge: u32,
+) -> eros::Result<((u32, u32), Vec<u8>)> {
+    use libwebp_sys::WebPDecodeRGBAInto;
+
+    let (width, height) = dims(bytes)?;
+    if width > max_edge || height > max_edge {
+        eros::bail!("webp: dimensions exceed limit");
+    }
+
+    let byte_len = super::rgba_byte_len(width, height)?;
+    let stride = rgba_stride(width)?;
+    let mut rgba = vec![0_u8; byte_len];
+    // SAFETY: `bytes` is live and `rgba` has `byte_len` bytes matching `width * height * 4`.
+    let decoded_ptr = unsafe {
+        WebPDecodeRGBAInto(
+            bytes.as_ptr(),
+            bytes.len(),
+            rgba.as_mut_ptr(),
+            rgba.len(),
+            stride,
+        )
+    };
+    if decoded_ptr.is_null() {
+        eros::bail!("webp: decode failed");
+    }
+    Ok(((width, height), rgba))
 }
 
 fn read_features(bytes: &[u8]) -> eros::Result<WebPBitstreamFeatures> {
@@ -178,8 +287,7 @@ fn decode_rgba(
         WEBP_CSP_MODE::MODE_RGBA,
         use_threads,
     )?;
-    let bytes_per_pixel = u32::try_from(super::RGBA_BYTES_PER_PIXEL)?;
-    let stride = i32::try_from(dims.0.saturating_mul(bytes_per_pixel))?;
+    let stride = rgba_stride(dims.0)?;
     guard.0.output.u.RGBA = WebPRGBABuffer {
         rgba: rgba.as_mut_ptr(),
         stride,
@@ -425,38 +533,27 @@ mod tests {
         use std::slice;
 
         use libwebp_sys::WebPEncodeLosslessRGBA;
-        use libwebp_sys::WebPEncodeRGBA;
         use libwebp_sys::WebPFree;
 
         const LOSSY_QUALITY: f32 = 90.0;
 
+        if !lossless {
+            return super::encode_rgba((width, height), rgba, LOSSY_QUALITY)
+                .expect("webp test encode failed");
+        }
         let stride = i32::try_from(width * 4).expect("stride fits i32");
         let width = i32::try_from(width).expect("width fits i32");
         let height = i32::try_from(height).expect("height fits i32");
         let mut out_ptr = ptr::null_mut();
-        let len = if lossless {
-            // SAFETY: `rgba` holds `width * height * 4` bytes for this call.
-            unsafe {
-                WebPEncodeLosslessRGBA(
-                    rgba.as_ptr(),
-                    width,
-                    height,
-                    stride,
-                    &raw mut out_ptr,
-                )
-            }
-        } else {
-            // SAFETY: `rgba` holds `width * height * 4` bytes for this call.
-            unsafe {
-                WebPEncodeRGBA(
-                    rgba.as_ptr(),
-                    width,
-                    height,
-                    stride,
-                    LOSSY_QUALITY,
-                    &raw mut out_ptr,
-                )
-            }
+        // SAFETY: `rgba` holds `width * height * 4` bytes for this call.
+        let len = unsafe {
+            WebPEncodeLosslessRGBA(
+                rgba.as_ptr(),
+                width,
+                height,
+                stride,
+                &raw mut out_ptr,
+            )
         };
         assert!(len > 0 && !out_ptr.is_null(), "webp test encode failed");
         // SAFETY: libwebp returned a non-null buffer of `len` bytes.

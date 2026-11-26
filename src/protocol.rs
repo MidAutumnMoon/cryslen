@@ -298,50 +298,33 @@ where
     IpcSharedMemory::from_bytes(bytemuck::cast_slice(samples))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-pub enum ThumbFormat {
-    Gray8,
-    Rgba8,
-}
+const MAX_THUMB_BYTES: usize = 256 * 1024;
 
-impl ThumbFormat {
-    #[must_use]
-    pub const fn bytes_per_pixel(self) -> usize {
-        match self {
-            Self::Gray8 => 1,
-            Self::Rgba8 => decode::RGBA_BYTES_PER_PIXEL,
-        }
-    }
-
-    #[must_use]
-    pub fn byte_len(self, width: u32, height: u32) -> Option<usize> {
-        usize::try_from(width)
-            .ok()?
-            .checked_mul(usize::try_from(height).ok()?)?
-            .checked_mul(self.bytes_per_pixel())
-    }
-}
-
-/// Compact 8-bit sRGB thumbnail attached to `Fit` delivery and persisted
-/// in the parent's per-book thumb pack.
+/// Compact WebP thumbnail attached to `Fit` delivery and persisted in the
+/// parent's shared thumbnail cache.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct WireThumb {
-    pub width: u32,
-    pub height: u32,
     pub page_dims: (u32, u32),
     pub format: Format,
-    pub pixels: ThumbFormat,
-    pub bytes: Vec<u8>,
+    pub webp: Vec<u8>,
 }
 
-/// Thumbnail whose dimensions and byte payload passed validation.
+/// Thumbnail whose metadata, WebP header, and edge bounds passed validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ValidatedThumb(WireThumb);
+pub struct ValidatedThumb {
+    wire: WireThumb,
+    dims: (u32, u32),
+}
 
 impl ValidatedThumb {
     #[must_use]
+    pub const fn dims(&self) -> (u32, u32) {
+        self.dims
+    }
+
+    #[must_use]
     pub fn into_wire(self) -> WireThumb {
-        self.0
+        self.wire
     }
 }
 
@@ -349,32 +332,27 @@ impl Deref for ValidatedThumb {
     type Target = WireThumb;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.wire
     }
 }
 
 impl WireThumb {
     pub fn validate(self) -> Result<ValidatedThumb, MsgError> {
-        if self.width == 0
-            || self.height == 0
-            || self.width > THUMB_EDGE
-            || self.height > THUMB_EDGE
-        {
-            return Err(MsgError::from_static("thumb dimensions"));
-        }
         decode::admit_dims(
             self.page_dims.0,
             self.page_dims.1,
             "thumb page dimensions",
         )?;
-        let expected_bytes = self
-            .pixels
-            .byte_len(self.width, self.height)
-            .ok_or_else(|| MsgError::from_static("thumb extent"))?;
-        if self.bytes.len() != expected_bytes {
-            return Err(MsgError::from_static("thumb extent"));
+        if self.webp.is_empty() || self.webp.len() > MAX_THUMB_BYTES {
+            return Err(MsgError::from_static("thumb payload"));
         }
-        Ok(ValidatedThumb(self))
+        let Some(dims) = decode::webp_dims(&self.webp) else {
+            return Err(MsgError::from_static("thumb payload"));
+        };
+        if TextureFault::check_dims(dims, THUMB_EDGE).is_err() {
+            return Err(MsgError::from_static("thumb dimensions"));
+        }
+        Ok(ValidatedThumb { wire: self, dims })
     }
 }
 
@@ -382,7 +360,7 @@ impl WireThumb {
 ///
 /// `current` runs first at max threads and cancels lower tiers;
 /// `lookahead` runs next once `current` is empty; `thumbs` warms missing
-/// `.cyth` entries when both upper tiers are empty.
+/// thumbnail cache entries when both upper tiers are empty.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct WorkPlan {
     pub current: Vec<Request>,

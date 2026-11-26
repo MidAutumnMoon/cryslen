@@ -15,6 +15,7 @@ use image::metadata::Orientation;
 use serde::Deserialize;
 use serde::Serialize;
 use strum::Display;
+use strum::FromRepr;
 
 mod avif;
 mod jxl;
@@ -476,18 +477,20 @@ pub enum Pixels {
     Eq,
     Deserialize,
     Serialize,
-    Display
+    Display,
+    FromRepr
 )]
+#[repr(u8)]
 #[strum(serialize_all = "lowercase")]
 pub enum Format {
-    Jpeg,
-    Png,
-    Gif,
-    Webp,
-    Bmp,
-    Tiff,
-    Avif,
-    Jxl,
+    Jpeg = 0,
+    Png = 1,
+    Gif = 2,
+    Webp = 3,
+    Bmp = 4,
+    Tiff = 5,
+    Avif = 6,
+    Jxl = 7,
 }
 
 impl Format {
@@ -1223,6 +1226,26 @@ pub fn format_from_name(name: &str) -> Option<Format> {
     })
 }
 
+pub fn encode_webp_rgba(
+    dims: (u32, u32),
+    rgba: &[u8],
+    quality: f32,
+) -> eros::Result<Vec<u8>> {
+    webp::encode_rgba(dims, rgba, quality)
+}
+
+pub fn decode_webp_rgba(
+    bytes: &[u8],
+    max_edge: u32,
+) -> eros::Result<((u32, u32), Vec<u8>)> {
+    webp::decode_rgba_bounded(bytes, max_edge)
+}
+
+#[must_use]
+pub fn webp_dims(bytes: &[u8]) -> Option<(u32, u32)> {
+    webp::dims(bytes).ok()
+}
+
 fn sniff(bytes: &[u8]) -> Option<Format> {
     if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
         return Some(Format::Jpeg);
@@ -1234,9 +1257,7 @@ fn sniff(bytes: &[u8]) -> Option<Format> {
     if bytes.starts_with(b"GIF8") {
         return Some(Format::Gif);
     }
-    if bytes.starts_with(b"RIFF")
-        && bytes.get(8..12).is_some_and(|tag| tag == b"WEBP")
-    {
+    if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
         return Some(Format::Webp);
     }
     if bytes.starts_with(b"BM") {

@@ -8,8 +8,8 @@
 
 ## Thumb pack (parent-owned)
 
-- One append-only pack per book at `$XDG_CACHE_HOME/cryslen/thumbs/<book-key>.cyth` (`src/cache.rs`).
-- Indexed from book metadata so warm thumbnails show before archive unpacking finishes; torn tails truncate on append, and directory pruning is LRU across books.
+- One shared `redb` store of lossy WebP thumbnails at `$XDG_CACHE_HOME/cryslen/thumbs-v1.redb` (`src/cache.rs`).
+- Safe across concurrent `cy` windows (`MultiWriter`), recreates on corruption or schema mismatch, tracks page presence in RAM so warm opens avoid payload reads, and evicts oldest books by LRU.
 
 ## Worker pool (child-owned)
 

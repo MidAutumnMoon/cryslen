@@ -36,6 +36,7 @@ gif = "0.14"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "bmp", "tiff"] }
 indoc = "2"
 parking_lot = "0.13"
+redb = "5"
 zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 sevenz-rust2 = { version = "0.26", default-features = false, features = ["bzip2"] }
 libavif-sys = { version = "0.18", default-features = false, features = ["codec-dav1d"] }

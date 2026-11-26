@@ -16,6 +16,7 @@ use crate::browse::Role;
 use crate::browse::Roles;
 use crate::browse::Spread;
 use crate::browse::WorkRole;
+use crate::cache::ThumbImage;
 use crate::cache::ThumbPack;
 use crate::catalog;
 use crate::catalog::PageName;
@@ -31,7 +32,6 @@ use crate::protocol::PlaybackEvent;
 use crate::protocol::PlaybackId;
 use crate::protocol::TextureFault;
 use crate::protocol::ValidatedImage;
-use crate::protocol::ValidatedThumb;
 use crate::protocol::WorkPlan;
 use crate::ui::ReadingStatus;
 
@@ -49,7 +49,7 @@ pub trait PageStore {
         role: WorkRole,
         image: &ValidatedImage,
     ) -> Result<(), TextureFault>;
-    fn insert_thumb(&mut self, page: usize, thumb: &ValidatedThumb);
+    fn insert_thumb(&mut self, page: usize, thumb: &ThumbImage);
     fn update_playback(
         &mut self,
         page: usize,
@@ -628,7 +628,7 @@ impl Reading {
                     continue;
                 };
                 textures.insert_thumb(page, &thumb);
-                self.record_page_info(page, thumb.page_dims, thumb.format);
+                self.record_page_info(page, thumb.page_dims(), thumb.format());
                 touched.push(page);
             }
         }
@@ -1231,7 +1231,6 @@ mod tests {
     #[derive(Default)]
     struct FakeStore {
         roles: BTreeMap<usize, Roles>,
-        thumbs: BTreeMap<usize, ValidatedThumb>,
         average_fit_bytes: Option<usize>,
         refuse_page: bool,
     }
@@ -1275,9 +1274,8 @@ mod tests {
             Ok(())
         }
 
-        fn insert_thumb(&mut self, page: usize, thumb: &ValidatedThumb) {
+        fn insert_thumb(&mut self, page: usize, _thumb: &ThumbImage) {
             self.roles.entry(page).or_default().set(Role::Thumb);
-            self.thumbs.insert(page, thumb.clone());
         }
 
         fn update_playback(
@@ -1504,7 +1502,7 @@ mod tests {
 
         let dir = TempDir::new().expect("temp dir");
         let root = dir.path().join("thumbs");
-        let mut pack = ThumbPack::open_at(&root, 42, 4).expect("pack");
+        let mut pack = ThumbPack::open_at(&root, [42; 16], 4).expect("pack");
         let thumb = cache::derive_thumb(
             &Decoded::rgba(
                 10,
@@ -1519,7 +1517,7 @@ mod tests {
         )
         .expect("thumb");
         pack.record(0, thumb.clone());
-        pack.record(1, thumb.clone());
+        pack.record(1, thumb);
         pack.flush();
 
         let info = BookInfo {
@@ -1540,7 +1538,8 @@ mod tests {
         let mut touched = Vec::new();
         reading.hydrate_thumbs(ReadingMode::Normal, false, &mut store, &mut touched);
         assert_eq!(touched, vec![0]);
-        assert_eq!(store.thumbs.get(&0), Some(&thumb));
+        assert!(store.roles(0).contains(Role::Thumb));
+        assert!(!store.has_any(1));
         assert_eq!(
             reading.page_info(0),
             Some(PageInfo {
@@ -1552,7 +1551,7 @@ mod tests {
         touched.clear();
         reading.hydrate_thumbs(ReadingMode::Normal, true, &mut store, &mut touched);
         assert_eq!(touched, vec![1]);
-        assert_eq!(store.thumbs.get(&1), Some(&thumb));
+        assert!(store.roles(1).contains(Role::Thumb));
     }
 
     #[test]
