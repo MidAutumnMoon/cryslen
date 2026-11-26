@@ -16,7 +16,8 @@ I built it from scratch because I want:
 
 What's not working right now:
 
-- HDR.
+- HDR. ← <sub>I don't care about HDR for now. Don't submit PR for HDR.</sub>
+- RAR archive format.
 - Very large pictures.
 - Animated AVIF.
 - Edge cases.
