@@ -8,18 +8,25 @@
 
 I built it from scratch because I want:
 
-- Minimal, config-less, stateless (except a throwaways thumbnail cache) viewer. This thing draws raw OpenGL. Knobs and shortcuts are all baked in. They fit my habit but maybe not yours.
+- Config-less, stateless <sub>*except a throwaway cache*</sub>, feature-less viewer. Knobs and shortcuts are all baked in. They fit my habit but maybe not yours.
 - Support enough file formats. I use JXL and AVIF heavily, so support for these two is very good.
 - Manga mode: right to left, double page. Of course it also has left to right mode like a normal image viewer.
 - Read manga directly from archives: 7z, cb7, zip, cbz.
-- Heavily utilize prefetching and caching to make it *feel snappy*. Hold arrow keys can flip pages extremely smoothly. Although the bottleneck is always the image dimension and your CPU.
+- The UX *feels snappy*. Hold arrow keys can skim through pages extremely fast. Although the bottleneck is always the image dimension and your CPU.
 
-What's not working:
+What's not working right now:
 
 - HDR.
 - Very large pictures.
 - Animated AVIF.
 - Edge cases.
+
+What *will not* be added (don't submit feature request or PR for that):
+
+- X11 support.
+- Runtime config or key binding remap.
+- Image editing.
+- Watch videos.
 
 ## Usage
 
