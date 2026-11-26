@@ -29,11 +29,19 @@ Proper CLI handling later.
 
 ## Build/Run
 
-    nix develop -c cargo build --release
+```sh
+nix develop -c cargo build --release
 
-    nix run github:MidAutumnMoon/cryslen
+nix run github:MidAutumnMoon/cryslen
+```
 
-## Screenshots (2026-10)
+I didn't set `lto` in cargo manifest. If you want smaller binary and better performance, build it with:
+
+```sh
+CARGO_PROFILE_RELEASE_LTO=thin
+```
+
+## Screenshots
 
 |![cryslen full window](assets/screenshot-2026-10/full.avif)|
 |-|
@@ -50,6 +58,10 @@ Proper CLI handling later.
 |![cryslen page jump popup](assets/screenshot-2026-11/page-jump-popup.avif)|
 |-|
 |The `:` page jump popup. Background is dimmed.|
+
+**Extremely snappy skimming:**
+
+https://github.com/user-attachments/assets/8c140333-8681-464c-b4d2-82594f4115f7
 
 ## Shortcuts
 
