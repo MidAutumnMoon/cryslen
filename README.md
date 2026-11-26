@@ -1,7 +1,7 @@
 # cryslen
 
 <div align="center">
-  <img src="assets/icon-raw.avif" alt="cryslen icon" width="350">
+  <img src="https://raw.githubusercontent.com/MidAutumnMoon/cryslen/refs/heads/main/assets/icon-raw.avif" alt="cryslen icon" width="300" height="300">
 
 ### `cy`: a minimal Wayland image viewer with manga mode.
 </div>
