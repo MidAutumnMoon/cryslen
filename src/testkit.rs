@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use bytes::Bytes;
 use eros::ErrorUnion;
 use image::DynamicImage;
 use image::ImageFormat;
@@ -8,46 +7,45 @@ use image::Rgb;
 use image::RgbImage;
 use image::codecs::gif::Repeat;
 
-use crate::protocol::ImageLimits;
-use crate::source::Source;
+use crate::book::source::Source;
+use crate::image::pixels::ImageLimits;
 
 pub const TEST_FIT_BOX: (u32, u32) = (2560, 1440);
 
-pub const SEVENZ_FIXTURE: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/two_pages.7z"
-);
+pub const SEVENZ_FIXTURE: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/two_pages.7z");
 
 pub fn limits() -> ImageLimits {
     const MAX_TEXTURE_EDGE: u32 = 16_384;
     ImageLimits::new(TEST_FIT_BOX, MAX_TEXTURE_EDGE)
 }
 
-fn encode(img: &DynamicImage, format: ImageFormat) -> Vec<u8> {
+fn encode(image: &DynamicImage, format: ImageFormat) -> Vec<u8> {
     use std::io::Cursor;
 
-    let mut buf = Vec::new();
-    img.write_to(&mut Cursor::new(&mut buf), format)
+    let mut bytes = Vec::new();
+    image
+        .write_to(&mut Cursor::new(&mut bytes), format)
         .expect("encode image");
-    buf
+    bytes
 }
 
 pub fn tiny_png(width: u32, height: u32, rgba: [u8; 4]) -> Vec<u8> {
     use image::Rgba;
     use image::RgbaImage;
 
-    let img = RgbaImage::from_pixel(width, height, Rgba(rgba));
-    encode(&DynamicImage::ImageRgba8(img), ImageFormat::Png)
+    let image = RgbaImage::from_pixel(width, height, Rgba(rgba));
+    encode(&DynamicImage::ImageRgba8(image), ImageFormat::Png)
 }
 
 pub fn tiny_jpeg(width: u32, height: u32, rgb: [u8; 3]) -> Vec<u8> {
-    let img = RgbImage::from_pixel(width, height, Rgb(rgb));
-    encode(&DynamicImage::ImageRgb8(img), ImageFormat::Jpeg)
+    let image = RgbImage::from_pixel(width, height, Rgb(rgb));
+    encode(&DynamicImage::ImageRgb8(image), ImageFormat::Jpeg)
 }
 
 pub fn tiny_gif(width: u32, height: u32, rgb: [u8; 3]) -> Vec<u8> {
-    let img = RgbImage::from_pixel(width, height, Rgb(rgb));
-    encode(&DynamicImage::ImageRgb8(img), ImageFormat::Gif)
+    let image = RgbImage::from_pixel(width, height, Rgb(rgb));
+    encode(&DynamicImage::ImageRgb8(image), ImageFormat::Gif)
 }
 
 /// A GIF whose frames are solid colors, all with the same delay.
@@ -83,16 +81,16 @@ pub fn tiny_animated_gif(
 }
 
 pub fn tiny_bmp(width: u32, height: u32, rgb: [u8; 3]) -> Vec<u8> {
-    let img = RgbImage::from_pixel(width, height, Rgb(rgb));
-    encode(&DynamicImage::ImageRgb8(img), ImageFormat::Bmp)
+    let image = RgbImage::from_pixel(width, height, Rgb(rgb));
+    encode(&DynamicImage::ImageRgb8(image), ImageFormat::Bmp)
 }
 
 pub fn tiny_tiff(width: u32, height: u32, rgb: [u8; 3]) -> Vec<u8> {
-    let img = RgbImage::from_pixel(width, height, Rgb(rgb));
-    encode(&DynamicImage::ImageRgb8(img), ImageFormat::Tiff)
+    let image = RgbImage::from_pixel(width, height, Rgb(rgb));
+    encode(&DynamicImage::ImageRgb8(image), ImageFormat::Tiff)
 }
 
-pub fn readable_page(source: &Source, index: usize) -> Bytes {
+pub fn readable_page(source: &Source, index: usize) -> Arc<[u8]> {
     match source.bytes(index) {
         Ok(bytes) => bytes,
         Err(error) => panic!("page {index} failed: {error}"),

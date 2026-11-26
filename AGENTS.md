@@ -32,7 +32,7 @@ Tools, usable separately:
 
 - App: run the release binary under `nix develop`, with `RUST_LOG=debug` and a scratch `XDG_CACHE_HOME` for a cold thumb pack. Its window `app_id` is `cryslen`; the log records navigation and frame events.
 - niri: `niri msg windows` lists windows, `niri msg action focus-window --id <id>` focuses one, `niri msg --json focused-window` confirms.
-- dotool: `printf 'key <name>\n' | nix run nixpkgs#dotool --` sends real input; it needs `/dev/uinput` and acts on the focused window. Key bindings: `src/app.rs`.
+- dotool: `printf 'key <name>\n' | nix run nixpkgs#dotool --` sends real input; it needs `/dev/uinput` and acts on the focused window. Key bindings: `src/app/input.rs`.
 - Screenshot: `niri msg action screenshot-window --id <id> --write-to-disk true` writes a PNG under `~/Pictures/Screenshots`.
 
 A screenshot shows the settled frame, not an interim one. Delete the screenshots you create and stop the app with `pkill -x cy`.

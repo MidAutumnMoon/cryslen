@@ -10,24 +10,28 @@ use std::fs;
 use std::fs::File;
 use std::io;
 use std::io::BufReader;
+use std::io::ErrorKind;
 use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
-use std::num::NonZeroUsize;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
-use bytes::Bytes;
 use eros::ErrorUnion;
 use parking_lot::Mutex;
 use sevenz_rust2::Archive;
 use zip::ZipArchive;
 
-use crate::browse::PageNames;
-use crate::catalog;
-use crate::decode;
+use crate::book::catalog;
+use crate::book::catalog::PageNames;
+use crate::book::sevenz;
+use crate::book::sevenz::SevenZipPlan;
+use crate::image::decode::codec;
 
 const ARCHIVE_READ_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_PREALLOCATED_BYTES: usize = 16 * 1024 * 1024;
@@ -94,6 +98,23 @@ impl<Reader: Read + Seek> Seek for SeekBufReader<Reader> {
     }
 }
 
+struct CancellableRead<'cancel, Reader: ?Sized> {
+    inner: &'cancel mut Reader,
+    cancel: &'cancel AtomicBool,
+}
+
+impl<Reader: Read + ?Sized> Read for CancellableRead<'_, Reader> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.cancel.load(Ordering::Relaxed) {
+            return Err(io::Error::new(
+                ErrorKind::Interrupted,
+                "canceled",
+            ));
+        }
+        self.inner.read(buf)
+    }
+}
+
 pub fn panic_message(payload: &(dyn Any + Send)) -> &str {
     payload
         .downcast_ref::<&str>()
@@ -118,12 +139,14 @@ pub fn catch_panic<Output>(
     }
 }
 
-type PageRead = Result<Bytes, Arc<ErrorUnion>>;
-type ReadyHook = Arc<dyn Fn() + Send + Sync>;
+pub type PageRead = Result<Arc<[u8]>, Arc<ErrorUnion>>;
+pub type ReadyHook = Arc<dyn Fn() + Send + Sync>;
 
 struct ArchiveSlots {
     slots: Box<[OnceLock<PageRead>]>,
     on_ready: Mutex<Option<ReadyHook>>,
+    cancel: AtomicBool,
+    resident_bytes: AtomicU64,
 }
 
 impl Debug for ArchiveSlots {
@@ -142,7 +165,17 @@ impl ArchiveSlots {
         Self {
             slots,
             on_ready: Mutex::new(None),
+            cancel: AtomicBool::new(false),
+            resident_bytes: AtomicU64::new(0),
         }
+    }
+
+    fn is_canceled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+
+    fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
     }
 
     fn is_ready(&self, index: usize) -> bool {
@@ -170,9 +203,13 @@ impl ArchiveSlots {
     }
 
     fn fill(&self, index: usize, page: PageRead) {
+        let added = page.as_ref().map_or(0, |bytes| bytes.len() as u64);
         if let Some(slot) = self.slots.get(index)
             && slot.set(page).is_ok()
         {
+            if added > 0 {
+                self.resident_bytes.fetch_add(added, Ordering::Relaxed);
+            }
             self.notify_ready();
         }
     }
@@ -200,8 +237,65 @@ pub struct TestArchiveSlots(Arc<ArchiveSlots>);
 
 #[cfg(test)]
 impl TestArchiveSlots {
-    pub fn fill(&self, index: usize, bytes: Bytes) {
+    pub fn fill(&self, index: usize, bytes: Arc<[u8]>) {
         self.0.fill(index, Ok(bytes));
+    }
+}
+
+enum UnpackTask {
+    Zip {
+        zip: ZipArchive<SeekBufReader<File>>,
+        indices: Vec<usize>,
+    },
+    SevenZip {
+        archive: Box<Archive>,
+        reader: SeekBufReader<File>,
+        plan: SevenZipPlan,
+    },
+}
+
+/// Listed book ready to start unpacking once adopted.
+pub struct ListedBook {
+    source: Source,
+    unpack: Option<UnpackTask>,
+}
+
+impl ListedBook {
+    #[must_use]
+    pub fn names(&self) -> &PageNames {
+        self.source.names()
+    }
+
+    #[must_use]
+    pub fn is_archive(&self) -> bool {
+        self.source.is_archive()
+    }
+
+    #[must_use]
+    pub fn start(self) -> Source {
+        if let (Some(unpack), Backend::Archive(slots)) =
+            (self.unpack, &self.source.backend)
+        {
+            match unpack {
+                UnpackTask::Zip { zip, indices } => {
+                    spawn_zip_materialize(zip, indices, slots);
+                }
+                UnpackTask::SevenZip {
+                    archive,
+                    reader,
+                    plan,
+                } => {
+                    spawn_sevenzip_materialize(
+                        *archive,
+                        reader,
+                        plan,
+                        &self.source.names,
+                        slots,
+                    );
+                }
+            }
+        }
+        self.source
     }
 }
 
@@ -218,10 +312,16 @@ pub struct Source {
 }
 
 impl Source {
+    #[cfg(test)]
     pub fn open(path: &Path) -> eros::Result<Self> {
-        use std::io::ErrorKind;
+        Ok(Self::open_listed(path, 0)?.start())
+    }
 
-        use crate::catalog::ArchiveKind;
+    pub fn open_listed(
+        path: &Path,
+        reclaimable_bytes: u64,
+    ) -> eros::Result<ListedBook> {
+        use crate::book::catalog::ArchiveKind;
 
         let metadata = match fs::metadata(path) {
             Ok(metadata) => metadata,
@@ -231,11 +331,19 @@ impl Source {
             Err(error) => return Err(error.into()),
         };
         if metadata.is_dir() {
-            return Self::open_dir(path);
+            let source = Self::open_dir(path)?;
+            return Ok(ListedBook {
+                source,
+                unpack: None,
+            });
         }
         match catalog::archive_kind(path) {
-            Some(ArchiveKind::Zip) => Self::open_zip(path),
-            Some(ArchiveKind::SevenZip) => Self::open_sevenzip(path),
+            Some(ArchiveKind::Zip) => {
+                Self::open_zip_listed(path, reclaimable_bytes)
+            }
+            Some(ArchiveKind::SevenZip) => {
+                Self::open_sevenzip_listed(path, reclaimable_bytes)
+            }
             None => eros::bail!("unsupported source: {}", path.display()),
         }
     }
@@ -245,17 +353,20 @@ impl Source {
             .filter_map(Result::ok)
             .filter_map(|entry| {
                 let name = entry.file_name().into_string().ok()?;
-                decode::format_from_name(&name)?;
+                codec::format_from_name(&name)?;
                 catalog::entry_is_file(&entry).then_some(name)
             })
             .collect();
-        sort_page_names(&mut names);
+        names.sort_by(|left, right| catalog::compare_names(left, right));
         Self::from_names(Backend::Directory(dir.to_path_buf()), names)
     }
 
     /// Listing reads the central directory, so a damaged local header fails
     /// only that member when materialization reaches it.
-    fn open_zip(path: &Path) -> eros::Result<Self> {
+    fn open_zip_listed(
+        path: &Path,
+        reclaimable_bytes: u64,
+    ) -> eros::Result<ListedBook> {
         let reader = SeekBufReader::new(
             File::open(path)?,
             ARCHIVE_READ_BUFFER_BYTES,
@@ -268,7 +379,7 @@ impl Source {
                 continue;
             }
             let name = entry.name()?.into_owned();
-            if decode::format_from_name(&name).is_some() {
+            if codec::format_from_name(&name).is_some() {
                 entries.push(ListedEntry {
                     name,
                     unpacked_bytes: entry.size(),
@@ -277,17 +388,26 @@ impl Source {
             }
         }
         let listing = validated_listing(entries)?;
-        let (source, slots) = Self::open_archive_slots(
+        let source = Self::open_archive_slots(
             listing.names,
             listing.unpacked_bytes,
+            reclaimable_bytes,
         )?;
-        spawn_zip_materialize(zip, listing.archive_indices, &slots);
-        Ok(source)
+        Ok(ListedBook {
+            source,
+            unpack: Some(UnpackTask::Zip {
+                zip,
+                indices: listing.archive_indices,
+            }),
+        })
     }
 
     /// No password: a 7z with encrypted headers fails to open, and the
     /// first encrypted block ends the pass.
-    fn open_sevenzip(path: &Path) -> eros::Result<Self> {
+    fn open_sevenzip_listed(
+        path: &Path,
+        reclaimable_bytes: u64,
+    ) -> eros::Result<ListedBook> {
         use sevenz_rust2::Password;
 
         let mut reader = SeekBufReader::new(
@@ -295,8 +415,10 @@ impl Source {
             ARCHIVE_READ_BUFFER_BYTES,
         );
         let password = Password::empty();
+        let available = sevenz::mem_available_bytes()
+            .map(|bytes| bytes.saturating_add(reclaimable_bytes));
         let header_limit_kib =
-            sevenzip_header_limit_kib(mem_available_bytes());
+            sevenz::sevenzip_header_limit_kib(available);
         let archive = Archive::read_with_memory_limit(
             &mut reader,
             &password,
@@ -308,7 +430,7 @@ impl Source {
             .enumerate()
             .filter(|(_, entry)| {
                 !entry.is_directory()
-                    && decode::format_from_name(&entry.name).is_some()
+                    && codec::format_from_name(&entry.name).is_some()
             })
             .map(|(file_index, entry)| ListedEntry {
                 name: entry.name.clone(),
@@ -325,27 +447,33 @@ impl Source {
         let needed_bytes = listing
             .unpacked_bytes
             .saturating_add(plan.decoder_peak_bytes(&archive));
-        let (source, slots) =
-            Self::open_archive_slots(listing.names, needed_bytes)?;
-        spawn_sevenzip_materialize(
-            archive,
-            reader,
-            plan,
-            &source.names,
-            &slots,
-        );
-        Ok(source)
+        let source = Self::open_archive_slots(
+            listing.names,
+            needed_bytes,
+            reclaimable_bytes,
+        )?;
+        Ok(ListedBook {
+            source,
+            unpack: Some(UnpackTask::SevenZip {
+                archive: Box::new(archive),
+                reader,
+                plan,
+            }),
+        })
     }
 
     fn open_archive_slots(
         names: Vec<String>,
         needed_bytes: u64,
-    ) -> eros::Result<(Self, Arc<ArchiveSlots>)> {
-        guard_memory(needed_bytes, mem_available_bytes())?;
+        reclaimable_bytes: u64,
+    ) -> eros::Result<Self> {
+        sevenz::guard_memory(
+            needed_bytes,
+            sevenz::mem_available_bytes(),
+            reclaimable_bytes,
+        )?;
         let slots = Arc::new(ArchiveSlots::new(names.len()));
-        let source =
-            Self::from_names(Backend::Archive(Arc::clone(&slots)), names)?;
-        Ok((source, slots))
+        Self::from_names(Backend::Archive(slots), names)
     }
 
     #[cfg(test)]
@@ -368,18 +496,15 @@ impl Source {
         Ok(Self { names, backend })
     }
 
-    #[cfg(test)]
-    pub fn len(&self) -> NonZeroUsize {
-        self.names.count()
-    }
-
     /// Every page's entry name, in reading order.
+    #[must_use]
     pub fn names(&self) -> &PageNames {
         &self.names
     }
 
     /// Entry name of one page. For archives this includes the inner
     /// path; for directories it is the bare filename.
+    #[must_use]
     pub fn name(&self, index: usize) -> Option<&str> {
         self.names.get(index).map(String::as_str)
     }
@@ -392,17 +517,19 @@ impl Source {
         };
         match &self.backend {
             Backend::Directory(dir) => match fs::read(dir.join(name)) {
-                Ok(bytes) => Ok(Bytes::from(bytes)),
+                Ok(bytes) => Ok(Arc::from(bytes)),
                 Err(error) => Err(Arc::new(error.into())),
             },
             Backend::Archive(slots) => slots.get(index),
         }
     }
 
+    #[must_use]
     pub fn is_archive(&self) -> bool {
         matches!(&self.backend, Backend::Archive(_))
     }
 
+    #[must_use]
     pub fn is_ready(&self, index: usize) -> bool {
         match &self.backend {
             Backend::Directory(_) => true,
@@ -410,31 +537,25 @@ impl Source {
         }
     }
 
-    pub fn on_ready(
-        &self,
-        hook: impl Fn() + Send + Sync + 'static,
-    ) -> ReadyGuard<'_> {
-        let slots = match &self.backend {
-            Backend::Directory(_) => None,
-            Backend::Archive(slots) => {
-                slots.set_on_ready(Some(Arc::new(hook)));
-                Some(slots.as_ref())
-            }
-        };
-        ReadyGuard { slots }
+    pub fn set_on_ready(&self, hook: Option<ReadyHook>) {
+        if let Backend::Archive(slots) = &self.backend {
+            slots.set_on_ready(hook);
+        }
     }
-}
 
-#[must_use]
-#[derive(Debug)]
-pub struct ReadyGuard<'source> {
-    slots: Option<&'source ArchiveSlots>,
-}
+    pub fn cancel(&self) {
+        if let Backend::Archive(slots) = &self.backend {
+            slots.cancel();
+        }
+    }
 
-impl Drop for ReadyGuard<'_> {
-    fn drop(&mut self) {
-        if let Some(slots) = self.slots {
-            slots.set_on_ready(None);
+    #[must_use]
+    pub fn archive_resident_bytes(&self) -> u64 {
+        match &self.backend {
+            Backend::Directory(_) => 0,
+            Backend::Archive(slots) => {
+                slots.resident_bytes.load(Ordering::Relaxed)
+            }
         }
     }
 }
@@ -448,10 +569,6 @@ fn duplicate_name(sorted: &[String]) -> Option<String> {
         .zip(sorted.iter().skip(1))
         .find(|(left, right)| left == right)
         .map(|(name, _)| name.clone())
-}
-
-fn sort_page_names(names: &mut [String]) {
-    names.sort_by(|left, right| catalog::compare_names(left, right));
 }
 
 struct ListedEntry {
@@ -496,9 +613,13 @@ fn validated_listing(
 fn read_member(
     member: &mut (impl Read + ?Sized),
     expected_bytes: u64,
-) -> eros::Result<Bytes> {
+    cancel: &AtomicBool,
+) -> eros::Result<Arc<[u8]>> {
     use std::time::Duration;
     use std::time::Instant;
+
+    const SLOW_MEMBER_READ_THRESHOLD: Duration =
+        Duration::from_millis(200);
 
     let started = Instant::now();
     let capacity = usize::try_from(expected_bytes)
@@ -506,21 +627,25 @@ fn read_member(
         .min(MAX_PREALLOCATED_BYTES)
         .saturating_add(READ_TO_END_PROBE_BYTES);
     let mut bytes = Vec::with_capacity(capacity);
-    member.read_to_end(&mut bytes)?;
+    let mut reader = CancellableRead {
+        inner: member,
+        cancel,
+    };
+    reader.read_to_end(&mut bytes)?;
     if bytes.capacity()
         > bytes.len().saturating_add(READ_TO_END_PROBE_BYTES)
     {
         bytes.shrink_to_fit();
     }
     let elapsed = started.elapsed();
-    if elapsed >= Duration::from_millis(200) {
+    if elapsed >= SLOW_MEMBER_READ_THRESHOLD {
         tracing::debug!(
             bytes = bytes.len(),
             elapsed = ?elapsed,
             "slow member read"
         );
     }
-    Ok(Bytes::from(bytes))
+    Ok(Arc::from(bytes))
 }
 
 fn spawn_zip_materialize(
@@ -532,10 +657,13 @@ fn spawn_zip_materialize(
         for (page_index, entry_index) in
             entry_indices.into_iter().enumerate()
         {
+            if slots.is_canceled() {
+                break;
+            }
             let page = match zip.by_index(entry_index) {
                 Ok(mut entry) => {
                     let expected_bytes = entry.size();
-                    read_member(&mut entry, expected_bytes)
+                    read_member(&mut entry, expected_bytes, &slots.cancel)
                         .map_err(Arc::new)
                 }
                 Err(error) => Err(Arc::new(error.into())),
@@ -561,15 +689,14 @@ fn spawn_materialize(
     let spawned =
         Builder::new().name("cy-unpack".into()).spawn(move || {
             let started = Instant::now();
-            let verdict = match catch_panic("unpack", || {
-                body(&thread_slots)
-            }) {
-                Ok(()) => Ok(()),
-                Err(reason) => {
-                    tracing::warn!(%reason, "unpack pass ended early");
-                    Err(Arc::new(reason))
-                }
-            };
+            let verdict =
+                match catch_panic("unpack", || body(&thread_slots)) {
+                    Ok(()) => Ok(()),
+                    Err(reason) => {
+                        tracing::warn!(%reason, "unpack pass ended early");
+                        Err(Arc::new(reason))
+                    }
+                };
             tracing::debug!(
                 elapsed = ?started.elapsed(),
                 ok = verdict.is_ok(),
@@ -584,156 +711,6 @@ fn spawn_materialize(
         let error: Arc<ErrorUnion> = Arc::new(error.into());
         slots.finish(Err(error));
     }
-}
-
-struct PlannedBlock {
-    index: usize,
-    page_count: NonZeroUsize,
-}
-
-struct SevenZipPlan {
-    blocks: Vec<PlannedBlock>,
-    empty_pages: Vec<usize>,
-}
-
-impl SevenZipPlan {
-    fn build(
-        file_block_index: &[Option<usize>],
-        block_count: usize,
-        page_file_indices: &[usize],
-    ) -> Self {
-        let mut block_page_counts = vec![0_usize; block_count];
-        let mut block_order = Vec::new();
-        let mut empty_pages = Vec::new();
-        for (page_index, &file_index) in
-            page_file_indices.iter().enumerate()
-        {
-            let block = file_block_index
-                .get(file_index)
-                .copied()
-                .flatten()
-                .filter(|&block_index| block_index < block_count);
-            if let Some(block_index) = block
-                && let Some(page_count) =
-                    block_page_counts.get_mut(block_index)
-            {
-                if *page_count == 0 {
-                    block_order.push(block_index);
-                }
-                *page_count += 1;
-            } else {
-                empty_pages.push(page_index);
-            }
-        }
-        let blocks = block_order
-            .into_iter()
-            .filter_map(|index| {
-                block_page_counts
-                    .get(index)
-                    .copied()
-                    .and_then(NonZeroUsize::new)
-                    .map(|page_count| PlannedBlock { index, page_count })
-            })
-            .collect();
-        Self {
-            blocks,
-            empty_pages,
-        }
-    }
-
-    fn decoder_peak_bytes(&self, archive: &Archive) -> u64 {
-        let mut peak_bytes = 0_u64;
-        for planned in &self.blocks {
-            let Some(block) = archive.blocks.get(planned.index) else {
-                continue;
-            };
-            let block_unpacked_bytes = block.get_unpack_size();
-            let mut block_peak_bytes = 0_u64;
-            for (coder_index, coder) in block.coders.iter().enumerate() {
-                let Some(dictionary_bytes) = coder_dictionary_bytes(
-                    coder.encoder_method_id(),
-                    coder.properties(),
-                ) else {
-                    continue;
-                };
-                let coder_unpacked_bytes =
-                    block.get_unpack_size_at_index(coder_index);
-                let unpacked_bytes = if coder_unpacked_bytes > 0 {
-                    coder_unpacked_bytes
-                } else {
-                    block_unpacked_bytes
-                };
-                block_peak_bytes = block_peak_bytes.saturating_add(
-                    lzma_growth_peak_bytes(
-                        dictionary_bytes,
-                        unpacked_bytes,
-                    ),
-                );
-            }
-            peak_bytes = peak_bytes.max(block_peak_bytes);
-        }
-        peak_bytes
-    }
-}
-
-#[expect(
-    clippy::little_endian_bytes,
-    reason = "LZMA properties store the dictionary size little-endian by format specification"
-)]
-fn coder_dictionary_bytes(
-    method_id: &[u8],
-    properties: &[u8],
-) -> Option<u64> {
-    use sevenz_rust2::EncoderMethod;
-
-    const LZMA2_MAX_DICTIONARY_CODE: u8 = 40;
-    const LZMA2_MANTISSA_BASE: u64 = 2;
-    const LZMA2_BASE_EXPONENT: u32 = 11;
-    const LZMA_DICTIONARY_OFFSET: usize = 1;
-    const LZMA_DICTIONARY_BYTES: usize = size_of::<u32>();
-
-    match method_id {
-        EncoderMethod::ID_LZMA2 => match properties.first().copied()? {
-            LZMA2_MAX_DICTIONARY_CODE => Some(u64::from(u32::MAX)),
-            code @ 0..LZMA2_MAX_DICTIONARY_CODE => {
-                let mantissa = LZMA2_MANTISSA_BASE | u64::from(code & 1);
-                let exponent = u32::from(code >> 1) + LZMA2_BASE_EXPONENT;
-                Some(mantissa << exponent)
-            }
-            _ => None,
-        },
-        EncoderMethod::ID_LZMA => {
-            let raw = properties
-                .get(LZMA_DICTIONARY_OFFSET..)
-                ?.first_chunk::<LZMA_DICTIONARY_BYTES>()?;
-            Some(u64::from(u32::from_le_bytes(*raw)))
-        }
-        _ => None,
-    }
-}
-
-/// Models `lzma-rust2`'s `LzDecoder::grow_slow` doubling reallocation
-/// where old and new dictionary buffers coexist.
-fn lzma_growth_peak_bytes(
-    dictionary_bytes: u64,
-    unpacked_bytes: u64,
-) -> u64 {
-    const MIN_GROWTH_BYTES: u64 = 64 * 1024;
-
-    let target_bytes = unpacked_bytes.min(dictionary_bytes);
-    if target_bytes == 0 {
-        return 0;
-    }
-    let mut previous_bytes = 0_u64;
-    let mut capacity_bytes = 0_u64;
-    while capacity_bytes < target_bytes {
-        previous_bytes = capacity_bytes;
-        capacity_bytes = capacity_bytes
-            .saturating_mul(2)
-            .max(MIN_GROWTH_BYTES)
-            .min(dictionary_bytes);
-    }
-    previous_bytes.saturating_add(capacity_bytes)
 }
 
 fn spawn_sevenzip_materialize(
@@ -757,10 +734,13 @@ fn spawn_sevenzip_materialize(
         .collect();
     spawn_materialize(slots, move |slots| {
         for page_index in plan.empty_pages {
-            slots.fill(page_index, Ok(Bytes::new()));
+            slots.fill(page_index, Ok(Arc::from([])));
         }
         let password = Password::empty();
         for planned in plan.blocks {
+            if slots.is_canceled() {
+                break;
+            }
             let mut remaining_pages = planned.page_count.get();
             let decoder = BlockDecoder::new(
                 BLOCK_DECODER_THREADS,
@@ -770,71 +750,25 @@ fn spawn_sevenzip_materialize(
                 &mut reader,
             );
             decoder.for_each_entries(&mut |entry, data| {
+                if slots.is_canceled() {
+                    return Ok(false);
+                }
                 let page_index = (!entry.is_directory())
                     .then(|| page_by_name.get(&entry.name).copied())
                     .flatten();
                 if let Some(index) = page_index {
                     slots.fill(
                         index,
-                        read_member(data, entry.size()).map_err(Arc::new),
+                        read_member(data, entry.size(), &slots.cancel)
+                            .map_err(Arc::new),
                     );
                     remaining_pages = remaining_pages.saturating_sub(1);
                 }
-                Ok(remaining_pages > 0)
+                Ok(remaining_pages > 0 && !slots.is_canceled())
             })?;
         }
         Ok(())
     });
-}
-
-/// `MemAvailable` from a `/proc/meminfo` text, converted to bytes. The
-/// line counts KiB. `None` when the line is missing or unparsable.
-fn parse_mem_available_bytes(meminfo: &str) -> Option<u64> {
-    let line = meminfo
-        .lines()
-        .find(|line| line.starts_with("MemAvailable:"))?;
-    let kib = line.split_whitespace().nth(1)?.parse::<u64>().ok()?;
-    kib.checked_mul(1024)
-}
-
-fn mem_available_bytes() -> Option<u64> {
-    parse_mem_available_bytes(&fs::read_to_string("/proc/meminfo").ok()?)
-}
-
-/// Kept free in `MemAvailable` for in-flight decodes, GPU textures, the
-/// preview store, and the rest of the system.
-const MEM_RESERVE_BYTES: u64 = 1024 * 1024 * 1024;
-const MAX_SEVENZIP_HEADER_KIB: u64 = 128 * 1024;
-
-fn sevenzip_header_limit_kib(available_bytes: Option<u64>) -> usize {
-    const KIB_SHIFT: u32 = 10;
-
-    let budget_kib = available_bytes.map_or(
-        MAX_SEVENZIP_HEADER_KIB,
-        |available_bytes| {
-            (available_bytes.saturating_sub(MEM_RESERVE_BYTES)
-                >> KIB_SHIFT)
-                .min(MAX_SEVENZIP_HEADER_KIB)
-        },
-    );
-    usize::try_from(budget_kib).unwrap_or(usize::MAX)
-}
-
-fn guard_memory(
-    needed_bytes: u64,
-    available_bytes: Option<u64>,
-) -> eros::Result<()> {
-    match available_bytes {
-        Some(available_bytes)
-            if needed_bytes
-                > available_bytes.saturating_sub(MEM_RESERVE_BYTES) =>
-        {
-            eros::bail!(
-                "archive too big: {needed_bytes} bytes needed, {available_bytes} bytes available"
-            );
-        }
-        _ => Ok(()),
-    }
 }
 
 #[cfg(test)]
@@ -846,19 +780,11 @@ fn guard_memory(
 )]
 mod tests {
     use super::*;
-
-    use crate::catalog;
-    use crate::catalog::PageName;
     use crate::testkit;
-
-    use std::cmp::Ordering;
-    use std::io::Write as _;
 
     use tempfile::TempDir;
     use zip::ZipWriter;
 
-    /// LZMA solid 7z with two PNGs and a non-page text member in the
-    /// same block, built by 7zz.
     const MIXED_SEVENZ_FIXTURE: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/mixed_pages.7z"
@@ -871,19 +797,12 @@ mod tests {
     }
 
     #[test]
-    fn panic_message_reads_payload_kinds() {
-        assert_eq!(panic_message(&String::from("boom")), "boom");
-        assert_eq!(panic_message(&"static boom"), "static boom");
-        assert_eq!(panic_message(&7_u8), "non-string panic payload");
-    }
-
-    #[test]
     fn a_failed_pass_answers_only_unfilled_pages() {
-        let good = Bytes::from_static(b"a");
+        let good: Arc<[u8]> = Arc::from(b"a".as_slice());
         let bad = failed_page("bad page");
         let fatal = failed_page("stream broke");
         let slots = ArchiveSlots::new(3);
-        slots.fill(0, Ok(good.clone()));
+        slots.fill(0, Ok(Arc::clone(&good)));
         slots.fill(1, Err(Arc::clone(&bad)));
         slots.finish(Err(Arc::clone(&fatal)));
         assert!(
@@ -896,7 +815,6 @@ mod tests {
             matches!(slots.get(2), Err(error) if Arc::ptr_eq(&error, &fatal))
         );
 
-        // A whole pass that missed a page rejects unfilled slots.
         let whole = ArchiveSlots::new(2);
         whole.fill(0, Ok(good));
         whole.finish(Ok(()));
@@ -905,191 +823,10 @@ mod tests {
     }
 
     #[test]
-    fn natural_order_compares_digit_runs_by_value() {
-        // Mixed padding widths order by numeric value.
-        let mut names = vec![
-            "9.png".to_owned(),
-            "010.png".to_owned(),
-            "1.png".to_owned(),
-        ];
-        sort_page_names(&mut names);
-        assert_eq!(names, ["1.png", "9.png", "010.png"]);
-        let mut padded =
-            vec!["page10.png".to_owned(), "page09.png".to_owned()];
-        sort_page_names(&mut padded);
-        assert_eq!(padded, ["page09.png", "page10.png"]);
-        // Equal values keep a deterministic order: fewer zeros first.
-        assert_eq!(
-            catalog::compare_names("10.png", "010.png"),
-            Ordering::Less
-        );
-        assert_eq!(
-            catalog::compare_names("010.png", "10.png"),
-            Ordering::Greater
-        );
-        assert_eq!(
-            catalog::compare_names("10.png", "10.png"),
-            Ordering::Equal
-        );
-        // Non-digits compare byte-wise; case and spaces stay significant.
-        assert_eq!(
-            catalog::compare_names("Page2.png", "page3.png"),
-            Ordering::Less
-        );
-        assert_eq!(
-            catalog::compare_names("page 2.png", "page2.png"),
-            Ordering::Less
-        );
-        assert_eq!(
-            catalog::compare_names("page.png", "page2.png"),
-            Ordering::Less
-        );
-        assert_eq!(catalog::compare_names("b", "a"), Ordering::Greater);
-        assert_eq!(catalog::compare_names("", ""), Ordering::Equal);
-        assert_eq!(catalog::compare_names("", "a"), Ordering::Less);
-    }
-
-    #[test]
-    fn natural_order_handles_non_ascii_prefixes() {
-        assert_eq!(
-            catalog::compare_names("漫画-2.jpg", "漫画-10.jpg"),
-            Ordering::Less
-        );
-        assert_eq!(
-            catalog::compare_names("第1話.cbz", "第10話.cbz"),
-            Ordering::Less
-        );
-        // Code-point order for non-ASCII text.
-        assert_eq!(catalog::compare_names("阿", "白"), Ordering::Greater);
-        assert_eq!(
-            catalog::compare_names("06-漫画.jpg", "漫画-06.jpg"),
-            Ordering::Less
-        );
-    }
-
-    #[test]
-    fn natural_order_is_total() {
-        let names = [
-            "",
-            "0",
-            "00",
-            "1",
-            "01",
-            "9",
-            "10",
-            "010",
-            "A",
-            "a",
-            "a0",
-            "a1",
-            "a01",
-            "b",
-            "page 2",
-            "page2",
-            "z",
-            "é",
-            "第1話",
-            "第10話",
-            "漫画-2",
-            "漫画-10",
-            "阿",
-            "白",
-        ];
-        for &left in &names {
-            for &right in &names {
-                let forward = catalog::compare_names(left, right);
-                assert_eq!(
-                    forward,
-                    catalog::compare_names(right, left).reverse(),
-                    "{left:?} vs {right:?}"
-                );
-                assert_eq!(
-                    forward == Ordering::Equal,
-                    left == right,
-                    "{left:?} vs {right:?}"
-                );
-            }
-        }
-        for &left in &names {
-            for &middle in &names {
-                if catalog::compare_names(left, middle)
-                    == Ordering::Greater
-                {
-                    continue;
-                }
-                for &right in &names {
-                    if catalog::compare_names(middle, right)
-                        == Ordering::Greater
-                    {
-                        continue;
-                    }
-                    assert_ne!(
-                        catalog::compare_names(left, right),
-                        Ordering::Greater,
-                        "{left:?} <= {middle:?} <= {right:?}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn meminfo_parsing() {
-        let meminfo = "MemTotal:       100 kB\nMemAvailable:   4096 kB\nSwapTotal:      2 kB\n";
-        assert_eq!(parse_mem_available_bytes(meminfo), Some(4096 * 1024));
-        assert_eq!(parse_mem_available_bytes("MemTotal: 1 kB\n"), None);
-        assert_eq!(
-            parse_mem_available_bytes("MemAvailable: notanumber kB\n"),
-            None
-        );
-        assert_eq!(
-            parse_mem_available_bytes(&format!(
-                "MemAvailable: {} kB\n",
-                u64::MAX
-            )),
-            None
-        );
-    }
-
-    #[test]
-    fn memory_guard() {
-        assert!(guard_memory(100, Some(50)).is_err());
-        guard_memory(50, Some(MEM_RESERVE_BYTES + 100)).unwrap();
-        guard_memory(u64::MAX, None).unwrap();
-        // The guard keeps a reserve free: an archive that would leave
-        // less than it is refused even though it still fits.
-        let available = 4 * 1024 * 1024 * 1024;
-        guard_memory(available - MEM_RESERVE_BYTES, Some(available))
-            .unwrap();
-        assert!(
-            guard_memory(
-                available - MEM_RESERVE_BYTES + 1,
-                Some(available),
-            )
-            .is_err()
-        );
-
-        let max_header_kib =
-            usize::try_from(MAX_SEVENZIP_HEADER_KIB).unwrap();
-        assert_eq!(sevenzip_header_limit_kib(None), max_header_kib);
-        assert_eq!(
-            sevenzip_header_limit_kib(Some(available)),
-            max_header_kib
-        );
-        assert_eq!(
-            sevenzip_header_limit_kib(Some(
-                MEM_RESERVE_BYTES + 4 * 1024 * 1024
-            )),
-            4 * 1024
-        );
-        assert_eq!(sevenzip_header_limit_kib(Some(MEM_RESERVE_BYTES)), 0);
-    }
-
-    #[test]
     fn a_panicking_materializer_answers_unfilled_pages() {
         let slots = Arc::new(ArchiveSlots::new(2));
         spawn_materialize(&slots, |slots| {
-            slots.fill(0, Ok(Bytes::from_static(b"a")));
+            slots.fill(0, Ok(Arc::from(b"a".as_slice())));
             panic!("boom");
         });
         assert_eq!(slots.get(0).unwrap().as_ref(), b"a");
@@ -1104,46 +841,19 @@ mod tests {
         use std::sync::mpsc;
 
         let slots = Arc::new(ArchiveSlots::new(2));
-        let (release_tx, release_rx) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel();
         spawn_materialize(&slots, move |slots| {
-            slots.fill(0, Ok(Bytes::from_static(b"first")));
-            release_rx.recv().expect("gate releases slot 1");
-            slots.fill(1, Ok(Bytes::from_static(b"second")));
+            slots.fill(0, Ok(Arc::from(b"first".as_slice())));
+            release_receiver.recv().expect("gate releases slot 1");
+            slots.fill(1, Ok(Arc::from(b"second".as_slice())));
             Ok(())
         });
 
         assert_eq!(slots.get(0).expect("slot 0 ready").as_ref(), b"first");
-        release_tx.send(()).expect("release slot 1");
+        release_sender.send(()).expect("release slot 1");
         assert_eq!(
             slots.get(1).expect("slot 1 ready").as_ref(),
             b"second"
-        );
-    }
-
-    #[test]
-    fn liar_sizes_refuse() {
-        let entries = vec![
-            ListedEntry {
-                name: "a.png".to_owned(),
-                unpacked_bytes: u64::MAX,
-                archive_index: 0,
-            },
-            ListedEntry {
-                name: "b.png".to_owned(),
-                unpacked_bytes: u64::MAX,
-                archive_index: 1,
-            },
-        ];
-        let listing =
-            validated_listing(entries).expect("liar names still list");
-        assert_eq!(listing.names, ["a.png", "b.png"]);
-        assert_eq!(listing.unpacked_bytes, u64::MAX);
-        assert!(
-            guard_memory(
-                listing.unpacked_bytes,
-                Some(4 * 1024 * 1024 * 1024)
-            )
-            .is_err()
         );
     }
 
@@ -1253,91 +963,19 @@ mod tests {
     }
 
     #[test]
-    fn sevenzip_plan_orders_blocks_and_skips_unused() {
-        let file_block_index =
-            [Some(2), Some(0), None, Some(1), Some(2), None];
-        let page_file_indices = [3, 2, 0, 4];
-        let plan =
-            SevenZipPlan::build(&file_block_index, 3, &page_file_indices);
-        let blocks: Vec<(usize, usize)> = plan
-            .blocks
-            .iter()
-            .map(|planned| (planned.index, planned.page_count.get()))
-            .collect();
-        assert_eq!(blocks, [(1, 1), (2, 2)]);
-        assert_eq!(plan.empty_pages, [1]);
-    }
-
-    #[test]
-    fn lzma_growth_peak_bytes_estimates_realloc_spike() {
-        use sevenz_rust2::EncoderMethod;
-
-        const KIB: u64 = 1024;
-        const MIB: u64 = 1024 * 1024;
-
-        assert_eq!(
-            coder_dictionary_bytes(EncoderMethod::ID_LZMA2, &[0]),
-            Some(4 * KIB)
-        );
-        assert_eq!(
-            coder_dictionary_bytes(EncoderMethod::ID_LZMA2, &[37]),
-            Some(1536 * MIB)
-        );
-        assert_eq!(
-            coder_dictionary_bytes(EncoderMethod::ID_LZMA2, &[40]),
-            Some(u64::from(u32::MAX))
-        );
-        assert_eq!(
-            coder_dictionary_bytes(EncoderMethod::ID_LZMA2, &[41]),
-            None
-        );
-        assert_eq!(
-            coder_dictionary_bytes(
-                EncoderMethod::ID_LZMA,
-                &[0x5d, 0, 0, 0x01, 0]
-            ),
-            Some(64 * KIB)
-        );
-
-        assert_eq!(
-            lzma_growth_peak_bytes(1536 * MIB, 1_119_464_490),
-            2560 * MIB
-        );
-        assert_eq!(
-            lzma_growth_peak_bytes(1024 * MIB, MIB),
-            512 * KIB + MIB
-        );
-        assert_eq!(lzma_growth_peak_bytes(16 * MIB, 147 * MIB), 24 * MIB);
-    }
-
-    #[test]
-    fn sevenz_listing() {
-        let source = Source::open(Path::new(testkit::SEVENZ_FIXTURE))
-            .expect("7z opens");
-        assert_eq!(source.names, ["p1.png", "p2.png"]);
-        assert_eq!(
-            catalog::page_name(&source.names, true, None, 0),
-            PageName {
-                parent_dir: None,
-                file: "p1.png".into()
-            }
-        );
-    }
-
-    #[test]
     fn sevenz_materializes_once_and_drains_non_page_members() {
-        use crate::decode;
-        use crate::decode::Format;
+        use crate::image::pixels::Format;
 
         let source = Source::open(Path::new(MIXED_SEVENZ_FIXTURE))
             .expect("7z opens");
-        assert_eq!(source.len().get(), 2);
+        let page_count = source.names().count().get();
+        assert_eq!(page_count, 2);
         let mut pages = Vec::new();
-        for index in 0..source.len().get() {
+        for index in 0..page_count {
             let name = source.name(index).expect("page listed");
             let bytes = source.bytes(index).expect("page materialized");
-            let page = decode::decode(&bytes, name)
-                .expect("fixture page decodes");
+            let page =
+                codec::decode(&bytes, name).expect("fixture page decodes");
             assert_eq!(page.format(), Format::Png);
             pages.push(bytes);
         }
@@ -1377,21 +1015,8 @@ mod tests {
             source.names,
             ["c1.png", "c2.png", "c10.png", "cover.PNG"]
         );
-        assert_eq!(source.len().get(), 4);
+        assert_eq!(source.names().count().get(), 4);
         assert_eq!(source.name(2), Some("c10.png"));
-        let dir_name = dir
-            .path()
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
-        assert_eq!(
-            catalog::page_name(&source.names, false, Some(&dir_name), 2),
-            PageName {
-                parent_dir: Some(dir_name),
-                file: "c10.png".into(),
-            }
-        );
         assert!(!source.is_archive());
         let expected = testkit::tiny_png(1, 1, [7, 8, 9, 255]);
         assert!(
@@ -1435,6 +1060,8 @@ mod tests {
 
     #[test]
     fn zip_listing_and_read() {
+        use std::io::Write as _;
+
         use zip::CompressionMethod;
         use zip::write::SimpleFileOptions;
 
@@ -1468,21 +1095,6 @@ mod tests {
             source.names,
             ["b/002.png", "b/010.png", "b/020.png", "b/deep/005.png"]
         );
-        assert_eq!(
-            catalog::page_name(&source.names, true, None, 1),
-            PageName {
-                parent_dir: Some("b".into()),
-                file: "010.png".into()
-            }
-        );
-        assert_eq!(
-            catalog::page_name(&source.names, true, None, 3),
-            PageName {
-                parent_dir: Some("deep".into()),
-                file: "005.png".into()
-            }
-        );
-        // bytes(1) is b/010.png, written with color 1.
         let page = testkit::readable_page(&source, 1);
         assert_eq!(
             page.as_ref(),
@@ -1493,7 +1105,7 @@ mod tests {
     #[test]
     fn zip_corruption_stays_page_local() {
         use std::io::Error as IoError;
-        use std::io::ErrorKind;
+        use std::io::Write as _;
 
         use zip::CompressionMethod;
         use zip::write::SimpleFileOptions;
@@ -1517,10 +1129,6 @@ mod tests {
             }
             zip.finish().unwrap();
         }
-        // Two corruption modes in one book: a flipped byte inside page
-        // 1's stored payload (its CRC stops matching) and a damaged
-        // page 2 local header (its central-directory entry stays
-        // whole). Each broken member must fail alone.
         {
             let mut book = fs::read(&zip_path).unwrap();
             let needle = &*pages[1];
@@ -1550,13 +1158,44 @@ mod tests {
         let read_error = failure
             .downcast_inner_ref::<IoError>()
             .expect("a corrupt member settles as an io error");
-        // zip reports a payload CRC mismatch as invalid data.
         assert_eq!(read_error.kind(), ErrorKind::InvalidData);
         testkit::unreadable_page(&source, 2);
         assert_eq!(
             testkit::readable_page(&source, 0).as_ref(),
             pages[0].as_slice()
         );
+    }
+
+    #[test]
+    fn cancel_stops_unpack_early() {
+        use std::io::Write as _;
+
+        use zip::CompressionMethod;
+        use zip::write::SimpleFileOptions;
+
+        let dir = TempDir::new().expect("create temp dir");
+        let zip_path = dir.path().join("book.cbz");
+        {
+            let file = File::create(&zip_path).unwrap();
+            let mut zip = ZipWriter::new(file);
+            let options = SimpleFileOptions::default()
+                .compression_method(CompressionMethod::Stored);
+            for index in 0..8 {
+                zip.start_file(format!("{index:03}.png"), options)
+                    .unwrap();
+                zip.write_all(&testkit::tiny_png(
+                    2,
+                    2,
+                    [index, 0, 0, 255],
+                ))
+                .unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        let listed = Source::open_listed(&zip_path, 0).expect("listed");
+        listed.source.cancel();
+        let source = listed.start();
+        let _error = testkit::unreadable_page(&source, 7);
     }
 
     #[test]
@@ -1578,81 +1217,9 @@ mod tests {
         assert!(unsupported.to_string().contains("unsupported source"));
         fs::write(dir.path().join("plain.txt"), b"not a directory")
             .expect("write plain.txt");
-        // A path under a regular file reports io.
         let under_file =
             Source::open(&dir.path().join("plain.txt").join("page.png"))
                 .expect_err("a path under a regular file must fail as io");
         assert!(under_file.downcast_inner_ref::<IoError>().is_some());
-    }
-
-    #[test]
-    fn sibling_books_step_between_their_own_kind() {
-        use crate::browse::Direction;
-
-        let parent = TempDir::new().expect("create temp dir");
-        let volume = |name: &str| {
-            let dir = parent.path().join(name);
-            fs::create_dir_all(&dir).expect("volume dir creates");
-            fs::write(
-                dir.join("p.png"),
-                testkit::tiny_png(1, 1, [0, 0, 0, 255]),
-            )
-            .expect("volume page writes");
-            dir
-        };
-        // Natural order puts "v1" < "v2" < "v10" by digit value.
-        let first = volume("v1");
-        let middle = volume("v2");
-        let last = volume("v10");
-        fs::write(parent.path().join("notes.txt"), b"not a book")
-            .expect("plain file writes");
-
-        assert_eq!(
-            catalog::sibling(&middle, false, Direction::Forward),
-            Some(last),
-            "forward follows natural order"
-        );
-        assert_eq!(
-            catalog::sibling(&middle, false, Direction::Backward),
-            Some(first.clone()),
-            "backward follows natural order"
-        );
-        assert_eq!(
-            catalog::sibling(&first, false, Direction::Backward),
-            None,
-            "the shelf's start has no earlier book"
-        );
-
-        // Archives step between archives only.
-        let shelf = TempDir::new().expect("create temp dir");
-        let write_cbz = |name: &str| {
-            use zip::write::SimpleFileOptions;
-
-            let path = shelf.path().join(name);
-            let file = File::create(&path).expect("zip creates");
-            let mut zip = ZipWriter::new(file);
-            zip.start_file("p.png", SimpleFileOptions::default())
-                .expect("entry starts");
-            zip.write_all(&testkit::tiny_png(1, 1, [0, 0, 0, 255]))
-                .expect("entry writes");
-            zip.finish().expect("zip finishes");
-            path
-        };
-        let before = write_cbz("a.cbz");
-        let after = write_cbz("b.cbz");
-        fs::write(shelf.path().join("notes.txt"), b"not a book")
-            .expect("plain file writes");
-        // The volumes directory is a sibling entry of the other kind and
-        // must not answer.
-        assert_eq!(
-            catalog::sibling(&before, true, Direction::Forward),
-            Some(after),
-            "archives step between archives"
-        );
-        assert_eq!(
-            catalog::sibling(&before, true, Direction::Backward),
-            None,
-            "the first archive has no earlier book"
-        );
     }
 }

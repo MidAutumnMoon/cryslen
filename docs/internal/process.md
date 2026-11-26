@@ -1,27 +1,15 @@
-# Processes: one child per book
+# Concurrency: in-process book lifecycle
 
-`cy` is the windowed parent; `cy --worker` serves one book over `src/protocol.rs`.
-
-The parent owns the window, UI, GL, app state, VRAM textures, and the thumb pack; the child owns the book source, archive unpacking, decode, and derivation. A child crash becomes a book fault.
+`cy` is a pure single-process binary (`src/main.rs` -> `src/app/run.rs`); decoded rasters live directly in `Arc<Image>` without IPC serialization or shared-memory copies.
 
 ## Lifecycle
 
-- Open (`src/book.rs`, `src/worker.rs`): fork on the event-loop thread so Linux's parent-death signal stays bound to a long-lived thread. Because `accept(2)` cannot unblock if the child exits early, the child connects before opening the source and the parent accepts on a helper thread under a timeout.
-- Archive (`src/source.rs`): list pages up front, unpack into per-page slots in the background, and serve each page as its slot fills. Per-page failures stay page-local; an aborted pass fills remaining empty slots with its error. Directories are ready immediately.
-- Switch (`src/app.rs`): kill the old child, start the new open, and keep the previous frame on screen until the new book adopts.
-- Worker (`src/worker.rs`): runs the decode pool alongside the IPC and playback loop (scheduling and caches in `docs/internal/cache.md`).
+- Open (`src/app/run.rs`, `src/book/source.rs`): background `cy-open` thread runs `Source::open_listed(path, reclaimable_bytes)`, scanning entries and checking `/proc/meminfo` against 7z LZMA memory estimates (`src/book/sevenz.rs`) before opening `ThumbHandle` (`src/book/thumbs.rs`).
+- Archive (`src/book/source.rs`): directories read on demand; ZIP and 7z share uniform `ArchiveSlots` populated asynchronously on `cy-unpack` only once `ListedBook::start()` runs, with cooperative read cancellation on switch/drop and mimalloc purging after unpack.
+- Switch (`src/app/run.rs`): keep the previous `LoadedBook` on screen while `cy-open` runs (crediting its `archive_resident_bytes` as `reclaimable_bytes`), then drop the old book (`DecodePool::stop` + `Source::cancel`) and clear VRAM before calling `listed.start()`.
+- Decode (`src/book/loader.rs`): `DecodePool` shares `Arc<Source>` across worker threads and wakes the event loop on completion.
 
-## Playback
+## Playback (`src/book/playback.rs`, `src/app/run.rs`)
 
-- Parent (`src/reading.rs`, `src/animation.rs`) owns display timing and session lifecycle; child (`src/worker.rs`) owns decode and loop policy.
-- One frame request is in flight per session; a monotonic generation rejects stale frames. A playback failure keeps the page's last raster.
-
-## Wire invariants
-
-- Page identity is the spawn-time book index; messages carry no paths.
-- The parent sends the whole `WorkPlan` and is the authority for resident state; the child sends only deliveries and failures.
-- Full and fit planes cross via shared memory per plane (`src/protocol.rs`); the parent validates extents before GL upload.
-
-## Trust boundary and limits
-
-The child runs with the user's filesystem access and shares stderr with the parent. Each transferred image copies once into shared memory. Switches and quit cancel running unpacks and decodes by killing the child.
+- Animated GIF pages shown at a settled spread spawn an in-process `GifPlayer` (`cy-gif`) streaming decoded frames over a 1-frame `crossbeam_channel` bounded channel.
+- Dropping a `GifPlayer` disconnects its channel so the producer exits; `Reading` decides settled targets while `LoadedBook` owns `GifPlayer` instances and frame timing.

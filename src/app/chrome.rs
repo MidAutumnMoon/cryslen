@@ -11,10 +11,10 @@ use egui::TextFormat;
 use egui::Ui;
 use egui::text::LayoutJob;
 
-use crate::browse::ReadingMode;
-use crate::browse::Spread;
-use crate::catalog::PageName;
-use crate::decode::Format;
+use crate::app::layout::ReadingMode;
+use crate::app::layout::Spread;
+use crate::book::catalog::PageName;
+use crate::image::pixels::Format;
 
 pub struct ReadingStatus {
     pub page_count: usize,
@@ -23,16 +23,16 @@ pub struct ReadingStatus {
     /// Set only when the decoded format differs from the filename extension.
     pub actual_format: Option<Format>,
     /// Placement scale, screen px per image px.
-    pub zoom: f64,
+    pub zoom_scale: f64,
 }
 
 pub struct StatusLine<'fault> {
     pub reading: Option<ReadingStatus>,
     pub mode: ReadingMode,
-    pub toast: bool,
+    pub show_mode_toast: bool,
     pub name: PageName,
     /// Whether to show `loading…`.
-    pub waiting: bool,
+    pub show_loading: bool,
     pub fault: Option<&'fault str>,
 }
 
@@ -57,32 +57,37 @@ pub struct Timers {
     toast_until: Option<Instant>,
 }
 
-const WAIT_GRACE: Duration = Duration::from_millis(150);
+const WAIT_INDICATOR_GRACE: Duration = Duration::from_millis(150);
 
-const MODE_TOAST: Duration = Duration::from_millis(1500);
+const MODE_TOAST_DURATION: Duration = Duration::from_millis(1500);
 
 impl Timers {
     pub fn toast(&mut self, now: Instant) {
-        self.toast_until = Some(now + MODE_TOAST);
+        self.toast_until = Some(now + MODE_TOAST_DURATION);
     }
 
     pub fn tick(&mut self, now: Instant, waiting: bool) -> TimerTick {
         let was_waiting = self.is_waiting();
         self.wait = if waiting {
             match self.wait {
-                WaitTimer::Idle => WaitTimer::Grace(now + WAIT_GRACE),
-                WaitTimer::Grace(due) if now >= due => WaitTimer::Shown,
+                WaitTimer::Idle => {
+                    WaitTimer::Grace(now + WAIT_INDICATOR_GRACE)
+                }
+                WaitTimer::Grace(deadline) if now >= deadline => {
+                    WaitTimer::Shown
+                }
                 state @ (WaitTimer::Grace(_) | WaitTimer::Shown) => state,
             }
         } else {
             WaitTimer::Idle
         };
         let wait_deadline = match self.wait {
-            WaitTimer::Grace(due) => Some(due),
+            WaitTimer::Grace(deadline) => Some(deadline),
             WaitTimer::Idle | WaitTimer::Shown => None,
         };
 
-        let toast_expired = self.toast_until.is_some_and(|due| now >= due);
+        let toast_expired =
+            self.toast_until.is_some_and(|deadline| now >= deadline);
         if toast_expired {
             self.toast_until = None;
         }
@@ -122,28 +127,29 @@ pub fn show(
             Sides::new().shrink_left().show(
                 ui,
                 |ui| {
-                    let job = line(ui.style(), status);
-                    ui.add(Label::new(job).truncate());
+                    let layout = status_line_layout(ui.style(), status);
+                    ui.add(Label::new(layout).truncate());
                 },
-                |ui| right_end(ui, status),
+                |ui| mode_indicators(ui, status),
             );
         });
     }
     ui.available_rect_before_wrap()
 }
 
-const PAGE_DIM_ALPHA: u8 = 150;
+const JUMP_BACKDROP_DIM_ALPHA: u8 = 150;
+const NO_CORNER_RADIUS: f32 = 0.0;
 const PROMPT_MARGIN: i8 = 28;
 const PROMPT_MIN_WIDTH: f32 = 480.0;
-const PROMPT_PREFIX_SIZE: f32 = 36.0;
-const PROMPT_VALUE_SIZE: f32 = 44.0;
+const PROMPT_PREFIX_FONT_SIZE: f32 = 36.0;
+const PROMPT_VALUE_FONT_SIZE: f32 = 44.0;
 const PROMPT_PREFIX_GAP: f32 = 12.0;
 
-/// Draws the prompt over `page_rect`; callers pass the page surface, so
+/// Draws the prompt over `page_area`; callers pass the page surface, so
 /// the status bar stays outside the dim.
 pub fn page_jump(
-    ctx: &Context,
-    page_rect: Rect,
+    context: &Context,
+    page_area: Rect,
     digits: &str,
     page_count: usize,
     digits_valid: bool,
@@ -156,24 +162,24 @@ pub fn page_jump(
     use egui::Margin;
     use egui::Order;
 
-    // The prompt frame is Foreground; keep the dim one layer below it.
     let dim_layer =
         LayerId::new(Order::Middle, Id::unique("page-jump-dim"));
-    ctx.layer_painter(dim_layer)
-        .with_clip_rect(page_rect)
+    context
+        .layer_painter(dim_layer)
+        .with_clip_rect(page_area)
         .rect_filled(
-            page_rect,
-            0.0,
-            Color32::from_black_alpha(PAGE_DIM_ALPHA),
+            page_area,
+            NO_CORNER_RADIUS,
+            Color32::from_black_alpha(JUMP_BACKDROP_DIM_ALPHA),
         );
 
     Area::new(Id::unique("page-jump"))
         .order(Order::Foreground)
         .interactable(false)
         .fade_in(false)
-        .fixed_pos(page_rect.center())
+        .fixed_pos(page_area.center())
         .pivot(Align2::CENTER_CENTER)
-        .show(ctx, |ui| {
+        .show(context, |ui| {
             Frame::popup(ui.style())
                 .inner_margin(Margin::same(PROMPT_MARGIN))
                 .show(ui, |ui| {
@@ -208,34 +214,34 @@ fn page_jump_text(
     let value_text = placeholder.as_deref().unwrap_or(digits);
 
     let mut prefix_format = TextFormat::simple(
-        FontId::monospace(PROMPT_PREFIX_SIZE),
+        FontId::monospace(PROMPT_PREFIX_FONT_SIZE),
         style.visuals.strong_text_color(),
     );
     prefix_format.valign = Align::Center;
 
-    let mut job = LayoutJob::default();
-    job.append(":", 0.0, prefix_format);
-    job.append(
+    let mut layout = LayoutJob::default();
+    layout.append(":", 0.0, prefix_format);
+    layout.append(
         value_text,
         PROMPT_PREFIX_GAP,
         TextFormat::simple(
-            FontId::monospace(PROMPT_VALUE_SIZE),
+            FontId::monospace(PROMPT_VALUE_FONT_SIZE),
             value_color,
         ),
     );
-    job
+    layout
 }
 
 /// `egui::Sides` lays out the right side right-to-left, so iterate in
 /// reverse.
-fn right_end(ui: &mut Ui, status: &StatusLine<'_>) {
+fn mode_indicators(ui: &mut Ui, status: &StatusLine<'_>) {
     use egui::RichText;
     use strum::VariantArray as _;
 
     for (mode_index, &mode) in
         ReadingMode::VARIANTS.iter().enumerate().rev()
     {
-        let text = RichText::new(group_label(mode)).monospace();
+        let text = RichText::new(mode_label(mode)).monospace();
         let text = if mode == status.mode {
             text.color(mode_color(mode)).strong()
         } else {
@@ -246,82 +252,83 @@ fn right_end(ui: &mut Ui, status: &StatusLine<'_>) {
             ui.label(RichText::new("·").weak().monospace());
         }
     }
-    if status.toast {
-        ui.label(RichText::new(status.mode.effect()).monospace());
+    if status.show_mode_toast {
+        ui.label(RichText::new(status.mode.description()).monospace());
     }
 }
 
-fn group_label(mode: ReadingMode) -> String {
+fn mode_label(mode: ReadingMode) -> String {
     format!("{mode} ({})", mode.shortcut())
 }
 
+const NORMAL_MODE_COLOR: Color32 = Color32::from_rgb(0x87, 0xb3, 0x7d);
+const MANGA_MODE_COLOR: Color32 = Color32::from_rgb(0xd2, 0x7b, 0x7b);
+const COMIC_MODE_COLOR: Color32 = Color32::from_rgb(0x7b, 0x9f, 0xd2);
+
 fn mode_color(mode: ReadingMode) -> Color32 {
     match mode {
-        ReadingMode::Normal => Color32::from_rgb(0x87, 0xb3, 0x7d),
-        ReadingMode::Manga => Color32::from_rgb(0xd2, 0x7b, 0x7b),
-        ReadingMode::Comic => Color32::from_rgb(0x7b, 0x9f, 0xd2),
+        ReadingMode::Normal => NORMAL_MODE_COLOR,
+        ReadingMode::Manga => MANGA_MODE_COLOR,
+        ReadingMode::Comic => COMIC_MODE_COLOR,
     }
 }
 
-/// Muted hue for the spread range, quieter than the mode colors so the
-/// group keeps the bar's strongest accent.
-const HEAD_COLOR: Color32 = Color32::from_rgb(0xc2, 0x9e, 0x6f);
+const PAGE_RANGE_COLOR: Color32 = Color32::from_rgb(0xc2, 0x9e, 0x6f);
+const FILE_NAME_COLOR: Color32 = Color32::from_rgb(0xa2, 0x92, 0xc5);
 
-const NAME_COLOR: Color32 = Color32::from_rgb(0xa2, 0x92, 0xc5);
-
-/// The left-side facts as one job of colored sections, separate so they
-/// are directly testable. One job, one label: the whole line keeps
-/// eliding together on narrow screens.
-fn line(style: &Style, status: &StatusLine<'_>) -> LayoutJob {
+fn status_line_layout(
+    style: &Style,
+    status: &StatusLine<'_>,
+) -> LayoutJob {
     use egui::TextStyle;
 
     let font = TextStyle::Monospace.resolve(style);
     let plain = style.visuals.text_color();
-    let section = |job: &mut LayoutJob, text: &str, color: Color32| {
-        job.append(text, 0.0, TextFormat::simple(font.clone(), color));
+    let section = |layout: &mut LayoutJob, text: &str, color: Color32| {
+        layout.append(text, 0.0, TextFormat::simple(font.clone(), color));
     };
-    let mut job = LayoutJob::default();
+    let mut layout = LayoutJob::default();
 
     if let Some(reading) = &status.reading {
-        let head = reading.spread.second.map_or_else(
+        let page_range = reading.spread.second.map_or_else(
             || format!("{}", reading.spread.first + 1),
             |second| {
                 format!("{}-{}", reading.spread.first + 1, second + 1)
             },
         );
-        section(&mut job, &head, HEAD_COLOR);
-        section(&mut job, &format!("/{}", reading.page_count), plain);
-        section(&mut job, " · ", plain);
+        section(&mut layout, &page_range, PAGE_RANGE_COLOR);
+        section(&mut layout, &format!("/{}", reading.page_count), plain);
+        section(&mut layout, " · ", plain);
     }
 
     if let Some(parent_dir) = &status.name.parent_dir {
-        section(&mut job, parent_dir, plain);
-        section(&mut job, "/", plain);
+        section(&mut layout, parent_dir, plain);
+        section(&mut layout, "/", plain);
     }
-    section(&mut job, &status.name.file, NAME_COLOR);
+    section(&mut layout, &status.name.file, FILE_NAME_COLOR);
 
     if let Some(reading) = &status.reading {
         if let Some((width, height)) = reading.page_dims {
-            section(&mut job, " · ", plain);
+            section(&mut layout, " · ", plain);
             let dims_text = reading.actual_format.map_or_else(
                 || format!("{width}x{height}"),
                 |format| format!("{format} {width}x{height}"),
             );
-            section(&mut job, &dims_text, plain);
+            section(&mut layout, &dims_text, plain);
         }
         section(
-            &mut job,
-            &format!(" · {:.0}%", reading.zoom * 100.0),
+            &mut layout,
+            &format!(" · {:.0}%", reading.zoom_scale * 100.0),
             plain,
         );
     }
-    if status.waiting {
-        section(&mut job, " · loading…", plain);
+    if status.show_loading {
+        section(&mut layout, " · loading…", plain);
     }
     if let Some(fault) = status.fault {
-        section(&mut job, &format!(" · {fault}"), plain);
+        section(&mut layout, &format!(" · {fault}"), plain);
     }
-    job
+    layout
 }
 
 #[cfg(test)]
@@ -342,13 +349,13 @@ mod tests {
         assert_eq!(
             timers.tick(start, true),
             TimerTick {
-                next_deadline: Some(start + WAIT_GRACE),
+                next_deadline: Some(start + WAIT_INDICATOR_GRACE),
                 changed: false,
             }
         );
         assert!(!timers.is_waiting());
         assert_eq!(
-            timers.tick(start + WAIT_GRACE, true),
+            timers.tick(start + WAIT_INDICATOR_GRACE, true),
             TimerTick {
                 next_deadline: None,
                 changed: true,
@@ -356,7 +363,7 @@ mod tests {
         );
         assert!(timers.is_waiting());
         assert_eq!(
-            timers.tick(start + WAIT_GRACE * 2, false),
+            timers.tick(start + WAIT_INDICATOR_GRACE * 2, false),
             TimerTick {
                 next_deadline: None,
                 changed: true,
@@ -369,19 +376,19 @@ mod tests {
         assert_eq!(
             timers.tick(start, true),
             TimerTick {
-                next_deadline: Some(start + WAIT_GRACE),
+                next_deadline: Some(start + WAIT_INDICATOR_GRACE),
                 changed: false,
             }
         );
         assert_eq!(
             timers.tick(start, false),
             TimerTick {
-                next_deadline: Some(start + MODE_TOAST),
+                next_deadline: Some(start + MODE_TOAST_DURATION),
                 changed: false,
             }
         );
         assert_eq!(
-            timers.tick(start + MODE_TOAST, false),
+            timers.tick(start + MODE_TOAST_DURATION, false),
             TimerTick {
                 next_deadline: None,
                 changed: true,
@@ -390,7 +397,7 @@ mod tests {
         assert!(!timers.is_toasting());
     }
 
-    fn status() -> StatusLine<'static> {
+    fn sample_status() -> StatusLine<'static> {
         StatusLine {
             reading: Some(ReadingStatus {
                 page_count: 214,
@@ -398,26 +405,24 @@ mod tests {
                     first: 11,
                     second: Some(12),
                 },
-                // The name claims png and the page decodes as jxl, so the
-                // format label prefixes the dims.
                 page_dims: Some((6000, 4000)),
                 actual_format: Some(Format::Jxl),
-                zoom: 0.866,
+                zoom_scale: 0.866,
             }),
             mode: ReadingMode::Manga,
-            toast: false,
+            show_mode_toast: false,
             name: PageName {
                 parent_dir: Some("b".into()),
                 file: "010.png".into(),
             },
-            waiting: false,
+            show_loading: false,
             fault: None,
         }
     }
 
     struct TextItem {
         text: String,
-        rect: Rect,
+        bounds: Rect,
         elided: bool,
     }
 
@@ -425,16 +430,16 @@ mod tests {
         clippy::wildcard_enum_match_arm,
         reason = "egui's non-text shape variants carry no text items"
     )]
-    fn walk(shape: &Shape, out: &mut Vec<TextItem>) {
+    fn collect_text_items(shape: &Shape, items: &mut Vec<TextItem>) {
         match shape {
-            Shape::Text(text_shape) => out.push(TextItem {
+            Shape::Text(text_shape) => items.push(TextItem {
                 text: text_shape
                     .galley
                     .rows
                     .iter()
                     .map(|row| row.text())
                     .collect::<String>(),
-                rect: text_shape
+                bounds: text_shape
                     .galley
                     .rect
                     .translate(text_shape.pos.to_vec2()),
@@ -442,15 +447,13 @@ mod tests {
             }),
             Shape::Vec(shapes) => {
                 for child_shape in shapes {
-                    walk(child_shape, out);
+                    collect_text_items(child_shape, items);
                 }
             }
             _ => {}
         }
     }
 
-    /// Render the bar headlessly on a `width`-wide screen; egui panel sizing
-    /// settles one frame late. Only the texture upload needs a GPU.
     fn render(
         width: f32,
         status: &StatusLine<'_>,
@@ -460,7 +463,7 @@ mod tests {
         use egui::Pos2;
         use egui::RawInput;
 
-        let ctx = Context::default();
+        let egui_context = Context::default();
         let input = || RawInput {
             screen_rect: Some(Rect::from_min_size(
                 Pos2::ZERO,
@@ -468,21 +471,22 @@ mod tests {
             )),
             ..Default::default()
         };
-        ctx.run_ui(input(), |ui| {
-            show(ui, status, true);
-        })
-        .drop_without_applying_deltas();
-        let mut content = Rect::NOTHING;
-        let mut out = ctx.run_ui(input(), |ui| {
-            content = show(ui, status, true);
+        egui_context
+            .run_ui(input(), |ui| {
+                show(ui, status, true);
+            })
+            .drop_without_applying_deltas();
+        let mut page_area = Rect::NOTHING;
+        let mut output = egui_context.run_ui(input(), |ui| {
+            page_area = show(ui, status, true);
         });
-        let shapes = mem::take(&mut out.shapes);
-        out.drop_without_applying_deltas();
+        let shapes = mem::take(&mut output.shapes);
+        output.drop_without_applying_deltas();
         let mut items = Vec::new();
-        for shape in &shapes {
-            walk(&shape.shape, &mut items);
+        for clipped in &shapes {
+            collect_text_items(&clipped.shape, &mut items);
         }
-        (items, content)
+        (items, page_area)
     }
 
     fn find<'items>(
@@ -495,100 +499,88 @@ mod tests {
             .expect(prefix)
     }
 
-    /// The panel frame's inner margin is the flush-left and
-    /// flush-right anchor. `ROUND` tolerates pixel rounding.
     const PANEL_MARGIN: f32 = 8.0;
-    const ROUND: f32 = 0.51;
+    const LAYOUT_TOLERANCE: f32 = 0.51;
     const SCREEN_HEIGHT: f32 = 600.0;
-    /// Screen widths: wide enough to show everything, narrow enough to
-    /// force elision.
-    const WIDE: f32 = 1280.0;
-    const NARROW: f32 = 480.0;
+    const WIDE_SCREEN_WIDTH: f32 = 1280.0;
+    const NARROW_SCREEN_WIDTH: f32 = 480.0;
+    const MIN_CANVAS_HEIGHT: f32 = 400.0;
+    const MAX_BAR_HEIGHT_DRIFT: f32 = 8.0;
 
     #[test]
     fn bar_geometry() {
-        let (plain, wide_rect) = render(WIDE, &status());
-        let mut with_toast = status();
-        with_toast.toast = true;
-        let (toast, _) = render(WIDE, &with_toast);
-        let (narrow, narrow_rect) = render(NARROW, &status());
+        let (plain_items, wide_area) =
+            render(WIDE_SCREEN_WIDTH, &sample_status());
+        let mut with_toast = sample_status();
+        with_toast.show_mode_toast = true;
+        let (toast_items, _) = render(WIDE_SCREEN_WIDTH, &with_toast);
+        let (narrow_items, narrow_area) =
+            render(NARROW_SCREEN_WIDTH, &sample_status());
 
-        assert!(wide_rect.min.x.abs() < ROUND, "{}", wide_rect.min.x);
-        assert!(wide_rect.min.y.abs() < ROUND, "{}", wide_rect.min.y);
+        assert!(wide_area.min.x.abs() < LAYOUT_TOLERANCE);
+        assert!(wide_area.min.y.abs() < LAYOUT_TOLERANCE);
         assert!(
-            (wide_rect.width() - WIDE).abs() < ROUND,
-            "{}",
-            wide_rect.width()
+            (wide_area.width() - WIDE_SCREEN_WIDTH).abs()
+                < LAYOUT_TOLERANCE
+        );
+        assert!(wide_area.max.y > MIN_CANVAS_HEIGHT);
+        assert!(wide_area.max.y < SCREEN_HEIGHT);
+        assert!(
+            (narrow_area.width() - NARROW_SCREEN_WIDTH).abs()
+                < LAYOUT_TOLERANCE
         );
         assert!(
-            wide_rect.max.y > 400.0,
-            "content must span most of the window: {}",
-            wide_rect.max.y
-        );
-        assert!(
-            wide_rect.max.y < SCREEN_HEIGHT,
-            "content must exclude the bar strip: {}",
-            wide_rect.max.y
-        );
-
-        assert!(
-            (narrow_rect.width() - NARROW).abs() < ROUND,
-            "{}",
-            narrow_rect.width()
-        );
-        // 8.0 tolerates a text line of bar-height difference across widths,
-        // unlike ROUND's sub-pixel rounding.
-        assert!(
-            (narrow_rect.max.y - wide_rect.max.y).abs() < 8.0,
-            "{narrow_rect:?} vs {wide_rect:?}"
+            (narrow_area.max.y - wide_area.max.y).abs()
+                < MAX_BAR_HEIGHT_DRIFT
         );
 
         assert!(
-            (find(&plain, "12-13/214").rect.left() - PANEL_MARGIN).abs()
-                < ROUND
+            (find(&plain_items, "12-13/214").bounds.left() - PANEL_MARGIN)
+                .abs()
+                < LAYOUT_TOLERANCE
         );
         assert_eq!(
-            find(&plain, "12-13/214").rect.left(),
-            find(&toast, "12-13/214").rect.left()
+            find(&plain_items, "12-13/214").bounds.left(),
+            find(&toast_items, "12-13/214").bounds.left()
         );
 
-        for items in [&plain, &toast] {
+        for items in [&plain_items, &toast_items] {
             let comic = find(items, "Comic (c)");
             let rightmost = items
                 .iter()
-                .map(|item| item.rect.right())
+                .map(|item| item.bounds.right())
                 .fold(f32::MIN, f32::max);
             assert!(
-                (rightmost - comic.rect.right()).abs() < ROUND,
-                "group must be rightmost"
+                (rightmost - comic.bounds.right()).abs()
+                    < LAYOUT_TOLERANCE
             );
             assert!(
-                (comic.rect.right() - (WIDE - PANEL_MARGIN)).abs() < ROUND,
-                "group must be flush right"
+                (comic.bounds.right()
+                    - (WIDE_SCREEN_WIDTH - PANEL_MARGIN))
+                    .abs()
+                    < LAYOUT_TOLERANCE
             );
         }
         assert_eq!(
-            find(&plain, "Comic (c)").rect,
-            find(&toast, "Comic (c)").rect,
-            "the group must not move when the toast appears"
+            find(&plain_items, "Comic (c)").bounds,
+            find(&toast_items, "Comic (c)").bounds,
         );
 
         assert!(
-            find(&toast, "right to left").rect.right()
-                < find(&toast, "Comic (c)").rect.left()
+            find(&toast_items, "right to left").bounds.right()
+                < find(&toast_items, "Comic (c)").bounds.left()
         );
-        assert!(
-            plain
-                .iter()
-                .all(|item| !item.text.contains(status().mode.effect()))
-        );
+        assert!(plain_items.iter().all(|item| {
+            !item.text.contains(sample_status().mode.description())
+        }));
 
-        let facts = find(&narrow, "12-13");
-        assert!(facts.elided, "facts must elide on a narrow screen");
-        assert!(facts.text.ends_with('…'));
+        let left_summary = find(&narrow_items, "12-13");
+        assert!(left_summary.elided);
+        assert!(left_summary.text.ends_with('…'));
         assert!(
-            facts.rect.right() <= find(&narrow, "Comic (c)").rect.left()
+            left_summary.bounds.right()
+                <= find(&narrow_items, "Comic (c)").bounds.left()
         );
-        assert!(!find(&plain, "12-13").elided);
+        assert!(!find(&plain_items, "12-13").elided);
     }
 }

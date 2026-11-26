@@ -1,42 +1,43 @@
-use super::Decoded;
-use super::Format;
+//! Raster still decoders via the `image` crate (JPEG, PNG, BMP, TIFF).
+
+use crate::image::pixels;
+use crate::image::pixels::Format;
+use crate::image::pixels::Image;
 
 /// Decode with a concrete decoder so EXIF orientation is readable, then
 /// apply it.
-pub(super) fn decode(
-    bytes: &[u8],
-    format: Format,
-) -> eros::Result<Decoded> {
-    use super::Transfer;
-    use super::WideDepth;
+pub(super) fn decode(bytes: &[u8], format: Format) -> eros::Result<Image> {
+    use std::io::Cursor;
+
     use image::DynamicImage;
     use image::ImageDecoder as _;
     use image::ImageFormat;
     use image::ImageReader;
-    use std::io::Cursor;
+
+    use crate::image::pixels::Transfer;
+    use crate::image::pixels::WideDepth;
 
     let image_format = match format {
         Format::Jpeg => ImageFormat::Jpeg,
         Format::Png => ImageFormat::Png,
-        Format::Gif => ImageFormat::Gif,
         Format::Bmp => ImageFormat::Bmp,
         Format::Tiff => ImageFormat::Tiff,
-        Format::Avif | Format::Jxl | Format::Webp => {
+        Format::Gif | Format::Avif | Format::Jxl | Format::Webp => {
             eros::bail!("unsupported internal dispatch");
         }
     };
     let reader =
         ImageReader::with_format(Cursor::new(bytes), image_format);
     let mut decoder = reader.into_decoder()?;
-    // Orientation only swaps w and h, and the cap checks both, so this
-    // pre-orientation check catches rotated pages too.
+    // Orientation only swaps width and height, and the cap checks both, so
+    // this pre-orientation check catches rotated pages too.
     let (width, height) = decoder.dimensions();
-    super::admit_dims(width, height, "bad dimensions")?;
+    pixels::admit_dims(width, height, "bad dimensions")?;
     let orientation = decoder.orientation()?;
     let mut oriented = DynamicImage::from_decoder(decoder)?;
     oriented.apply_orientation(orientation);
     Ok(if let DynamicImage::ImageLuma8(gray) = oriented {
-        Decoded::gray_u8(
+        Image::gray_u8(
             gray.width(),
             gray.height(),
             format,
@@ -44,7 +45,7 @@ pub(super) fn decode(
             gray.into_raw().into_boxed_slice(),
         )?
     } else if let DynamicImage::ImageLuma16(gray) = oriented {
-        Decoded::gray_u16(
+        Image::gray_u16(
             gray.width(),
             gray.height(),
             format,
@@ -54,7 +55,7 @@ pub(super) fn decode(
         )?
     } else {
         let rgba = oriented.into_rgba8();
-        Decoded::rgba(
+        Image::rgba(
             rgba.width(),
             rgba.height(),
             format,
@@ -72,18 +73,16 @@ pub(super) fn decode(
 )]
 mod tests {
     use super::*;
+    use crate::image::decode::codec;
+    use crate::image::pixels::Pixels;
+    use crate::image::pixels::SamplePlanes;
 
-    use crate::decode;
-    use crate::decode::Pixels;
-
-    // The encoder cannot write EXIF orientation tags, so orientation
-    // handling has no testable fixture.
     #[test]
     fn encoder_roundtrips() {
         use crate::testkit;
 
         let png = testkit::tiny_png(4, 3, [10, 20, 30, 255]);
-        let png_page = decode::decode(&png, "p.png").expect("png decodes");
+        let png_page = codec::decode(&png, "p.png").expect("png decodes");
         assert_eq!((png_page.width(), png_page.height()), (4, 3));
         assert_eq!(png_page.format(), Format::Png);
         match png_page.pixels() {
@@ -91,44 +90,43 @@ mod tests {
                 assert_eq!(bytes.len(), 4 * 4 * 3);
                 assert_eq!(bytes.get(..4), Some(&[10, 20, 30, 255][..]));
             }
-            Pixels::Gray(_) | Pixels::Yuv(_) => {
+            Pixels::Gray { .. } | Pixels::Yuv { .. } => {
                 panic!("png must decode to rgba")
             }
         }
 
         let jpeg = testkit::tiny_jpeg(5, 2, [200, 100, 50]);
         let jpeg_page =
-            decode::decode(&jpeg, "p.jpg").expect("jpeg decodes");
+            codec::decode(&jpeg, "p.jpg").expect("jpeg decodes");
         assert_eq!(jpeg_page.format(), Format::Jpeg);
         assert_eq!((jpeg_page.width(), jpeg_page.height()), (5, 2));
 
         let gif = testkit::tiny_gif(3, 2, [200, 100, 50]);
-        let gif_page = decode::decode(&gif, "p.gif").expect("gif decodes");
+        let gif_page = codec::decode(&gif, "p.gif").expect("gif decodes");
         assert_eq!(gif_page.format(), Format::Gif);
         assert_eq!((gif_page.width(), gif_page.height()), (3, 2));
 
         let bmp = testkit::tiny_bmp(2, 3, [200, 100, 50]);
-        let bmp_page = decode::decode(&bmp, "p.bmp").expect("bmp decodes");
+        let bmp_page = codec::decode(&bmp, "p.bmp").expect("bmp decodes");
         assert_eq!(bmp_page.format(), Format::Bmp);
         assert_eq!((bmp_page.width(), bmp_page.height()), (2, 3));
 
         let tiff = testkit::tiny_tiff(3, 1, [200, 100, 50]);
         let tiff_page =
-            decode::decode(&tiff, "p.tiff").expect("tiff decodes");
+            codec::decode(&tiff, "p.tiff").expect("tiff decodes");
         assert_eq!(tiff_page.format(), Format::Tiff);
         assert_eq!((tiff_page.width(), tiff_page.height()), (3, 1));
     }
 
     #[test]
     fn opaque_grayscale_png_decodes_to_gray() {
-        use crate::decode::Samples;
-        use crate::decode::WideDepth;
+        use std::io::Cursor;
+
         use image::DynamicImage;
         use image::GrayImage;
         use image::ImageBuffer;
         use image::ImageFormat;
         use image::Luma;
-        use std::io::Cursor;
 
         {
             let mut png = Vec::new();
@@ -139,19 +137,26 @@ mod tests {
                 .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
                 .expect("encode 8-bit grayscale png");
             let page =
-                decode::decode(&png, "g8.png").expect("luma8 decodes");
-            let Pixels::Gray(gray) = page.pixels() else {
-                panic!("opaque luma8 png must decode to gray");
+                codec::decode(&png, "g8.png").expect("luma8 decodes");
+            let Pixels::Gray {
+                full_range,
+                planes:
+                    SamplePlanes::U8 {
+                        planes: [luma],
+                        alpha,
+                    },
+            } = page.pixels()
+            else {
+                panic!("opaque luma8 png must decode to U8 gray");
             };
-            assert!(gray.full_range);
-            let Samples::U8(planes) = &gray.samples else {
-                panic!("opaque luma8 png must use 8-bit samples");
-            };
-            assert!(planes.alpha.is_none());
-            assert_eq!(*planes.luma, [0, 40, 80, 120, 160, 200]);
+            assert!(*full_range);
+            assert!(alpha.is_none());
+            assert_eq!(&**luma, [0, 40, 80, 120, 160, 200]);
         }
 
         {
+            use crate::image::pixels::WideDepth;
+
             let mut png = Vec::new();
             let image = ImageBuffer::<Luma<u16>, Vec<u16>>::from_raw(
                 2,
@@ -162,21 +167,25 @@ mod tests {
             DynamicImage::ImageLuma16(image)
                 .write_to(&mut Cursor::new(&mut png), ImageFormat::Png)
                 .expect("encode 16-bit grayscale png");
+
             let page =
-                decode::decode(&png, "g16.png").expect("luma16 decodes");
-            let Pixels::Gray(gray) = page.pixels() else {
-                panic!("opaque luma16 png must decode to gray");
-            };
-            assert!(gray.full_range);
-            let Samples::U16 {
-                depth: WideDepth::D16,
-                planes,
-            } = &gray.samples
+                codec::decode(&png, "g16.png").expect("luma16 decodes");
+            let Pixels::Gray {
+                full_range,
+                planes:
+                    SamplePlanes::U16 {
+                        depth,
+                        planes: [luma],
+                        alpha,
+                    },
+            } = page.pixels()
             else {
-                panic!("opaque luma16 png must use 16-bit samples");
+                panic!("opaque luma16 png must decode to U16 gray");
             };
-            assert!(planes.alpha.is_none());
-            assert_eq!(*planes.luma, [0, 15000, 30000, 45000]);
+            assert!(*full_range);
+            assert_eq!(*depth, WideDepth::D16);
+            assert!(alpha.is_none());
+            assert_eq!(&**luma, [0, 15000, 30000, 45000]);
         }
     }
 }

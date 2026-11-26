@@ -1,28 +1,33 @@
 //! AVIF decode through libavif. The FFI `unsafe` is confined to this
 //! module.
 
+use std::marker::PhantomData;
+
 use bytemuck::Pod;
 use image::metadata::Orientation;
 use libavif_sys::avifDecoder;
 use libavif_sys::avifImage;
 use libavif_sys::avifResult;
-use std::marker::PhantomData;
 
-use super::Decoded;
-use super::GrayPlanes;
-use super::Samples;
-use super::Subsampling;
-use super::WideDepth;
-use super::YuvPlanes;
+use crate::image::pixels;
+use crate::image::pixels::Image;
+use crate::image::pixels::SamplePlanes;
+use crate::image::pixels::Subsampling;
+use crate::image::pixels::WideDepth;
 
 /// dav1d parallelism saturates quickly on stills, so the thread count
 /// is capped.
-const MAX_THREADS: i32 = 8;
+const MAX_DAV1D_THREADS: i32 = 8;
+
+enum AvifDepth {
+    U8,
+    U16(WideDepth),
+}
 
 pub(super) fn decode(
     bytes: &[u8],
     max_threads: usize,
-) -> eros::Result<Decoded> {
+) -> eros::Result<Image> {
     use libavif_sys::AVIF_MATRIX_COEFFICIENTS_BT470BG;
     use libavif_sys::AVIF_MATRIX_COEFFICIENTS_BT601;
     use libavif_sys::AVIF_MATRIX_COEFFICIENTS_BT709;
@@ -37,24 +42,23 @@ pub(super) fn decode(
     use libavif_sys::AVIF_TRANSFER_CHARACTERISTICS_HLG;
     use libavif_sys::AVIF_TRANSFER_CHARACTERISTICS_SMPTE2084;
 
-    use super::Format;
-    use super::GrayImage;
-    use super::Matrix;
-    use super::Transfer;
-    use super::YuvImage;
+    use crate::image::pixels::Format;
+    use crate::image::pixels::Matrix;
+    use crate::image::pixels::Transfer;
+    use crate::image::pixels::YuvSpec;
 
     let decoder = DecoderGuard::new(bytes, max_threads)?;
     let frame = decoder.image()?;
 
     let (width, height) = (frame.width, frame.height);
-    let wide_depth = match frame.depth {
-        8 => None,
-        10 => Some(WideDepth::D10),
-        12 => Some(WideDepth::D12),
-        16 => Some(WideDepth::D16),
+    let avif_depth = match frame.depth {
+        8 => AvifDepth::U8,
+        10 => AvifDepth::U16(WideDepth::D10),
+        12 => AvifDepth::U16(WideDepth::D12),
+        16 => AvifDepth::U16(WideDepth::D16),
         _ => eros::bail!("avif: bad depth"),
     };
-    super::admit_dims(width, height, "avif: bad dimensions")?;
+    pixels::admit_dims(width, height, "avif: bad dimensions")?;
     let full_range = frame.yuvRange == AVIF_RANGE_FULL;
     // HLG has no fixed SDR map; a wrong render is worse than a
     // refused page.
@@ -66,81 +70,93 @@ pub(super) fn decode(
         _ => Transfer::Srgb,
     };
     let orientation = orientation(frame);
-    let yuv = if frame.yuvFormat == AVIF_PIXEL_FORMAT_YUV400 {
-        None
-    } else {
-        let subsampling = match frame.yuvFormat {
-            AVIF_PIXEL_FORMAT_YUV444 => Subsampling::Yuv444,
-            AVIF_PIXEL_FORMAT_YUV422 => Subsampling::Yuv422,
-            AVIF_PIXEL_FORMAT_YUV420 => Subsampling::Yuv420,
-            _ => eros::bail!("avif: unsupported pixel format"),
-        };
-        let matrix = match u32::from(frame.matrixCoefficients) {
-            AVIF_MATRIX_COEFFICIENTS_IDENTITY => Matrix::Identity,
-            AVIF_MATRIX_COEFFICIENTS_BT709 => Matrix::Bt709,
-            AVIF_MATRIX_COEFFICIENTS_BT2020_NCL => Matrix::Bt2020,
-            // avifCalcYUVCoefficients treats unspecified/BG/601 as BT.601.
-            AVIF_MATRIX_COEFFICIENTS_UNSPECIFIED
-            | AVIF_MATRIX_COEFFICIENTS_BT470BG
-            | AVIF_MATRIX_COEFFICIENTS_BT601 => Matrix::Bt601,
-            _ => eros::bail!("avif: unsupported matrix coefficients"),
-        };
-        // A quarter turn makes 4:2:2 subsample vertically instead of
-        // horizontally, which no plane geometry in the model expresses.
-        if super::orientation_swaps_dims(orientation)
-            && subsampling == Subsampling::Yuv422
-        {
-            eros::bail!("avif: unsupported rotated 4:2:2");
-        }
-        Some((subsampling, matrix))
-    };
-
-    let Some((subsampling, matrix)) = yuv else {
-        let samples = match wide_depth {
-            // SAFETY: the guard keeps `frame`'s planes live; `copy_plane` rejects null/short strides.
-            None => Samples::U8(unsafe { copy_gray_planes::<u8>(frame) }?),
-            Some(depth) => Samples::U16 {
-                depth,
+    if frame.yuvFormat == AVIF_PIXEL_FORMAT_YUV400 {
+        let planes = match avif_depth {
+            AvifDepth::U8 => {
                 // SAFETY: the guard keeps `frame`'s planes live; `copy_plane` rejects null/short strides.
-                planes: unsafe { copy_gray_planes::<u16>(frame) }?,
-            },
+                let (luma, alpha) =
+                    unsafe { copy_gray_planes::<u8>(frame) }?;
+                SamplePlanes::U8 {
+                    planes: [luma],
+                    alpha,
+                }
+            }
+            AvifDepth::U16(depth) => {
+                // SAFETY: the guard keeps `frame`'s planes live; `copy_plane` rejects null/short strides.
+                let (luma, alpha) =
+                    unsafe { copy_gray_planes::<u16>(frame) }?;
+                SamplePlanes::U16 {
+                    depth,
+                    planes: [luma],
+                    alpha,
+                }
+            }
         };
-        return Ok(Decoded::gray(
+        return Ok(Image::gray(
             width,
             height,
             Format::Avif,
             transfer,
-            GrayImage {
-                full_range,
-                samples,
-            },
+            full_range,
+            planes,
         )?
         .apply_orientation(orientation));
-    };
+    }
 
-    let samples = match wide_depth {
-        // SAFETY: the guard keeps `frame`'s planes live; `copy_plane` rejects null/short strides.
-        None => Samples::U8(unsafe {
-            copy_yuv_planes::<u8>(frame, subsampling)
-        }?),
-        Some(depth) => Samples::U16 {
-            depth,
+    let subsampling = match frame.yuvFormat {
+        AVIF_PIXEL_FORMAT_YUV444 => Subsampling::Yuv444,
+        AVIF_PIXEL_FORMAT_YUV422 => Subsampling::Yuv422,
+        AVIF_PIXEL_FORMAT_YUV420 => Subsampling::Yuv420,
+        _ => eros::bail!("avif: unsupported pixel format"),
+    };
+    let matrix = match u32::from(frame.matrixCoefficients) {
+        AVIF_MATRIX_COEFFICIENTS_IDENTITY => Matrix::Identity,
+        AVIF_MATRIX_COEFFICIENTS_BT709 => Matrix::Bt709,
+        AVIF_MATRIX_COEFFICIENTS_BT2020_NCL => Matrix::Bt2020,
+        // avifCalcYUVCoefficients treats unspecified/BG/601 as BT.601.
+        AVIF_MATRIX_COEFFICIENTS_UNSPECIFIED
+        | AVIF_MATRIX_COEFFICIENTS_BT470BG
+        | AVIF_MATRIX_COEFFICIENTS_BT601 => Matrix::Bt601,
+        _ => eros::bail!("avif: unsupported matrix coefficients"),
+    };
+    // A quarter turn makes 4:2:2 subsample vertically instead of
+    // horizontally, which no plane geometry in the model expresses.
+    if pixels::orientation_swaps_dims(orientation)
+        && subsampling == Subsampling::Yuv422
+    {
+        eros::bail!("avif: unsupported rotated 4:2:2");
+    }
+
+    let planes = match avif_depth {
+        AvifDepth::U8 => {
             // SAFETY: the guard keeps `frame`'s planes live; `copy_plane` rejects null/short strides.
-            planes: unsafe { copy_yuv_planes::<u16>(frame, subsampling) }?,
-        },
+            let (yuv, alpha) =
+                unsafe { copy_yuv_planes::<u8>(frame, subsampling) }?;
+            SamplePlanes::U8 { planes: yuv, alpha }
+        }
+        AvifDepth::U16(depth) => {
+            // SAFETY: the guard keeps `frame`'s planes live; `copy_plane` rejects null/short strides.
+            let (yuv, alpha) =
+                unsafe { copy_yuv_planes::<u16>(frame, subsampling) }?;
+            SamplePlanes::U16 {
+                depth,
+                planes: yuv,
+                alpha,
+            }
+        }
     };
 
-    Ok(Decoded::yuv(
+    Ok(Image::yuv(
         width,
         height,
         Format::Avif,
         transfer,
-        YuvImage {
+        YuvSpec {
             subsampling,
             full_range,
             matrix,
-            samples,
         },
+        planes,
     )?
     .apply_orientation(orientation))
 }
@@ -185,25 +201,30 @@ fn orientation(frame: &avifImage) -> Orientation {
 
 fn clamp_threads(max_threads: usize) -> i32 {
     i32::try_from(max_threads)
-        .unwrap_or(MAX_THREADS)
-        .clamp(1, MAX_THREADS)
+        .unwrap_or(MAX_DAV1D_THREADS)
+        .clamp(1, MAX_DAV1D_THREADS)
 }
 
 fn check(code: avifResult, what: &'static str) -> eros::Result<()> {
+    use std::ffi::CStr;
+
     use libavif_sys::AVIF_RESULT_OK;
     use libavif_sys::avifResultToString;
-    use std::ffi::CStr;
 
     if code == AVIF_RESULT_OK {
         return Ok(());
     }
     // SAFETY: `avifResultToString` returns a static NUL-terminated string for
     // any `avifResult`.
-    let message_ptr = unsafe { avifResultToString(code) };
-    // SAFETY: `message_ptr` points to a static NUL-terminated string.
-    let detail = unsafe { CStr::from_ptr(message_ptr) }.to_string_lossy();
+    let message_pointer = unsafe { avifResultToString(code) };
+    // SAFETY: `message_pointer` points to a static NUL-terminated string.
+    let detail =
+        unsafe { CStr::from_ptr(message_pointer) }.to_string_lossy();
     eros::bail!("{what}: {detail}")
 }
+
+type GrayPlanes<Sample> = (Box<[Sample]>, Option<Box<[Sample]>>);
+type YuvPlanes<Sample> = ([Box<[Sample]>; 3], Option<Box<[Sample]>>);
 
 /// # Safety
 ///
@@ -237,7 +258,7 @@ where
             })
             .transpose()?
     };
-    Ok(GrayPlanes { luma, alpha })
+    Ok((luma, alpha))
 }
 
 /// # Safety
@@ -252,9 +273,9 @@ where
     Sample: Copy + Default + Pod,
 {
     // SAFETY: caller guarantees `frame`'s luma and alpha planes are live.
-    let gray = unsafe { copy_gray_planes::<Sample>(frame) }?;
+    let (luma, alpha) = unsafe { copy_gray_planes::<Sample>(frame) }?;
     let (_, (chroma_width, chroma_height)) =
-        super::plane_dims((frame.width, frame.height), subsampling);
+        pixels::plane_dims((frame.width, frame.height), subsampling);
     // SAFETY: caller guarantees `frame`'s Cb plane is live.
     let cb = unsafe {
         copy_plane::<Sample>(
@@ -273,20 +294,15 @@ where
             chroma_height,
         )
     }?;
-    Ok(YuvPlanes {
-        luma: gray.luma,
-        cb,
-        cr,
-        alpha: gray.alpha,
-    })
+    Ok(([luma, cb, cr], alpha))
 }
 
 /// # Safety
 ///
-/// When non-null, `plane_ptr` must hold `height` live rows spaced by
+/// When non-null, `plane_pointer` must hold `height` live rows spaced by
 /// `row_stride` bytes.
 unsafe fn copy_plane<Sample>(
-    plane_ptr: *const u8,
+    plane_pointer: *const u8,
     row_stride: u32,
     width: u32,
     height: u32,
@@ -294,7 +310,7 @@ unsafe fn copy_plane<Sample>(
 where
     Sample: Copy + Default + Pod,
 {
-    if plane_ptr.is_null() {
+    if plane_pointer.is_null() {
         eros::bail!("avif: missing plane");
     }
     let width = width as usize;
@@ -307,26 +323,26 @@ where
     if width == 0 || height == 0 {
         return Ok(Box::new([]));
     }
-    let mut out = vec![Sample::default(); width * height];
-    // SAFETY: `plane_ptr` holds `height` live rows at `row_stride >= row_bytes`.
+    let mut samples = vec![Sample::default(); width * height];
+    // SAFETY: `plane_pointer` holds `height` live rows at `row_stride >= row_bytes`.
     unsafe {
         copy_strided_bytes(
-            plane_ptr,
+            plane_pointer,
             row_stride,
             row_bytes,
             height,
-            bytemuck::cast_slice_mut(&mut out),
+            bytemuck::cast_slice_mut(&mut samples),
         );
     }
-    Ok(out.into_boxed_slice())
+    Ok(samples.into_boxed_slice())
 }
 
 /// # Safety
 ///
-/// `plane_ptr` must hold `height` live rows at `row_stride`, each at
+/// `plane_pointer` must hold `height` live rows at `row_stride`, each at
 /// least `row_bytes` wide, and `target.len() == row_bytes * height`.
 unsafe fn copy_strided_bytes(
-    plane_ptr: *const u8,
+    plane_pointer: *const u8,
     row_stride: usize,
     row_bytes: usize,
     height: usize,
@@ -337,7 +353,7 @@ unsafe fn copy_strided_bytes(
     if row_stride == row_bytes {
         // SAFETY: `row_stride == row_bytes` means all rows are contiguous.
         let source = unsafe {
-            slice::from_raw_parts(plane_ptr, row_bytes * height)
+            slice::from_raw_parts(plane_pointer, row_bytes * height)
         };
         target.copy_from_slice(source);
         return;
@@ -345,9 +361,10 @@ unsafe fn copy_strided_bytes(
     for (row, target_row) in target.chunks_exact_mut(row_bytes).enumerate()
     {
         // SAFETY: `row < height`, so the row pointer stays within the allocated plane.
-        let row_ptr = unsafe { plane_ptr.add(row * row_stride) };
+        let row_pointer = unsafe { plane_pointer.add(row * row_stride) };
         // SAFETY: each row holds `row_bytes` live sample bytes.
-        let source = unsafe { slice::from_raw_parts(row_ptr, row_bytes) };
+        let source =
+            unsafe { slice::from_raw_parts(row_pointer, row_bytes) };
         target_row.copy_from_slice(source);
     }
 }
@@ -356,7 +373,7 @@ unsafe fn copy_strided_bytes(
 /// the input, which the decoder reads through a raw pointer until
 /// destroyed.
 struct DecoderGuard<'bytes> {
-    ptr: *mut avifDecoder,
+    decoder: *mut avifDecoder,
     _bytes: PhantomData<&'bytes [u8]>,
 }
 
@@ -372,58 +389,62 @@ impl<'bytes> DecoderGuard<'bytes> {
         const NO_DIMENSION_LIMIT: u32 = 0;
 
         // SAFETY: allocates an independent decoder instance.
-        let ptr = unsafe { avifDecoderCreate() };
-        if ptr.is_null() {
+        let decoder = unsafe { avifDecoderCreate() };
+        if decoder.is_null() {
             eros::bail!("avif: decoder create failed");
         }
         let guard = Self {
-            ptr,
+            decoder,
             _bytes: PhantomData,
         };
         {
-            // SAFETY: `guard.ptr` is newly allocated, non-null, and uniquely
+            // SAFETY: `guard.decoder` is newly allocated, non-null, and uniquely
             // owned; the mutable borrow ends before subsequent C calls.
-            let decoder = unsafe { &mut *guard.ptr };
-            decoder.maxThreads = clamp_threads(max_threads);
+            let raw_decoder = unsafe { &mut *guard.decoder };
+            raw_decoder.maxThreads = clamp_threads(max_threads);
             // The decoder's pixel cap runs before the pixel decode, so an
             // oversized hostile file fails at parse instead of funding a
             // multi-gigabyte dav1d picture first. Clear libavif's per-axis
             // edge cap so tall strips under `MAX_PIXELS` still decode.
-            decoder.imageSizeLimit = super::MAX_PIXELS;
-            decoder.imageDimensionLimit = NO_DIMENSION_LIMIT;
+            raw_decoder.imageSizeLimit = pixels::MAX_PIXELS;
+            raw_decoder.imageDimensionLimit = NO_DIMENSION_LIMIT;
             // Opt into 16-bit sample-transform items (off by default in
             // libavif 1.4); gain maps stay off as rendering skips them.
-            decoder.imageContentToDecode |=
+            raw_decoder.imageContentToDecode |=
                 AVIF_IMAGE_CONTENT_SAMPLE_TRANSFORMS;
             // Neither EXIF nor XMP is read from decoded AVIF frames; skipping
             // Exif also avoids failing on malformed Exif TIFF offsets.
             let enable = AVIF_TRUE.cast_signed();
-            decoder.ignoreExif = enable;
-            decoder.ignoreXMP = enable;
+            raw_decoder.ignoreExif = enable;
+            raw_decoder.ignoreXMP = enable;
         }
-        // SAFETY: `guard.ptr` is uniquely owned and `bytes` stays live until
+        // SAFETY: `guard.decoder` is uniquely owned and `bytes` stays live until
         // `guard` drops.
         let io = unsafe {
-            avifDecoderSetIOMemory(guard.ptr, bytes.as_ptr(), bytes.len())
+            avifDecoderSetIOMemory(
+                guard.decoder,
+                bytes.as_ptr(),
+                bytes.len(),
+            )
         };
         check(io, "avif io")?;
-        // SAFETY: `guard.ptr` is valid with attached input bytes.
-        let parsed = unsafe { avifDecoderParse(guard.ptr) };
+        // SAFETY: `guard.decoder` is valid with attached input bytes.
+        let parsed = unsafe { avifDecoderParse(guard.decoder) };
         check(parsed, "avif parse")?;
-        // SAFETY: `guard.ptr` parsed cleanly above.
-        let next = unsafe { avifDecoderNextImage(guard.ptr) };
+        // SAFETY: `guard.decoder` parsed cleanly above.
+        let next = unsafe { avifDecoderNextImage(guard.decoder) };
         check(next, "avif image")?;
         Ok(guard)
     }
 
     fn image(&self) -> eros::Result<&avifImage> {
-        // SAFETY: `self.ptr` stays live while `self` is borrowed and was
+        // SAFETY: `self.decoder` stays live while `self` is borrowed and was
         // decoded in `new`.
-        let frame = unsafe { (*self.ptr).image };
+        let frame = unsafe { (*self.decoder).image };
         if frame.is_null() {
             eros::bail!("avif: no image");
         }
-        // SAFETY: `frame` is non-null and owned by `self.ptr` while `&self`
+        // SAFETY: `frame` is non-null and owned by `self.decoder` while `&self`
         // stays live.
         Ok(unsafe { &*frame })
     }
@@ -436,14 +457,22 @@ impl Drop for DecoderGuard<'_> {
         // SAFETY: the guard solely owns the decoder from
         // `avifDecoderCreate`, and drop runs exactly once.
         unsafe {
-            avifDecoderDestroy(self.ptr);
+            avifDecoderDestroy(self.decoder);
         }
     }
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "a panic in test code is inconsequential"
+)]
 mod tests {
     use super::*;
+    use crate::image::decode::codec;
+    use crate::image::pixels::Format;
+    use crate::image::pixels::Pixels;
 
     #[test]
     fn copy_plane_handles_contiguous_and_padded_strides() {
@@ -474,5 +503,32 @@ mod tests {
             strided_u16,
             Ok(words) if *words == [100, 200, 300, 400]
         ));
+    }
+
+    // 32x16 10-bit 4:0:0 fixture, a black-to-white grayscale gradient.
+    #[test]
+    fn avif_fixture_decodes() {
+        let page = codec::decode(
+            include_bytes!("../../../tests/fixtures/mono.avif"),
+            "a.avif",
+        )
+        .expect("mono avif decodes");
+        assert_eq!(page.format(), Format::Avif);
+        assert_eq!((page.width(), page.height()), (32, 16));
+        let Pixels::Gray {
+            planes:
+                SamplePlanes::U16 {
+                    planes: [luma],
+                    alpha,
+                    ..
+                },
+            ..
+        } = page.pixels()
+        else {
+            panic!("mono avif must decode to 16-bit gray plane")
+        };
+        assert_eq!(luma.len(), 32 * 16);
+        assert!(luma.first() < luma.last());
+        assert!(alpha.is_none());
     }
 }

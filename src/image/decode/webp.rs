@@ -18,9 +18,11 @@ use libwebp_sys::WebPBitstreamFeatures;
 use libwebp_sys::WebPData;
 use libwebp_sys::WebPDecoderConfig;
 
-use super::Decoded;
-use super::Format;
-use super::Subsampling;
+use crate::image::pixels;
+use crate::image::pixels::Format;
+use crate::image::pixels::Image;
+use crate::image::pixels::SamplePlanes;
+use crate::image::pixels::Subsampling;
 
 /// `features.format` value for lossy VP8 bitstreams (`decode.h`).
 const WEBP_FORMAT_LOSSY: i32 = 1;
@@ -28,7 +30,7 @@ const WEBP_FORMAT_LOSSY: i32 = 1;
 pub(super) fn decode(
     bytes: &[u8],
     max_threads: usize,
-) -> eros::Result<Decoded> {
+) -> eros::Result<Image> {
     let features = read_features(bytes)?;
     let (Ok(width), Ok(height)) = (
         u32::try_from(features.width),
@@ -36,29 +38,38 @@ pub(super) fn decode(
     ) else {
         eros::bail!("webp: bad dimensions");
     };
-    super::admit_dims(width, height, "webp: bad dimensions")?;
+    pixels::admit_dims(width, height, "webp: bad dimensions")?;
 
     let orientation = exif_orientation(bytes);
     let use_threads = max_threads > 1;
 
     if features.has_animation != 0 {
-        return decode_animated_first_frame(bytes, orientation, use_threads);
+        return decode_animated_first_frame(
+            bytes,
+            orientation,
+            use_threads,
+        );
     }
     if features.format == WEBP_FORMAT_LOSSY && features.has_alpha == 0 {
-        return decode_yuv(bytes, (width, height), orientation, use_threads);
+        return decode_yuv(
+            bytes,
+            (width, height),
+            orientation,
+            use_threads,
+        );
     }
     decode_rgba(bytes, (width, height), orientation, use_threads)
 }
 
 fn rgba_stride(width: u32) -> eros::Result<i32> {
-    let bytes_per_pixel = u32::try_from(super::RGBA_BYTES_PER_PIXEL)?;
+    let bytes_per_pixel = u32::try_from(pixels::RGBA_BYTES_PER_PIXEL)?;
     let stride = width
         .checked_mul(bytes_per_pixel)
         .ok_or_else(|| eros::error!("webp: stride overflows u32"))?;
     Ok(i32::try_from(stride)?)
 }
 
-pub(super) fn encode_rgba(
+pub fn encode_rgba(
     dims: (u32, u32),
     rgba: &[u8],
     quality: f32,
@@ -68,14 +79,14 @@ pub(super) fn encode_rgba(
     use libwebp_sys::WebPEncodeRGBA;
     use libwebp_sys::WebPFree;
 
-    let expected_bytes = super::rgba_byte_len(dims.0, dims.1)?;
+    let expected_bytes = pixels::rgba_byte_len(dims.0, dims.1)?;
     if rgba.len() != expected_bytes {
         eros::bail!("webp: unexpected rgba buffer size");
     }
     let stride = rgba_stride(dims.0)?;
     let width = i32::try_from(dims.0)?;
     let height = i32::try_from(dims.1)?;
-    let mut out_ptr = ptr::null_mut();
+    let mut encoded_pointer = ptr::null_mut();
     // SAFETY: `rgba` holds `width * height * 4` bytes matching `stride` for this call.
     let len = unsafe {
         WebPEncodeRGBA(
@@ -84,24 +95,24 @@ pub(super) fn encode_rgba(
             height,
             stride,
             quality,
-            &raw mut out_ptr,
+            &raw mut encoded_pointer,
         )
     };
-    if out_ptr.is_null() {
+    if encoded_pointer.is_null() {
         eros::bail!("webp: encode failed");
     }
     let owned = (len > 0).then(|| {
         // SAFETY: `WebPEncodeRGBA` returned a non-null buffer of `len` bytes.
-        unsafe { slice::from_raw_parts(out_ptr, len) }.to_vec()
+        unsafe { slice::from_raw_parts(encoded_pointer, len) }.to_vec()
     });
-    // SAFETY: `out_ptr` was allocated by `WebPEncodeRGBA`.
+    // SAFETY: `encoded_pointer` was allocated by `WebPEncodeRGBA`.
     unsafe {
-        WebPFree(out_ptr.cast());
+        WebPFree(encoded_pointer.cast());
     }
     owned.ok_or_else(|| eros::error!("webp: encode failed"))
 }
 
-pub(super) fn dims(bytes: &[u8]) -> eros::Result<(u32, u32)> {
+pub fn dims(bytes: &[u8]) -> eros::Result<(u32, u32)> {
     use libwebp_sys::WebPGetInfo;
 
     let mut raw_width = 0_i32;
@@ -129,7 +140,7 @@ pub(super) fn dims(bytes: &[u8]) -> eros::Result<(u32, u32)> {
     Ok((width, height))
 }
 
-pub(super) fn decode_rgba_bounded(
+pub fn decode_rgba_bounded(
     bytes: &[u8],
     max_edge: u32,
 ) -> eros::Result<((u32, u32), Vec<u8>)> {
@@ -140,11 +151,11 @@ pub(super) fn decode_rgba_bounded(
         eros::bail!("webp: dimensions exceed limit");
     }
 
-    let byte_len = super::rgba_byte_len(width, height)?;
+    let byte_len = pixels::rgba_byte_len(width, height)?;
     let stride = rgba_stride(width)?;
     let mut rgba = vec![0_u8; byte_len];
     // SAFETY: `bytes` is live and `rgba` has `byte_len` bytes matching `width * height * 4`.
-    let decoded_ptr = unsafe {
+    let decoded_pointer = unsafe {
         WebPDecodeRGBAInto(
             bytes.as_ptr(),
             bytes.len(),
@@ -153,7 +164,7 @@ pub(super) fn decode_rgba_bounded(
             stride,
         )
     };
-    if decoded_ptr.is_null() {
+    if decoded_pointer.is_null() {
         eros::bail!("webp: decode failed");
     }
     Ok(((width, height), rgba))
@@ -198,18 +209,16 @@ fn decode_yuv(
     dims: (u32, u32),
     orientation: Orientation,
     use_threads: bool,
-) -> eros::Result<Decoded> {
+) -> eros::Result<Image> {
     use libwebp_sys::WebPDecode;
     use libwebp_sys::WebPYUVABuffer;
 
-    use super::Matrix;
-    use super::Samples;
-    use super::Transfer;
-    use super::YuvImage;
-    use super::YuvPlanes;
+    use crate::image::pixels::Matrix;
+    use crate::image::pixels::Transfer;
+    use crate::image::pixels::YuvSpec;
 
     let ((luma_width, luma_height), (chroma_width, chroma_height)) =
-        super::plane_dims(dims, Subsampling::Yuv420);
+        pixels::plane_dims(dims, Subsampling::Yuv420);
     let mut luma = vec![0_u8; luma_width as usize * luma_height as usize];
     let mut cb =
         vec![0_u8; chroma_width as usize * chroma_height as usize];
@@ -248,21 +257,23 @@ fn decode_yuv(
     drop(guard);
     check_status(status, "webp decode")?;
 
-    Ok(Decoded::yuv(
+    Ok(Image::yuv(
         dims.0,
         dims.1,
         Format::Webp,
         Transfer::Srgb,
-        YuvImage {
+        YuvSpec {
             subsampling: Subsampling::Yuv420,
             full_range: false,
             matrix: Matrix::Bt601,
-            samples: Samples::U8(YuvPlanes {
-                luma: luma.into_boxed_slice(),
-                cb: cb.into_boxed_slice(),
-                cr: cr.into_boxed_slice(),
-                alpha: None,
-            }),
+        },
+        SamplePlanes::U8 {
+            planes: [
+                luma.into_boxed_slice(),
+                cb.into_boxed_slice(),
+                cr.into_boxed_slice(),
+            ],
+            alpha: None,
         },
     )?
     .apply_orientation(orientation))
@@ -273,11 +284,11 @@ fn decode_rgba(
     dims: (u32, u32),
     orientation: Orientation,
     use_threads: bool,
-) -> eros::Result<Decoded> {
+) -> eros::Result<Image> {
     use libwebp_sys::WebPDecode;
     use libwebp_sys::WebPRGBABuffer;
 
-    let byte_len = super::rgba_byte_len(dims.0, dims.1)?;
+    let byte_len = pixels::rgba_byte_len(dims.0, dims.1)?;
     let mut rgba = vec![0_u8; byte_len];
 
     let mut guard = DecoderConfigGuard::new()?;
@@ -309,18 +320,20 @@ fn finish_rgba(
     rgba: Box<[u8]>,
     dims: (u32, u32),
     orientation: Orientation,
-) -> eros::Result<Decoded> {
-    use super::Transfer;
+) -> eros::Result<Image> {
+    use crate::image::pixels::Transfer;
 
-    Ok(Decoded::rgba(dims.0, dims.1, Format::Webp, Transfer::Srgb, rgba)?
-        .apply_orientation(orientation))
+    Ok(
+        Image::rgba(dims.0, dims.1, Format::Webp, Transfer::Srgb, rgba)?
+            .apply_orientation(orientation),
+    )
 }
 
 fn decode_animated_first_frame(
     bytes: &[u8],
     orientation: Orientation,
     use_threads: bool,
-) -> eros::Result<Decoded> {
+) -> eros::Result<Image> {
     use std::mem::MaybeUninit;
     use std::slice;
 
@@ -342,25 +355,25 @@ fn decode_animated_first_frame(
     let decoder = AnimDecoderGuard::new(bytes, &options)?;
     let info = decoder.info()?;
     let dims = (info.canvas_width, info.canvas_height);
-    let byte_len = super::rgba_byte_len(dims.0, dims.1)?;
+    let byte_len = pixels::rgba_byte_len(dims.0, dims.1)?;
 
-    let mut frame_ptr = ptr::null_mut();
+    let mut frame_pointer = ptr::null_mut();
     let mut timestamp = 0_i32;
-    // SAFETY: `decoder.ptr` is live and `bytes` outlives it via `'bytes`.
+    // SAFETY: `decoder.decoder` is live and `bytes` outlives it via `'bytes`.
     let got_frame = unsafe {
         WebPAnimDecoderGetNext(
-            decoder.ptr,
-            &raw mut frame_ptr,
+            decoder.decoder,
+            &raw mut frame_pointer,
             &raw mut timestamp,
         )
     };
-    if got_frame == 0 || frame_ptr.is_null() {
+    if got_frame == 0 || frame_pointer.is_null() {
         eros::bail!("webp: missing animation frame");
     }
     // SAFETY: `WebPAnimDecoderGetNext` returned `byte_len` RGBA bytes owned
     // by `decoder` while `decoder` remains live.
     let frame_slice =
-        unsafe { slice::from_raw_parts(frame_ptr, byte_len) };
+        unsafe { slice::from_raw_parts(frame_pointer, byte_len) };
     let owned = frame_slice.to_vec().into_boxed_slice();
     drop(decoder);
 
@@ -389,7 +402,7 @@ impl Drop for DecoderConfigGuard {
 }
 
 struct AnimDecoderGuard<'bytes> {
-    ptr: *mut WebPAnimDecoder,
+    decoder: *mut WebPAnimDecoder,
     _bytes: PhantomData<&'bytes [u8]>,
 }
 
@@ -405,12 +418,13 @@ impl<'bytes> AnimDecoderGuard<'bytes> {
             size: bytes.len(),
         };
         // SAFETY: `data` (`bytes` outlives the guard via `'bytes`) and `options` are initialized.
-        let ptr = unsafe { WebPAnimDecoderNew(&raw const data, options) };
-        if ptr.is_null() {
+        let decoder =
+            unsafe { WebPAnimDecoderNew(&raw const data, options) };
+        if decoder.is_null() {
             eros::bail!("webp: anim decoder init failed");
         }
         Ok(Self {
-            ptr,
+            decoder,
             _bytes: PhantomData,
         })
     }
@@ -419,9 +433,9 @@ impl<'bytes> AnimDecoderGuard<'bytes> {
         use libwebp_sys::WebPAnimDecoderGetInfo;
 
         let mut info = WebPAnimInfo::default();
-        // SAFETY: `self.ptr` is live (`AnimDecoderGuard::new`) and `info` is initialized.
+        // SAFETY: `self.decoder` is live (`AnimDecoderGuard::new`) and `info` is initialized.
         let ok =
-            unsafe { WebPAnimDecoderGetInfo(self.ptr, &raw mut info) };
+            unsafe { WebPAnimDecoderGetInfo(self.decoder, &raw mut info) };
         if ok == 0 {
             eros::bail!("webp: anim info unavailable");
         }
@@ -433,9 +447,9 @@ impl Drop for AnimDecoderGuard<'_> {
     fn drop(&mut self) {
         use libwebp_sys::WebPAnimDecoderDelete;
 
-        // SAFETY: `self.ptr` is uniquely owned from `WebPAnimDecoderNew`.
+        // SAFETY: `self.decoder` is uniquely owned from `WebPAnimDecoderNew`.
         unsafe {
-            WebPAnimDecoderDelete(self.ptr);
+            WebPAnimDecoderDelete(self.decoder);
         }
     }
 }
@@ -506,7 +520,8 @@ fn find_exif_chunk(bytes: &[u8]) -> Option<&[u8]> {
         if fourcc == b"EXIF" {
             return bytes.get(payload_start..payload_end);
         }
-        let padded_len = chunk_len.checked_add(chunk_len & 1)?;
+        let pad_byte = chunk_len & 1;
+        let padded_len = chunk_len.checked_add(pad_byte)?;
         offset = payload_start.checked_add(padded_len)?;
     }
     None
@@ -521,8 +536,9 @@ fn find_exif_chunk(bytes: &[u8]) -> Option<&[u8]> {
 )]
 mod tests {
     use super::*;
-    use crate::decode;
-    use crate::decode::Pixels;
+    use crate::image::decode::codec;
+    use crate::image::pixels::Matrix;
+    use crate::image::pixels::Pixels;
 
     fn encode_rgba(
         width: u32,
@@ -538,8 +554,12 @@ mod tests {
         const LOSSY_QUALITY: f32 = 90.0;
 
         if !lossless {
-            return super::encode_rgba((width, height), rgba, LOSSY_QUALITY)
-                .expect("webp test encode failed");
+            return super::encode_rgba(
+                (width, height),
+                rgba,
+                LOSSY_QUALITY,
+            )
+            .expect("webp test encode failed");
         }
         let stride = i32::try_from(width * 4).expect("stride fits i32");
         let width = i32::try_from(width).expect("width fits i32");
@@ -686,43 +706,37 @@ mod tests {
 
     #[test]
     fn webp_decodes_yuv_rgba_and_animation() {
-        use crate::decode::Matrix;
-        use crate::decode::Samples;
-
         let lossy =
             encode_rgba(5, 3, &[200_u8, 120, 60, 255].repeat(15), false);
         let decoded_lossy =
-            decode::decode(&lossy, "page.webp").expect("lossy webp");
+            codec::decode(&lossy, "page.webp").expect("lossy webp");
         assert_eq!(decoded_lossy.format(), Format::Webp);
         assert_eq!(
             (decoded_lossy.width(), decoded_lossy.height()),
             (5, 3)
         );
-        let Pixels::Yuv(yuv) = decoded_lossy.pixels() else {
+        let Pixels::Yuv { spec, planes } = decoded_lossy.pixels() else {
             panic!("opaque lossy webp must decode to yuv");
         };
-        assert_eq!(yuv.subsampling, Subsampling::Yuv420);
-        assert_eq!(yuv.matrix, Matrix::Bt601);
-        assert!(!yuv.full_range);
-        assert!(matches!(
-            &yuv.samples,
-            Samples::U8(planes) if planes.alpha.is_none()
-        ));
+        assert_eq!(spec.subsampling, Subsampling::Yuv420);
+        assert_eq!(spec.matrix, Matrix::Bt601);
+        assert!(!spec.full_range);
+        assert!(matches!(planes, SamplePlanes::U8 { alpha: None, .. }));
 
         let lossless =
             encode_rgba(4, 2, &[10_u8, 20, 30, 255].repeat(8), true);
         let decoded_lossless =
-            decode::decode(&lossless, "lossless.webp").expect("lossless");
+            codec::decode(&lossless, "lossless.webp").expect("lossless");
         let Pixels::Rgba8(lossless_bytes) = decoded_lossless.pixels()
         else {
             panic!("lossless webp must decode to rgba");
         };
         assert_eq!(lossless_bytes.get(..4), Some(&[10, 20, 30, 255][..]));
 
-        let alpha =
+        let alpha_plane =
             encode_rgba(3, 2, &[40_u8, 80, 120, 128].repeat(6), false);
         let decoded_alpha =
-            decode::decode(&alpha, "alpha.webp").expect("alpha webp");
+            codec::decode(&alpha_plane, "alpha.webp").expect("alpha webp");
         let Pixels::Rgba8(alpha_bytes) = decoded_alpha.pixels() else {
             panic!("alpha webp must decode to rgba");
         };
@@ -732,7 +746,7 @@ mod tests {
             encode_rgba(4, 2, &[200_u8, 100, 50, 255].repeat(8), true);
         let animated = wrap_animated_webp(&lossless, &second_frame, 4, 2);
         let decoded_anim =
-            decode::decode(&animated, "anim.webp").expect("anim webp");
+            codec::decode(&animated, "anim.webp").expect("anim webp");
         let Pixels::Rgba8(anim_bytes) = decoded_anim.pixels() else {
             panic!("animated webp must decode to rgba");
         };
@@ -745,7 +759,7 @@ mod tests {
             encode_rgba(4, 2, &[50_u8, 100, 150, 255].repeat(8), false);
         // Orientation 6 = 90 deg CW: 4x2 becomes 2x4.
         let rotated = wrap_vp8x_with_exif(&plain, 4, 2, 6);
-        let decoded = decode::decode(&rotated, "rot.webp")
+        let decoded = codec::decode(&rotated, "rot.webp")
             .expect("rotated webp decodes");
         assert_eq!((decoded.width(), decoded.height()), (2, 4));
     }

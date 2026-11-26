@@ -1,5 +1,17 @@
 //! Usage: cy <dir | archive | image-file>.
 
+mod app;
+mod book;
+mod image;
+mod render;
+#[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "a panic in test code is inconsequential"
+)]
+mod testkit;
+
 use std::process::ExitCode;
 
 use rustfs_mimalloc::MiMalloc;
@@ -16,5 +28,5 @@ fn main() -> ExitCode {
 
     // env::args panics on non-UTF-8 argv, which file managers pass.
     let args: Vec<_> = env::args_os().collect();
-    cryslen::run(&args)
+    app::run::main(&args)
 }
