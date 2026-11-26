@@ -51,19 +51,19 @@ CARGO_PROFILE_RELEASE_LTO=thin
 
 ## Screenshots
 
-|![cryslen full window](assets/screenshot-2026-10/full.avif)|
+|![cryslen full window](https://raw.githubusercontent.com/MidAutumnMoon/cryslen/refs/heads/main/assets/screenshot-2026-10/full.avif)|
 |-|
 |Full window with transparent background. Blur effect is by niri.|
 
-|![cryslen left side](assets/screenshot-2026-10/left-side.avif)|
+|![cryslen left side](https://raw.githubusercontent.com/MidAutumnMoon/cryslen/refs/heads/main/assets/screenshot-2026-10/left-side.avif)|
 |-|
 |From left to right: <br/><br/> - `current page`/`total pages`. <br/> - `immediate parent`/`filename`. <br/> - image dimension <br/> - zoom level|
 
-|![cryslen right side](assets/screenshot-2026-10/right-side.avif)|
+|![cryslen right side](https://raw.githubusercontent.com/MidAutumnMoon/cryslen/refs/heads/main/assets/screenshot-2026-10/right-side.avif)|
 |-|
 |Mode indicators|
 
-|![cryslen page jump popup](assets/screenshot-2026-11/page-jump-popup.avif)|
+|![cryslen page jump popup](https://raw.githubusercontent.com/MidAutumnMoon/cryslen/refs/heads/main/assets/screenshot-2026-11/page-jump-popup.avif)|
 |-|
 |The `:` page jump popup. Background is dimmed.|
 
